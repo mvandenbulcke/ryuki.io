@@ -1,0 +1,525 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/postgresql-infrastructure-attestation-envelope.schema.json",
+  "title": "Ryuki PostgreSQL infrastructure attestation response",
+  "description": "Closed response returned by an independently pinned PostgreSQL provider-control-plane authority. Schema validity never grants trust. The runtime verifier consumes one nonce-bound request, verifies the domain-separated Ed25519 signature and exact request/workload/guard/profile/expected-value echoes, compares the full independently observed backend-session and caller-observed TLS-channel preimages, recomputes TLS-channel, database, session, and storage digests, requires the receipt-bound provider-route digest to match the caller-validated route and every response projection, rejects channel/route/cluster/storage cross-wiring, and enforces an exclusive 300-second freshness ceiling.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_kind",
+    "canonicalization",
+    "signature_algorithm",
+    "authority",
+    "request_nonce",
+    "request_digest",
+    "namespace",
+    "workload",
+    "guard",
+    "attestation_profile",
+    "expected",
+    "outcome",
+    "measurement",
+    "signature_base64"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "postgresql-infrastructure-attestation-response" },
+    "canonicalization": { "const": "ryuki-canonical-json-v1" },
+    "signature_algorithm": { "const": "ed25519" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "request_nonce": { "$ref": "#/$defs/nonce" },
+    "request_digest": { "$ref": "#/$defs/digest" },
+    "namespace": { "$ref": "#/$defs/namespace" },
+    "workload": { "$ref": "#/$defs/workload" },
+    "guard": { "$ref": "#/$defs/guard" },
+    "attestation_profile": { "$ref": "#/$defs/attestationProfile" },
+    "expected": { "$ref": "#/$defs/expected" },
+    "outcome": { "const": "matched" },
+    "measurement": { "$ref": "#/$defs/measurement" },
+    "signature_base64": {
+      "description": "Canonical Base64 of a 64-byte Ed25519 signature. Signing bytes are a little-endian u64 length frame for ryuki-v1/postgresql-infrastructure-attestation-response followed by a frame for canonical response bytes with signature_base64 removed.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
+    }
+  },
+  "$defs": {
+    "positiveCounter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "not": { "const": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }
+    },
+    "timestampSeconds": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "format": "date-time"
+    },
+    "timestampAuto": {
+      "type": "string",
+      "maxLength": 35,
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]{1,9})?Z$",
+      "format": "date-time"
+    },
+    "deploymentId": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trustDomainId": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "workloadId": {
+      "type": "string",
+      "pattern": "^workload:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "postgresqlIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+      "not": { "const": "postgres" }
+    },
+    "runtimeIdentifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[a-z0-9][a-z0-9._:/-]{2,254}$"
+    },
+    "ipAddress": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "ipv4",
+          "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"
+        },
+        {
+          "type": "string",
+          "format": "ipv6",
+          "minLength": 2,
+          "maxLength": 45,
+          "pattern": "^[0-9a-f:]+$"
+        }
+      ]
+    },
+    "dnsName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_id",
+        "key_id",
+        "public_key_fingerprint",
+        "authority_epoch",
+        "authority_revision"
+      ],
+      "properties": {
+        "authority_id": {
+          "type": "string",
+          "pattern": "^postgresql-infrastructure-attestation-authority:[a-z0-9][a-z0-9._:/-]{2,189}$"
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^postgresql-infrastructure-attestation-key:[a-z0-9][a-z0-9._:/-]{2,189}$"
+        },
+        "public_key_fingerprint": { "$ref": "#/$defs/digest" },
+        "authority_epoch": { "$ref": "#/$defs/positiveCounter" },
+        "authority_revision": { "$ref": "#/$defs/positiveCounter" }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployment_id", "trust_domain_id", "workload_id"],
+      "properties": {
+        "deployment_id": { "$ref": "#/$defs/deploymentId" },
+        "trust_domain_id": { "$ref": "#/$defs/trustDomainId" },
+        "workload_id": { "$ref": "#/$defs/workloadId" }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "artifact_digest",
+        "workload_instance_binding_digest"
+      ],
+      "properties": {
+        "source_revision": {
+          "type": "string",
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+          "not": {
+            "enum": [
+              "0000000000000000000000000000000000000000",
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            ]
+          }
+        },
+        "artifact_digest": { "$ref": "#/$defs/digest" },
+        "workload_instance_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["guard_id", "requirement_digest", "challenge_binding_digest"],
+      "properties": {
+        "guard_id": { "const": "durable-postgresql" },
+        "requirement_digest": { "$ref": "#/$defs/digest" },
+        "challenge_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "attestationProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_version", "content_digest"],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "pattern": "^postgresql-infrastructure-attestation-profile:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "profile_version": { "$ref": "#/$defs/positiveCounter" },
+        "content_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "database_provider",
+        "server_major_version",
+        "provider_route_binding_digest",
+        "database_identity_digest",
+        "storage_binding_digest",
+        "migration_inventory_digest",
+        "application_role",
+        "migration_role",
+        "session_request_tag",
+        "session_binding_digest",
+        "tls_channel_binding_digest"
+      ],
+      "properties": {
+        "database_provider": { "$ref": "#/$defs/databaseProvider" },
+        "server_major_version": { "const": 18 },
+        "provider_route_binding_digest": {
+          "description": "ryuki-postgresql-provider-route-binding-v1 digest of the exact direct-session-v1 provider route selected by the workload and echoed by the independent authority.",
+          "$ref": "#/$defs/digest"
+        },
+        "database_identity_digest": { "$ref": "#/$defs/digest" },
+        "storage_binding_digest": { "$ref": "#/$defs/digest" },
+        "migration_inventory_digest": { "$ref": "#/$defs/digest" },
+        "application_role": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "migration_role": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "session_request_tag": {
+          "type": "string",
+          "pattern": "^ryuki-pg-attest-[a-f0-9]{40}$"
+        },
+        "session_binding_digest": { "$ref": "#/$defs/digest" },
+        "tls_channel_binding_digest": {
+          "description": "ryuki-postgresql-tls-channel-binding-v1 digest of the exact caller-observed direct TLS channel preimage.",
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "databaseProvider": {
+      "enum": ["cloudnativepg", "aws-rds", "azure-postgresql", "gcp-cloud-sql"]
+    },
+    "trustedTimeInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["not_before", "not_after"],
+      "properties": {
+        "not_before": { "$ref": "#/$defs/timestampSeconds" },
+        "not_after": { "$ref": "#/$defs/timestampSeconds" }
+      }
+    },
+    "optionalDistinguishedName": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        }
+      ]
+    },
+    "sessionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "application_name",
+        "database_name",
+        "database_oid",
+        "datid",
+        "server_address",
+        "server_port",
+        "server_major_version",
+        "primary",
+        "transaction_writable",
+        "default_transaction_writable",
+        "client_address",
+        "client_port",
+        "backend_process_id",
+        "backend_start",
+        "backend_type",
+        "session_login_role",
+        "session_user_oid",
+        "current_role",
+        "selected_role",
+        "tls_enabled",
+        "tls_protocol",
+        "tls_cipher_suite",
+        "tls_cipher_bits",
+        "client_distinguished_name",
+        "issuer_distinguished_name",
+        "tls_channel_binding"
+      ],
+      "properties": {
+        "application_name": {
+          "type": "string",
+          "pattern": "^ryuki-pg-attest-[a-f0-9]{40}$"
+        },
+        "database_name": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "database_oid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "datid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "server_address": { "$ref": "#/$defs/ipAddress" },
+        "server_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "server_major_version": { "const": 18 },
+        "primary": { "const": true },
+        "transaction_writable": { "const": true },
+        "default_transaction_writable": { "const": true },
+        "client_address": { "$ref": "#/$defs/ipAddress" },
+        "client_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "backend_process_id": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "backend_start": { "$ref": "#/$defs/timestampAuto" },
+        "backend_type": { "const": "client backend" },
+        "session_login_role": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "session_user_oid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "current_role": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "selected_role": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "tls_enabled": { "const": true },
+        "tls_protocol": { "const": "tlsv1.3" },
+        "tls_cipher_suite": { "$ref": "#/$defs/runtimeIdentifier" },
+        "tls_cipher_bits": { "type": "integer", "minimum": 128, "maximum": 65535 },
+        "client_distinguished_name": { "$ref": "#/$defs/optionalDistinguishedName" },
+        "issuer_distinguished_name": { "$ref": "#/$defs/optionalDistinguishedName" },
+        "tls_channel_binding": { "$ref": "#/$defs/tlsChannelBinding" }
+      }
+    },
+    "tlsChannelBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_route_binding_digest",
+        "server_name",
+        "peer_address",
+        "peer_port",
+        "trust_anchor_bundle_digest",
+        "peer_leaf_certificate_digest",
+        "peer_certificate_chain_digest",
+        "exporter_digest",
+        "tls_protocol",
+        "tls_cipher_suite",
+        "tls_cipher_bits"
+      ],
+      "properties": {
+        "provider_route_binding_digest": {
+          "description": "ryuki-postgresql-provider-route-binding-v1 digest of the direct-session-v1 route used for this channel.",
+          "$ref": "#/$defs/digest"
+        },
+        "server_name": {
+          "description": "Exact canonical lowercase DNS name used as the TLS SNI and certificate identity.",
+          "$ref": "#/$defs/dnsName"
+        },
+        "peer_address": {
+          "description": "Canonical IP address of the TCP peer observed by the caller before the PostgreSQL TLS upgrade.",
+          "$ref": "#/$defs/ipAddress"
+        },
+        "peer_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "trust_anchor_bundle_digest": {
+          "description": "SHA-256 digest of the exact exclusive CA bundle bytes used to verify the peer; public or native root augmentation is forbidden.",
+          "$ref": "#/$defs/digest"
+        },
+        "peer_leaf_certificate_digest": {
+          "description": "SHA-256 digest of the exact DER leaf certificate observed on the channel.",
+          "$ref": "#/$defs/digest"
+        },
+        "peer_certificate_chain_digest": {
+          "description": "SHA-256 digest of the exact ordered peer certificate chain, with each DER certificate framed by an unsigned big-endian u64 length.",
+          "$ref": "#/$defs/digest"
+        },
+        "exporter_digest": {
+          "description": "SHA-256 digest of the 32-byte TLS 1.3 exporter produced with label EXPORTER-ryuki-postgresql-migration-direct-session-v1 and the request-specific context.",
+          "$ref": "#/$defs/digest"
+        },
+        "tls_protocol": { "const": "tlsv1.3" },
+        "tls_cipher_suite": { "$ref": "#/$defs/runtimeIdentifier" },
+        "tls_cipher_bits": { "type": "integer", "minimum": 128, "maximum": 65535 }
+      }
+    },
+    "databaseIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_id",
+        "trust_domain_id",
+        "database_provider",
+        "database_name",
+        "database_oid",
+        "cluster_system_identifier",
+        "server_address",
+        "server_port",
+        "tls_enabled",
+        "tls_protocol",
+        "tls_cipher_suite",
+        "tls_cipher_bits",
+        "server_major_version",
+        "primary",
+        "writable"
+      ],
+      "properties": {
+        "deployment_id": { "$ref": "#/$defs/deploymentId" },
+        "trust_domain_id": { "$ref": "#/$defs/trustDomainId" },
+        "database_provider": { "$ref": "#/$defs/databaseProvider" },
+        "database_name": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "database_oid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "cluster_system_identifier": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,19}$"
+        },
+        "server_address": { "$ref": "#/$defs/ipAddress" },
+        "server_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "tls_enabled": { "const": true },
+        "tls_protocol": { "const": "tlsv1.3" },
+        "tls_cipher_suite": { "$ref": "#/$defs/runtimeIdentifier" },
+        "tls_cipher_bits": { "type": "integer", "minimum": 128, "maximum": 65535 },
+        "server_major_version": { "const": 18 },
+        "primary": { "const": true },
+        "writable": { "const": true }
+      }
+    },
+    "storageBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "purpose",
+        "provider_cluster_uid_digest",
+        "persistent_volume_claim_uid_digest",
+        "persistent_volume_uid_digest",
+        "csi_driver",
+        "volume_handle_digest",
+        "storage_class"
+      ],
+      "properties": {
+        "purpose": { "enum": ["data", "wal"] },
+        "provider_cluster_uid_digest": { "$ref": "#/$defs/digest" },
+        "persistent_volume_claim_uid_digest": { "$ref": "#/$defs/digest" },
+        "persistent_volume_uid_digest": { "$ref": "#/$defs/digest" },
+        "csi_driver": { "$ref": "#/$defs/runtimeIdentifier" },
+        "volume_handle_digest": { "$ref": "#/$defs/digest" },
+        "storage_class": { "$ref": "#/$defs/runtimeIdentifier" }
+      }
+    },
+    "storageBindings": {
+      "oneOf": [
+        {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/storageBinding" },
+                { "properties": { "purpose": { "const": "data" } } }
+              ]
+            }
+          ],
+          "items": false
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/storageBinding" },
+                { "properties": { "purpose": { "const": "data" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/storageBinding" },
+                { "properties": { "purpose": { "const": "wal" } } }
+              ]
+            }
+          ],
+          "items": false
+        }
+      ]
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "method",
+        "tls_channel_verification_method",
+        "observed_at",
+        "valid_until",
+        "restored_state_reconciled",
+        "session_binding",
+        "session_binding_digest",
+        "provider_route_binding_digest",
+        "tls_channel_binding_digest",
+        "database_identity",
+        "database_identity_digest",
+        "provider_cluster_uid_digest",
+        "storage_bindings",
+        "storage_binding_digest"
+      ],
+      "properties": {
+        "sequence": { "$ref": "#/$defs/positiveCounter" },
+        "method": { "const": "provider-control-plane-postgresql-direct-session-v1" },
+        "tls_channel_verification_method": { "const": "provider-tls-endpoint-exporter-direct-session-v1" },
+        "observed_at": { "$ref": "#/$defs/trustedTimeInterval" },
+        "valid_until": { "$ref": "#/$defs/timestampSeconds" },
+        "restored_state_reconciled": { "const": true },
+        "session_binding": { "$ref": "#/$defs/sessionBinding" },
+        "session_binding_digest": { "$ref": "#/$defs/digest" },
+        "provider_route_binding_digest": {
+          "description": "Independent authority echo of the exact receipt-bound direct-session-v1 provider route digest.",
+          "$ref": "#/$defs/digest"
+        },
+        "tls_channel_binding_digest": {
+          "description": "Independent authority digest of the exact caller-observed and authority-correlated TLS channel binding.",
+          "$ref": "#/$defs/digest"
+        },
+        "database_identity": { "$ref": "#/$defs/databaseIdentity" },
+        "database_identity_digest": { "$ref": "#/$defs/digest" },
+        "provider_cluster_uid_digest": { "$ref": "#/$defs/digest" },
+        "storage_bindings": { "$ref": "#/$defs/storageBindings" },
+        "storage_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

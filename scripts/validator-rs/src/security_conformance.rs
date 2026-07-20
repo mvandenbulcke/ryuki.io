@@ -52,7 +52,7 @@ const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
 
-const SCHEMAS: [(&str, &str); 15] = [
+const SCHEMAS: [(&str, &str); 16] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -96,6 +96,10 @@ const SCHEMAS: [(&str, &str); 15] = [
     (
         "public-ingress-attestation-envelope.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/public-ingress-attestation-envelope.schema.json",
+    ),
+    (
+        "postgresql-infrastructure-attestation-envelope.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/postgresql-infrastructure-attestation-envelope.schema.json",
     ),
     (
         "security-limit-profile.schema.json",
@@ -393,7 +397,7 @@ impl<'de> Visitor<'de> for DuplicateCheckedValueVisitor {
     }
 }
 
-fn parse_json_strict(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+pub(crate) fn parse_json_strict(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = DuplicateCheckedValue::deserialize(&mut deserializer)?.0;
     deserializer.end()?;
@@ -6450,6 +6454,10 @@ mod tests {
                 "kind": "durable-postgresql",
                 "database_provider": "cloudnativepg",
                 "server_major_version": 18,
+                "attestation_profile_id": "postgresql-infrastructure-attestation-profile:validator",
+                "attestation_profile_version": 1,
+                "attestation_profile_digest": digest('1'),
+                "provider_route_binding_digest": digest('5'),
                 "database_identity_digest": digest('2'),
                 "storage_binding_digest": digest('3'),
                 "migration_inventory_digest": digest('4'),
@@ -7683,6 +7691,81 @@ mod tests {
             &mut errors,
         );
         assert!(!errors.is_empty());
+
+        for field in [
+            "attestation_profile_id",
+            "attestation_profile_version",
+            "attestation_profile_digest",
+            "provider_route_binding_digest",
+        ] {
+            let mut missing_postgresql_profile_field = production_deployment_profile_fixture();
+            missing_postgresql_profile_field["runtime_guard_evidence"]["guards"][0]
+                ["expected_value"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            errors.clear();
+            validate_instance(
+                &format!("test:durable-postgresql-missing-{field}"),
+                "deployment-security-profile.schema.json",
+                &schema,
+                &missing_postgresql_profile_field,
+                &mut errors,
+            );
+            assert!(
+                !errors.is_empty(),
+                "omitting durable PostgreSQL {field} must fail schema validation"
+            );
+        }
+
+        for (label, field, value) in [
+            (
+                "wrong-profile-namespace",
+                "attestation_profile_id",
+                json!("ingress-attestation-profile:validator"),
+            ),
+            (
+                "zero-profile-version",
+                "attestation_profile_version",
+                json!(0),
+            ),
+            (
+                "malformed-profile-digest",
+                "attestation_profile_digest",
+                json!("sha256:not-a-digest"),
+            ),
+            (
+                "unresolved-profile-digest",
+                "attestation_profile_digest",
+                json!(ZERO_SHA256_DIGEST),
+            ),
+            (
+                "malformed-provider-route-digest",
+                "provider_route_binding_digest",
+                json!("sha256:not-a-digest"),
+            ),
+            (
+                "unresolved-provider-route-digest",
+                "provider_route_binding_digest",
+                json!(ZERO_SHA256_DIGEST),
+            ),
+        ] {
+            let mut invalid_postgresql_profile = production_deployment_profile_fixture();
+            invalid_postgresql_profile["runtime_guard_evidence"]["guards"][0]["expected_value"]
+                [field] = value;
+            errors.clear();
+            validate_instance(
+                &format!("test:durable-postgresql-{label}"),
+                "deployment-security-profile.schema.json",
+                &schema,
+                &invalid_postgresql_profile,
+                &mut errors,
+            );
+            assert!(
+                !errors.is_empty(),
+                "invalid durable PostgreSQL {field} must fail schema validation"
+            );
+        }
 
         let mut wrong_kind = production.clone();
         wrong_kind["runtime_guard_evidence"]["guards"][0]["expected_value"] =

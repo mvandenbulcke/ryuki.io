@@ -4,6 +4,7 @@ pub mod conformance_closure;
 pub mod conformance_trust;
 pub mod cookie_policy;
 pub mod deployed_workload;
+pub mod postgresql_infrastructure;
 pub mod production_applicability;
 pub mod production_build;
 pub mod production_deployment_applicability;

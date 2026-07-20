@@ -109,6 +109,35 @@ exchange and accepts only a short-lived observation of the receipt-bound HTTPS
 origins, DNS/TLS state, ingress generation, and exact API backend workload.
 The receipt therefore precommits a stable provisioned workload-instance
 binding; it cannot be satisfied by a newly randomized identity.
+Every production process additionally requires the complete, production-only
+PostgreSQL infrastructure attestation group:
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID`,
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION`, and
+`RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST`. The nine values
+are complete-or-none and must be independently provisioned; development and
+test must leave them unset. The PostgreSQL socket and decoded-key fingerprint
+must differ from the checkpoint, workload, and ingress authorities. A
+lower-level production `apply-only` protocol performs one fresh nonce-bound, no-retry
+Ed25519 exchange with an authorization ceiling of 300 seconds. It establishes
+one exclusive-CA TLS 1.3 channel, requires its peer leaf-certificate digest to
+match the receipt-bound route before releasing credentials, permits only
+SCRAM-SHA-256, binds its exporter and provider route into the request tag, and
+relays only that channel into one direct
+PgConnection. The independent authority must derive the same exporter at the
+database endpoint; an echoed client tag is insufficient. After exact receipt
+matching, pre-DDL recheck, every pending migration, exact ledger postflight,
+and the durable operation marker run in one transaction. A pre-COMMIT failure
+rolls back; a lost COMMIT acknowledgement is `CommitOutcomeUnknown` and needs
+a fresh independently attested reconciliation run.
+Production execution remains disabled before credential loading until live
+Kubernetes render admission, one-use attempt consumption, materialized-pin
+binding, and runtime receipt freshness are implemented.
 The build manifest pins expected build identity and claims an implementation-
 applicability inventory; startup independently derives that build-side
 inventory from the authenticated ControlTrace and measured build facts and
@@ -118,10 +147,11 @@ child-manifest resolution must also be internally consistent. Startup now
 derives the complete implementation-plus-deployment applicability inventory,
 verifies exact semantic closure, and consumes the checkpoint, current SB-9
 root, authenticated documents, pinned profile/build, and workload proof into
-one non-cloneable production-boundary proof. It now retains verified
-`HttpsPublicUrls` and `SecureCookies` witnesses, but still exits before
-migrations, workers, routing, or listeners until the remaining six
-receipt-bound live runtime guards are implemented and verified.
+one non-cloneable production-boundary proof. Serving startup now retains
+verified `HttpsPublicUrls`, `SecureCookies`, and `ApprovedSecretProvider`
+witnesses, but still exits before database publication, workers, routing, or
+listeners until the remaining five receipt-bound live runtime guards are
+implemented and verified.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

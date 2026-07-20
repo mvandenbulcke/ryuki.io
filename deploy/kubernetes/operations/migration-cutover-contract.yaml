@@ -1,10 +1,25 @@
 # Static release-orchestrator input, not a Kubernetes resource. The release
-# system must validate this file against the rendered objects, then execute the
-# gates in order. It carries no credential value and is never applied with
+# system may validate this file against a frozen snapshot, but production
+# execution is deliberately disabled. This validator is not an in-cluster
+# admission controller and cannot authorize Job creation. The contract carries
+# no credential value and is never applied with
 # kubectl/GitOps. Every digest-scoped name, label, Vault role, database role,
 # and `digestPrefix` is derived from the first 12 lowercase hex characters of
-# `release.image`; a render must never replace these independently.
+# `release.image`; a render must never replace these independently. This source
+# template is not executable. The retained final-render shape is diagnostic
+# only: every final render is rejected until an independently anchored
+# in-cluster admission layer fences live object identity and consumes a unique
+# attempt, and the runtime revalidates receipt freshness before database access.
 contractVersion: migration-cutover-v1
+productionExecutionEnabled: false
+runtimeAdmission:
+  requiredCapability: in-cluster-final-render-admission-and-runtime-freshness-v1
+  capabilityAvailable: false
+  offlineSnapshotValidationOnly: true
+  snapshotAuthorizesJobCreation: false
+  snapshotFencesConfigMapDeleteRecreate: false
+  snapshotConsumesExecutionAttempt: false
+  snapshotEnforcesReceiptExpiryAtPodStartOrRuntime: false
 release:
   namespace: ryuki-platform
   apiDeployment: platform-api
@@ -14,6 +29,249 @@ release:
   digestPrefix: "111111111111"
   apiMigrationMode: verify-only
   jobMigrationMode: apply-only
+finalRender:
+  contractId: migration-final-render-v1
+  sourceMode: source-template
+  finalMode: final-render
+  unresolvedSentinel: RENDER_REQUIRED
+  atomicRewriteRequired: true
+  unresolvedSentinelForbiddenInFinal: true
+  exactReleaseDigestPrefixRequired: true
+  sourceSuspendRequired: true
+  finalSuspendExplicitlyFalseRequired: true
+  jobAnnotations:
+    exactKeys:
+      - ryuki.io/cutover-contract
+      - ryuki.io/release-image
+      - ryuki.io/render-contract
+      - ryuki.io/render-mode
+      - ryuki.io/pin-migration-config-receipt
+      - ryuki.io/pin-security-admission-receipt
+      - ryuki.io/pin-production-build-manifest-receipt
+      - ryuki.io/pin-conformance-trust-checkpoint-receipt
+      - ryuki.io/pin-deployed-workload-attestation-receipt
+      - ryuki.io/pin-public-ingress-attestation-receipt
+      - ryuki.io/pin-postgresql-infrastructure-attestation-receipt
+      - ryuki.io/pin-socket-projection-authority-receipt
+      - ryuki.io/socket-projection-receipt-digest
+      - ryuki.io/socket-contract-digest
+    unknownRyukiAnnotationsForbidden: true
+  pinConfigMapReceipt:
+    exactCanonicalJsonFields:
+      - configMapName
+      - uid
+      - resourceVersion
+      - contentDigest
+    unknownFieldsForbidden: true
+    contentDigestAlgorithm: sha256
+    contentDigestPreimage: canonical-sorted-json-data-object
+    binaryDataForbidden: true
+    configMapAnnotationsRequired:
+      - ryuki.io/release-digest-prefix
+      - ryuki.io/content-digest
+    immutableRequired: true
+    receiptMustExactlyMatchApiReadback: true
+    uidAndResourceVersionAreOpaqueStrings: true
+    offlineSnapshotFencesEnvironmentConfigMapDeleteRecreate: false
+    offlineSnapshotFencesNonEnvironmentAuthorityDeleteRecreate: false
+  socketProjectionReceipt:
+    sourceTemplateMayOmitDynamicSocketMounts: true
+    sourceTemplateExecutable: false
+    finalRenderMustCarryExactSocketProjections: true
+    exactSocketCount: 4
+    inlineCsiDriver: authority-socket-projection.ryuki.io
+    inlineCsiReadOnlyRequired: true
+    exactVolumeAttributeKeys:
+      - environmentVariable
+      - authorityClass
+      - socketPath
+    deterministicVolumeNames:
+      conformanceTrustCheckpoint: conformance-trust-checkpoint-socket
+      deployedWorkloadAttestation: deployed-workload-attestation-socket
+      publicIngressAttestation: public-ingress-attestation-socket
+      postgresqlInfrastructureAttestation: postgresql-infrastructure-attestation-socket
+    mountsAreSocketParentDirectories: true
+    socketPathsDistinctRequired: true
+    mountParentPathsDistinctRequired: true
+    postgresqlFingerprintDistinctFromOtherAuthoritiesRequired: true
+    authorityConfigMapContract: socketProjectionAuthority
+    receiptConfigMapContract: socketProjectionReceiptResource
+    strictSignedEnvelopeContract: migration-socket-projection-receipt-v1
+    receiptRawDigestAlgorithm: sha256
+    jobCarriesReceiptDigestOnly: true
+    renderedJobPreimageExcludesOnlyReceiptDigestAnnotation: true
+    receiptDigestForbiddenInCsiAttributes: true
+    receiptBindsReleaseImageAndAllEightPinConfigMapReceipts: true
+    receiptBindsExactRenderedJobPreimageDigest: true
+    receiptBindsExactSocketPathsAuthoritiesKeysAndFingerprints: true
+    receiptMaximumAuthorizationSeconds: 300
+    finalSocketsReachableBeforeRunnerStartRequired: true
+    receiptAnnotations:
+      digest: ryuki.io/socket-projection-receipt-digest
+      authorityConfigMapReceipt: ryuki.io/pin-socket-projection-authority-receipt
+      contractDigest: ryuki.io/socket-contract-digest
+  closedSocketContract:
+    contractId: migration-authority-socket-projection-v1
+    requiredSockets:
+      - environmentVariable: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET
+        authorityClass: conformance-trust-checkpoint
+      - environmentVariable: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET
+        authorityClass: deployed-workload-attestation
+      - environmentVariable: RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET
+        authorityClass: public-ingress-attestation
+      - environmentVariable: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET
+        authorityClass: postgresql-infrastructure-attestation
+    exactSocketCount: 4
+    unixSocketsOnly: true
+    normalizedAbsolutePinnedPathsRequired: true
+    liveReachabilityBeforeRunnerStartRequired: true
+    privateAuthorityKeyInJobForbidden: true
+    inImageAuthorityFallbackForbidden: true
+    hostPathFallbackForbidden: true
+    postgresqlSocketDistinctFromEveryOtherSocket: true
+    postgresqlKeyFingerprintDistinctFromEveryOtherAuthority: true
+  closedSocketContractDigestAlgorithm: sha256
+  closedSocketContractDigestPreimage: canonical-sorted-json-finalRender.closedSocketContract
+  closedSocketContractDigest: sha256:369bca5b159d7535a2b3523796ff3632e9e7ca44f9a94b4140cc572163767697
+socketProjectionAuthority:
+  configMapName: platform-migration-socket-projection-authority-pins-111111111111
+  contentDigest: RENDER_REQUIRED
+  uid: RENDER_REQUIRED
+  resourceVersion: RENDER_REQUIRED
+  jobReceiptAnnotation: ryuki.io/pin-socket-projection-authority-receipt
+  configKeys:
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_AUTHORITY_ID
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_KEY_ID
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_BASE64
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_FINGERPRINT
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_MIN_AUTHORITY_EPOCH
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_ID
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_VERSION
+    - RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_DIGEST
+  canonicalRenderIdentifiersRequired: true
+  positiveProfileVersionRequired: true
+  positiveMinimumAuthorityEpochRequired: true
+  publicKeyAlgorithm: ed25519
+  publicKeyRawBytes: 32
+  canonicalPaddedStandardBase64Required: true
+  decodedKeyFingerprintAlgorithm: sha256
+  weakPublicKeysForbidden: true
+  futureAdmissionExactTrustAnchorEqualityRequired: true
+  manifestSuppliedKeyIsNeverTrustAuthority: true
+  releaseDigestPrefixBoundNameRequired: true
+  immutableConfigMapRequired: true
+  contentDigestAnnotationRequired: true
+  uidAndResourceVersionReadbackRequired: true
+  uidAndResourceVersionAreOpaqueStrings: true
+  independentlyGovernedConfigMapRequired: true
+  importedAsApplicationEnvironment: false
+  mountedInWorkload: false
+  retainedReceiptBindsExactUidAndResourceVersion: true
+  offlineSnapshotFencesDeletionAndRecreationAfterValidation: false
+socketProjectionReceiptResource:
+  configMapNamePrefix: platform-socket-projection-receipt-
+  configMapNameSuffixSource: all-64-lowercase-hex-of-receipt-raw-digest
+  namespaceMustEqualReleaseNamespace: true
+  exactDataKeys:
+    - receipt.json
+  binaryDataForbidden: true
+  immutableRequired: true
+  exactAnnotations:
+    - ryuki.io/release-digest-prefix
+    - ryuki.io/content-digest
+    - ryuki.io/socket-projection-receipt-raw-digest
+  contentDigestMustEqualCanonicalDataObjectDigest: true
+  rawDigestAnnotationMustEqualReceiptJsonSha256: true
+  jobDigestAnnotationMustEqualReceiptJsonSha256: true
+  receiptJsonMustBeCanonicalRawBytes: true
+  importedAsApplicationEnvironment: false
+  mountedInWorkload: false
+  futureAdmissionApiReadbackRequiredBeforeJobAdmission: true
+  offlineSnapshotFencesDeletionAndRecreationAfterValidation: false
+  envelope:
+    exactTopLevelFields:
+      - payload
+      - signature
+    unknownFieldsForbiddenAtEveryLevel: true
+    maximumRawBytes: 65536
+    canonicalJson: ryuki-canonical-json-v1
+    canonicalRawBytesNoBomOrTrailingWhitespace: true
+    payload:
+      contractId: migration-socket-projection-receipt-v1
+      canonicalization: ryuki-canonical-json-v1
+      exactFields:
+        - canonicalization
+        - contractId
+        - expiresAtUnixSeconds
+        - notBeforeUnixSeconds
+        - pinConfigMapReceipts
+        - receiptAuthority
+        - releaseDigestPrefix
+        - releaseImage
+        - renderedJobPreimageDigest
+        - socketContractDigest
+        - socketProjections
+      receiptAuthorityExactFields:
+        - authorityEpoch
+        - authorityId
+        - keyId
+        - minAuthorityEpoch
+        - profileDigest
+        - profileId
+        - profileVersion
+        - publicKeyFingerprint
+      futureAdmissionAuthorityAndProfileMustExactlyMatchTrustAnchor: true
+      authorityEpochAtLeastPinnedMinimum: true
+      pinConfigMapReceiptExactCount: 8
+      pinConfigMapReceiptExactOrderByAnnotation:
+        - ryuki.io/pin-migration-config-receipt
+        - ryuki.io/pin-security-admission-receipt
+        - ryuki.io/pin-production-build-manifest-receipt
+        - ryuki.io/pin-conformance-trust-checkpoint-receipt
+        - ryuki.io/pin-deployed-workload-attestation-receipt
+        - ryuki.io/pin-public-ingress-attestation-receipt
+        - ryuki.io/pin-postgresql-infrastructure-attestation-receipt
+        - ryuki.io/pin-socket-projection-authority-receipt
+      pinConfigMapReceiptEntryExactFields:
+        - annotation
+        - receipt
+      nestedPinReceiptContract: finalRender.pinConfigMapReceipt
+      socketProjectionExactCount: 4
+      socketProjectionExactOrder: finalRender.closedSocketContract.requiredSockets
+      socketProjectionExactFields:
+        - authorityClass
+        - authorityId
+        - csiDriver
+        - environmentVariable
+        - keyId
+        - mountPath
+        - publicKeyFingerprint
+        - readOnly
+        - socketPath
+        - volumeName
+      releaseImageAndDigestPrefixMustExactlyMatchJob: true
+      renderedJobPreimageDigestAlgorithm: sha256
+      renderedJobPreimageCanonicalization: ryuki-canonical-json-v1
+      renderedJobPreimageExcludesOnlyAnnotation: ryuki.io/socket-projection-receipt-digest
+      receiptDigestForbiddenInRenderedJobOutsideExcludedAnnotation: true
+      offlineSnapshotAllEightPinReceiptsMustMatchApiReadback: true
+      offlineSnapshotAllSocketProjectionsMustMatchPinsAndRenderedJob: true
+    signature:
+      exactFields:
+        - algorithm
+        - signatureBase64
+      algorithm: ed25519
+      signatureRawBytes: 64
+      canonicalPaddedStandardBase64Required: true
+      signedValue: canonical-payload-only
+      domain: ryuki-v1/migration-socket-projection-receipt
+      framing: u64-little-endian-length-prefixed-domain-and-canonical-payload
+    offlineTrustedValidationTimeRequired: true
+    validityInterval: "[notBefore, expiresAt)"
+    timestampsArePositiveUnixSeconds: true
+    notBeforeUnixSecondsNotAfterTrustedValidationTime: true
+    trustedValidationTimeBeforeExpiresAtUnixSeconds: true
+    maximumValiditySeconds: 300
 drain:
   withdrawIngressTraffic: true
   requiredWorkloadKinds:
@@ -53,13 +311,178 @@ credentials:
     vaultDatabaseRole: ryuki-schema-migrator-111111111111
     createAfterDrain: true
     revokeAndDeleteAfterReadback: true
+productionPinProjections:
+  migrationConfig:
+    sourceTemplateConfigMapName: platform-api-migration-config
+    finalConfigMapName: platform-api-migration-config-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-migration-config-receipt
+    configKeys:
+      - RYUKI_MIGRATION_MODE
+      - RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS
+      - RYUKI_MIGRATION_LOCK_TIMEOUT_SECS
+      - RYUKI_MIGRATION_EXPECTED_ROLE
+      - RYUKI_APPLICATION_DATABASE_ROLE
+    sourceTemplateStableReferenceAllowed: true
+    finalRenderMustRewriteEnvFromReference: true
+    finalRenderDigestPrefixBoundNameRequired: true
+    immutableConfigMapRequired: true
+    contentDigestAnnotationRequired: true
+    uidAndResourceVersionReadbackRequired: true
+    exactKeyInventoryRequired: true
+    exactReviewedValuesRequired: true
+  baselineAdmission:
+    configMapName: platform-security-admission-config-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-security-admission-receipt
+    configKeys:
+      - RYUKI_SECURITY_CONTRACT_ROOT
+      - RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
+      - RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+      - RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
+      - RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
+      - RYUKI_EXPECTED_DEPLOYMENT_ID
+      - RYUKI_SECURITY_PROFILE
+  buildManifest:
+    configMapName: platform-production-build-manifest-pins-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-production-build-manifest-receipt
+    configKeys:
+      - RYUKI_PRODUCTION_BUILD_MANIFEST_PATH
+      - RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST
+  conformanceTrustCheckpoint:
+    configMapName: platform-conformance-trust-checkpoint-pins-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-conformance-trust-checkpoint-receipt
+    configKeys:
+      - RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET
+      - RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID
+      - RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID
+      - RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64
+      - RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT
+      - RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH
+  deployedWorkloadAttestation:
+    configMapName: platform-deployed-workload-attestation-pins-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-deployed-workload-attestation-receipt
+    configKeys:
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION
+      - RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST
+      - RYUKI_EXPECTED_WORKLOAD_ID
+  publicIngressAttestation:
+    configMapName: platform-public-ingress-attestation-pins-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-public-ingress-attestation-receipt
+    configKeys:
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION
+      - RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST
+  completeGroupsRequired: true
+  exactPinConfigMapReceiptCount: 8
+  releaseDigestPrefixBoundNamesRequired: true
+  immutableConfigMapsRequired: true
+  contentDigestAnnotationsRequired: true
+  uidAndResourceVersionReadbackRequired: true
+  jobReceiptAnnotationsRequired: true
+  inlineValuesForbidden: true
+  independentlyGovernedConfigMapsRequired: true
+  renderedUnixSocketProjectionsRequired: true
+  renderedSocketPathsMustEqualPins: true
+  socketAvailabilityBeforeRunnerStartRequired: true
+  hostPathFallbackForbidden: true
+postgresqlInfrastructureAttestation:
+  configMapName: platform-postgresql-infrastructure-attestation-pins-111111111111
+  contentDigest: RENDER_REQUIRED
+  uid: RENDER_REQUIRED
+  resourceVersion: RENDER_REQUIRED
+  jobReceiptAnnotation: ryuki.io/pin-postgresql-infrastructure-attestation-receipt
+  configKeys:
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION
+    - RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST
+  completeGroupRequired: true
+  productionOnly: true
+  releaseDigestPrefixBoundNameRequired: true
+  immutableConfigMapRequired: true
+  contentDigestAnnotationRequired: true
+  uidAndResourceVersionReadbackRequired: true
+  inlineValuesForbidden: true
+  independentlyGovernedConfigMapRequired: true
+  independentlyGovernedAuthorityRequired: true
+  ed25519Required: true
+  privateKeyInWorkloadForbidden: true
+  preprovisionedUnixSocketRequired: true
+  renderedSocketPathMustEqualPin: true
+  socketAvailabilityBeforeRunnerStartRequired: true
+  hostPathFallbackForbidden: true
+  receiptBoundTargetAndStorageRequired: true
+  freshNonceRequired: true
+  singleExchangeWithoutRetry: true
+  maximumAuthorizationSeconds: 300
+  socketDistinctFromCheckpointWorkloadAndIngressRequired: true
+  keyFingerprintDistinctFromCheckpointWorkloadAndIngressRequired: true
+  sqlVisibleFactsObservedLocallyRequired: true
+  providerClusterAndStorageSignedEvidenceRequired: true
+  directPgConnectionRequired: true
+  sameVerifiedConnectionForDdlRequired: true
+  sameVerifiedConnectionForPostflightRequired: true
+  exactPostflightLedgerRequired: true
 execution:
-  createSemantics: create-once
+  createSemantics: disabled-until-runtime-admission
   generatedNamePrefix: platform-api-migrations-111111111111-
   completions: 1
   parallelism: 1
   backoffLimit: 0
-  activeDeadlineSeconds: 2400
+  activeDeadlineSeconds: 300
+  maximumProofAuthorizationSeconds: 300
+  statementTimeoutSeconds: 180
+  lockTimeoutSeconds: 30
+  directPgConnectionRequired: true
+  singleDatabaseTransactionRequired: true
+  sessionScopedAdvisoryLockBeforeBeginRequired: true
+  transactionScopedAdvisoryLockPromotionFirstStatementRequired: true
+  sessionScopedAdvisoryLockReleasedAfterPromotionRequired: true
+  migrationSqlCannotReleaseTransactionLockRequired: true
+  localSqlVisibleFactsOnlyFromDirectConnection: true
+  providerClusterAndStorageOnlyFromSignedEvidence: true
+  exactReceiptCompositionRequired: true
+  preDdlRecheckInsideTransactionRequired: true
+  allPendingMigrationsInsideTransactionRequired: true
+  exactLedgerPostflightInsideTransactionRequired: true
+  commitDispatchBeforeProofSafetyDeadlineRequired: true
+  rollbackWholeWaveBeforeCommitDispatchRequired: true
+  commitOutcomeUnknownReconciliationRequired: true
   automaticTtlForbidden: true
 readback:
   requireJobComplete: true
@@ -68,6 +491,9 @@ readback:
   requireEmbeddedInventoryMatch: true
   requireNoDirtyMigration: true
   requireDatabaseRoleEvidence: true
+  requireAttestedDatabaseIdentityEvidence: true
+  requireAttestedDurableStorageEvidence: true
+  requireExactPostflightLedgerEvidence: true
   retainGeneratedJobNameAndLogs: true
 restart:
   requireMatchingApiImage: true
@@ -75,19 +501,7 @@ restart:
   requireReadyBeforeTraffic: true
   requireMatchingWorkersBeforeEnable: true
 sequence:
-  - freeze-render-and-digest
-  - withdraw-traffic
-  - stop-and-drain-all-writers
-  - readback-zero-database-sessions
-  - create-jit-migration-credential
-  - create-generated-job-once
-  - wait-for-single-completion
-  - readback-role-and-migration-ledger
-  - revoke-jit-migration-credential
-  - start-matching-verify-only-api
-  - require-readiness
-  - enable-matching-workers
-  - restore-traffic
+  - stop-production-execution-runtime-admission-unavailable
 failure:
   keepTrafficAndWritersStopped: true
   automaticRetryForbidden: true

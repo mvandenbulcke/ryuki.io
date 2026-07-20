@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::VerifyingKey;
 use jsonschema::{Retrieve, Uri};
 use rand::{rngs::OsRng, RngCore};
 use ryuki_core::config::{AuthMode, RyukiConfig};
@@ -39,6 +40,14 @@ use ryuki_core::deployed_workload::{
     DeployedWorkloadAuthorityAnchor, ExpectedDeployedWorkload, VerifiedDeployedWorkload,
     MAX_DEPLOYED_WORKLOAD_REQUEST_BYTES, MAX_DEPLOYED_WORKLOAD_RESPONSE_BYTES,
 };
+use ryuki_core::postgresql_infrastructure::{
+    build_postgresql_infrastructure_attestation_request, postgresql_attestation_request_tag,
+    postgresql_tls_channel_binding_digest, verify_postgresql_infrastructure_attestation,
+    ExpectedPostgresqlInfrastructure, PostgresqlInfrastructureAuthorityAnchor,
+    PostgresqlSessionBinding, PostgresqlTlsChannelBinding,
+    VerifiedPostgresqlInfrastructureAttestation, MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES,
+    MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES,
+};
 use ryuki_core::production_applicability::validate_exact_implementation_applicability;
 use ryuki_core::production_build::{
     BuildComponent, BuildSelectorDisposition, ProductionBuildManifest, ShippedAdapter,
@@ -57,8 +66,9 @@ use ryuki_core::public_ingress::{
 use ryuki_core::security_profile::{
     secret_provider_inventory_digest, ArtifactKind, DeploymentSecurityProfile,
     ExpectedProviderBinding, ExpectedSecretProviderBinding, GuardId, MigrationAuthoritySource,
-    ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile, StartupAdmissionContext,
-    TenancyMode, VersionedContentReference, SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT,
+    ProductionDatabaseProvider, ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile,
+    StartupAdmissionContext, TenancyMode, VersionedContentReference,
+    SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -132,6 +142,24 @@ pub(crate) const PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION_ENV: &str =
     "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION";
 pub(crate) const PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST_ENV: &str =
     "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION";
+pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST_ENV: &str =
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_PATH_ENV: &str = "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_DIGEST_ENV: &str =
     "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST";
@@ -164,6 +192,8 @@ const DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs
 const MAX_DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
 const PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
+const POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
 
 const PROFILE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/deployment-security-profile.schema.json");
@@ -225,6 +255,19 @@ pub(crate) struct StartupPublicIngressAttestationPins {
     pub(crate) attestation_profile_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupPostgresqlInfrastructureAttestationPins {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) authority_id: String,
+    pub(crate) key_id: String,
+    pub(crate) public_key_base64: String,
+    pub(crate) public_key_fingerprint: String,
+    pub(crate) minimum_authority_epoch: u64,
+    pub(crate) attestation_profile_id: String,
+    pub(crate) attestation_profile_version: u64,
+    pub(crate) attestation_profile_digest: String,
+}
+
 /// Detached build identity selected by independently governed deployment
 /// configuration. The manifest deliberately lives outside the rollbackable
 /// security-contract root and is bound by the digest supplied here.
@@ -244,6 +287,8 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) conformance_trust_checkpoint_authority: Option<StartupTrustCheckpointAuthorityPins>,
     pub(crate) deployed_workload_attestation: Option<StartupDeployedWorkloadAttestationPins>,
     pub(crate) public_ingress_attestation: Option<StartupPublicIngressAttestationPins>,
+    pub(crate) postgresql_infrastructure_attestation:
+        Option<StartupPostgresqlInfrastructureAttestationPins>,
     pub(crate) production_build_manifest: Option<StartupProductionBuildManifestPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
@@ -291,7 +336,49 @@ impl StartupSecurityPins {
         let conformance_trust_checkpoint_authority = optional_trust_checkpoint_authority(&mut get)?;
         let deployed_workload_attestation = optional_deployed_workload_attestation(&mut get)?;
         let public_ingress_attestation = optional_public_ingress_attestation(&mut get)?;
+        let postgresql_infrastructure_attestation =
+            optional_postgresql_infrastructure_attestation(&mut get)?;
         let production_build_manifest = optional_production_build_manifest(&mut get)?;
+
+        if let Some(postgresql) = postgresql_infrastructure_attestation.as_ref() {
+            let other_authorities = [
+                conformance_trust_checkpoint_authority.as_ref().map(|pins| {
+                    (
+                        "conformance trust-checkpoint",
+                        pins.socket_path.as_path(),
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+                deployed_workload_attestation.as_ref().map(|pins| {
+                    (
+                        "deployed-workload attestation",
+                        pins.socket_path.as_path(),
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+                public_ingress_attestation.as_ref().map(|pins| {
+                    (
+                        "public-ingress attestation",
+                        pins.socket_path.as_path(),
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+            ];
+            for (label, socket_path, public_key_fingerprint) in
+                other_authorities.into_iter().flatten()
+            {
+                if postgresql.socket_path.as_path() == socket_path {
+                    return Err(format!(
+                        "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV} must use a distinct Unix socket from the {label} authority"
+                    ));
+                }
+                if postgresql.public_key_fingerprint.as_str() == public_key_fingerprint {
+                    return Err(format!(
+                        "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV} must use a cryptographically distinct key from the {label} authority"
+                    ));
+                }
+            }
+        }
 
         let deployment_id = required_unicode(&mut get, EXPECTED_DEPLOYMENT_ID_ENV)?;
         validate_namespaced_id(EXPECTED_DEPLOYMENT_ID_ENV, &deployment_id, "deployment:")?;
@@ -327,6 +414,11 @@ impl StartupSecurityPins {
                 "production {SECURITY_PROFILE_ENV} requires the complete independently pinned public-ingress attestation binding beginning with {PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV}"
             ));
         }
+        if security_profile.is_production() && postgresql_infrastructure_attestation.is_none() {
+            return Err(format!(
+                "production {SECURITY_PROFILE_ENV} requires the complete independently pinned PostgreSQL-infrastructure attestation binding beginning with {POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV}"
+            ));
+        }
         if !security_profile.is_production() && production_build_manifest.is_some() {
             return Err(format!(
                 "{PRODUCTION_BUILD_MANIFEST_PATH_ENV} and {PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} are production-only and must be unset for {profile_raw}"
@@ -342,6 +434,11 @@ impl StartupSecurityPins {
                 "the public-ingress attestation binding beginning with {PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV} is production-only and must be unset for {profile_raw}"
             ));
         }
+        if !security_profile.is_production() && postgresql_infrastructure_attestation.is_some() {
+            return Err(format!(
+                "the PostgreSQL-infrastructure attestation binding beginning with {POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV} is production-only and must be unset for {profile_raw}"
+            ));
+        }
 
         Ok(Self {
             contract_root,
@@ -352,6 +449,7 @@ impl StartupSecurityPins {
             conformance_trust_checkpoint_authority,
             deployed_workload_attestation,
             public_ingress_attestation,
+            postgresql_infrastructure_attestation,
             production_build_manifest,
             deployment_id,
             security_profile,
@@ -2296,19 +2394,21 @@ pub(crate) enum ConformanceState {
 /// authenticated target and durable-storage evidence is bound to the exact TLS
 /// session. It carries no listener, router, application-pool, or serving
 /// authority.
-pub(crate) struct VerifiedProductionMigrationAdmission {
+pub(crate) struct PendingProductionMigrationTarget {
     boundary: Box<VerifiedProductionBoundary>,
     role_contract: crate::database::MigrationRoleContract,
     receipt_bound_database_target: RuntimeGuardExpectedValue,
     expected_migration_inventory_digest: String,
     requirement_digest: String,
     challenge_binding_digest: String,
+    pins: StartupPostgresqlInfrastructureAttestationPins,
+    request_nonce: [u8; 32],
 }
 
-impl fmt::Debug for VerifiedProductionMigrationAdmission {
+impl fmt::Debug for PendingProductionMigrationTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("VerifiedProductionMigrationAdmission")
+            .debug_struct("PendingProductionMigrationTarget")
             .field("requirement_digest", &self.requirement_digest)
             .field("challenge_binding_digest", &self.challenge_binding_digest)
             .field(
@@ -2319,22 +2419,278 @@ impl fmt::Debug for VerifiedProductionMigrationAdmission {
                 "receipt_bound_database_target_guard",
                 &self.receipt_bound_database_target.guard_id(),
             )
+            .field("request_tag", &"[DERIVED-FROM-TLS-CHANNEL]")
+            .field("attestation_authority", &self.pins.authority_id)
             .field("role_contract", &"[RECEIPT-BOUND]")
             .finish()
+    }
+}
+
+/// The sole production DDL capability. It can be minted only by consuming the
+/// pending target and verifying one signed, nonce-bound response for the exact
+/// already-open PostgreSQL session. Retaining the production boundary and the
+/// opaque proof makes freshness rechecks mandatory immediately before DDL.
+pub(crate) struct VerifiedProductionMigrationExecution {
+    boundary: Box<VerifiedProductionBoundary>,
+    role_contract: crate::database::MigrationRoleContract,
+    expected_migration_inventory_digest: String,
+    verified_infrastructure: VerifiedPostgresqlInfrastructureAttestation,
+}
+
+/// Non-sensitive projection retained after a production migration commits.
+///
+/// This deliberately excludes the signed response, signature, public key,
+/// database identity preimage, storage-binding preimages, session preimage,
+/// network addresses, and distinguished names. The retained digests and
+/// authority/profile counters are sufficient to correlate completion with the
+/// independently verified attestation without turning durable inventory into
+/// an alternate disclosure surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductionMigrationCompletionEvidence {
+    authority_id: String,
+    authority_epoch: u64,
+    authority_revision: u64,
+    attestation_profile_id: String,
+    attestation_profile_version: u64,
+    attestation_profile_digest: String,
+    measurement_sequence: u64,
+    response_digest: String,
+    session_binding_digest: String,
+    database_identity_digest: String,
+    storage_binding_digest: String,
+}
+
+impl ProductionMigrationCompletionEvidence {
+    pub(crate) fn authority_id(&self) -> &str {
+        &self.authority_id
+    }
+
+    pub(crate) fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+
+    pub(crate) fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+
+    pub(crate) fn attestation_profile_id(&self) -> &str {
+        &self.attestation_profile_id
+    }
+
+    pub(crate) fn attestation_profile_version(&self) -> u64 {
+        self.attestation_profile_version
+    }
+
+    pub(crate) fn attestation_profile_digest(&self) -> &str {
+        &self.attestation_profile_digest
+    }
+
+    pub(crate) fn measurement_sequence(&self) -> u64 {
+        self.measurement_sequence
+    }
+
+    pub(crate) fn response_digest(&self) -> &str {
+        &self.response_digest
+    }
+
+    pub(crate) fn session_binding_digest(&self) -> &str {
+        &self.session_binding_digest
+    }
+
+    pub(crate) fn database_identity_digest(&self) -> &str {
+        &self.database_identity_digest
+    }
+
+    pub(crate) fn storage_binding_digest(&self) -> &str {
+        &self.storage_binding_digest
+    }
+}
+
+impl fmt::Debug for VerifiedProductionMigrationExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedProductionMigrationExecution")
+            .field(
+                "expected_migration_inventory_digest",
+                &self.expected_migration_inventory_digest,
+            )
+            .field("role_contract", &"[RECEIPT-BOUND]")
+            .field("verified_infrastructure", &self.verified_infrastructure)
+            .finish()
+    }
+}
+
+impl VerifiedProductionMigrationExecution {
+    pub(crate) fn ensure_fresh(&self, now: DateTime<Utc>) -> Result<(), String> {
+        ensure_production_migration_execution_before_expiry(now, self.valid_until())?;
+        let trusted_now = trusted_time_point(now);
+        self.boundary.ensure_fresh(trusted_now)?;
+        self.verified_infrastructure
+            .verify_integrity()
+            .map_err(|error| {
+                format!(
+                    "verified PostgreSQL-infrastructure proof lost integrity before DDL: {error}"
+                )
+            })?;
+        let challenge =
+            runtime_admission::exact_challenge(self.boundary.as_ref(), GuardId::DurablePostgresql)
+                .map_err(|error| {
+                    format!(
+                "verified PostgreSQL-infrastructure proof lost its exact runtime challenge: {error}"
+            )
+                })?;
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            database_provider,
+            server_major_version,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            provider_route_binding_digest,
+            database_identity_digest,
+            storage_binding_digest,
+            migration_inventory_digest,
+            application_role,
+            migration_role,
+        } = challenge.expected_value()
+        else {
+            return Err(
+                "verified PostgreSQL-infrastructure proof no longer has a DurablePostgresql challenge"
+                    .into(),
+            );
+        };
+        if self.verified_infrastructure.deployment_id()
+            != self.boundary.deployed_workload.deployment_id()
+            || self.verified_infrastructure.trust_domain_id()
+                != self.boundary.deployed_workload.trust_domain_id()
+            || self.verified_infrastructure.workload_id()
+                != self.boundary.deployed_workload.workload_id()
+            || self.verified_infrastructure.source_revision()
+                != self.boundary.conformance.source_revision()
+            || self.verified_infrastructure.artifact_digest()
+                != self.boundary.deployed_workload.oci_subject_digest()
+            || self
+                .verified_infrastructure
+                .workload_instance_binding_digest()
+                != self
+                    .boundary
+                    .deployed_workload
+                    .workload_instance_binding_digest()
+            || self.verified_infrastructure.requirement_digest() != challenge.requirement_digest()
+            || self.verified_infrastructure.challenge_binding_digest()
+                != challenge.challenge_binding_digest()
+            || self.verified_infrastructure.database_provider() != *database_provider
+            || self.verified_infrastructure.server_major_version() != *server_major_version
+            || self.verified_infrastructure.attestation_profile_id()
+                != attestation_profile_id.as_str()
+            || self.verified_infrastructure.attestation_profile_version()
+                != *attestation_profile_version
+            || self.verified_infrastructure.attestation_profile_digest()
+                != attestation_profile_digest.as_str()
+            || self.verified_infrastructure.provider_route_binding_digest()
+                != provider_route_binding_digest.as_str()
+            || self.verified_infrastructure.database_identity_digest()
+                != database_identity_digest.as_str()
+            || self.verified_infrastructure.storage_binding_digest()
+                != storage_binding_digest.as_str()
+            || self.verified_infrastructure.migration_inventory_digest()
+                != migration_inventory_digest.as_str()
+            || self.verified_infrastructure.application_role() != application_role.as_str()
+            || self.verified_infrastructure.migration_role() != migration_role.as_str()
+        {
+            return Err(
+                "verified PostgreSQL-infrastructure proof differs from the retained production boundary"
+                    .into(),
+            );
+        }
+        self.verified_infrastructure
+            .ensure_fresh(trusted_now)
+            .map_err(|error| {
+                format!("verified PostgreSQL-infrastructure proof is stale before DDL: {error}")
+            })
+    }
+
+    pub(crate) fn role_contract(&self) -> &crate::database::MigrationRoleContract {
+        &self.role_contract
+    }
+
+    pub(crate) fn expected_migration_inventory_digest(&self) -> &str {
+        &self.expected_migration_inventory_digest
+    }
+
+    /// Exclusive upper bound for the retained signed infrastructure proof.
+    /// Callers may use it only to shorten an already-bounded migration run;
+    /// `ensure_fresh` remains the sole DDL freshness decision.
+    pub(crate) fn valid_until(&self) -> DateTime<Utc> {
+        self.verified_infrastructure.valid_until()
+    }
+
+    /// Project the independently verified proof into the narrow durable
+    /// evidence stored with a successfully committed migration inventory.
+    pub(crate) fn completion_evidence(&self) -> ProductionMigrationCompletionEvidence {
+        ProductionMigrationCompletionEvidence {
+            authority_id: self.verified_infrastructure.authority_id().to_string(),
+            authority_epoch: self.verified_infrastructure.authority_epoch(),
+            authority_revision: self.verified_infrastructure.authority_revision(),
+            attestation_profile_id: self
+                .verified_infrastructure
+                .attestation_profile_id()
+                .to_string(),
+            attestation_profile_version: self.verified_infrastructure.attestation_profile_version(),
+            attestation_profile_digest: self
+                .verified_infrastructure
+                .attestation_profile_digest()
+                .to_string(),
+            measurement_sequence: self.verified_infrastructure.measurement_sequence(),
+            response_digest: self.verified_infrastructure.response_digest().to_string(),
+            session_binding_digest: self
+                .verified_infrastructure
+                .session_binding_digest()
+                .to_string(),
+            database_identity_digest: self
+                .verified_infrastructure
+                .database_identity_digest()
+                .to_string(),
+            storage_binding_digest: self
+                .verified_infrastructure
+                .storage_binding_digest()
+                .to_string(),
+        }
+    }
+
+    pub(crate) fn verified_infrastructure(&self) -> &VerifiedPostgresqlInfrastructureAttestation {
+        &self.verified_infrastructure
+    }
+
+    pub(crate) fn session_binding(&self) -> &PostgresqlSessionBinding {
+        self.verified_infrastructure.session_binding()
+    }
+}
+
+fn ensure_production_migration_execution_before_expiry(
+    now: DateTime<Utc>,
+    valid_until: DateTime<Utc>,
+) -> Result<(), String> {
+    if now >= valid_until {
+        Err(
+            "verified PostgreSQL-infrastructure proof cannot authorize DDL at or after its exclusive valid_until"
+                .into(),
+        )
+    } else {
+        Ok(())
     }
 }
 
 /// Apply-only admission state. Both variants are issued only after the
 /// deployment security root is loaded. Non-production is executable with its
 /// configured local role contract; production retains and rechecks the sealed
-/// workload-bound prerequisite but remains non-executable until the independent
-/// target-attestation adapter is present.
+/// workload-bound prerequisite and remains non-executable until one exact
+/// retained database session receives a valid independent target attestation.
 pub(crate) enum VerifiedApplyOnlyMigrationAdmission {
     NonProduction {
         role_contract: crate::database::MigrationRoleContract,
         expected_migration_inventory_digest: String,
     },
-    Production(VerifiedProductionMigrationAdmission),
+    Production(Box<PendingProductionMigrationTarget>),
 }
 
 impl fmt::Debug for VerifiedApplyOnlyMigrationAdmission {
@@ -2357,43 +2713,285 @@ impl fmt::Debug for VerifiedApplyOnlyMigrationAdmission {
 }
 
 impl VerifiedApplyOnlyMigrationAdmission {
-    /// Consume the one-shot state immediately before the database module would
-    /// open its isolated migration connection. Production refuses at this seam
-    /// until an authenticated target-attestation adapter can complete it.
-    pub(crate) fn into_database_execution(
+    /// Consume the one-shot admission immediately before opening the isolated
+    /// migration connection. Production yields only a pending target whose
+    /// nonce-derived application name must be installed on that connection;
+    /// it is not DDL authority.
+    pub(crate) fn into_database_preflight(
         self,
         now: DateTime<Utc>,
-    ) -> Result<(crate::database::MigrationRoleContract, String), String> {
+    ) -> Result<MigrationDatabasePreflight, String> {
         match self {
             Self::NonProduction {
                 role_contract,
                 expected_migration_inventory_digest,
-            } => Ok((role_contract, expected_migration_inventory_digest)),
+            } => Ok(MigrationDatabasePreflight::NonProduction {
+                role_contract,
+                expected_migration_inventory_digest,
+            }),
             Self::Production(admission) => {
                 admission.boundary.ensure_fresh(trusted_time_point(now))?;
-                // The receipt carries only digests for the database identity
-                // and durable storage projection. Until a separately signed
-                // target-attestation adapter supplies and revalidates those
-                // preimages against the exact TLS session, allowing this token
-                // to reach DDL would let a substituted database with matching
-                // role names receive production migrations.
-                Err(
-                    "production migration execution requires independently authenticated database-target and durable-storage evidence before DDL"
-                        .into(),
-                )
+                Ok(MigrationDatabasePreflight::Production(admission))
             }
         }
+    }
+}
+
+pub(crate) enum MigrationDatabasePreflight {
+    NonProduction {
+        role_contract: crate::database::MigrationRoleContract,
+        expected_migration_inventory_digest: String,
+    },
+    Production(Box<PendingProductionMigrationTarget>),
+}
+
+impl fmt::Debug for MigrationDatabasePreflight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonProduction {
+                expected_migration_inventory_digest,
+                ..
+            } => formatter
+                .debug_struct("MigrationDatabasePreflight::NonProduction")
+                .field(
+                    "expected_migration_inventory_digest",
+                    expected_migration_inventory_digest,
+                )
+                .field("role_contract", &"[CONFIGURED]")
+                .finish(),
+            Self::Production(pending) => pending.fmt(formatter),
+        }
+    }
+}
+
+impl PendingProductionMigrationTarget {
+    /// Fresh context consumed by the TLS exporter. It cannot be turned into
+    /// an application name until the exact direct TLS channel is measured.
+    pub(crate) fn tls_exporter_context(&self) -> &[u8; 32] {
+        &self.request_nonce
+    }
+
+    pub(crate) fn database_provider_and_route_digest(
+        &self,
+    ) -> Result<(ProductionDatabaseProvider, &str), String> {
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            database_provider,
+            provider_route_binding_digest,
+            ..
+        } = &self.receipt_bound_database_target
+        else {
+            return Err(
+                "production migration target no longer carries a DurablePostgresql expectation"
+                    .into(),
+            );
+        };
+        Ok((*database_provider, provider_route_binding_digest))
+    }
+
+    /// Derive the request tag from the one-shot nonce and the exact caller-
+    /// observed exporter-bound TLS channel.
+    pub(crate) fn request_tag_for_channel(
+        &self,
+        channel: &PostgresqlTlsChannelBinding,
+    ) -> Result<String, String> {
+        let (_, expected_route_digest) = self.database_provider_and_route_digest()?;
+        if channel.provider_route_binding_digest != expected_route_digest {
+            return Err(
+                "observed PostgreSQL TLS channel differs from the receipt-bound provider route"
+                    .into(),
+            );
+        }
+        let channel_digest = postgresql_tls_channel_binding_digest(channel)
+            .map_err(|error| format!("PostgreSQL TLS channel binding is invalid: {error}"))?;
+        Ok(postgresql_attestation_request_tag(
+            &self.request_nonce,
+            &channel_digest,
+        ))
+    }
+
+    /// Receipt-bound role names are exposed only for connection establishment
+    /// and role attestation. DDL requires the later execution capability.
+    pub(crate) fn migration_role_contract(&self) -> &crate::database::MigrationRoleContract {
+        &self.role_contract
+    }
+
+    /// Bind one independently signed infrastructure measurement to the exact
+    /// retained PostgreSQL session. The pending capability and nonce are
+    /// consumed, preventing retry or proof reuse against a second connection.
+    pub(crate) async fn attest_exact_session(
+        self,
+        session_binding: PostgresqlSessionBinding,
+        requested_at: DateTime<Utc>,
+    ) -> Result<VerifiedProductionMigrationExecution, String> {
+        self.boundary
+            .ensure_fresh(trusted_time_point(requested_at))?;
+        {
+            let challenge = runtime_admission::exact_challenge(
+                self.boundary.as_ref(),
+                GuardId::DurablePostgresql,
+            )
+            .map_err(|error| {
+                format!(
+                    "production migration target lost its exact DurablePostgresql challenge: {error}"
+                )
+            })?;
+            if challenge.requirement_digest() != self.requirement_digest
+                || challenge.challenge_binding_digest() != self.challenge_binding_digest
+                || challenge.expected_value() != &self.receipt_bound_database_target
+            {
+                return Err(
+                    "production migration target differs from its retained workload-bound database challenge"
+                        .into(),
+                );
+            }
+        }
+        let request_tag = self.request_tag_for_channel(&session_binding.tls_channel_binding)?;
+        if session_binding.application_name != request_tag {
+            return Err(
+                "PostgreSQL session application_name differs from the one-shot attestation request tag"
+                    .into(),
+            );
+        }
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            database_provider,
+            server_major_version,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            provider_route_binding_digest,
+            database_identity_digest,
+            storage_binding_digest,
+            migration_inventory_digest,
+            application_role,
+            migration_role,
+        } = &self.receipt_bound_database_target
+        else {
+            return Err(
+                "production migration target no longer carries a DurablePostgresql expectation"
+                    .into(),
+            );
+        };
+        if self.pins.attestation_profile_id.as_str() != attestation_profile_id.as_str()
+            || self.pins.attestation_profile_version != *attestation_profile_version
+            || self.pins.attestation_profile_digest.as_str() != attestation_profile_digest.as_str()
+        {
+            return Err(
+                "PostgreSQL-infrastructure authority profile pins differ from the receipt-bound runtime guard"
+                    .into(),
+            );
+        }
+        let public_key = decode_postgresql_infrastructure_authority_public_key(&self.pins)?;
+        let authority = PostgresqlInfrastructureAuthorityAnchor {
+            authority_id: &self.pins.authority_id,
+            key_id: &self.pins.key_id,
+            public_key: &public_key,
+            public_key_fingerprint: &self.pins.public_key_fingerprint,
+            minimum_authority_epoch: self.pins.minimum_authority_epoch,
+            attestation_profile_id: &self.pins.attestation_profile_id,
+            attestation_profile_version: self.pins.attestation_profile_version,
+            attestation_profile_digest: &self.pins.attestation_profile_digest,
+        };
+        let request = build_postgresql_infrastructure_attestation_request(
+            ExpectedPostgresqlInfrastructure {
+                deployment_id: self.boundary.deployed_workload.deployment_id(),
+                trust_domain_id: self.boundary.deployed_workload.trust_domain_id(),
+                workload_id: self.boundary.deployed_workload.workload_id(),
+                source_revision: self.boundary.conformance.source_revision(),
+                artifact_digest: self.boundary.deployed_workload.oci_subject_digest(),
+                workload_instance_binding_digest: self
+                    .boundary
+                    .deployed_workload
+                    .workload_instance_binding_digest(),
+                requirement_digest: &self.requirement_digest,
+                challenge_binding_digest: &self.challenge_binding_digest,
+                database_provider: *database_provider,
+                server_major_version: *server_major_version,
+                provider_route_binding_digest,
+                database_identity_digest,
+                storage_binding_digest,
+                migration_inventory_digest,
+                application_role,
+                migration_role,
+                session_binding: &session_binding,
+            },
+            authority,
+            self.request_nonce,
+            requested_at,
+        )
+        .map_err(|error| {
+            format!("cannot build exact PostgreSQL-infrastructure attestation request: {error}")
+        })?;
+        if request.request_tag() != request_tag {
+            return Err(
+                "PostgreSQL-infrastructure request tag changed after exact session binding".into(),
+            );
+        }
+        let transport = UnixAuthorityTransport::new(
+            self.pins.socket_path.clone(),
+            AuthorityTransportDeadlines {
+                connect: POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+                write: POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+                read: POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+            },
+            AuthorityTransportBounds {
+                max_request_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES,
+                max_response_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES,
+            },
+            AuthorityTransportHardLimits {
+                max_socket_path_bytes: MAX_AUTHORITY_SOCKET_PATH_BYTES,
+                max_phase_deadline: MAX_POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+                max_request_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES,
+                max_response_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES,
+            },
+        )
+        .map_err(|error| {
+            format!("cannot configure bounded PostgreSQL-infrastructure transport: {error}")
+        })?;
+        let raw_response = transport
+            .exchange(request.as_bytes())
+            .await
+            .map_err(|error| {
+                format!("PostgreSQL-infrastructure attestation exchange failed: {error}")
+            })?;
+        let verified_at = Utc::now();
+        self.boundary
+            .ensure_fresh(trusted_time_point(verified_at))?;
+        let verified_infrastructure = verify_postgresql_infrastructure_attestation(
+            request,
+            &raw_response,
+            authority,
+            trusted_time_point(verified_at),
+        )
+        .map_err(|error| {
+            format!("PostgreSQL-infrastructure attestation verification failed: {error}")
+        })?;
+        if verified_infrastructure.session_binding() != &session_binding {
+            return Err(
+                "verified PostgreSQL-infrastructure response substituted the measured session"
+                    .into(),
+            );
+        }
+        let execution = VerifiedProductionMigrationExecution {
+            boundary: self.boundary,
+            role_contract: self.role_contract,
+            expected_migration_inventory_digest: self.expected_migration_inventory_digest,
+            verified_infrastructure,
+        };
+        execution.ensure_fresh(verified_at)?;
+        Ok(execution)
     }
 }
 
 fn verify_production_migration_admission(
     boundary: Box<VerifiedProductionBoundary>,
     mode: crate::database::MigrationStartupMode,
+    pins: StartupPostgresqlInfrastructureAttestationPins,
     now: DateTime<Utc>,
-) -> Result<VerifiedProductionMigrationAdmission, String> {
+) -> Result<PendingProductionMigrationTarget, String> {
     let embedded_digest = crate::database::embedded_migration_inventory_digest()
         .map_err(|error| format!("cannot derive the embedded migration inventory: {error}"))?;
     verify_production_migration_admission_with_inventory_digest(
+        pins,
         boundary,
         mode,
         now,
@@ -2402,11 +3000,12 @@ fn verify_production_migration_admission(
 }
 
 fn verify_production_migration_admission_with_inventory_digest(
+    pins: StartupPostgresqlInfrastructureAttestationPins,
     boundary: Box<VerifiedProductionBoundary>,
     mode: crate::database::MigrationStartupMode,
     now: DateTime<Utc>,
     embedded_digest: &str,
-) -> Result<VerifiedProductionMigrationAdmission, String> {
+) -> Result<PendingProductionMigrationTarget, String> {
     if mode != crate::database::MigrationStartupMode::ApplyOnly {
         return Err("production migration admission requires exact apply-only mode".into());
     }
@@ -2417,6 +3016,9 @@ fn verify_production_migration_admission_with_inventory_digest(
         )?;
     let receipt_bound_database_target = challenge.expected_value().clone();
     let RuntimeGuardExpectedValue::DurablePostgresql {
+        attestation_profile_id,
+        attestation_profile_version,
+        attestation_profile_digest,
         application_role,
         migration_role,
         migration_inventory_digest,
@@ -2427,6 +3029,15 @@ fn verify_production_migration_admission_with_inventory_digest(
             "production migration admission received a non-PostgreSQL database guard value".into(),
         );
     };
+    if pins.attestation_profile_id.as_str() != attestation_profile_id.as_str()
+        || pins.attestation_profile_version != *attestation_profile_version
+        || pins.attestation_profile_digest.as_str() != attestation_profile_digest.as_str()
+    {
+        return Err(
+            "PostgreSQL-infrastructure startup profile pins differ from the receipt-bound runtime guard"
+                .into(),
+        );
+    }
     let role_contract = crate::database::MigrationRoleContract::from_receipt_bound_roles(
         migration_role,
         application_role,
@@ -2439,13 +3050,25 @@ fn verify_production_migration_admission_with_inventory_digest(
     let expected_migration_inventory_digest = migration_inventory_digest.to_owned();
     let requirement_digest = challenge.requirement_digest().to_owned();
     let challenge_binding_digest = challenge.challenge_binding_digest().to_owned();
-    Ok(VerifiedProductionMigrationAdmission {
+    let mut request_nonce = [0u8; 32];
+    OsRng.try_fill_bytes(&mut request_nonce).map_err(|_| {
+        "cannot generate the one-shot PostgreSQL-infrastructure attestation nonce".to_string()
+    })?;
+    if request_nonce.iter().all(|byte| *byte == 0) {
+        return Err(
+            "operating-system randomness produced an invalid PostgreSQL-infrastructure attestation nonce"
+                .into(),
+        );
+    }
+    Ok(PendingProductionMigrationTarget {
         boundary,
         role_contract,
         receipt_bound_database_target,
         expected_migration_inventory_digest,
         requirement_digest,
         challenge_binding_digest,
+        pins,
+        request_nonce,
     })
 }
 
@@ -2528,6 +3151,15 @@ struct PreparedSecurityContract {
     provider_registry_applicability: ActiveProviderRegistryApplicabilityClaim,
     conformance_registry_lineage: Option<ValidatedConformanceRegistryLineage>,
     production_build_manifest: Option<PinnedProductionBuildManifest>,
+}
+
+/// Deliberately false until a live, one-use Kubernetes render-admission proof
+/// is verified by the migration process itself. Keeping this as a runtime
+/// fence preserves compilation and testability of the lower-level protocol
+/// without making the offline manifest validator an execution authority.
+#[inline(never)]
+fn production_migration_runtime_render_admission_is_implemented() -> bool {
+    false
 }
 
 impl SecurityContractContext {
@@ -2680,13 +3312,28 @@ impl SecurityContractContext {
     pub(crate) fn into_apply_only_migration_admission(
         self,
         mode: crate::database::MigrationStartupMode,
+        pins: &StartupSecurityPins,
         now: DateTime<Utc>,
     ) -> Result<VerifiedApplyOnlyMigrationAdmission, String> {
         if mode != crate::database::MigrationStartupMode::ApplyOnly {
             return Err("migration capability issuance requires exact apply-only mode".into());
         }
+        if self.profile.security_profile != pins.security_profile
+            || self.profile.deployment_id != pins.deployment_id
+        {
+            return Err(
+                "migration admission startup pins differ from the loaded deployment identity"
+                    .into(),
+            );
+        }
         match self.conformance_state {
             ConformanceState::NonProduction => {
+                if pins.postgresql_infrastructure_attestation.is_some() {
+                    return Err(
+                        "non-production migration admission retained PostgreSQL-infrastructure production authority"
+                            .into(),
+                    );
+                }
                 let role_contract = crate::database::MigrationRoleContract::from_env()?;
                 let expected_migration_inventory_digest =
                     crate::database::embedded_migration_inventory_digest().map_err(|error| {
@@ -2698,11 +3345,36 @@ impl SecurityContractContext {
                 })
             }
             ConformanceState::Production(boundary) => {
-                let admission = verify_production_migration_admission(boundary, mode, now)?;
+                // The repository currently validates only an offline render
+                // snapshot. It has no in-cluster admission/consume authority
+                // and no runtime verifier that can bind ConfigMap materialized
+                // values and receipt freshness to the executing Pod. Refuse
+                // production before the caller reads the migration credential
+                // or opens a database connection. Re-enable only by replacing
+                // this containment fence with a non-cloneable, runtime-verified
+                // render-admission capability carried into the DDL capability.
+                if !production_migration_runtime_render_admission_is_implemented() {
+                    return Err(
+                        "production apply-only is disabled until live migration render admission, one-use attempt consumption, materialized-pin binding, and runtime receipt freshness are implemented"
+                            .into(),
+                    );
+                }
+                let authority = pins
+                    .postgresql_infrastructure_attestation
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "production migration admission has no independently pinned PostgreSQL-infrastructure authority"
+                            .to_string()
+                    })?
+                    .clone();
+                let admission =
+                    verify_production_migration_admission(boundary, mode, authority, now)?;
                 admission
                     .role_contract
                     .validate_optional_environment_consistency()?;
-                Ok(VerifiedApplyOnlyMigrationAdmission::Production(admission))
+                Ok(VerifiedApplyOnlyMigrationAdmission::Production(Box::new(
+                    admission,
+                )))
             }
         }
     }
@@ -3817,6 +4489,28 @@ fn decode_public_ingress_authority_public_key(
     decoded
         .try_into()
         .map_err(|_| "configured public-ingress authority public key is not 32 bytes".to_string())
+}
+
+fn decode_postgresql_infrastructure_authority_public_key(
+    pins: &StartupPostgresqlInfrastructureAttestationPins,
+) -> Result<[u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES], String> {
+    let decoded = BASE64_STANDARD
+        .decode(&pins.public_key_base64)
+        .map_err(|_| {
+            "configured PostgreSQL-infrastructure authority public key is not canonical base64"
+                .to_string()
+        })?;
+    if BASE64_STANDARD.encode(&decoded) != pins.public_key_base64
+        || raw_digest(&decoded) != pins.public_key_fingerprint
+    {
+        return Err(
+            "configured PostgreSQL-infrastructure authority public key does not match its canonical independent fingerprint pin"
+                .into(),
+        );
+    }
+    decoded.try_into().map_err(|_| {
+        "configured PostgreSQL-infrastructure authority public key is not 32 bytes".to_string()
+    })
 }
 
 fn conformance_document_digests(
@@ -5044,6 +5738,178 @@ fn optional_public_ingress_attestation(
     )?;
 
     Ok(Some(StartupPublicIngressAttestationPins {
+        socket_path: PathBuf::from(socket_path),
+        authority_id,
+        key_id,
+        public_key_base64,
+        public_key_fingerprint,
+        minimum_authority_epoch,
+        attestation_profile_id,
+        attestation_profile_version,
+        attestation_profile_digest,
+    }))
+}
+
+fn optional_postgresql_infrastructure_attestation(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupPostgresqlInfrastructureAttestationPins>, String> {
+    let socket_path = optional_unicode(get, POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV)?;
+    let authority_id =
+        optional_unicode(get, POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID_ENV)?;
+    let key_id = optional_unicode(get, POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID_ENV)?;
+    let public_key_base64 = optional_unicode(
+        get,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+    )?;
+    let public_key_fingerprint = optional_unicode(
+        get,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+    )?;
+    let minimum_authority_epoch = optional_unicode(
+        get,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+    )?;
+    let attestation_profile_id =
+        optional_unicode(get, POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_ENV)?;
+    let attestation_profile_version = optional_unicode(
+        get,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION_ENV,
+    )?;
+    let attestation_profile_digest = optional_unicode(
+        get,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST_ENV,
+    )?;
+
+    let any_present = [
+        socket_path.as_ref(),
+        authority_id.as_ref(),
+        key_id.as_ref(),
+        public_key_base64.as_ref(),
+        public_key_fingerprint.as_ref(),
+        minimum_authority_epoch.as_ref(),
+        attestation_profile_id.as_ref(),
+        attestation_profile_version.as_ref(),
+        attestation_profile_digest.as_ref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    if !any_present {
+        return Ok(None);
+    }
+
+    let required = |value: Option<String>, name: &str| {
+        value.ok_or_else(|| {
+            format!(
+                "{name} is required when any PostgreSQL-infrastructure attestation binding is configured"
+            )
+        })
+    };
+    let socket_path = required(
+        socket_path,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV,
+    )?;
+    let authority_id = required(
+        authority_id,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID_ENV,
+    )?;
+    let key_id = required(key_id, POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID_ENV)?;
+    let public_key_base64 = required(
+        public_key_base64,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+    )?;
+    let public_key_fingerprint = required(
+        public_key_fingerprint,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+    )?;
+    let minimum_authority_epoch = required(
+        minimum_authority_epoch,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+    )?;
+    let attestation_profile_id = required(
+        attestation_profile_id,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_ENV,
+    )?;
+    let attestation_profile_version = required(
+        attestation_profile_version,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION_ENV,
+    )?;
+    let attestation_profile_digest = required(
+        attestation_profile_digest,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST_ENV,
+    )?;
+
+    validate_absolute_socket_path(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV,
+        &socket_path,
+    )?;
+    validate_namespaced_id(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID_ENV,
+        &authority_id,
+        "postgresql-infrastructure-attestation-authority:",
+    )?;
+    validate_namespaced_id(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID_ENV,
+        &key_id,
+        "postgresql-infrastructure-attestation-key:",
+    )?;
+    validate_namespaced_id(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_ENV,
+        &attestation_profile_id,
+        "postgresql-infrastructure-attestation-profile:",
+    )?;
+    validate_digest_pin(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+        &public_key_fingerprint,
+    )?;
+    validate_digest_pin(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST_ENV,
+        &attestation_profile_digest,
+    )?;
+    let public_key = BASE64_STANDARD.decode(&public_key_base64).map_err(|_| {
+        format!(
+            "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        )
+    })?;
+    if public_key.len() != ED25519_AUTHORITY_PUBLIC_KEY_BYTES
+        || BASE64_STANDARD.encode(&public_key) != public_key_base64
+    {
+        return Err(format!(
+            "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        ));
+    }
+    if raw_digest(&public_key) != public_key_fingerprint {
+        return Err(format!(
+            "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV} does not match the decoded authority public key"
+        ));
+    }
+    let key_bytes: [u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES] = public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must encode a valid Ed25519 public key"
+            )
+        })?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| {
+        format!(
+            "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must encode a valid Ed25519 public key"
+        )
+    })?;
+    if verifying_key.is_weak() {
+        return Err(format!(
+            "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must not encode a weak Ed25519 public key"
+        ));
+    }
+    let minimum_authority_epoch = parse_positive_exact_json_integer(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+        &minimum_authority_epoch,
+    )?;
+    let attestation_profile_version = parse_positive_exact_json_integer(
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION_ENV,
+        &attestation_profile_version,
+    )?;
+
+    Ok(Some(StartupPostgresqlInfrastructureAttestationPins {
         socket_path: PathBuf::from(socket_path),
         authority_id,
         key_id,
@@ -7310,6 +8176,11 @@ mod tests {
     const SECRET_PROVIDER_RUNTIME_BINDING_PATH: &str =
         "catalog/security-contracts/v1/secret-provider-runtime-binding.runtime-test.json";
 
+    #[test]
+    fn production_migration_execution_remains_contained_without_live_render_admission() {
+        assert!(!production_migration_runtime_render_admission_is_implemented());
+    }
+
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
     }
@@ -7382,13 +8253,96 @@ mod tests {
         .expect("one exact signed production identity must seal")
     }
 
+    fn postgresql_infrastructure_pins(
+        boundary: &VerifiedProductionBoundary,
+    ) -> StartupPostgresqlInfrastructureAttestationPins {
+        let challenge =
+            exact_challenge(boundary, GuardId::DurablePostgresql).expect("database challenge");
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            ..
+        } = challenge.expected_value()
+        else {
+            panic!("database challenge changed kind");
+        };
+        let signing_key = SigningKey::from_bytes(&rand::random());
+        let public_key = signing_key.verifying_key().to_bytes();
+        StartupPostgresqlInfrastructureAttestationPins {
+            socket_path: PathBuf::from("/run/ryuki/postgresql-infrastructure/authority.sock"),
+            authority_id: "postgresql-infrastructure-attestation-authority:runtime-test".into(),
+            key_id: "postgresql-infrastructure-attestation-key:runtime-test".into(),
+            public_key_base64: BASE64_STANDARD.encode(public_key),
+            public_key_fingerprint: raw_digest(&public_key),
+            minimum_authority_epoch: 3,
+            attestation_profile_id: attestation_profile_id.clone(),
+            attestation_profile_version: *attestation_profile_version,
+            attestation_profile_digest: attestation_profile_digest.clone(),
+        }
+    }
+
+    fn postgresql_tls_channel_binding(
+        provider_route_binding_digest: impl Into<String>,
+    ) -> PostgresqlTlsChannelBinding {
+        PostgresqlTlsChannelBinding {
+            provider_route_binding_digest: provider_route_binding_digest.into(),
+            server_name: "postgresql.database.svc".into(),
+            peer_address: "127.0.0.1".into(),
+            peer_port: 5432,
+            trust_anchor_bundle_digest: raw_digest(b"postgresql exclusive CA bundle"),
+            peer_leaf_certificate_digest: raw_digest(b"postgresql peer leaf certificate"),
+            peer_certificate_chain_digest: raw_digest(b"postgresql peer certificate chain"),
+            exporter_digest: raw_digest(b"postgresql TLS exporter"),
+            tls_protocol: "tlsv1.3".into(),
+            tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
+            tls_cipher_bits: 256,
+        }
+    }
+
+    fn postgresql_session_binding(
+        application_name: impl Into<String>,
+        tls_channel_binding: PostgresqlTlsChannelBinding,
+    ) -> PostgresqlSessionBinding {
+        PostgresqlSessionBinding {
+            application_name: application_name.into(),
+            database_name: "ryuki".into(),
+            database_oid: 16_384,
+            datid: 16_384,
+            server_address: "127.0.0.1".into(),
+            server_port: 5432,
+            server_major_version: 18,
+            primary: true,
+            transaction_writable: true,
+            default_transaction_writable: true,
+            client_address: "127.0.0.1".into(),
+            client_port: 43_210,
+            backend_process_id: 4_321,
+            backend_start: production_composition_time(7, 7).not_before,
+            backend_type: "client backend".into(),
+            session_login_role: "ryuki_migration_login".into(),
+            session_user_oid: 20_001,
+            current_role: "ryuki_migrator".into(),
+            selected_role: "ryuki_migrator".into(),
+            tls_enabled: true,
+            tls_protocol: "tlsv1.3".into(),
+            tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
+            tls_cipher_bits: 256,
+            client_distinguished_name: None,
+            issuer_distinguished_name: None,
+            tls_channel_binding,
+        }
+    }
+
     #[test]
     fn production_migration_admission_uses_receipt_bound_roles_only() {
         let boundary = genuine_production_boundary(240);
-        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
-            .expect("database challenge")
-            .expected_value()
-        {
+        let database_challenge =
+            exact_challenge(&boundary, GuardId::DurablePostgresql).expect("database challenge");
+        let expected_requirement_digest = database_challenge.requirement_digest().to_owned();
+        let expected_challenge_binding_digest =
+            database_challenge.challenge_binding_digest().to_owned();
+        let expected_inventory_digest = match database_challenge.expected_value() {
             RuntimeGuardExpectedValue::DurablePostgresql {
                 migration_inventory_digest,
                 ..
@@ -7396,6 +8350,7 @@ mod tests {
             _ => panic!("database challenge changed kind"),
         };
         let admission = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
             Box::new(boundary),
             crate::database::MigrationStartupMode::ApplyOnly,
             production_composition_time(9, 9).not_before,
@@ -7412,10 +8367,129 @@ mod tests {
         assert!(!admission
             .role_contract
             .matches_receipt_bound_roles("ryuki_application", "ryuki_migrator"));
+        assert_eq!(admission.requirement_digest, expected_requirement_digest);
+        assert_eq!(
+            admission.challenge_binding_digest,
+            expected_challenge_binding_digest
+        );
     }
 
     #[test]
-    fn production_migration_execution_stays_blocked_without_target_attestation() {
+    fn production_migration_admission_rejects_attestation_profile_substitution() {
+        let boundary = genuine_production_boundary(240);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let mut pins = postgresql_infrastructure_pins(&boundary);
+        pins.attestation_profile_id =
+            "postgresql-infrastructure-attestation-profile:substituted".into();
+        let error = verify_production_migration_admission_with_inventory_digest(
+            pins,
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(9, 9).not_before,
+            &expected_inventory_digest,
+        )
+        .unwrap_err();
+        assert!(error.contains("profile pins differ"));
+    }
+
+    #[tokio::test]
+    async fn production_migration_execution_rechecks_workload_challenge_binding() {
+        let boundary = genuine_production_boundary(240);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let mut admission = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(9, 9).not_before,
+            &expected_inventory_digest,
+        )
+        .expect("the sealed database requirement must validate structurally");
+        admission.challenge_binding_digest = raw_digest(b"substituted database challenge");
+        let MigrationDatabasePreflight::Production(pending) =
+            VerifiedApplyOnlyMigrationAdmission::Production(Box::new(admission))
+                .into_database_preflight(production_composition_time(10, 10).not_before)
+                .expect("the boundary itself remains fresh")
+        else {
+            panic!("production preflight changed kind");
+        };
+        let (_, route_digest) = pending
+            .database_provider_and_route_digest()
+            .expect("pending target retains its exact provider route");
+        let channel = postgresql_tls_channel_binding(route_digest);
+        let request_tag = pending
+            .request_tag_for_channel(&channel)
+            .expect("request tag is derived from the exact TLS channel");
+        let error = pending
+            .attest_exact_session(
+                postgresql_session_binding(request_tag, channel),
+                production_composition_time(11, 11).not_before,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("workload-bound database challenge"));
+    }
+
+    #[test]
+    fn nonproduction_migration_preflight_remains_executable_without_attestation() {
+        let role_contract = crate::database::MigrationRoleContract::from_receipt_bound_roles(
+            "ryuki_migrator",
+            "ryuki_application",
+        )
+        .expect("canonical role contract");
+        let inventory_digest = raw_digest(b"nonproduction embedded inventory");
+        let preflight = VerifiedApplyOnlyMigrationAdmission::NonProduction {
+            role_contract,
+            expected_migration_inventory_digest: inventory_digest.clone(),
+        }
+        .into_database_preflight(production_composition_time(9, 9).not_before)
+        .expect("nonproduction preflight does not require production target authority");
+        let MigrationDatabasePreflight::NonProduction {
+            role_contract,
+            expected_migration_inventory_digest,
+        } = preflight
+        else {
+            panic!("nonproduction preflight changed kind");
+        };
+        assert!(role_contract.matches_receipt_bound_roles("ryuki_migrator", "ryuki_application"));
+        assert_eq!(expected_migration_inventory_digest, inventory_digest);
+    }
+
+    #[test]
+    fn production_migration_execution_cannot_authorize_ddl_at_or_after_valid_until() {
+        let valid_until = production_composition_time(120, 120).not_before;
+        ensure_production_migration_execution_before_expiry(
+            valid_until - TimeDelta::nanoseconds(1),
+            valid_until,
+        )
+        .expect("the exclusive fence remains open immediately before valid_until");
+        for now in [valid_until, valid_until + TimeDelta::nanoseconds(1)] {
+            let error =
+                ensure_production_migration_execution_before_expiry(now, valid_until).unwrap_err();
+            assert!(error.contains("cannot authorize DDL"));
+            assert!(error.contains("at or after"));
+        }
+    }
+
+    #[test]
+    fn production_migration_preflight_withholds_ddl_authority_until_target_attestation() {
         let boundary = genuine_production_boundary(240);
         let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
             .expect("database challenge")
@@ -7428,6 +8502,7 @@ mod tests {
             _ => panic!("database challenge changed kind"),
         };
         let admission = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
             Box::new(boundary),
             crate::database::MigrationStartupMode::ApplyOnly,
             production_composition_time(9, 9).not_before,
@@ -7435,11 +8510,66 @@ mod tests {
         )
         .expect("the sealed database requirement must validate structurally");
 
-        let error = VerifiedApplyOnlyMigrationAdmission::Production(admission)
-            .into_database_execution(production_composition_time(10, 10).not_before)
+        let preflight = VerifiedApplyOnlyMigrationAdmission::Production(Box::new(admission))
+            .into_database_preflight(production_composition_time(10, 10).not_before)
+            .expect("the pending target remains fresh before connection");
+        let MigrationDatabasePreflight::Production(pending) = preflight else {
+            panic!("production preflight changed kind");
+        };
+        let (_, route_digest) = pending
+            .database_provider_and_route_digest()
+            .expect("pending target retains its exact provider route");
+        let channel = postgresql_tls_channel_binding(route_digest);
+        let request_tag = pending
+            .request_tag_for_channel(&channel)
+            .expect("request tag is derived from the exact TLS channel");
+        assert!(request_tag.starts_with("ryuki-pg-attest-"));
+        assert!(request_tag.len() <= 63);
+        assert!(pending
+            .migration_role_contract()
+            .matches_receipt_bound_roles("ryuki_migrator", "ryuki_application"));
+    }
+
+    #[tokio::test]
+    async fn production_migration_rejects_session_tag_substitution_before_exchange() {
+        let boundary = genuine_production_boundary(240);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let admission = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(9, 9).not_before,
+            &expected_inventory_digest,
+        )
+        .expect("the sealed database requirement must validate structurally");
+        let MigrationDatabasePreflight::Production(pending) =
+            VerifiedApplyOnlyMigrationAdmission::Production(Box::new(admission))
+                .into_database_preflight(production_composition_time(10, 10).not_before)
+                .expect("pending target remains fresh")
+        else {
+            panic!("production preflight changed kind");
+        };
+        let (_, route_digest) = pending
+            .database_provider_and_route_digest()
+            .expect("pending target retains its exact provider route");
+        let channel = postgresql_tls_channel_binding(route_digest);
+        let error = pending
+            .attest_exact_session(
+                postgresql_session_binding("ryuki-pg-attest-substituted", channel),
+                production_composition_time(11, 11).not_before,
+            )
+            .await
             .unwrap_err();
-        assert!(error.contains("authenticated database-target"));
-        assert!(error.contains("before DDL"));
+        assert!(error.contains("application_name differs"));
     }
 
     #[test]
@@ -7456,6 +8586,7 @@ mod tests {
             _ => panic!("database challenge changed kind"),
         };
         let error = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
             Box::new(boundary),
             crate::database::MigrationStartupMode::ApplyOnly,
             production_composition_time(13, 13).not_before,
@@ -7482,6 +8613,7 @@ mod tests {
             _ => panic!("database challenge changed kind"),
         };
         let error = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
             Box::new(boundary),
             crate::database::MigrationStartupMode::VerifyOnly,
             production_composition_time(9, 9).not_before,
@@ -7492,6 +8624,7 @@ mod tests {
 
         let boundary = genuine_production_boundary(240);
         let error = verify_production_migration_admission_with_inventory_digest(
+            postgresql_infrastructure_pins(&boundary),
             Box::new(boundary),
             crate::database::MigrationStartupMode::ApplyOnly,
             production_composition_time(9, 9).not_before,
@@ -8854,6 +9987,7 @@ mod tests {
                 conformance_trust_checkpoint_authority: None,
                 deployed_workload_attestation: None,
                 public_ingress_attestation: None,
+                postgresql_infrastructure_attestation: None,
                 production_build_manifest: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
@@ -9499,9 +10633,102 @@ mod tests {
         for (name, value) in &ingress_group {
             production_complete.insert((*name).into(), OsString::from(value));
         }
+        assert!(
+            StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
+                .unwrap_err()
+                .contains(POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV)
+        );
+
+        let postgresql_key = SigningKey::from_bytes(&rand::random());
+        let postgresql_public_key =
+            BASE64_STANDARD.encode(postgresql_key.verifying_key().to_bytes());
+        let postgresql_fingerprint = raw_digest(&postgresql_key.verifying_key().to_bytes());
+        let postgresql_group = [
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV,
+                "/run/ryuki/postgresql-infrastructure/authority.sock".to_string(),
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID_ENV,
+                "postgresql-infrastructure-attestation-authority:runtime-test".to_string(),
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID_ENV,
+                "postgresql-infrastructure-attestation-key:runtime-test".to_string(),
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+                postgresql_public_key,
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+                postgresql_fingerprint,
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+                "17".to_string(),
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_ENV,
+                "postgresql-infrastructure-attestation-profile:runtime-test".to_string(),
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION_ENV,
+                "7".to_string(),
+            ),
+            (
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST_ENV,
+                digest.clone(),
+            ),
+        ];
+        for (name, value) in &postgresql_group {
+            production_complete.insert((*name).into(), OsString::from(value));
+        }
         let production_pins =
             StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
                 .expect("production pins are complete");
+        for (label, socket_path, public_key) in [
+            (
+                "conformance trust-checkpoint",
+                "/run/ryuki/trust-checkpoint/authority.sock",
+                checkpoint_key.verifying_key().to_bytes(),
+            ),
+            (
+                "deployed-workload attestation",
+                "/run/ryuki/workload-attestation/authority.sock",
+                workload_key.verifying_key().to_bytes(),
+            ),
+            (
+                "public-ingress attestation",
+                "/run/ryuki/public-ingress/authority.sock",
+                ingress_key.verifying_key().to_bytes(),
+            ),
+        ] {
+            let mut reused_socket = production_complete.clone();
+            reused_socket.insert(
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV.into(),
+                OsString::from(socket_path),
+            );
+            let error = StartupSecurityPins::from_source(|name| reused_socket.get(name).cloned())
+                .unwrap_err();
+            assert!(error.contains("distinct Unix socket"), "{label}: {error}");
+
+            let mut reused_key = production_complete.clone();
+            reused_key.insert(
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV.into(),
+                OsString::from(BASE64_STANDARD.encode(public_key)),
+            );
+            reused_key.insert(
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+                OsString::from(raw_digest(&public_key)),
+            );
+            let error =
+                StartupSecurityPins::from_source(|name| reused_key.get(name).cloned()).unwrap_err();
+            assert!(
+                error.contains("cryptographically distinct key"),
+                "{label}: {error}"
+            );
+        }
         let workload_pins = production_pins
             .deployed_workload_attestation
             .as_ref()
@@ -9515,6 +10742,12 @@ mod tests {
             .expect("production public-ingress attestation binding");
         assert_eq!(ingress_pins.minimum_authority_epoch, 13);
         assert_eq!(ingress_pins.attestation_profile_version, 5);
+        let postgresql_pins = production_pins
+            .postgresql_infrastructure_attestation
+            .as_ref()
+            .expect("production PostgreSQL-infrastructure attestation binding");
+        assert_eq!(postgresql_pins.minimum_authority_epoch, 17);
+        assert_eq!(postgresql_pins.attestation_profile_version, 7);
         let build_pins = production_pins
             .production_build_manifest
             .expect("production build manifest binding");
@@ -9556,6 +10789,16 @@ mod tests {
         .unwrap_err()
         .contains("production-only"));
 
+        let mut nonproduction_with_postgresql = values.clone();
+        for (name, value) in &postgresql_group {
+            nonproduction_with_postgresql.insert((*name).into(), OsString::from(value));
+        }
+        assert!(StartupSecurityPins::from_source(|name| {
+            nonproduction_with_postgresql.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("production-only"));
+
         for (missing, _) in &workload_group {
             assert!(StartupSecurityPins::from_source(|name| {
                 (name != *missing)
@@ -9567,6 +10810,16 @@ mod tests {
         }
 
         for (missing, _) in &ingress_group {
+            assert!(StartupSecurityPins::from_source(|name| {
+                (name != *missing)
+                    .then(|| production_complete.get(name).cloned())
+                    .flatten()
+            })
+            .unwrap_err()
+            .contains(*missing));
+        }
+
+        for (missing, _) in &postgresql_group {
             assert!(StartupSecurityPins::from_source(|name| {
                 (name != *missing)
                     .then(|| production_complete.get(name).cloned())
@@ -9642,6 +10895,21 @@ mod tests {
             StartupSecurityPins::from_source(|name| mismatched_workload_key.get(name).cloned())
                 .unwrap_err()
                 .contains("does not match")
+        );
+        let weak_postgresql_key = [0u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES];
+        let mut invalid_postgresql_key = production_complete.clone();
+        invalid_postgresql_key.insert(
+            POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64_ENV.into(),
+            OsString::from(BASE64_STANDARD.encode(weak_postgresql_key)),
+        );
+        invalid_postgresql_key.insert(
+            POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+            OsString::from(raw_digest(&weak_postgresql_key)),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| invalid_postgresql_key.get(name).cloned())
+                .unwrap_err()
+                .contains("Ed25519 public key")
         );
         let mut zero_build_digest = production_complete;
         zero_build_digest.insert(

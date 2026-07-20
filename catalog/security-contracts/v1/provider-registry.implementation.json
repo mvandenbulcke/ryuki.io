@@ -26,7 +26,7 @@
         "excluded_json_pointers": ["/payload_digest"],
         "digest_encoding": "sha256-prefix-lowercase-hex"
       },
-      "payload_digest": "sha256:4fca80c44f9c5b5c4c7cead245b089d55132783cd11dcea3d87d8ff2af92076c",
+      "payload_digest": "sha256:2846ce8ef3388cfcc992aa931a108c87a314b82f8d6fac10cb2681855976ecf3",
       "immutable": true,
       "trust_domain_id": "trust-domain:repository-fixture",
       "allowed_security_profiles": [
@@ -49,7 +49,7 @@
         "mandatory_baseline_ref": {
           "document_id": "baseline:repository-development-fixture-v1",
           "document_version": 1,
-          "content_digest": "sha256:eca12824f8d084b699df2d449e6661eb77938b049c45168b12041e1f00bd19aa",
+          "content_digest": "sha256:1cfc05fc38039081bf0a532237a1f541a20a39db606223a3c7b231320ed1a14b",
           "artifact_locator": "docs/architecture/platform-security-boundary.md"
         },
         "implementation_applicable": true,
@@ -80,7 +80,7 @@
       "governing_contract_ref": {
         "document_id": "security-boundary:platform-production-v1",
         "document_version": 1,
-        "content_digest": "sha256:eca12824f8d084b699df2d449e6661eb77938b049c45168b12041e1f00bd19aa",
+        "content_digest": "sha256:1cfc05fc38039081bf0a532237a1f541a20a39db606223a3c7b231320ed1a14b",
         "artifact_locator": "docs/architecture/platform-security-boundary.md"
       }
     }

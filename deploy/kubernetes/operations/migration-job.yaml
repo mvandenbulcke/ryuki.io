@@ -1,8 +1,13 @@
 # Operations-only template. Do not add this file to a continuously reconciled
-# base or GitOps Application. Render one approved digest, create it once, and
-# retain the generated Job name/logs with the release evidence. Every
+# base or GitOps Application. Production creation is currently disabled: the
+# offline validator rejects every `final-render` until an in-cluster admission
+# layer fences live ConfigMap identity and consumes one unique attempt, and the
+# runner revalidates receipt freshness before database access. Every
 # `111111111111` identity below is the first 12 lowercase hex characters of
 # the admitted image digest and must be rewritten atomically with that image.
+# `RENDER_REQUIRED` is never an admissible final value: the renderer replaces
+# every sentinel and changes render-mode to `final-render` only as a diagnostic
+# shape. That shape is not execution authority and must not be submitted.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -11,18 +16,37 @@ metadata:
   annotations:
     ryuki.io/cutover-contract: migration-cutover-v1
     ryuki.io/release-image: registry.example.invalid/ryuki/platform-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    ryuki.io/render-contract: migration-final-render-v1
+    ryuki.io/render-mode: source-template
+    ryuki.io/pin-migration-config-receipt: RENDER_REQUIRED
+    ryuki.io/pin-security-admission-receipt: RENDER_REQUIRED
+    ryuki.io/pin-production-build-manifest-receipt: RENDER_REQUIRED
+    ryuki.io/pin-conformance-trust-checkpoint-receipt: RENDER_REQUIRED
+    ryuki.io/pin-deployed-workload-attestation-receipt: RENDER_REQUIRED
+    ryuki.io/pin-public-ingress-attestation-receipt: RENDER_REQUIRED
+    ryuki.io/pin-postgresql-infrastructure-attestation-receipt: RENDER_REQUIRED
+    ryuki.io/pin-socket-projection-authority-receipt: RENDER_REQUIRED
+    ryuki.io/socket-projection-receipt-digest: RENDER_REQUIRED
+    ryuki.io/socket-contract-digest: sha256:369bca5b159d7535a2b3523796ff3632e9e7ca44f9a94b4140cc572163767697
   labels:
     app.kubernetes.io/part-of: ryuki-infrastructure-platform
     app.kubernetes.io/name: platform-api-migrations
     app.kubernetes.io/component: database-migration-runner
     ryuki.io/release-digest-prefix: "111111111111"
 spec:
+  # Fail safely if this source template is submitted accidentally. Do not clear
+  # suspension: no production final render is admissible with the current
+  # snapshot-only validator.
+  suspend: true
   # A failed or timed-out DDL wave requires operator readback before any new
   # generated Job is created. Kubernetes must never retry the migration writer.
+  # The Job duration is capped at 300 seconds. This does not enforce receipt
+  # freshness at Pod start or during runtime; that missing gate is why
+  # production execution remains disabled.
   completions: 1
   parallelism: 1
   backoffLimit: 0
-  activeDeadlineSeconds: 2400
+  activeDeadlineSeconds: 300
   # Deliberately no ttlSecondsAfterFinished: evidence retention/deletion is an
   # explicit release operation, not an automatic recreate loop.
   template:
@@ -38,8 +62,12 @@ spec:
       enableServiceLinks: false
       restartPolicy: Never
       terminationGracePeriodSeconds: 30
-      # Project only CloudNativePG's public CA certificate. SQLx verify-full
-      # uses this file before sending the JIT migration password.
+      # Project CloudNativePG's public CA and one bounded memory-backed
+      # workspace for the owner-only SQLx-to-TLS relay socket. No credential or
+      # durable state is written there.
+      # Live authority socket volumes are deliberately absent from this source
+      # template. The retained `migration-final-render-v1` diagnostic shape adds
+      # exactly four reviewed mounts, but is still rejected and never created.
       volumes:
         - name: cnpg-ca
           secret:
@@ -47,10 +75,16 @@ spec:
             items:
               - key: ca.crt
                 path: ca.crt
+        - name: postgresql-relay-workspace
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -63,11 +97,25 @@ spec:
             - name: cnpg-ca
               mountPath: /var/run/secrets/ryuki/cnpg
               readOnly: true
+            - name: postgresql-relay-workspace
+              mountPath: /run/ryuki-postgresql-relay
+              readOnly: false
           envFrom:
+            # Source-template placeholder only. The diagnostic final-render
+            # shape rewrites this to
+            # platform-api-migration-config-<release-digest-prefix>, requires
+            # immutable API readback, and binds it as one of eight pin receipts.
             - configMapRef:
                 name: platform-api-migration-config
-          # The digest-scoped VaultDynamicSecret and the external admission
-          # ConfigMap are imported key-by-key; neither can widen configuration.
+          # The digest-scoped VaultDynamicSecret and independently governed
+          # admission/attestation ConfigMaps are imported key-by-key; none can
+          # widen configuration. The PostgreSQL authority owns the pre-
+          # provisioned Unix socket named by its ConfigMap. No database
+          # credential or private signing material belongs in either ConfigMap.
+          # A future independently governed in-cluster admission layer must
+          # project every pinned live socket and fence it through Pod
+          # materialization before this container starts. This template does
+          # not permit an implicit hostPath or an in-image authority fallback.
           env:
             - name: RYUKI_MIGRATION_DATABASE_URL
               valueFrom:
@@ -77,38 +125,218 @@ spec:
             - name: RYUKI_SECURITY_CONTRACT_ROOT
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_SECURITY_CONTRACT_ROOT
             - name: RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
             - name: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
             - name: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
             - name: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
             - name: RYUKI_EXPECTED_DEPLOYMENT_ID
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_EXPECTED_DEPLOYMENT_ID
             - name: RYUKI_SECURITY_PROFILE
               valueFrom:
                 configMapKeyRef:
-                  name: platform-security-admission-config
+                  name: platform-security-admission-config-111111111111
                   key: RYUKI_SECURITY_PROFILE
+            - name: RYUKI_PRODUCTION_BUILD_MANIFEST_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-production-build-manifest-pins-111111111111
+                  key: RYUKI_PRODUCTION_BUILD_MANIFEST_PATH
+            - name: RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-production-build-manifest-pins-111111111111
+                  key: RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST
+            - name: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-conformance-trust-checkpoint-pins-111111111111
+                  key: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET
+            - name: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-conformance-trust-checkpoint-pins-111111111111
+                  key: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID
+            - name: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-conformance-trust-checkpoint-pins-111111111111
+                  key: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID
+            - name: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-conformance-trust-checkpoint-pins-111111111111
+                  key: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64
+            - name: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-conformance-trust-checkpoint-pins-111111111111
+                  key: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT
+            - name: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-conformance-trust-checkpoint-pins-111111111111
+                  key: RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION
+            - name: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST
+            - name: RYUKI_EXPECTED_WORKLOAD_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deployed-workload-attestation-pins-111111111111
+                  key: RYUKI_EXPECTED_WORKLOAD_ID
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION
+            - name: RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-public-ingress-attestation-pins-111111111111
+                  key: RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION
+            - name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-postgresql-infrastructure-attestation-pins-111111111111
+                  key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST
           resources:
             requests:
               cpu: 50m

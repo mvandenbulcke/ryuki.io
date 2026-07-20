@@ -16,3 +16,8 @@ proc-macro2 = { workspace = true }
 syn = { workspace = true }
 jsonschema = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[dev-dependencies]
+rand = "0.8"

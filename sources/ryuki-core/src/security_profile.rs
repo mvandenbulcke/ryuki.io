@@ -22,6 +22,9 @@ pub const AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-runtime-binding-v1";
 pub const POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT: &str =
     "ryuki-postgresql-database-identity-v1";
+pub const POSTGRESQL_PROVIDER_ROUTE_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-postgresql-provider-route-binding-v1";
+pub const POSTGRESQL_PROVIDER_ROUTE_MODE_DIRECT_SESSION_V1: &str = "direct-session-v1";
 pub const POSTGRESQL_STORAGE_BINDING_DIGEST_CONTRACT: &str = "ryuki-postgresql-storage-binding-v1";
 pub const POSTGRESQL_MIGRATION_INVENTORY_DIGEST_CONTRACT: &str =
     "ryuki-postgresql-migration-inventory-v1";
@@ -309,6 +312,10 @@ pub enum RuntimeGuardExpectedValue {
     DurablePostgresql {
         database_provider: ProductionDatabaseProvider,
         server_major_version: u16,
+        attestation_profile_id: String,
+        attestation_profile_version: u64,
+        attestation_profile_digest: String,
+        provider_route_binding_digest: String,
         database_identity_digest: String,
         storage_binding_digest: String,
         migration_inventory_digest: String,
@@ -354,6 +361,11 @@ pub enum RuntimeGuardExpectedValue {
 /// Canonical namespace shared by the deployment profile and the independently
 /// verified public-ingress attestation protocol.
 pub const INGRESS_ATTESTATION_PROFILE_ID_PREFIX: &str = "ingress-attestation-profile:";
+
+/// Canonical namespace shared by the deployment profile and the independently
+/// verified PostgreSQL infrastructure attestation protocol.
+pub const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_PREFIX: &str =
+    "postgresql-infrastructure-attestation-profile:";
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -426,6 +438,22 @@ pub struct PostgresqlDatabaseIdentity {
     pub writable: bool,
 }
 
+/// Stable, receipt-bound route used to establish one direct PostgreSQL TLS
+/// session. The exact leaf certificate is pinned so a second endpoint with a
+/// different certificate under the same CA cannot receive authentication
+/// material before the independent session attestation runs. Socket addresses
+/// and exporter values remain per-connection measurements.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresqlProviderRouteBinding {
+    pub route_mode: String,
+    pub database_provider: ProductionDatabaseProvider,
+    pub endpoint_dns_name: String,
+    pub endpoint_port: u16,
+    pub trust_anchor_bundle_digest: String,
+    pub peer_leaf_certificate_digest: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum PostgresqlStoragePurpose {
@@ -473,6 +501,12 @@ struct PostgresqlDatabaseIdentityProjection<'a> {
 }
 
 #[derive(Serialize)]
+struct PostgresqlProviderRouteBindingProjection<'a> {
+    digest_contract: &'static str,
+    provider_route_binding: &'a PostgresqlProviderRouteBinding,
+}
+
+#[derive(Serialize)]
 struct PostgresqlStorageBindingProjection<'a> {
     digest_contract: &'static str,
     storage_bindings: &'a [PostgresqlStorageBinding],
@@ -498,6 +532,22 @@ pub fn postgresql_database_identity_digest(
     identity: &PostgresqlDatabaseIdentity,
 ) -> Result<String, RuntimeGuardDigestError> {
     digest_canonical_bytes(postgresql_database_identity_canonical_bytes(identity)?)
+}
+
+pub fn postgresql_provider_route_binding_canonical_bytes(
+    binding: &PostgresqlProviderRouteBinding,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_postgresql_provider_route_binding_projection(binding)?;
+    canonical_projection_bytes(PostgresqlProviderRouteBindingProjection {
+        digest_contract: POSTGRESQL_PROVIDER_ROUTE_BINDING_DIGEST_CONTRACT,
+        provider_route_binding: binding,
+    })
+}
+
+pub fn postgresql_provider_route_binding_digest(
+    binding: &PostgresqlProviderRouteBinding,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(postgresql_provider_route_binding_canonical_bytes(binding)?)
 }
 
 pub fn postgresql_storage_binding_canonical_bytes(
@@ -1093,10 +1143,49 @@ fn validate_postgresql_database_identity_projection(
     Ok(())
 }
 
+fn validate_postgresql_provider_route_binding_projection(
+    binding: &PostgresqlProviderRouteBinding,
+) -> Result<(), RuntimeGuardDigestError> {
+    let dns_is_canonical = !binding.endpoint_dns_name.is_empty()
+        && binding.endpoint_dns_name.len() <= 253
+        && !binding.endpoint_dns_name.ends_with('.')
+        && binding.endpoint_dns_name.parse::<IpAddr>().is_err()
+        && binding.endpoint_dns_name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        });
+    if binding.route_mode != POSTGRESQL_PROVIDER_ROUTE_MODE_DIRECT_SESSION_V1
+        || !dns_is_canonical
+        || binding.endpoint_port == 0
+        || !valid_sha256_digest(&binding.trust_anchor_bundle_digest)
+        || !valid_sha256_digest(&binding.peer_leaf_certificate_digest)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "postgresql provider route binding",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_postgresql_storage_binding_projection(
     bindings: &[PostgresqlStorageBinding],
 ) -> Result<(), RuntimeGuardDigestError> {
-    if bindings.is_empty()
+    let has_required_purpose_shape = matches!(bindings, [data] if data.purpose == PostgresqlStoragePurpose::Data)
+        || matches!(bindings, [data, wal]
+                if data.purpose == PostgresqlStoragePurpose::Data
+                    && wal.purpose == PostgresqlStoragePurpose::Wal);
+    if !has_required_purpose_shape
         || !bindings
             .windows(2)
             .all(|pair| pair[0].purpose < pair[1].purpose)
@@ -2118,6 +2207,10 @@ pub(crate) fn validate_runtime_guard_expected_value(
     match value {
         RuntimeGuardExpectedValue::DurablePostgresql {
             server_major_version,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            provider_route_binding_digest,
             database_identity_digest,
             storage_binding_digest,
             migration_inventory_digest,
@@ -2129,7 +2222,27 @@ pub(crate) fn validate_runtime_guard_expected_value(
                 errors
                     .push("durable-postgresql expected server_major_version must equal 18".into());
             }
+            validate_id(
+                attestation_profile_id,
+                POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID_PREFIX,
+                "durable-postgresql attestation_profile_id",
+                errors,
+            );
+            require_positive_version(
+                "durable-postgresql attestation_profile_version",
+                *attestation_profile_version,
+                errors,
+            );
+            validate_digest(
+                "durable-postgresql attestation_profile_digest",
+                attestation_profile_digest,
+                errors,
+            );
             for (label, digest) in [
+                (
+                    "provider_route_binding_digest",
+                    provider_route_binding_digest,
+                ),
                 ("database_identity_digest", database_identity_digest),
                 ("storage_binding_digest", storage_binding_digest),
                 ("migration_inventory_digest", migration_inventory_digest),
@@ -2606,6 +2719,17 @@ mod tests {
         }
     }
 
+    fn postgresql_provider_route_binding() -> PostgresqlProviderRouteBinding {
+        PostgresqlProviderRouteBinding {
+            route_mode: POSTGRESQL_PROVIDER_ROUTE_MODE_DIRECT_SESSION_V1.into(),
+            database_provider: ProductionDatabaseProvider::CloudNativePg,
+            endpoint_dns_name: "postgresql-rw.database.svc.cluster.local".into(),
+            endpoint_port: 5432,
+            trust_anchor_bundle_digest: fixture_digest('1'),
+            peer_leaf_certificate_digest: fixture_digest('2'),
+        }
+    }
+
     fn postgresql_storage_bindings() -> Vec<PostgresqlStorageBinding> {
         vec![
             PostgresqlStorageBinding {
@@ -2743,6 +2867,11 @@ mod tests {
             GuardId::DurablePostgresql => RuntimeGuardExpectedValue::DurablePostgresql {
                 database_provider: ProductionDatabaseProvider::CloudNativePg,
                 server_major_version: 18,
+                attestation_profile_id: "postgresql-infrastructure-attestation-profile:fixture"
+                    .into(),
+                attestation_profile_version: 1,
+                attestation_profile_digest: fixture_digest('1'),
+                provider_route_binding_digest: fixture_digest('5'),
                 database_identity_digest: fixture_digest('2'),
                 storage_binding_digest: fixture_digest('3'),
                 migration_inventory_digest: fixture_digest('4'),
@@ -2890,6 +3019,50 @@ mod tests {
         )
     }
 
+    fn durable_postgresql_attestation_profile_parts(
+        profile: &mut DeploymentSecurityProfile,
+    ) -> (&mut String, &mut u64, &mut String) {
+        let guard = profile
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::DurablePostgresql)
+            .unwrap();
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            ..
+        } = &mut guard.expected_value
+        else {
+            unreachable!()
+        };
+        (
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+        )
+    }
+
+    fn durable_postgresql_provider_route_digest(
+        profile: &mut DeploymentSecurityProfile,
+    ) -> &mut String {
+        let guard = profile
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::DurablePostgresql)
+            .unwrap();
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            provider_route_binding_digest,
+            ..
+        } = &mut guard.expected_value
+        else {
+            unreachable!()
+        };
+        provider_route_binding_digest
+    }
+
     #[test]
     fn checked_in_profile_round_trips_without_semantic_loss() {
         let raw: serde_json::Value = serde_json::from_str(include_str!(
@@ -3028,6 +3201,87 @@ mod tests {
     }
 
     #[test]
+    fn durable_postgresql_requires_a_canonical_receipt_bound_attestation_profile() {
+        let assert_invalid = |profile: DeploymentSecurityProfile, needle: &str| {
+            let errors = profile.validate_structure_at(fixed_now());
+            assert!(
+                errors.iter().any(|error| error.contains(needle)),
+                "expected {needle:?} in {errors:?}"
+            );
+        };
+
+        let mut wrong_namespace = structurally_complete_production_profile();
+        *durable_postgresql_attestation_profile_parts(&mut wrong_namespace).0 =
+            "ingress-attestation-profile:fixture".into();
+        assert_invalid(
+            wrong_namespace,
+            "must use the postgresql-infrastructure-attestation-profile: namespace",
+        );
+
+        let mut noncanonical_id = structurally_complete_production_profile();
+        *durable_postgresql_attestation_profile_parts(&mut noncanonical_id).0 =
+            "postgresql-infrastructure-attestation-profile:Fixture".into();
+        assert_invalid(noncanonical_id, "is not a canonical lowercase identifier");
+
+        let mut zero_version = structurally_complete_production_profile();
+        *durable_postgresql_attestation_profile_parts(&mut zero_version).1 = 0;
+        assert_invalid(
+            zero_version,
+            "durable-postgresql attestation_profile_version must be greater than zero",
+        );
+
+        let mut malformed_digest = structurally_complete_production_profile();
+        *durable_postgresql_attestation_profile_parts(&mut malformed_digest).2 =
+            "sha256:not-a-digest".into();
+        assert_invalid(
+            malformed_digest,
+            "durable-postgresql attestation_profile_digest must contain 64 lowercase hexadecimal characters",
+        );
+
+        let mut unresolved_digest = structurally_complete_production_profile();
+        *durable_postgresql_attestation_profile_parts(&mut unresolved_digest).2 =
+            format!("sha256:{}", "0".repeat(64));
+        assert_invalid(
+            unresolved_digest,
+            "durable-postgresql attestation_profile_digest must not use the unresolved all-zero digest",
+        );
+
+        let mut malformed_route_digest = structurally_complete_production_profile();
+        *durable_postgresql_provider_route_digest(&mut malformed_route_digest) =
+            "sha256:not-a-digest".into();
+        assert_invalid(
+            malformed_route_digest,
+            "durable-postgresql provider_route_binding_digest must contain 64 lowercase hexadecimal characters",
+        );
+
+        let mut unresolved_route_digest = structurally_complete_production_profile();
+        *durable_postgresql_provider_route_digest(&mut unresolved_route_digest) =
+            format!("sha256:{}", "0".repeat(64));
+        assert_invalid(
+            unresolved_route_digest,
+            "durable-postgresql provider_route_binding_digest must not use the unresolved all-zero digest",
+        );
+    }
+
+    #[test]
+    fn durable_postgresql_attestation_profile_fields_cannot_be_omitted() {
+        let expected_value = expected_guard_value(GuardId::DurablePostgresql, "unused");
+        for field in [
+            "attestation_profile_id",
+            "attestation_profile_version",
+            "attestation_profile_digest",
+            "provider_route_binding_digest",
+        ] {
+            let mut raw = serde_json::to_value(&expected_value).unwrap();
+            raw.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<RuntimeGuardExpectedValue>(raw).is_err(),
+                "omitting {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn postgresql_digest_contracts_match_independent_goldens_and_reject_drifted_order() {
         let identity = postgresql_database_identity("deployment:fixture");
         assert_independent_canonical_golden(
@@ -3060,6 +3314,71 @@ mod tests {
             postgresql_database_identity_digest(&drifted_identity).unwrap(),
             identity_digest
         );
+
+        let route = postgresql_provider_route_binding();
+        assert_independent_canonical_golden(
+            postgresql_provider_route_binding_canonical_bytes(&route).unwrap(),
+            json!({
+                "digest_contract": "ryuki-postgresql-provider-route-binding-v1",
+                "provider_route_binding": {
+                    "route_mode": "direct-session-v1",
+                    "database_provider": "cloudnativepg",
+                    "endpoint_dns_name": "postgresql-rw.database.svc.cluster.local",
+                    "endpoint_port": 5432,
+                    "trust_anchor_bundle_digest": fixture_digest('1'),
+                    "peer_leaf_certificate_digest": fixture_digest('2')
+                }
+            }),
+        );
+        let route_digest = postgresql_provider_route_binding_digest(&route).unwrap();
+        let mut drifted_route = route.clone();
+        drifted_route.endpoint_dns_name = "postgresql-ro.database.svc.cluster.local".into();
+        assert_ne!(
+            postgresql_provider_route_binding_digest(&drifted_route).unwrap(),
+            route_digest
+        );
+        let mut substituted_leaf = route.clone();
+        substituted_leaf.peer_leaf_certificate_digest = fixture_digest('9');
+        assert_ne!(
+            postgresql_provider_route_binding_digest(&substituted_leaf).unwrap(),
+            route_digest
+        );
+
+        for invalid_route in [
+            PostgresqlProviderRouteBinding {
+                route_mode: "pooler-session-v1".into(),
+                ..route.clone()
+            },
+            PostgresqlProviderRouteBinding {
+                endpoint_dns_name: "PostgreSQL.example.test".into(),
+                ..route.clone()
+            },
+            PostgresqlProviderRouteBinding {
+                endpoint_dns_name: "postgresql.example.test.".into(),
+                ..route.clone()
+            },
+            PostgresqlProviderRouteBinding {
+                endpoint_dns_name: "192.0.2.10".into(),
+                ..route.clone()
+            },
+            PostgresqlProviderRouteBinding {
+                endpoint_port: 0,
+                ..route.clone()
+            },
+            PostgresqlProviderRouteBinding {
+                trust_anchor_bundle_digest: format!("sha256:{}", "0".repeat(64)),
+                ..route.clone()
+            },
+            PostgresqlProviderRouteBinding {
+                peer_leaf_certificate_digest: format!("sha256:{}", "0".repeat(64)),
+                ..route.clone()
+            },
+        ] {
+            assert!(
+                postgresql_provider_route_binding_digest(&invalid_route).is_err(),
+                "invalid PostgreSQL provider route must fail closed: {invalid_route:?}"
+            );
+        }
 
         let bindings = postgresql_storage_bindings();
         assert_independent_canonical_golden(
@@ -3097,6 +3416,11 @@ mod tests {
         );
         drifted_bindings.swap(0, 1);
         assert!(postgresql_storage_binding_digest(&drifted_bindings).is_err());
+
+        let data_only = vec![bindings[0].clone()];
+        assert!(postgresql_storage_binding_digest(&data_only).is_ok());
+        let wal_only = vec![bindings[1].clone()];
+        assert!(postgresql_storage_binding_digest(&wal_only).is_err());
 
         let migrations = postgresql_migrations();
         assert_independent_canonical_golden(

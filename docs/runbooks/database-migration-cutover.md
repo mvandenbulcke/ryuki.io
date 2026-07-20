@@ -6,37 +6,245 @@ use the same digest-pinned `platform-api` image, so they compare the database
 against the same compile-time embedded migration inventory without a
 hard-coded latest version.
 
+> **Production execution is disabled.** The Kubernetes validator is an offline
+> snapshot checker, not runtime admission. It rejects every `final-render`
+> because the required
+> `in-cluster-final-render-admission-and-runtime-freshness-v1` capability is not
+> implemented. A snapshot cannot fence ConfigMap deletion/recreation through
+> Pod materialization, consume a unique migration attempt, or enforce receipt
+> expiry when the Pod starts and while it runs. Do not drain production, mint a
+> migration credential, clear `spec.suspend`, or create the migration Job from
+> this repository.
+
 ## Startup modes
 
 Before interpreting `RYUKI_MIGRATION_MODE` or opening a database connection,
-every mode admits the same five independently pinned deployment-security
-inputs documented in `docs/configuration.md`. The one-shot Job uses the same
-root-owned contract tree baked into the release image and imports the same exact
-key references as the serving Deployment. A missing, inactive, unresolved, or
-digest-mismatched contract therefore exits before migration credentials or
-PostgreSQL are touched.
+every mode admits the same seven baseline deployment-security pins documented
+in `docs/configuration.md`; production additionally requires its complete
+build, checkpoint, deployed-workload, and operation-specific attestation pin
+groups. The one-shot Job uses the same root-owned contract tree baked into the
+release image and imports every external value by an exact `ConfigMap` or
+`Secret` key reference. A missing, inactive, unresolved, partial, or digest-
+mismatched contract therefore exits before migration credentials or PostgreSQL
+are touched.
 
 `RYUKI_MIGRATION_MODE` is a closed enum:
 
 - `local-auto` must be selected explicitly. It preserves local
   development auto-apply behavior, but applies through an isolated
-  one-connection migration pool rather than the application pool.
-- `apply-only` requires `RYUKI_MIGRATION_DATABASE_URL`, applies every pending
-  embedded migration with SQLx advisory locking, reads back the complete
-  migration ledger, closes the pool, and exits. It never loads application
-  provider/auth configuration, initializes the normal application pool, starts
-  reconciliation or background loops, or binds an HTTP listener.
+  one-connection `PgPool` that is closed after verification rather than through
+  the published application pool.
+- `apply-only` requires `RYUKI_MIGRATION_DATABASE_URL` and, in production, the
+  complete PostgreSQL infrastructure attestation pin group. It opens one direct
+  TLS 1.3 channel and relays that one channel into a direct `PgConnection`. It
+  takes the bounded session advisory lock before `BEGIN`, begins the
+  repeatable-read transaction, promotes the lock to the same unreleaseable
+  transaction-scoped advisory key, releases the session-scoped copy, sets the
+  bounded local timeouts, and reads the exact SQL-visible session and ledger
+  facts. While that same connection, transaction, and transaction lock remain
+  held, it performs one fresh nonce-bound
+  authority exchange without retry and accepts no proof with more than 300
+  seconds of authorization.
+  It exact-matches independently signed provider, cluster, and durable-storage
+  evidence to the receipt, then performs the final pre-DDL check, every pending
+  embedded migration, exact ledger postflight, and a non-secret content-addressed
+  operation marker in that transaction. It dispatches `COMMIT` only while the
+  proof is fresh. A pre-commit failure rolls back the wave; a lost or failed
+  `COMMIT` acknowledgement is reported as `CommitOutcomeUnknown`, never as a
+  rollback.
+  It never loads application provider/auth configuration, initializes the
+  normal application pool, starts reconciliation or background loops, or binds
+  an HTTP listener.
 - `verify-only` uses only `RYUKI_DATABASE_URL`. It performs read-only checks of
   `_sqlx_migrations` and refuses process startup before readiness/listener
   creation when any embedded migration is missing, dirty, unexpected, or has a
   different checksum. It never creates the migration table or applies DDL.
 
-The reviewed runner defaults are a 1,800-second statement timeout and a
-60-second lock timeout. `RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS` must remain
-between 60 and 7,200 seconds; `RYUKI_MIGRATION_LOCK_TIMEOUT_SECS` must remain
-between 1 and 300 seconds and strictly below the statement timeout. A release
-that needs a different envelope requires an explicit capacity and lock-impact
-review before changing the non-secret Job ConfigMap.
+The reviewed production runner uses a 180-second statement timeout, a 30-second
+lock timeout, a separate 30-second `COMMIT` acknowledgement deadline, and a
+300-second Job deadline. The runtime's wider parser bounds do not authorize a
+production override: the retained diagnostic render shape requires exactly
+these values. All DDL,
+ledger changes, ACL reconciliation, postflight, and operation-marker insertion
+must finish before the proof safety margin; `COMMIT` is then dispatched as the
+single boundary whose acknowledgement may be uncertain. A release that cannot
+finish within this envelope needs a redesigned migration and fresh review, not
+a longer proof or an in-place timeout increase.
+
+## Production pin resources and socket projection
+
+The checked-in Job is a suspended `source-template`, not an admissible Job. It
+contains `RENDER_REQUIRED` receipt sentinels and intentionally omits dynamic
+socket mounts. Accidental submission therefore cannot start a Pod; the signed
+final-render shape is retained only for diagnostic parsing and is always
+rejected, including when it sets `spec.suspend: false`. The hardened source Pod
+has exactly two volumes and mounts. It projects the
+CloudNativePG CA read-only and mounts the `postgresql-relay-workspace`
+memory-backed `emptyDir` read-write at `/run/ryuki-postgresql-relay`, with an
+exact `1Mi` limit. Pod `fsGroup: 10001` and
+`fsGroupChangePolicy: OnRootMismatch` let the non-root process create its
+owner-only, one-use Unix relay socket despite `readOnlyRootFilesystem: true`;
+the workspace must never hold a credential or durable state. Final render must
+preserve those exact two entries and add only the four receipt-bound read-only
+authority-socket CSI projections, producing exactly six volumes and six mounts.
+A disk-backed, larger, renamed, differently owned, or authority-reused relay
+workspace fails structural validation, but passing those shape checks never
+authorizes Job creation.
+
+A future admission-capable release environment would require these non-secret,
+independently governed, `immutable: true` ConfigMaps. Do not create them as a
+means of bypassing the current execution block:
+
+| ConfigMap | Exact contents |
+|---|---|
+| `platform-api-migration-config-<digest-prefix>` | The exact five reviewed apply-only mode, timeout, and role values; final render replaces the source template's stable `envFrom` name with this immutable name |
+| `platform-security-admission-config-<digest-prefix>` | The seven baseline contract/profile/registry/deployment pins |
+| `platform-production-build-manifest-pins-<digest-prefix>` | The complete two-value production build-manifest binding |
+| `platform-conformance-trust-checkpoint-pins-<digest-prefix>` | The complete six-value checkpoint authority binding |
+| `platform-deployed-workload-attestation-pins-<digest-prefix>` | The complete ten-value workload authority, measurement-profile, and expected-workload binding |
+| `platform-public-ingress-attestation-pins-<digest-prefix>` | The complete nine-value public-ingress authority/profile binding required by production startup |
+| `platform-postgresql-infrastructure-attestation-pins-<digest-prefix>` | The complete nine-value PostgreSQL infrastructure authority/profile binding |
+| `platform-migration-socket-projection-authority-pins-<digest-prefix>` | The exact eight `RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_*` authority/key/profile values; it is render-verification input only and is never imported as application environment or mounted into the Job |
+
+These resources contain reviewed non-secret settings, selectors, public keys,
+fingerprints, epochs, profile identities/versions/digests, and normalized
+socket paths only. They contain no database password, bearer credential,
+private signing key, or raw provider data. The sole migration connection
+string remains the one exact key in the digest-scoped VaultDynamicSecret.
+
+Each of the eight pin ConfigMap names ends in the same first 12 image-digest hex
+characters as the Job. Its metadata carries `ryuki.io/release-digest-prefix` and
+`ryuki.io/content-digest`; the content digest is SHA-256 of the canonical,
+key-sorted JSON `data` object, and `binaryData` is forbidden. After creating
+each immutable ConfigMap, read it back and capture its exact name,
+`metadata.uid`, `metadata.resourceVersion`, and content digest. The final Job
+carries one closed canonical-JSON receipt
+annotation for each ConfigMap with exactly those four fields. The annotation,
+rendered reference where applicable, ConfigMap metadata, and API readback must
+match exactly. UID and resourceVersion are opaque byte strings, not assumed
+UUIDs or decimal counters. These comparisons describe only the objects observed
+in one offline snapshot. They do not fence deletion/recreation after validation:
+the Job still dereferences names when Kubernetes materializes the Pod.
+`immutable: true` prevents mutation of one object but does not prevent deletion
+and name reuse. The missing in-cluster admission capability must hold that fence
+through Pod materialization for all eight maps.
+
+Kubernetes cannot project a live Unix socket from a ConfigMap or Secret. The
+authority deployment mechanism is intentionally external to this repository.
+A future independently governed in-cluster admission layer must supply exactly
+four reachable authority sockets in the final Pod at the pinned paths. The
+production validator accepts neither an inline trust anchor nor a trust-anchor
+path selected by the render context. Unit tests may inject an anchor only to
+exercise cryptographic parsing. The future admission capability must receive
+the authority anchor through an independently provisioned trust channel outside
+the render request; a manifest public key is never self-authenticating.
+
+The authority emits a strict canonical root object with exactly `payload` and
+`signature`. The payload identifies
+`migration-socket-projection-receipt-v1` and
+`ryuki-canonical-json-v1`; it binds the approved authority epoch and profile,
+positive Unix-second `[notBefore, expiresAt)` validity interval of at most 300
+seconds, exact release image and digest prefix, closed socket-contract digest,
+all eight live ConfigMap receipts in the contract's annotation order, the exact
+four path/authority/key/fingerprint/CSI projections, and the SHA-256 digest of
+the canonical rendered Job preimage. The signature object contains only
+`algorithm: ed25519` and a canonical padded `signatureBase64`; its
+domain-separated, length-framed signature covers the canonical payload. Unknown
+fields, duplicate keys, non-canonical encodings, weak keys, or a receipt outside
+its interval fail offline validation. That time check is not runtime freshness:
+a Pod may start later or continue after expiry unless the runner revalidates
+the receipt before database access and while the authorization matters.
+
+The complete canonical envelope is stored as the sole `receipt.json` data key
+in an immutable
+`platform-socket-projection-receipt-<receipt-digest-hex>` ConfigMap. The suffix
+is all 64 lowercase hex characters of the SHA-256 digest of the exact
+`receipt.json` bytes. Metadata contains exactly the release digest prefix, the
+canonical key-sorted `data`-object content digest, and the independently checked
+raw-receipt digest. Within the rendered Job and CSI graph, the final Job carries
+that raw digest only in
+`ryuki.io/socket-projection-receipt-digest`; CSI attributes must not duplicate
+it. The signed Job preimage excludes only that annotation, eliminating a
+self-referential digest. The snapshot validator can read and verify this shape,
+but it cannot authorize Job creation. A future in-cluster capability would need
+to atomically replace every sentinel and change `ryuki.io/render-mode` from
+`source-template` to `final-render` while consuming a unique, non-replayable
+attempt identity.
+
+The source template does not claim these mounts, remains suspended, and must
+never be submitted to Kubernetes. Every `final-render` also fails closed with a
+specific runtime-admission-unavailable error, even if all sentinels, signatures,
+pins, and socket shapes are valid. A sentinel, missing/mismatched projection,
+invalid receipt, unreviewed injected container/volume, or changed closed-
+contract digest adds a structural error; none can bypass the unconditional
+production containment. Do not create the Job.
+
+## PostgreSQL infrastructure attestation boundary
+
+The production Job imports these nine non-secret pins, key-by-key, from the
+independently governed
+`platform-postgresql-infrastructure-attestation-pins-<digest-prefix>` ConfigMap:
+
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION`
+- `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST`
+
+The group is complete-or-none, mandatory in production, and forbidden in
+development/test. Provision its Ed25519 authority, public key, fencing floor,
+profile, and Unix-socket projection independently of the release contract,
+image, migration credential, database endpoint, and PostgreSQL operator. The
+authority private key must never enter the Job. The rendered socket path must
+name the pre-provisioned socket owned by that independent authority; the Job
+must not create, replace, proxy, or fall back from it. Its socket path and
+decoded-public-key fingerprint must each differ from the checkpoint,
+deployed-workload, and public-ingress authorities.
+
+The signed response is not sufficient on its own. It must bind a fresh nonce
+and exact request digest to the receipt's `durable-postgresql` requirement,
+deployment/trust/workload namespace, expected database provider and major
+version, exact leaf-certificate-pinned provider route, database-identity digest, and
+durable-storage digest. The proof may authorize at most 300 seconds. The runner
+establishes one exclusive-CA TLS 1.3 channel, requires its peer leaf-certificate
+digest to match the receipt-bound provider route before releasing credentials,
+permits only SCRAM-SHA-256 authentication, binds the exporter into the request
+tag, and relays only that channel into one direct `PgConnection`. The
+authority must independently derive the same exporter at the database endpoint;
+echoing a caller-supplied tag is insufficient. Provider identity, cluster
+system identity, and storage bindings come from the independently signed
+evidence; their typed digests and the local observations must together equal
+the receipt exactly.
+
+Immediately before DDL, the runner takes the reviewed bounded session-level
+advisory lock on the direct backend and only then begins one repeatable-read
+transaction. Its first transactional statement promotes the same key into a
+transaction-scoped lock before releasing the session-scoped copy. This ordering
+ensures a waiter cannot retain a stale pre-lock ledger/marker snapshot while
+migration SQL cannot release the serialization fence. It rechecks proof integrity, freshness, and local SQL
+facts; every pending migration and ledger mutation executes in that
+transaction, followed by exact ledger readback, ACL verification, and insertion
+of one durable operation marker derived from the release, exact attested target,
+and final inventory. `COMMIT` is dispatched only while the proof is current. A
+stale proof, mismatch, target change, DDL error, postflight mismatch, or deadline
+before that dispatch rolls back the whole wave. A timeout or connection error
+after dispatch has an unknown outcome: terminating the connection does not
+prove rollback. The transaction-scoped lock remains held until PostgreSQL ends
+the transaction. There is no automatic
+authority or Job retry.
+
+The marker lives in `public.production_migration_operations`. The application
+role has read-only access; only the migration role can insert it. If an operator
+explicitly starts a fresh one-shot attempt after `CommitOutcomeUnknown`, that
+attempt obtains a new nonce-bound infrastructure attestation and checks the
+exact deterministic operation id plus the complete embedded inventory before
+any migration write. An exact marker converts the attempt into no-write
+reconciliation and reports `reconciled_after_prior_attempt=true`. A missing or
+mismatched marker never proves rollback and never authorizes blind replay.
 
 ## Credential and image boundary
 
@@ -67,54 +275,48 @@ Secret destinations, PostgreSQL grants, and credential revocation/rotation
 timing match this separation. The migration Job image must be byte-for-byte
 the same registry/repository digest as the replacement API Deployment.
 
-## Ordered production cutover
+## Production cutover is blocked
 
-Do not overlap pre-migration writers, the migration Job, or the replacement API.
-The accepted tradeoff is a short control-plane outage.
+There is no authorized ordered production cutover in this revision. The only
+contract sequence is
+`stop-production-execution-runtime-admission-unavailable`. Stop before traffic
+drain, migration-credential issuance, final-render creation, or any Kubernetes
+Job submission.
 
-1. Freeze and validate the release contract, the operations-only migration
-   credential template, the generated Job template, and the replacement API
-   Deployment against the same reviewed digest. Confirm the runtime API lease
-   and exact-key import evidence is current, and confirm that no standing
-   migration VaultAuth, VaultDynamicSecret, destination Secret, or Job exists.
-2. Stop the old API (`replicas: 0`) and drain every external worker or scheduled
-   writer for this control plane. Wait until all old API pods are deleted and
-   prove no leased/running work or active database writer session from the old
-   release remains. Do not rely on `Recreate` alone for workers deployed outside
-   the base skeleton.
-3. Using the frozen digest prefix, create the operations-only migrator
-   VaultAuth and revoking VaultDynamicSecret. Require independent readback that
-   the lease uses the reviewed digest-scoped Vault role and database role and
-   that its destination contains exactly `RYUKI_MIGRATION_DATABASE_URL`.
-4. Create exactly one generated `platform-api-migrations-<digest-prefix>-*`
-   Job. Its
-   `restartPolicy: Never`, `backoffLimit: 0`, single completion/parallelism, and
-   2,400-second active deadline prevent an automatic second migration writer.
-5. Require Job condition `Complete`. Capture its exit status and logs showing
-   the dynamically discovered embedded migration count/latest version and
-   successful post-apply readback. Using an independently authenticated
-   operator read path, capture ordered `_sqlx_migrations` version, success, and
-   checksum rows and prove there is no `success = false` row. Do not infer
-   completeness from a numeric ceiling; the Job and replacement image compare
-   every embedded version/checksum.
-6. After the independent role and ledger readback passes, delete the
-   digest-scoped VaultDynamicSecret and VaultAuth and prove the migration lease
-   and destination Secret were revoked/deleted. Do this before starting any
-   matching API or worker.
-7. Only after revocation evidence passes, apply/recreate the `platform-api`
-   Deployment with `RYUKI_MIGRATION_MODE=verify-only`. Require startup log
-   evidence that the complete embedded inventory was accepted, then require
-   `/ready` success before restoring traffic and external writers.
-8. Retain the Job object/logs, frozen templates, revocation receipt, and
-   database readback with the release evidence.
-   Delete a prior completed Job only after its evidence has been archived and
-   before intentionally creating the next release Job.
+Production execution may be reconsidered only after one independently reviewed
+capability closes all of these boundaries:
 
-If the Job fails, times out, or reports a dirty/checksum/missing condition, keep
-the API and workers stopped. Do not retry automatically, edit
-`_sqlx_migrations`, run down migrations, or start an older API. Investigate the
-DDL transaction and lock state, recover according to the reviewed migration,
-then create a new one-shot Job only after explicit operator approval.
+1. In-cluster admission uses a trust anchor provisioned outside the render
+   request and atomically validates the live Job, receipt, socket projections,
+   and all eight ConfigMap identities through Pod materialization.
+2. One immutable attempt identity is signed, consumed exactly once, and bound to
+   a non-replayable Kubernetes Job identity; a replay cannot create a second
+   generated Job.
+3. The migration runtime revalidates the signed receipt and trusted time before
+   touching its credential or database, and fails closed if authorization
+   expires before the protected operation is complete.
+4. Tests exercise deletion/recreation races, delayed Pod scheduling, receipt
+   replay, and expiry after snapshot validation across the real admission and
+   runtime boundary.
+
+The retained signed-envelope, ConfigMap-receipt, socket-projection, SQL
+transaction, readback, and recovery material describes the intended future
+shape. Passing those offline checks is diagnostic evidence only and must never
+be interpreted as permission to execute.
+
+After any future capability is implemented and separately approved, if the
+authority exchange, pre-DDL target/storage comparison, Job, or exact
+postflight ledger fails or times out, keep the API and workers stopped. Do not
+retry the exchange or Job automatically, reconnect to another target, edit
+`_sqlx_migrations` or `production_migration_operations`, run down migrations, or
+start an older API. For a failure explicitly reported before `COMMIT` dispatch,
+confirm rollback through an independently authenticated read path before any
+new attempt. For `CommitOutcomeUnknown`, assume neither commit nor rollback:
+retain its operation id, read back the marker and exact final inventory, and
+allow only an explicitly approved fresh one-shot attempt whose independent
+attestation can reconcile that same marker. If no exact marker exists, stop for
+manual recovery; do not replay DDL merely because the original connection was
+hard-closed.
 
 Local development may continue using the default `local-auto` mode. That
 compatibility is not authorization to use the application database role as a

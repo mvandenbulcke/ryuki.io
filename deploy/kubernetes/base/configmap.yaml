@@ -65,11 +65,13 @@ metadata:
     app.kubernetes.io/part-of: ryuki-infrastructure-platform
     app.kubernetes.io/name: platform-api-migrations
 data:
-  # Reviewed offline-DDL envelope. The runner validates these bounds before
-  # opening its dedicated one-connection pool and exits after readback.
+  # Reviewed offline-DDL envelope. Both bounds remain inside the 300-second
+  # PostgreSQL infrastructure proof lifetime so DDL cannot outlive admission.
+  # The runner validates them before opening its dedicated connection and exits
+  # after exact postflight readback.
   RYUKI_MIGRATION_MODE: "apply-only"
-  RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS: "1800"
-  RYUKI_MIGRATION_LOCK_TIMEOUT_SECS: "60"
+  RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS: "180"
+  RYUKI_MIGRATION_LOCK_TIMEOUT_SECS: "30"
   # The dynamic login must SET ROLE to the stable schema owner so every release
   # can alter objects created by earlier short-lived Vault credentials.
   RYUKI_MIGRATION_EXPECTED_ROLE: "ryuki_schema_migrator"

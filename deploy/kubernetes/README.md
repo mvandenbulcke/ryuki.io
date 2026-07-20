@@ -6,7 +6,7 @@ The Kubernetes skeleton targets a portable runtime for early manifest validation
 |---|---|
 | [base](base/) | Namespace, service accounts, deployments, services, ingress, and NetworkPolicy baseline. |
 | [vault](vault/) | Static HashiCorp Vault Helm values and bootstrap runbook for HA Raft foundation. |
-| [operations](operations/) | Digest-scoped, create-once migration Job, JIT VaultDynamicSecret, and ordered cutover contract; never continuously reconciled. |
+| [operations](operations/) | Suspended migration source Job, JIT VaultDynamicSecret, and a fail-closed cutover contract; production execution remains disabled pending live admission/runtime receipt enforcement. |
 
 ## Current Scope
 
@@ -45,6 +45,13 @@ scheme-prefixed, malformed, or non-lowercase-SHA-256 image references. The
 checked-in placeholder digests prove only the repository policy shape; adopted
 registry resolution, signature verification, and the running image ID remain
 deployment evidence.
+
+The manifest validator is deliberately not a Kubernetes admission controller.
+It rejects executable migration `final-render` documents: repository snapshots
+cannot fence ConfigMap deletion/recreation, atomically consume an attempt, or
+enforce receipt expiry in the running Pod. The checked-in migration Job must
+therefore remain suspended, and production `apply-only` exits before reading
+its database credential until those live controls exist.
 
 ```bash
 cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all

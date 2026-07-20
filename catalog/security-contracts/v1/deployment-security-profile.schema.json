@@ -417,11 +417,15 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "database_provider", "server_major_version", "database_identity_digest", "storage_binding_digest", "migration_inventory_digest", "application_role", "migration_role"],
+          "required": ["kind", "database_provider", "server_major_version", "attestation_profile_id", "attestation_profile_version", "attestation_profile_digest", "provider_route_binding_digest", "database_identity_digest", "storage_binding_digest", "migration_inventory_digest", "application_role", "migration_role"],
           "properties": {
             "kind": { "const": "durable-postgresql" },
             "database_provider": { "enum": ["cloudnativepg", "aws-rds", "azure-postgresql", "gcp-cloud-sql"] },
             "server_major_version": { "const": 18 },
+            "attestation_profile_id": { "description": "Receipt-bound profile understood by the independently pinned PostgreSQL infrastructure attestation authority.", "type": "string", "pattern": "^postgresql-infrastructure-attestation-profile:[a-z0-9][a-z0-9._-]{2,126}$" },
+            "attestation_profile_version": { "$ref": "#/$defs/positiveVersion" },
+            "attestation_profile_digest": { "description": "Nonzero digest of the exact independently pinned PostgreSQL infrastructure measurement profile.", "$ref": "#/$defs/nonzeroDigest" },
+            "provider_route_binding_digest": { "description": "ryuki-postgresql-provider-route-binding-v1 digest of the exact direct-session-v1 provider, DNS endpoint, port, exclusive trust-anchor bundle, and pre-authentication peer leaf-certificate digest.", "$ref": "#/$defs/nonzeroDigest" },
             "database_identity_digest": { "description": "ryuki-postgresql-database-identity-v1 digest.", "$ref": "#/$defs/nonzeroDigest" },
             "storage_binding_digest": { "description": "ryuki-postgresql-storage-binding-v1 digest of independently authenticated durable storage identity.", "$ref": "#/$defs/nonzeroDigest" },
             "migration_inventory_digest": { "description": "ryuki-postgresql-migration-inventory-v1 digest of the exact ordered version/checksum set.", "$ref": "#/$defs/nonzeroDigest" },

@@ -446,6 +446,173 @@ const SECURITY_ADMISSION_KEYS: [&str; 7] = [
     "RYUKI_EXPECTED_DEPLOYMENT_ID",
     "RYUKI_SECURITY_PROFILE",
 ];
+const PRODUCTION_BUILD_MANIFEST_CONFIG_MAP: &str = "platform-production-build-manifest-pins";
+const PRODUCTION_BUILD_MANIFEST_KEYS: &[&str] = &[
+    "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH",
+    "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST",
+];
+const CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP: &str = "platform-conformance-trust-checkpoint-pins";
+const CONFORMANCE_TRUST_CHECKPOINT_KEYS: &[&str] = &[
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH",
+];
+const DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP: &str =
+    "platform-deployed-workload-attestation-pins";
+const DEPLOYED_WORKLOAD_ATTESTATION_KEYS: &[&str] = &[
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST",
+    "RYUKI_EXPECTED_WORKLOAD_ID",
+];
+const PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP: &str = "platform-public-ingress-attestation-pins";
+const PUBLIC_INGRESS_ATTESTATION_KEYS: &[&str] = &[
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST",
+];
+const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP: &str =
+    "platform-postgresql-infrastructure-attestation-pins";
+const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS: &[&str] = &[
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST",
+];
+const MIGRATION_PRODUCTION_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
+    (
+        SECURITY_ADMISSION_CONFIG_MAP,
+        &SECURITY_ADMISSION_KEYS,
+        "ryuki.io/pin-security-admission-receipt",
+    ),
+    (
+        PRODUCTION_BUILD_MANIFEST_CONFIG_MAP,
+        PRODUCTION_BUILD_MANIFEST_KEYS,
+        "ryuki.io/pin-production-build-manifest-receipt",
+    ),
+    (
+        CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP,
+        CONFORMANCE_TRUST_CHECKPOINT_KEYS,
+        "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+    ),
+    (
+        DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP,
+        DEPLOYED_WORKLOAD_ATTESTATION_KEYS,
+        "ryuki.io/pin-deployed-workload-attestation-receipt",
+    ),
+    (
+        PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP,
+        PUBLIC_INGRESS_ATTESTATION_KEYS,
+        "ryuki.io/pin-public-ingress-attestation-receipt",
+    ),
+    (
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
+        "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    ),
+];
+const SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP: &str =
+    "platform-migration-socket-projection-authority-pins";
+const SOCKET_PROJECTION_AUTHORITY_KEYS: &[&str] = &[
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_AUTHORITY_ID",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_KEY_ID",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_BASE64",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_MIN_AUTHORITY_EPOCH",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_ID",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_VERSION",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_DIGEST",
+];
+const MIGRATION_RENDER_PIN_RECEIPT_ANNOTATIONS: [&str; 8] = [
+    "ryuki.io/pin-migration-config-receipt",
+    "ryuki.io/pin-security-admission-receipt",
+    "ryuki.io/pin-production-build-manifest-receipt",
+    "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+    "ryuki.io/pin-deployed-workload-attestation-receipt",
+    "ryuki.io/pin-public-ingress-attestation-receipt",
+    "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    "ryuki.io/pin-socket-projection-authority-receipt",
+];
+const MIGRATION_JOB_RYUKI_ANNOTATIONS: [&str; 14] = [
+    "ryuki.io/cutover-contract",
+    "ryuki.io/release-image",
+    "ryuki.io/render-contract",
+    "ryuki.io/render-mode",
+    "ryuki.io/pin-migration-config-receipt",
+    "ryuki.io/pin-security-admission-receipt",
+    "ryuki.io/pin-production-build-manifest-receipt",
+    "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+    "ryuki.io/pin-deployed-workload-attestation-receipt",
+    "ryuki.io/pin-public-ingress-attestation-receipt",
+    "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    "ryuki.io/pin-socket-projection-authority-receipt",
+    "ryuki.io/socket-projection-receipt-digest",
+    "ryuki.io/socket-contract-digest",
+];
+const MIGRATION_JOB_ENV_COUNT: usize = 44;
+const FINAL_RENDER_CONTRACT: &str = "migration-final-render-v1";
+const SOURCE_TEMPLATE_MODE: &str = "source-template";
+const FINAL_RENDER_MODE: &str = "final-render";
+const FINAL_RENDER_REQUIRED_RUNTIME_CAPABILITY: &str =
+    "in-cluster-final-render-admission-and-runtime-freshness-v1";
+const RENDER_REQUIRED_SENTINEL: &str = "RENDER_REQUIRED";
+const SOCKET_CONTRACT_DIGEST: &str =
+    "sha256:369bca5b159d7535a2b3523796ff3632e9e7ca44f9a94b4140cc572163767697";
+const AUTHORITY_SOCKET_CSI_DRIVER: &str = "authority-socket-projection.ryuki.io";
+const POSTGRESQL_RELAY_VOLUME_NAME: &str = "postgresql-relay-workspace";
+const POSTGRESQL_RELAY_MOUNT_PATH: &str = "/run/ryuki-postgresql-relay";
+const POSTGRESQL_RELAY_SIZE_LIMIT: &str = "1Mi";
+const MIGRATION_AUTHORITY_SOCKET_FIXTURE_SPECS: &[(&str, &str, &str)] = &[
+    (
+        "conformance-trust-checkpoint-socket",
+        "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET",
+        "conformance-trust-checkpoint",
+    ),
+    (
+        "deployed-workload-attestation-socket",
+        "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET",
+        "deployed-workload-attestation",
+    ),
+    (
+        "public-ingress-attestation-socket",
+        "RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET",
+        "public-ingress-attestation",
+    ),
+    (
+        "postgresql-infrastructure-attestation-socket",
+        "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET",
+        "postgresql-infrastructure-attestation",
+    ),
+];
+
+#[derive(Clone)]
+struct RenderedSocketPinFixture {
+    volume_name: &'static str,
+    environment_variable: &'static str,
+    authority_class: &'static str,
+    socket_path: String,
+    fingerprint: String,
+}
 const PLATFORM_API_CONFIG_KEYS: [&str; 23] = [
     "RYUKI_SERVER__BIND_ADDRESS",
     "RYUKI_PLATFORM_URL",
@@ -525,6 +692,409 @@ fn assert_ordered_security_admission_env(env: &[serde_yaml::Value]) {
             "{expected_key} must come only from the admission ConfigMap"
         );
     }
+}
+
+fn migration_production_pin_env_error(
+    env: &[serde_yaml::Value],
+    release_digest_prefix: &str,
+) -> Result<(), String> {
+    if env.len() != MIGRATION_JOB_ENV_COUNT {
+        return Err(format!(
+            "expected {MIGRATION_JOB_ENV_COUNT} exact migration environment entries, found {}",
+            env.len()
+        ));
+    }
+
+    let database_url = &env[0];
+    if database_url.as_mapping().map(|map| map.len()) != Some(2)
+        || database_url["name"] != "RYUKI_MIGRATION_DATABASE_URL"
+        || database_url["valueFrom"].as_mapping().map(|map| map.len()) != Some(1)
+        || database_url["valueFrom"]["secretKeyRef"]
+            .as_mapping()
+            .map(|map| map.len())
+            != Some(2)
+        || database_url["valueFrom"]["secretKeyRef"]["key"] != "RYUKI_MIGRATION_DATABASE_URL"
+        || !database_url["value"].is_null()
+        || !database_url["valueFrom"]["configMapKeyRef"].is_null()
+    {
+        return Err("migration database URL must be one exact Secret key projection".to_string());
+    }
+
+    let expected: Vec<(String, &str)> = MIGRATION_PRODUCTION_PIN_GROUPS
+        .iter()
+        .flat_map(|(config_map, keys, _)| {
+            let config_map = digest_scoped_pin_config_map_name(config_map, release_digest_prefix);
+            keys.iter().map(move |key| (config_map.clone(), *key))
+        })
+        .collect();
+    if expected.len() + 1 != MIGRATION_JOB_ENV_COUNT {
+        return Err(format!(
+            "migration production pin inventory has {} entries but the Job contract requires {}",
+            expected.len() + 1,
+            MIGRATION_JOB_ENV_COUNT
+        ));
+    }
+    let names: Vec<&str> = env
+        .iter()
+        .map(|entry| {
+            entry["name"]
+                .as_str()
+                .ok_or_else(|| "migration environment entry has no string name".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if names.iter().copied().collect::<HashSet<_>>().len() != names.len() {
+        return Err("migration environment names must be unique".to_string());
+    }
+
+    for (entry, (expected_config_map, expected_key)) in env[1..].iter().zip(expected) {
+        if entry.as_mapping().map(|map| map.len()) != Some(2)
+            || entry["name"] != expected_key
+            || entry["valueFrom"].as_mapping().map(|map| map.len()) != Some(1)
+            || entry["valueFrom"]["configMapKeyRef"]
+                .as_mapping()
+                .map(|map| map.len())
+                != Some(2)
+            || entry["valueFrom"]["configMapKeyRef"]["name"] != expected_config_map.as_str()
+            || entry["valueFrom"]["configMapKeyRef"]["key"] != expected_key
+            || !entry["value"].is_null()
+            || !entry["valueFrom"]["secretKeyRef"].is_null()
+        {
+            return Err(format!(
+                "{expected_key} must be projected exactly from {expected_config_map}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn assert_migration_production_pin_env(env: &[serde_yaml::Value], release_digest_prefix: &str) {
+    migration_production_pin_env_error(env, release_digest_prefix)
+        .unwrap_or_else(|error| panic!("invalid migration production pin projection: {error}"));
+}
+
+fn digest_scoped_pin_config_map_name(base_name: &str, release_digest_prefix: &str) -> String {
+    format!("{base_name}-{release_digest_prefix}")
+}
+
+fn final_render_socket_fixture() -> (serde_yaml::Value, Vec<RenderedSocketPinFixture>) {
+    let mut job = parse_multi_doc("deploy/kubernetes/operations/migration-job.yaml")
+        .into_iter()
+        .next()
+        .expect("migration Job source template");
+    let receipt_digest = format!("sha256:{}", "a".repeat(64));
+    job["metadata"]["annotations"]["ryuki.io/render-mode"] =
+        serde_yaml::Value::String(FINAL_RENDER_MODE.to_string());
+    job["spec"]["suspend"] = serde_yaml::Value::Bool(false);
+    job["metadata"]["annotations"]["ryuki.io/socket-projection-receipt-digest"] =
+        serde_yaml::Value::String(receipt_digest.clone());
+
+    let mut pins = Vec::new();
+    for (index, (volume_name, environment_variable, authority_class)) in
+        MIGRATION_AUTHORITY_SOCKET_FIXTURE_SPECS.iter().enumerate()
+    {
+        let socket_path = format!("/var/run/ryuki-authorities/{authority_class}/authority.sock");
+        let mount_path = socket_path
+            .rsplit_once('/')
+            .expect("socket path parent")
+            .0
+            .to_string();
+        let fingerprint = format!(
+            "sha256:{}",
+            char::from(b'c' + index as u8).to_string().repeat(64)
+        );
+        let volume = serde_yaml::to_value(serde_json::json!({
+            "name": volume_name,
+            "csi": {
+                "driver": AUTHORITY_SOCKET_CSI_DRIVER,
+                "readOnly": true,
+                "volumeAttributes": {
+                    "environmentVariable": environment_variable,
+                    "authorityClass": authority_class,
+                    "socketPath": socket_path
+                }
+            }
+        }))
+        .expect("inline CSI fixture volume");
+        job["spec"]["template"]["spec"]["volumes"]
+            .as_sequence_mut()
+            .expect("migration Job volumes")
+            .push(volume);
+        let mount = serde_yaml::to_value(serde_json::json!({
+            "name": volume_name,
+            "mountPath": mount_path,
+            "readOnly": true
+        }))
+        .expect("inline CSI fixture mount");
+        job["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+            .as_sequence_mut()
+            .expect("migration Job mounts")
+            .push(mount);
+        pins.push(RenderedSocketPinFixture {
+            volume_name,
+            environment_variable,
+            authority_class,
+            socket_path,
+            fingerprint,
+        });
+    }
+
+    (job, pins)
+}
+
+fn migration_relay_workspace_error(job: &serde_yaml::Value) -> Result<(), String> {
+    let pod = &job["spec"]["template"]["spec"];
+    let volumes = pod["volumes"]
+        .as_sequence()
+        .ok_or_else(|| "missing migration volumes".to_string())?;
+    let mounts = pod["containers"][0]["volumeMounts"]
+        .as_sequence()
+        .ok_or_else(|| "missing migration volume mounts".to_string())?;
+    let relay_volumes: Vec<&serde_yaml::Value> = volumes
+        .iter()
+        .filter(|volume| volume["name"].as_str() == Some(POSTGRESQL_RELAY_VOLUME_NAME))
+        .collect();
+    let relay_mounts: Vec<&serde_yaml::Value> = mounts
+        .iter()
+        .filter(|mount| mount["name"].as_str() == Some(POSTGRESQL_RELAY_VOLUME_NAME))
+        .collect();
+    let volume = relay_volumes
+        .first()
+        .copied()
+        .unwrap_or(&serde_yaml::Value::Null);
+    let mount = relay_mounts
+        .first()
+        .copied()
+        .unwrap_or(&serde_yaml::Value::Null);
+    if relay_volumes.len() != 1
+        || relay_mounts.len() != 1
+        || volume.as_mapping().map(|map| map.len()) != Some(2)
+        || volume["emptyDir"].as_mapping().map(|map| map.len()) != Some(2)
+        || volume["emptyDir"]["medium"].as_str() != Some("Memory")
+        || volume["emptyDir"]["sizeLimit"].as_str() != Some(POSTGRESQL_RELAY_SIZE_LIMIT)
+        || mount.as_mapping().map(|map| map.len()) != Some(3)
+        || mount["mountPath"].as_str() != Some(POSTGRESQL_RELAY_MOUNT_PATH)
+        || mount["readOnly"].as_bool() != Some(false)
+    {
+        return Err(
+            "migration relay workspace must be one exact bounded memory emptyDir and writable mount"
+                .to_string(),
+        );
+    }
+
+    let pod_security = pod["securityContext"]
+        .as_mapping()
+        .ok_or_else(|| "missing migration Pod security context".to_string())?;
+    let actual_security_keys: HashSet<&str> = pod_security
+        .keys()
+        .map(|key| {
+            key.as_str()
+                .ok_or_else(|| "migration Pod security key is not a string".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let expected_security_keys: HashSet<&str> = [
+        "runAsNonRoot",
+        "runAsUser",
+        "runAsGroup",
+        "fsGroup",
+        "fsGroupChangePolicy",
+        "seccompProfile",
+    ]
+    .into_iter()
+    .collect();
+    if actual_security_keys != expected_security_keys
+        || pod["securityContext"]["runAsNonRoot"].as_bool() != Some(true)
+        || pod["securityContext"]["runAsUser"].as_i64() != Some(10001)
+        || pod["securityContext"]["runAsGroup"].as_i64() != Some(10001)
+        || pod["securityContext"]["fsGroup"].as_i64() != Some(10001)
+        || pod["securityContext"]["fsGroupChangePolicy"].as_str() != Some("OnRootMismatch")
+        || pod["securityContext"]["seccompProfile"]
+            .as_mapping()
+            .map(|map| map.len())
+            != Some(1)
+        || pod["securityContext"]["seccompProfile"]["type"].as_str() != Some("RuntimeDefault")
+    {
+        return Err(
+            "migration Pod security context must grant only GID 10001 ownership to projected volumes"
+                .to_string(),
+        );
+    }
+
+    let container_security = pod["containers"][0]["securityContext"]
+        .as_mapping()
+        .ok_or_else(|| "missing migration container security context".to_string())?;
+    let actual_container_security_keys: HashSet<&str> = container_security
+        .keys()
+        .map(|key| {
+            key.as_str()
+                .ok_or_else(|| "migration container security key is not a string".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let expected_container_security_keys: HashSet<&str> = [
+        "runAsNonRoot",
+        "runAsUser",
+        "runAsGroup",
+        "allowPrivilegeEscalation",
+        "readOnlyRootFilesystem",
+        "capabilities",
+        "seccompProfile",
+    ]
+    .into_iter()
+    .collect();
+    let drop_capabilities = pod["containers"][0]["securityContext"]["capabilities"]["drop"]
+        .as_sequence()
+        .ok_or_else(|| "missing migration dropped-capabilities inventory".to_string())?;
+    if actual_container_security_keys != expected_container_security_keys
+        || pod["containers"][0]["securityContext"]["runAsNonRoot"].as_bool() != Some(true)
+        || pod["containers"][0]["securityContext"]["runAsUser"].as_i64() != Some(10001)
+        || pod["containers"][0]["securityContext"]["runAsGroup"].as_i64() != Some(10001)
+        || pod["containers"][0]["securityContext"]["allowPrivilegeEscalation"].as_bool()
+            != Some(false)
+        || pod["containers"][0]["securityContext"]["readOnlyRootFilesystem"].as_bool() != Some(true)
+        || pod["containers"][0]["securityContext"]["capabilities"]
+            .as_mapping()
+            .map(|map| map.len())
+            != Some(1)
+        || drop_capabilities.len() != 1
+        || drop_capabilities[0].as_str() != Some("ALL")
+        || pod["containers"][0]["securityContext"]["seccompProfile"]
+            .as_mapping()
+            .map(|map| map.len())
+            != Some(1)
+        || pod["containers"][0]["securityContext"]["seccompProfile"]["type"].as_str()
+            != Some("RuntimeDefault")
+    {
+        return Err("migration container security context must remain closed".to_string());
+    }
+
+    Ok(())
+}
+
+fn final_render_socket_projection_error(
+    job: &serde_yaml::Value,
+    pins: &[RenderedSocketPinFixture],
+) -> Result<(), String> {
+    let receipt_digest =
+        job["metadata"]["annotations"]["ryuki.io/socket-projection-receipt-digest"]
+            .as_str()
+            .ok_or_else(|| "missing receipt digest".to_string())?;
+    let receipt_hex = receipt_digest
+        .strip_prefix("sha256:")
+        .filter(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| "receipt digest must be lowercase SHA-256".to_string())?;
+    if receipt_hex.bytes().all(|byte| byte == b'0') {
+        return Err("receipt digest must be nonzero".to_string());
+    }
+    let volumes = job["spec"]["template"]["spec"]["volumes"]
+        .as_sequence()
+        .ok_or_else(|| "missing final-render volumes".to_string())?;
+    let mounts = job["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+        .as_sequence()
+        .ok_or_else(|| "missing final-render mounts".to_string())?;
+    if pins.len() != 4 || volumes.len() != 6 || mounts.len() != 6 {
+        return Err(
+            "final render must have one CA, one relay workspace, and exactly four socket projections"
+                .to_string(),
+        );
+    }
+    migration_relay_workspace_error(job)?;
+    let expected_names: HashSet<&str> = std::iter::once("cnpg-ca")
+        .chain(std::iter::once(POSTGRESQL_RELAY_VOLUME_NAME))
+        .chain(pins.iter().map(|pin| pin.volume_name))
+        .collect();
+    let actual_volume_names: HashSet<&str> = volumes
+        .iter()
+        .map(|volume| {
+            volume["name"]
+                .as_str()
+                .ok_or_else(|| "final-render volume name is not a string".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let actual_mount_names: HashSet<&str> = mounts
+        .iter()
+        .map(|mount| {
+            mount["name"]
+                .as_str()
+                .ok_or_else(|| "final-render mount name is not a string".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if actual_volume_names != expected_names || actual_mount_names != expected_names {
+        return Err(
+            "final-render volume and mount names must match the closed inventory".to_string(),
+        );
+    }
+    let mut paths = HashSet::new();
+    let mut parents = HashSet::new();
+    for pin in pins {
+        if !pin.socket_path.starts_with('/')
+            || !pin.socket_path.ends_with(".sock")
+            || pin.socket_path.contains("//")
+            || !paths.insert(pin.socket_path.as_str())
+        {
+            return Err("socket paths must be normalized absolute and distinct".to_string());
+        }
+        let parent = pin
+            .socket_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .filter(|parent| !parent.is_empty() && *parent != "/")
+            .ok_or_else(|| "socket path must have a non-root parent".to_string())?;
+        if !parents.insert(parent) {
+            return Err("socket mount parents must be distinct".to_string());
+        }
+        let matching_volumes: Vec<&serde_yaml::Value> = volumes
+            .iter()
+            .filter(|volume| volume["name"].as_str() == Some(pin.volume_name))
+            .collect();
+        let matching_mounts: Vec<&serde_yaml::Value> = mounts
+            .iter()
+            .filter(|mount| mount["name"].as_str() == Some(pin.volume_name))
+            .collect();
+        let volume = matching_volumes
+            .first()
+            .copied()
+            .unwrap_or(&serde_yaml::Value::Null);
+        let mount = matching_mounts
+            .first()
+            .copied()
+            .unwrap_or(&serde_yaml::Value::Null);
+        let csi = &volume["csi"];
+        let attributes = &csi["volumeAttributes"];
+        if matching_volumes.len() != 1
+            || matching_mounts.len() != 1
+            || volume.as_mapping().map(|map| map.len()) != Some(2)
+            || csi.as_mapping().map(|map| map.len()) != Some(3)
+            || attributes.as_mapping().map(|map| map.len()) != Some(3)
+            || csi["driver"].as_str() != Some(AUTHORITY_SOCKET_CSI_DRIVER)
+            || csi["readOnly"].as_bool() != Some(true)
+            || attributes["environmentVariable"].as_str() != Some(pin.environment_variable)
+            || attributes["authorityClass"].as_str() != Some(pin.authority_class)
+            || attributes["socketPath"].as_str() != Some(pin.socket_path.as_str())
+            || mount.as_mapping().map(|map| map.len()) != Some(3)
+            || mount["mountPath"].as_str() != Some(parent)
+            || mount["readOnly"].as_bool() != Some(true)
+        {
+            return Err(format!(
+                "invalid receipt-bound inline CSI projection {}",
+                pin.volume_name
+            ));
+        }
+    }
+    let postgresql_fingerprint = &pins[3].fingerprint;
+    if !postgresql_fingerprint.starts_with("sha256:")
+        || postgresql_fingerprint.len() != 71
+        || pins[..3]
+            .iter()
+            .any(|pin| pin.fingerprint == *postgresql_fingerprint)
+    {
+        return Err("PostgreSQL authority fingerprint must be valid and distinct".to_string());
+    }
+    Ok(())
 }
 
 #[test]
@@ -1332,9 +1902,9 @@ fn api_is_verify_only_and_migration_config_is_non_secret_apply_only() {
     assert_eq!(migration["data"]["RYUKI_MIGRATION_MODE"], "apply-only");
     assert_eq!(
         migration["data"]["RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS"],
-        "1800"
+        "180"
     );
-    assert_eq!(migration["data"]["RYUKI_MIGRATION_LOCK_TIMEOUT_SECS"], "60");
+    assert_eq!(migration["data"]["RYUKI_MIGRATION_LOCK_TIMEOUT_SECS"], "30");
     assert!(migration["data"]["RYUKI_MIGRATION_DATABASE_URL"].is_null());
 }
 
@@ -1361,7 +1931,7 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     assert_eq!(job["spec"]["completions"], 1);
     assert_eq!(job["spec"]["parallelism"], 1);
     assert_eq!(job["spec"]["backoffLimit"], 0);
-    assert_eq!(job["spec"]["activeDeadlineSeconds"], 2400);
+    assert_eq!(job["spec"]["activeDeadlineSeconds"], 300);
     assert!(job["spec"]["ttlSecondsAfterFinished"].is_null());
     for forbidden in [
         "podFailurePolicy",
@@ -1376,19 +1946,101 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
         );
     }
 
+    let annotations = job["metadata"]["annotations"]
+        .as_mapping()
+        .expect("migration Job annotations");
+    let actual_annotation_keys: HashSet<&str> = annotations
+        .keys()
+        .map(|key| key.as_str().expect("annotation key"))
+        .collect();
+    let expected_annotation_keys: HashSet<&str> =
+        MIGRATION_JOB_RYUKI_ANNOTATIONS.iter().copied().collect();
+    assert_eq!(
+        actual_annotation_keys, expected_annotation_keys,
+        "Job annotation inventory must contain exactly 14 keys"
+    );
+    assert_eq!(
+        job["metadata"]["annotations"]["ryuki.io/render-contract"],
+        FINAL_RENDER_CONTRACT
+    );
+    assert_eq!(
+        job["metadata"]["annotations"]["ryuki.io/render-mode"],
+        SOURCE_TEMPLATE_MODE
+    );
+    assert_eq!(
+        job["spec"]["suspend"], true,
+        "the unresolved source template must be inert if submitted accidentally"
+    );
+    assert_eq!(
+        job["metadata"]["annotations"]["ryuki.io/socket-contract-digest"],
+        SOCKET_CONTRACT_DIGEST
+    );
+    for receipt_annotation in MIGRATION_RENDER_PIN_RECEIPT_ANNOTATIONS {
+        assert_eq!(
+            job["metadata"]["annotations"][receipt_annotation],
+            RENDER_REQUIRED_SENTINEL
+        );
+    }
+    assert_eq!(
+        job["metadata"]["annotations"]["ryuki.io/socket-projection-receipt-digest"],
+        RENDER_REQUIRED_SENTINEL
+    );
+    assert_eq!(
+        annotations
+            .values()
+            .filter(|value| value.as_str() == Some(RENDER_REQUIRED_SENTINEL))
+            .count(),
+        9,
+        "source template must retain eight pin receipts plus one socket receipt digest sentinel"
+    );
+
     let pod = &job["spec"]["template"]["spec"];
     assert_eq!(pod["serviceAccountName"], "platform-api-migrator");
     assert_eq!(pod["automountServiceAccountToken"], false);
     assert_eq!(pod["enableServiceLinks"], false);
     assert_eq!(pod["restartPolicy"], "Never");
+    migration_relay_workspace_error(job)
+        .unwrap_or_else(|error| panic!("invalid migration relay workspace: {error}"));
     let volumes = pod["volumes"]
         .as_sequence()
-        .expect("migration CNPG CA volume");
-    assert_eq!(volumes.len(), 1, "only the CNPG CA may be projected");
+        .expect("migration CNPG CA and relay-workspace volumes");
+    assert_eq!(
+        volumes.len(),
+        2,
+        "only the CNPG CA and bounded relay workspace may be projected"
+    );
+    assert_eq!(volumes[0].as_mapping().map(|map| map.len()), Some(2));
     assert_eq!(volumes[0]["name"], "cnpg-ca");
+    assert_eq!(
+        volumes[0]["secret"].as_mapping().map(|map| map.len()),
+        Some(2)
+    );
     assert_eq!(volumes[0]["secret"]["secretName"], "ryuki-platform-db-ca");
+    assert_eq!(
+        volumes[0]["secret"]["items"]
+            .as_sequence()
+            .map(|items| items.len()),
+        Some(1)
+    );
+    assert_eq!(
+        volumes[0]["secret"]["items"][0]
+            .as_mapping()
+            .map(|map| map.len()),
+        Some(2)
+    );
     assert_eq!(volumes[0]["secret"]["items"][0]["key"], "ca.crt");
     assert_eq!(volumes[0]["secret"]["items"][0]["path"], "ca.crt");
+    assert_eq!(volumes[1].as_mapping().map(|map| map.len()), Some(2));
+    assert_eq!(volumes[1]["name"], POSTGRESQL_RELAY_VOLUME_NAME);
+    assert_eq!(
+        volumes[1]["emptyDir"].as_mapping().map(|map| map.len()),
+        Some(2)
+    );
+    assert_eq!(volumes[1]["emptyDir"]["medium"], "Memory");
+    assert_eq!(
+        volumes[1]["emptyDir"]["sizeLimit"],
+        POSTGRESQL_RELAY_SIZE_LIMIT
+    );
     let container = &pod["containers"][0];
     assert_eq!(container["name"], "platform-api-migrations");
     assert!(container["command"].is_null());
@@ -1399,10 +2051,21 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     let mounts = container["volumeMounts"]
         .as_sequence()
         .expect("migration volume mounts");
-    assert_eq!(mounts.len(), 1, "only the CNPG CA may be mounted");
+    assert_eq!(
+        mounts.len(),
+        2,
+        "only the CNPG CA and bounded relay workspace may be mounted"
+    );
+    assert_eq!(mounts[0].as_mapping().map(|map| map.len()), Some(3));
     assert_eq!(mounts[0]["name"], "cnpg-ca");
     assert_eq!(mounts[0]["mountPath"], "/var/run/secrets/ryuki/cnpg");
     assert_eq!(mounts[0]["readOnly"], true);
+    assert!(mounts[0]["subPath"].is_null());
+    assert_eq!(mounts[1].as_mapping().map(|map| map.len()), Some(3));
+    assert_eq!(mounts[1]["name"], POSTGRESQL_RELAY_VOLUME_NAME);
+    assert_eq!(mounts[1]["mountPath"], POSTGRESQL_RELAY_MOUNT_PATH);
+    assert_eq!(mounts[1]["readOnly"], false);
+    assert!(mounts[1]["subPath"].is_null());
 
     let deployments = parse_multi_doc("deploy/kubernetes/base/deployments.yaml");
     let api = find_deployment(&deployments, "platform-api");
@@ -1428,7 +2091,7 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     let env = container["env"]
         .as_sequence()
         .expect("job exact secret env");
-    assert_ordered_security_admission_env(env);
+    assert_migration_production_pin_env(env, digest_prefix);
     assert_eq!(env[0]["name"], "RYUKI_MIGRATION_DATABASE_URL");
     assert_eq!(
         env[0]["valueFrom"]["secretKeyRef"]["name"],
@@ -1440,7 +2103,31 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     );
     assert!(env[0]["value"].is_null());
     assert!(env[0]["valueFrom"]["configMapKeyRef"].is_null());
+    let container_security = container["securityContext"]
+        .as_mapping()
+        .expect("migration container security context");
+    let actual_container_security_keys: HashSet<&str> = container_security
+        .keys()
+        .map(|key| key.as_str().expect("container security key"))
+        .collect();
+    let expected_container_security_keys: HashSet<&str> = [
+        "runAsNonRoot",
+        "runAsUser",
+        "runAsGroup",
+        "allowPrivilegeEscalation",
+        "readOnlyRootFilesystem",
+        "capabilities",
+        "seccompProfile",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        actual_container_security_keys, expected_container_security_keys,
+        "migration container security context must remain closed"
+    );
     assert_eq!(container["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(container["securityContext"]["runAsUser"], 10001);
+    assert_eq!(container["securityContext"]["runAsGroup"], 10001);
     assert_eq!(
         container["securityContext"]["allowPrivilegeEscalation"],
         false
@@ -1459,6 +2146,267 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
 }
 
 #[test]
+fn migration_job_pin_projection_detects_missing_duplicate_miswired_and_inline_entries() {
+    let jobs = parse_multi_doc("deploy/kubernetes/operations/migration-job.yaml");
+    let release_image = jobs[0]["metadata"]["annotations"]["ryuki.io/release-image"]
+        .as_str()
+        .expect("migration release image");
+    let digest_prefix = image_digest_prefix(release_image);
+    let baseline = jobs[0]["spec"]["template"]["spec"]["containers"][0]["env"]
+        .as_sequence()
+        .expect("migration production env")
+        .clone();
+    assert_migration_production_pin_env(&baseline, digest_prefix);
+
+    let governed_config_maps: HashSet<&str> = MIGRATION_PRODUCTION_PIN_GROUPS
+        .iter()
+        .map(|(config_map, _, _)| *config_map)
+        .collect();
+    assert_eq!(
+        governed_config_maps.len(),
+        MIGRATION_PRODUCTION_PIN_GROUPS.len(),
+        "each production pin group must use an independently named ConfigMap"
+    );
+
+    let mut missing = baseline.clone();
+    let index = missing
+        .iter()
+        .position(|entry| {
+            entry["name"].as_str()
+                == Some("RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST")
+        })
+        .expect("PostgreSQL profile digest pin");
+    missing.remove(index);
+    assert!(migration_production_pin_env_error(&missing, digest_prefix).is_err());
+
+    let mut duplicate = baseline.clone();
+    let duplicate_entry = duplicate[duplicate.len() - 2].clone();
+    let last = duplicate.len() - 1;
+    duplicate[last] = duplicate_entry;
+    assert!(migration_production_pin_env_error(&duplicate, digest_prefix).is_err());
+
+    let mut miswired_postgresql = baseline.clone();
+    let entry = miswired_postgresql
+        .iter_mut()
+        .find(|entry| {
+            entry["name"].as_str() == Some("RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET")
+        })
+        .expect("PostgreSQL socket pin");
+    entry["valueFrom"]["configMapKeyRef"]["name"] =
+        serde_yaml::Value::String(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP.to_string());
+    assert!(migration_production_pin_env_error(&miswired_postgresql, digest_prefix).is_err());
+
+    for (config_map, keys, _) in MIGRATION_PRODUCTION_PIN_GROUPS {
+        let mut miswired_group = baseline.clone();
+        let first_key = keys
+            .first()
+            .copied()
+            .expect("nonempty production pin group");
+        let entry = miswired_group
+            .iter_mut()
+            .find(|entry| entry["name"].as_str() == Some(first_key))
+            .unwrap_or_else(|| panic!("missing first pin from {config_map}"));
+        entry["valueFrom"]["configMapKeyRef"]["name"] =
+            serde_yaml::Value::String("unreviewed-pin-source".to_string());
+        assert!(
+            migration_production_pin_env_error(&miswired_group, digest_prefix).is_err(),
+            "miswired group {config_map} must fail closed"
+        );
+
+        if *config_map != POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP {
+            let mut missing_group = baseline.clone();
+            let index = missing_group
+                .iter()
+                .position(|entry| entry["name"].as_str() == Some(first_key))
+                .unwrap_or_else(|| panic!("missing first pin from {config_map}"));
+            missing_group.remove(index);
+            assert!(
+                migration_production_pin_env_error(&missing_group, digest_prefix).is_err(),
+                "missing pin from existing group {config_map} must fail closed"
+            );
+
+            let mut duplicate_group = baseline.clone();
+            let index = duplicate_group
+                .iter()
+                .position(|entry| entry["name"].as_str() == Some(first_key))
+                .unwrap_or_else(|| panic!("missing first pin from {config_map}"));
+            duplicate_group[index + 1] = duplicate_group[index].clone();
+            assert!(
+                migration_production_pin_env_error(&duplicate_group, digest_prefix).is_err(),
+                "duplicate pin in existing group {config_map} must fail closed"
+            );
+        }
+    }
+
+    let mut inline = baseline;
+    let entry = inline
+        .iter_mut()
+        .find(|entry| {
+            entry["name"].as_str()
+                == Some("RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID")
+        })
+        .expect("PostgreSQL authority pin");
+    *entry = serde_yaml::from_str(
+        "name: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID\nvalue: inline-authority\n",
+    )
+    .expect("inline mutation YAML");
+    assert!(migration_production_pin_env_error(&inline, digest_prefix).is_err());
+}
+
+#[test]
+fn final_render_socket_fixture_checks_diagnostic_shape_without_authorizing_execution() {
+    let (job, pins) = final_render_socket_fixture();
+    assert!(
+        final_render_socket_projection_error(&job, &pins).is_ok(),
+        "reviewed final-render inline CSI diagnostic shape must pass its structural check"
+    );
+    assert_eq!(
+        job["spec"]["suspend"], false,
+        "the fixture deliberately represents a would-be executable render that the validator must contain"
+    );
+
+    let mut mutations = Vec::new();
+    let mut missing = job.clone();
+    missing["spec"]["template"]["spec"]["volumes"]
+        .as_sequence_mut()
+        .expect("final-render volumes")
+        .remove(2);
+    mutations.push(("missing socket volume", missing));
+
+    let mut wrong_driver = job.clone();
+    wrong_driver["spec"]["template"]["spec"]["volumes"][2]["csi"]["driver"] =
+        serde_yaml::Value::String("unreviewed.example.invalid".to_string());
+    mutations.push(("unpinned CSI driver", wrong_driver));
+
+    let mut writable = job.clone();
+    writable["spec"]["template"]["spec"]["volumes"][2]["csi"]["readOnly"] =
+        serde_yaml::Value::Bool(false);
+    mutations.push(("writable CSI volume", writable));
+
+    let mut substituted_path = job.clone();
+    substituted_path["spec"]["template"]["spec"]["volumes"][2]["csi"]["volumeAttributes"]["socketPath"] =
+        serde_yaml::Value::String("/var/run/substituted/authority.sock".to_string());
+    mutations.push(("substituted socket path", substituted_path));
+
+    let mut injected_receipt_digest = job.clone();
+    injected_receipt_digest["spec"]["template"]["spec"]["volumes"][2]["csi"]["volumeAttributes"]
+        ["receiptDigest"] = serde_yaml::Value::String(format!("sha256:{}", "7".repeat(64)));
+    mutations.push((
+        "forbidden CSI receipt digest carrier",
+        injected_receipt_digest,
+    ));
+
+    let mut wrong_mount = job.clone();
+    wrong_mount["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][2]["mountPath"] =
+        serde_yaml::Value::String("/var/run/substituted".to_string());
+    mutations.push(("miswired mount parent", wrong_mount));
+
+    let mut alternate_source = job.clone();
+    alternate_source["spec"]["template"]["spec"]["volumes"][2]["emptyDir"] =
+        serde_yaml::to_value(serde_json::json!({})).expect("emptyDir mutation");
+    mutations.push(("alternate volume source", alternate_source));
+
+    let mut disk_backed_relay = job.clone();
+    disk_backed_relay["spec"]["template"]["spec"]["volumes"][1]["emptyDir"]["medium"] =
+        serde_yaml::Value::String(String::new());
+    mutations.push(("disk-backed relay workspace", disk_backed_relay));
+
+    let mut oversized_relay = job.clone();
+    oversized_relay["spec"]["template"]["spec"]["volumes"][1]["emptyDir"]["sizeLimit"] =
+        serde_yaml::Value::String("2Mi".to_string());
+    mutations.push(("oversized relay workspace", oversized_relay));
+
+    let mut read_only_relay_mount = job.clone();
+    read_only_relay_mount["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][1]["readOnly"] =
+        serde_yaml::Value::Bool(true);
+    mutations.push(("read-only relay workspace mount", read_only_relay_mount));
+
+    let mut wrong_relay_group = job.clone();
+    wrong_relay_group["spec"]["template"]["spec"]["securityContext"]["fsGroup"] =
+        serde_yaml::Value::Number(10002.into());
+    mutations.push(("wrong relay workspace fsGroup", wrong_relay_group));
+
+    for (label, invalid) in mutations {
+        assert!(
+            final_render_socket_projection_error(&invalid, &pins).is_err(),
+            "final render must reject {label}"
+        );
+    }
+
+    let mut duplicate_paths = pins.clone();
+    duplicate_paths[1].socket_path = duplicate_paths[0].socket_path.clone();
+    assert!(
+        final_render_socket_projection_error(&job, &duplicate_paths).is_err(),
+        "rendered ConfigMap socket paths must remain distinct"
+    );
+
+    let mut reused_postgresql_key = pins;
+    reused_postgresql_key[3].fingerprint = reused_postgresql_key[0].fingerprint.clone();
+    assert!(
+        final_render_socket_projection_error(&job, &reused_postgresql_key).is_err(),
+        "PostgreSQL key fingerprint must differ from the other authorities"
+    );
+}
+
+#[test]
+fn migration_production_execution_is_contained_until_runtime_admission_exists() {
+    let contract_raw =
+        std::fs::read_to_string("deploy/kubernetes/operations/migration-cutover-contract.yaml")
+            .expect("migration cutover contract");
+    let contract: serde_yaml::Value =
+        serde_yaml::from_str(&contract_raw).expect("migration cutover contract YAML");
+    let source_job = parse_multi_doc("deploy/kubernetes/operations/migration-job.yaml")
+        .into_iter()
+        .next()
+        .expect("migration source Job");
+    let (final_shape, _) = final_render_socket_fixture();
+
+    assert_eq!(contract["productionExecutionEnabled"], false);
+    assert_eq!(
+        contract["runtimeAdmission"]["requiredCapability"],
+        FINAL_RENDER_REQUIRED_RUNTIME_CAPABILITY
+    );
+    assert_eq!(contract["runtimeAdmission"]["capabilityAvailable"], false);
+    assert_eq!(
+        contract["runtimeAdmission"]["offlineSnapshotValidationOnly"],
+        true
+    );
+    for field in [
+        "snapshotAuthorizesJobCreation",
+        "snapshotFencesConfigMapDeleteRecreate",
+        "snapshotConsumesExecutionAttempt",
+        "snapshotEnforcesReceiptExpiryAtPodStartOrRuntime",
+    ] {
+        assert_eq!(
+            contract["runtimeAdmission"][field], false,
+            "offline validation must not claim runtime enforcement for {field}"
+        );
+    }
+    assert_eq!(source_job["spec"]["suspend"], true);
+    assert_eq!(
+        source_job["metadata"]["annotations"]["ryuki.io/render-mode"],
+        SOURCE_TEMPLATE_MODE
+    );
+    assert_eq!(
+        final_shape["metadata"]["annotations"]["ryuki.io/render-mode"],
+        FINAL_RENDER_MODE
+    );
+    assert_eq!(
+        contract["sequence"].as_sequence().map(Vec::len),
+        Some(1),
+        "contained contract must not retain an executable cutover sequence"
+    );
+    assert_eq!(
+        contract["sequence"][0],
+        "stop-production-execution-runtime-admission-unavailable"
+    );
+    assert!(
+        contract["socketProjectionTrustAnchor"].is_null(),
+        "production contract must not expose a manifest-selected trust-anchor input"
+    );
+}
+
+#[test]
 fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
     let raw =
         std::fs::read_to_string("deploy/kubernetes/operations/migration-cutover-contract.yaml")
@@ -1469,6 +2417,83 @@ fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
         .expect("cutover release image");
     let digest_prefix = image_digest_prefix(release_image);
     assert_eq!(contract["release"]["digestPrefix"], digest_prefix);
+    let final_render = &contract["finalRender"];
+    assert_eq!(final_render["contractId"], FINAL_RENDER_CONTRACT);
+    assert_eq!(final_render["sourceMode"], SOURCE_TEMPLATE_MODE);
+    assert_eq!(final_render["finalMode"], FINAL_RENDER_MODE);
+    assert_eq!(final_render["unresolvedSentinel"], RENDER_REQUIRED_SENTINEL);
+    assert_eq!(final_render["atomicRewriteRequired"], true);
+    assert_eq!(contract["productionExecutionEnabled"], false);
+    assert_eq!(
+        contract["runtimeAdmission"]["requiredCapability"],
+        FINAL_RENDER_REQUIRED_RUNTIME_CAPABILITY
+    );
+    assert_eq!(
+        final_render["pinConfigMapReceipt"]["immutableRequired"],
+        true
+    );
+    assert_eq!(
+        final_render["pinConfigMapReceipt"]["receiptMustExactlyMatchApiReadback"],
+        true
+    );
+    assert_eq!(
+        final_render["pinConfigMapReceipt"]["offlineSnapshotFencesEnvironmentConfigMapDeleteRecreate"],
+        false
+    );
+    assert_eq!(
+        final_render["pinConfigMapReceipt"]["offlineSnapshotFencesNonEnvironmentAuthorityDeleteRecreate"],
+        false
+    );
+    assert_eq!(
+        final_render["socketProjectionReceipt"]["exactSocketCount"],
+        4
+    );
+    assert_eq!(
+        final_render["socketProjectionReceipt"]["inlineCsiDriver"],
+        AUTHORITY_SOCKET_CSI_DRIVER
+    );
+    assert_eq!(
+        final_render["socketProjectionReceipt"]["inlineCsiReadOnlyRequired"],
+        true
+    );
+    let exact_volume_attribute_keys: Vec<&str> =
+        final_render["socketProjectionReceipt"]["exactVolumeAttributeKeys"]
+            .as_sequence()
+            .expect("exact CSI volume attributes")
+            .iter()
+            .map(|key| key.as_str().expect("CSI volume attribute key"))
+            .collect();
+    assert_eq!(
+        exact_volume_attribute_keys,
+        ["environmentVariable", "authorityClass", "socketPath"]
+    );
+    for flag in [
+        "mountsAreSocketParentDirectories",
+        "socketPathsDistinctRequired",
+        "mountParentPathsDistinctRequired",
+        "postgresqlFingerprintDistinctFromOtherAuthoritiesRequired",
+    ] {
+        assert_eq!(
+            final_render["socketProjectionReceipt"][flag], true,
+            "final-render socket projection gate {flag} must remain fail-closed"
+        );
+    }
+    assert_eq!(
+        final_render["socketProjectionReceipt"]["strictSignedEnvelopeContract"],
+        "migration-socket-projection-receipt-v1"
+    );
+    assert_eq!(
+        final_render["socketProjectionReceipt"]["receiptDigestForbiddenInCsiAttributes"],
+        true
+    );
+    assert_eq!(
+        final_render["socketProjectionReceipt"]["receiptMaximumAuthorizationSeconds"],
+        300
+    );
+    assert_eq!(
+        final_render["closedSocketContractDigest"],
+        SOCKET_CONTRACT_DIGEST
+    );
     assert_eq!(
         contract["execution"]["generatedNamePrefix"],
         format!("platform-api-migrations-{digest_prefix}-")
@@ -1489,6 +2514,181 @@ fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
         contract["credentials"]["migration"]["vaultDatabaseRole"],
         format!("ryuki-schema-migrator-{digest_prefix}")
     );
+    assert_eq!(contract["execution"]["activeDeadlineSeconds"], 300);
+    assert_eq!(
+        contract["execution"]["maximumProofAuthorizationSeconds"],
+        300
+    );
+    assert_eq!(contract["execution"]["statementTimeoutSeconds"], 180);
+    assert_eq!(contract["execution"]["lockTimeoutSeconds"], 30);
+    assert_eq!(
+        contract["execution"]["singleDatabaseTransactionRequired"],
+        true
+    );
+    assert_eq!(
+        contract["execution"]["sessionScopedAdvisoryLockBeforeBeginRequired"],
+        true
+    );
+    assert_eq!(
+        contract["execution"]["transactionScopedAdvisoryLockPromotionFirstStatementRequired"],
+        true
+    );
+    assert_eq!(
+        contract["execution"]["sessionScopedAdvisoryLockReleasedAfterPromotionRequired"],
+        true
+    );
+    assert_eq!(
+        contract["execution"]["migrationSqlCannotReleaseTransactionLockRequired"],
+        true
+    );
+
+    let projections = &contract["productionPinProjections"];
+    let migration_config = &projections["migrationConfig"];
+    assert_eq!(
+        migration_config["sourceTemplateConfigMapName"],
+        "platform-api-migration-config"
+    );
+    assert_eq!(
+        migration_config["finalConfigMapName"],
+        digest_scoped_pin_config_map_name("platform-api-migration-config", digest_prefix)
+    );
+    let migration_config_keys: Vec<&str> = migration_config["configKeys"]
+        .as_sequence()
+        .expect("migration config keys")
+        .iter()
+        .map(|key| key.as_str().expect("migration config key"))
+        .collect();
+    assert_eq!(
+        migration_config_keys, PLATFORM_API_MIGRATION_CONFIG_KEYS,
+        "migration config pin inventory changed"
+    );
+    assert_eq!(
+        migration_config["finalRenderMustRewriteEnvFromReference"],
+        true
+    );
+    for (field, config_map, keys) in [
+        (
+            "baselineAdmission",
+            digest_scoped_pin_config_map_name(SECURITY_ADMISSION_CONFIG_MAP, digest_prefix),
+            SECURITY_ADMISSION_KEYS.as_slice(),
+        ),
+        (
+            "buildManifest",
+            digest_scoped_pin_config_map_name(PRODUCTION_BUILD_MANIFEST_CONFIG_MAP, digest_prefix),
+            PRODUCTION_BUILD_MANIFEST_KEYS,
+        ),
+        (
+            "conformanceTrustCheckpoint",
+            digest_scoped_pin_config_map_name(
+                CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP,
+                digest_prefix,
+            ),
+            CONFORMANCE_TRUST_CHECKPOINT_KEYS,
+        ),
+        (
+            "deployedWorkloadAttestation",
+            digest_scoped_pin_config_map_name(
+                DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP,
+                digest_prefix,
+            ),
+            DEPLOYED_WORKLOAD_ATTESTATION_KEYS,
+        ),
+        (
+            "publicIngressAttestation",
+            digest_scoped_pin_config_map_name(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP, digest_prefix),
+            PUBLIC_INGRESS_ATTESTATION_KEYS,
+        ),
+    ] {
+        assert_eq!(projections[field]["configMapName"], config_map.as_str());
+        let actual_keys: Vec<&str> = projections[field]["configKeys"]
+            .as_sequence()
+            .expect("production pin ConfigMap keys")
+            .iter()
+            .map(|key| key.as_str().expect("production pin key"))
+            .collect();
+        assert_eq!(actual_keys, keys, "pin inventory changed for {field}");
+    }
+    for flag in [
+        "completeGroupsRequired",
+        "releaseDigestPrefixBoundNamesRequired",
+        "immutableConfigMapsRequired",
+        "contentDigestAnnotationsRequired",
+        "uidAndResourceVersionReadbackRequired",
+        "jobReceiptAnnotationsRequired",
+        "inlineValuesForbidden",
+        "independentlyGovernedConfigMapsRequired",
+        "renderedUnixSocketProjectionsRequired",
+        "renderedSocketPathsMustEqualPins",
+        "socketAvailabilityBeforeRunnerStartRequired",
+        "hostPathFallbackForbidden",
+    ] {
+        assert_eq!(
+            projections[flag], true,
+            "production pin projection gate {flag} must stay fail-closed"
+        );
+    }
+    assert_eq!(projections["exactPinConfigMapReceiptCount"], 8);
+
+    let socket_authority = &contract["socketProjectionAuthority"];
+    assert_eq!(
+        socket_authority["configMapName"],
+        digest_scoped_pin_config_map_name(SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP, digest_prefix)
+    );
+    let socket_authority_keys: Vec<&str> = socket_authority["configKeys"]
+        .as_sequence()
+        .expect("socket receipt authority pin keys")
+        .iter()
+        .map(|key| key.as_str().expect("socket receipt authority pin key"))
+        .collect();
+    assert_eq!(socket_authority_keys, SOCKET_PROJECTION_AUTHORITY_KEYS);
+    assert_eq!(socket_authority["importedAsApplicationEnvironment"], false);
+    assert_eq!(socket_authority["mountedInWorkload"], false);
+
+    let postgresql = &contract["postgresqlInfrastructureAttestation"];
+    assert_eq!(
+        postgresql["configMapName"],
+        digest_scoped_pin_config_map_name(
+            POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP,
+            digest_prefix
+        )
+    );
+    let postgresql_keys: Vec<&str> = postgresql["configKeys"]
+        .as_sequence()
+        .expect("PostgreSQL infrastructure pin keys")
+        .iter()
+        .map(|key| key.as_str().expect("PostgreSQL pin key"))
+        .collect();
+    assert_eq!(postgresql_keys, POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS);
+    for flag in [
+        "completeGroupRequired",
+        "productionOnly",
+        "inlineValuesForbidden",
+        "independentlyGovernedConfigMapRequired",
+        "independentlyGovernedAuthorityRequired",
+        "ed25519Required",
+        "privateKeyInWorkloadForbidden",
+        "preprovisionedUnixSocketRequired",
+        "renderedSocketPathMustEqualPin",
+        "socketAvailabilityBeforeRunnerStartRequired",
+        "hostPathFallbackForbidden",
+        "receiptBoundTargetAndStorageRequired",
+        "freshNonceRequired",
+        "singleExchangeWithoutRetry",
+        "socketDistinctFromCheckpointWorkloadAndIngressRequired",
+        "keyFingerprintDistinctFromCheckpointWorkloadAndIngressRequired",
+        "sqlVisibleFactsObservedLocallyRequired",
+        "providerClusterAndStorageSignedEvidenceRequired",
+        "directPgConnectionRequired",
+        "sameVerifiedConnectionForDdlRequired",
+        "sameVerifiedConnectionForPostflightRequired",
+        "exactPostflightLedgerRequired",
+    ] {
+        assert_eq!(
+            postgresql[flag], true,
+            "PostgreSQL infrastructure gate {flag} must stay fail-closed"
+        );
+    }
+    assert_eq!(postgresql["maximumAuthorizationSeconds"], 300);
 
     let workload_kinds: Vec<&str> = contract["drain"]["requiredWorkloadKinds"]
         .as_sequence()

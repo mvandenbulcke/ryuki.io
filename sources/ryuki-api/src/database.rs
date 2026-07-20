@@ -1,3 +1,8 @@
+use chrono::{DateTime, Utc};
+use ryuki_core::postgresql_infrastructure::{
+    postgresql_session_binding_digest, PostgresqlSessionBinding, PostgresqlTlsChannelBinding,
+    VerifiedPostgresqlInfrastructureAttestation,
+};
 use ryuki_core::security_profile::{
     postgresql_database_identity_digest, postgresql_migration_inventory_digest,
     postgresql_storage_binding_digest, PostgresqlDatabaseIdentity, PostgresqlMigrationInventoryRow,
@@ -11,10 +16,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
 use std::fmt;
 use std::net::IpAddr;
+use std::path::{Component, Path};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use url::{Host, Url};
+
+use crate::postgresql_tls_channel::ProductionPostgresqlTarget;
 
 #[cfg(not(test))]
 static POOL: OnceLock<Option<Arc<PgPool>>> = OnceLock::new();
@@ -36,6 +45,8 @@ const MAX_MIGRATION_STATEMENT_TIMEOUT_SECS: u64 = 7_200;
 const MIN_MIGRATION_LOCK_TIMEOUT_SECS: u64 = 1;
 const MAX_MIGRATION_LOCK_TIMEOUT_SECS: u64 = 300;
 const MIGRATION_CONNECTION_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const REVIEWED_PRODUCTION_MIGRATION_STATEMENT_TIMEOUT_SECS: u64 = 180;
+const REVIEWED_PRODUCTION_MIGRATION_LOCK_TIMEOUT_SECS: u64 = 30;
 
 /// Selects who owns schema mutation during process startup.
 ///
@@ -560,6 +571,10 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("port_reservations", true, true, true),
     TablePolicy::new("portal_notification_reads", true, true, true),
     TablePolicy::new("portal_notifications", true, true, true),
+    // Completion witnesses are written only by the one-shot migration role.
+    // The serving role may inspect them for operations, but can never create,
+    // mutate, or delete a witness.
+    TablePolicy::new("production_migration_operations", false, false, false),
     TablePolicy::new("quarantine_log", true, true, true),
     TablePolicy::new("recertification_campaigns", true, true, true),
     TablePolicy::new("request_approval_decisions", true, false, false),
@@ -618,6 +633,203 @@ pub fn migration_database_url_from_env() -> Result<String, String> {
     Ok(url)
 }
 
+/// Parse the production migration target without accepting libpq-style target
+/// overrides. The signed infrastructure exchange proves the live target, but
+/// the connection bootstrap must independently exclude Unix sockets, literal
+/// IP targets, opportunistic TLS, and implicit database selection before any
+/// network connection is attempted.
+fn percent_decode_url_component(raw: &str, label: &str) -> Result<String, String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(format!(
+                "production migration URL {label} has invalid percent encoding"
+            ));
+        }
+        let hex = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let high = hex(bytes[index + 1]).ok_or_else(|| {
+            format!("production migration URL {label} has invalid percent encoding")
+        })?;
+        let low = hex(bytes[index + 2]).ok_or_else(|| {
+            format!("production migration URL {label} has invalid percent encoding")
+        })?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| format!("production migration URL {label} is not UTF-8"))?;
+    if decoded.is_empty() || decoded.chars().any(char::is_control) {
+        return Err(format!(
+            "production migration URL {label} is empty or contains control characters"
+        ));
+    }
+    Ok(decoded)
+}
+
+fn canonical_absolute_certificate_path(raw: &str) -> bool {
+    let path = Path::new(raw);
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::RootDir))
+        && components.clone().next().is_some()
+        && components.all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn production_migration_target(raw_url: &str) -> Result<ProductionPostgresqlTarget, String> {
+    if raw_url.is_empty()
+        || raw_url.len() > 8192
+        || raw_url != raw_url.trim()
+        || raw_url.chars().any(char::is_control)
+    {
+        return Err(
+            "production migration database URL is empty, oversized, or noncanonical".into(),
+        );
+    }
+    let parsed = Url::parse(raw_url)
+        .map_err(|_| "production migration database URL could not be parsed".to_owned())?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql")
+        || parsed.cannot_be_a_base()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "production migration database URL must be a hierarchical PostgreSQL URL without a fragment"
+                .into(),
+        );
+    }
+
+    let hostname = match parsed.host() {
+        Some(Host::Domain(hostname)) => hostname,
+        _ => {
+            return Err(
+                "production migration database URL must use a TCP DNS hostname, not an IP literal or Unix socket"
+                    .into(),
+            )
+        }
+    };
+    let hostname_is_canonical = hostname.parse::<IpAddr>().is_err()
+        && !hostname.is_empty()
+        && hostname.len() <= 253
+        && !hostname.ends_with('.')
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        });
+    if !hostname_is_canonical {
+        return Err("production migration database hostname is not canonical DNS".into());
+    }
+    let username = canonical_database_role_name(
+        "production migration URL username",
+        percent_decode_url_component(parsed.username(), "username")?,
+    )?;
+    let password = /* secret-scan-allow: reviewed runtime URL credential */ percent_decode_url_component(
+        parsed.password().ok_or_else(|| {
+            "production migration database URL must carry an explicit password".to_owned()
+        })?,
+        "password",
+    )?;
+    if password.len() > 4096 {
+        return Err("production migration database URL password is oversized".into());
+    }
+    let port = parsed.port().filter(|port| *port != 0).ok_or_else(|| {
+        "production migration database URL must carry an explicit nonzero TCP port".to_owned()
+    })?;
+    let database_segments = parsed
+        .path_segments()
+        .ok_or_else(|| {
+            "production migration database URL must name an explicit database".to_owned()
+        })?
+        .collect::<Vec<_>>();
+    if database_segments.len() != 1 || database_segments[0].is_empty() {
+        return Err(
+            "production migration database URL must contain one explicit canonical database path segment"
+                .into(),
+        );
+    }
+    let database = canonical_database_role_name(
+        "production migration URL database",
+        percent_decode_url_component(database_segments[0], "database")?,
+    )?;
+    if database == "postgres" {
+        return Err("the postgres maintenance database is not a migration target".into());
+    }
+
+    let mut ssl_mode = None;
+    let mut ssl_root_cert = None;
+    let mut seen = BTreeSet::new();
+    for (key, value) in parsed.query_pairs() {
+        if !seen.insert(key.to_string()) {
+            return Err("production migration database URL repeats a parameter".into());
+        }
+        match key.as_ref() {
+            "sslmode" => ssl_mode = Some(value.into_owned()),
+            "sslrootcert" => ssl_root_cert = Some(value.into_owned()),
+            _ => {
+                return Err(
+                    "production migration database URL contains a parameter that is not permitted"
+                        .into(),
+                );
+            }
+        }
+    }
+    if ssl_mode.as_deref() != Some("verify-full") {
+        return Err("production migration database URL must set sslmode=verify-full".into());
+    }
+    let ssl_root_cert = ssl_root_cert.ok_or_else(|| {
+        "production migration database URL must set an explicit sslrootcert".to_owned()
+    })?;
+    if !canonical_absolute_certificate_path(&ssl_root_cert)
+        || ssl_root_cert.len() > 4096
+        || ssl_root_cert.chars().any(char::is_control)
+    {
+        return Err(
+            "production migration database sslrootcert must be a canonical absolute path".into(),
+        );
+    }
+
+    // The app-owned TLS channel ignores libpq target variables entirely. The
+    // remaining variables could otherwise imply a client certificate or
+    // server-side option outside the closed direct-session profile.
+    for ambient in ["PGOPTIONS", "PGSSLCERT", "PGSSLKEY"] {
+        if std::env::var_os(ambient).is_some() {
+            return Err(
+                "ambient PostgreSQL options or client-certificate variables are prohibited for production migrations"
+                    .into(),
+            );
+        }
+    }
+    ProductionPostgresqlTarget::new(
+        hostname.to_owned(),
+        port,
+        username,
+        password,
+        database,
+        Path::new(&ssl_root_cert).to_path_buf(),
+    )
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationInventory {
     pub embedded_count: usize,
@@ -625,6 +837,37 @@ pub struct MigrationInventory {
     /// Canonical `ryuki-postgresql-migration-inventory-v1` digest of the
     /// exact ordered version/checksum rows read back after verification.
     pub content_digest: String,
+    pub(crate) production_attestation:
+        Option<crate::security_contracts::ProductionMigrationCompletionEvidence>,
+    pub(crate) production_operation: Option<ProductionMigrationOperationReceipt>,
+}
+
+/// Non-secret operation projection returned only after a confirmed commit or
+/// an independently attested readback of a previously committed marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductionMigrationOperationReceipt {
+    operation_id: String,
+    reconciled_after_prior_attempt: bool,
+}
+
+impl ProductionMigrationOperationReceipt {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn reconciled_after_prior_attempt(&self) -> bool {
+        self.reconciled_after_prior_attempt
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProductionMigrationOperationMarker {
+    operation_id: String,
+    release_binding_digest: String,
+    target_binding_digest: String,
+    migration_inventory_digest: String,
+    attestation_response_digest: String,
+    session_binding_digest: String,
 }
 
 /// Exact successful row retained from `public._sqlx_migrations`. Installation
@@ -890,12 +1133,60 @@ pub enum PostgresqlRuntimePublicationError {
 /// cannot safely observe.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait VerifiedPostgresqlInfrastructureEvidence: Send + Sync {
-    fn verify_integrity(&self) -> bool;
+    fn verify_integrity(&self) -> Result<(), String>;
     fn deployment_id(&self) -> &str;
     fn trust_domain_id(&self) -> &str;
     fn database_provider(&self) -> ProductionDatabaseProvider;
+    fn attestation_profile_id(&self) -> &str;
+    fn attestation_profile_version(&self) -> u64;
+    fn attestation_profile_digest(&self) -> &str;
+    fn provider_route_binding_digest(&self) -> &str;
     fn cluster_system_identifier(&self) -> &str;
     fn storage_bindings(&self) -> &[PostgresqlStorageBinding];
+}
+
+impl VerifiedPostgresqlInfrastructureEvidence for VerifiedPostgresqlInfrastructureAttestation {
+    fn verify_integrity(&self) -> Result<(), String> {
+        VerifiedPostgresqlInfrastructureAttestation::verify_integrity(self)
+            .map_err(|error| error.to_string())
+    }
+
+    fn deployment_id(&self) -> &str {
+        VerifiedPostgresqlInfrastructureAttestation::deployment_id(self)
+    }
+
+    fn trust_domain_id(&self) -> &str {
+        VerifiedPostgresqlInfrastructureAttestation::trust_domain_id(self)
+    }
+
+    fn database_provider(&self) -> ProductionDatabaseProvider {
+        VerifiedPostgresqlInfrastructureAttestation::database_provider(self)
+    }
+
+    fn attestation_profile_id(&self) -> &str {
+        VerifiedPostgresqlInfrastructureAttestation::attestation_profile_id(self)
+    }
+
+    fn attestation_profile_version(&self) -> u64 {
+        VerifiedPostgresqlInfrastructureAttestation::attestation_profile_version(self)
+    }
+
+    fn attestation_profile_digest(&self) -> &str {
+        VerifiedPostgresqlInfrastructureAttestation::attestation_profile_digest(self)
+    }
+
+    fn provider_route_binding_digest(&self) -> &str {
+        VerifiedPostgresqlInfrastructureAttestation::provider_route_binding_digest(self)
+    }
+
+    fn cluster_system_identifier(&self) -> &str {
+        &VerifiedPostgresqlInfrastructureAttestation::database_identity(self)
+            .cluster_system_identifier
+    }
+
+    fn storage_bindings(&self) -> &[PostgresqlStorageBinding] {
+        VerifiedPostgresqlInfrastructureAttestation::storage_bindings(self)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1024,7 +1315,7 @@ impl VerifiedLocalDurablePostgresqlRuntime {
     }
 
     fn recheck_retained_projection(&self) -> Result<(), DurablePostgresqlRuntimeVerificationError> {
-        if !self.infrastructure_evidence.verify_integrity() {
+        if self.infrastructure_evidence.verify_integrity().is_err() {
             return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
         }
         let current = measured_durable_postgresql_value(
@@ -1037,7 +1328,7 @@ impl VerifiedLocalDurablePostgresqlRuntime {
         // An evidence implementation may re-hash retained bytes here. Check it
         // on both sides of the projection so mutable or replaced authority
         // cannot splice one comparison from two evidence states.
-        if !self.infrastructure_evidence.verify_integrity() {
+        if self.infrastructure_evidence.verify_integrity().is_err() {
             return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
         }
         Ok(())
@@ -1108,6 +1399,14 @@ fn measured_durable_postgresql_value(
     Ok(RuntimeGuardExpectedValue::DurablePostgresql {
         database_provider: infrastructure_evidence.database_provider(),
         server_major_version: observation.server_major_version(),
+        attestation_profile_id: infrastructure_evidence.attestation_profile_id().to_owned(),
+        attestation_profile_version: infrastructure_evidence.attestation_profile_version(),
+        attestation_profile_digest: infrastructure_evidence
+            .attestation_profile_digest()
+            .to_owned(),
+        provider_route_binding_digest: infrastructure_evidence
+            .provider_route_binding_digest()
+            .to_owned(),
         database_identity_digest: postgresql_database_identity_digest(&identity)?,
         storage_binding_digest: postgresql_storage_binding_digest(
             infrastructure_evidence.storage_bindings(),
@@ -1139,7 +1438,7 @@ pub(crate) fn verify_local_durable_postgresql_runtime(
     ) {
         return Err(DurablePostgresqlRuntimeVerificationError::ExpectedGuardKind);
     }
-    if !infrastructure_evidence.verify_integrity() {
+    if infrastructure_evidence.verify_integrity().is_err() {
         return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
     }
     let runtime = unpublished.retained_handle();
@@ -1148,7 +1447,7 @@ pub(crate) fn verify_local_durable_postgresql_runtime(
     if &observed_value != expected_value {
         return Err(DurablePostgresqlRuntimeVerificationError::ExpectedValueMismatch);
     }
-    if !infrastructure_evidence.verify_integrity() {
+    if infrastructure_evidence.verify_integrity().is_err() {
         return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
     }
     let verified = VerifiedLocalDurablePostgresqlRuntime {
@@ -1215,6 +1514,8 @@ pub enum MigrationVerificationError {
     UnexpectedApplied(i64),
     #[error("applied migration {0} checksum differs from this image")]
     ChecksumMismatch(i64),
+    #[error("applied migration {0} is not a contiguous embedded migration prefix")]
+    NonPrefixApplied(i64),
     #[error("embedded migrations are not applied: {0:?}")]
     Missing(Vec<i64>),
     #[error("migration inventory digest projection is invalid: {0}")]
@@ -1225,14 +1526,64 @@ pub enum MigrationVerificationError {
 pub enum MigrationRunError {
     #[error("migration admission was rejected: {0}")]
     Admission(String),
+    #[error("production migration target was rejected before connection: {0}")]
+    Target(String),
+    #[error("production migration pre-DDL verification failed: {0}")]
+    Preflight(String),
     #[error("dedicated migration database connection failed: {0}")]
     Connect(#[source] sqlx::Error),
     #[error("embedded migration execution failed: {0}")]
     Apply(#[source] sqlx::migrate::MigrateError),
+    #[error("atomic production migration {version} failed: {source}")]
+    AtomicApply {
+        version: i64,
+        #[source]
+        source: sqlx::Error,
+    },
     #[error("application database privileges could not be reconciled: {0}")]
     Privileges(#[source] sqlx::Error),
+    #[error(
+        "production migration COMMIT outcome is unknown for operation {operation_id} ({reason}); do not retry DDL blindly -- a fresh independently attested run must reconcile the exact durable operation marker and final inventory"
+    )]
+    CommitOutcomeUnknown {
+        operation_id: String,
+        reason: &'static str,
+        #[source]
+        source: Option<sqlx::Error>,
+    },
     #[error(transparent)]
     Verify(#[from] MigrationVerificationError),
+}
+
+impl MigrationRunError {
+    fn commit_outcome_unknown(&self) -> bool {
+        matches!(self, Self::CommitOutcomeUnknown { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionMigrationFailureBoundary {
+    BeforeCommitDispatch,
+    CommitDispatched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionMigrationFailureDisposition {
+    RollbackExpected,
+    OutcomeUnknown,
+}
+
+const fn classify_production_migration_failure(
+    boundary: ProductionMigrationFailureBoundary,
+) -> ProductionMigrationFailureDisposition {
+    match boundary {
+        ProductionMigrationFailureBoundary::BeforeCommitDispatch => {
+            ProductionMigrationFailureDisposition::RollbackExpected
+        }
+        ProductionMigrationFailureBoundary::CommitDispatched => {
+            ProductionMigrationFailureDisposition::OutcomeUnknown
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1487,7 +1838,209 @@ fn verify_migration_inventory(
         embedded_count: expected.len(),
         latest_version: expected.keys().next_back().copied(),
         content_digest: migration_inventory_content_digest(applied)?,
+        production_attestation: None,
+        production_operation: None,
     })
+}
+
+/// Validate the ledger before production DDL. A fresh database may have no
+/// ledger yet, and a previously migrated database may contain any contiguous
+/// prefix of the exact embedded inventory. Dirty, unknown, reordered, skipped,
+/// or checksum-substituted rows all fail before the atomic embedded migrator
+/// can create or alter an object.
+fn verify_preflight_migration_inventory(
+    rows: &[(i64, Vec<u8>, bool)],
+) -> Result<(), MigrationVerificationError> {
+    if let Some((version, _, _)) = rows.iter().find(|(_, _, success)| !success) {
+        return Err(MigrationVerificationError::Dirty(*version));
+    }
+    let expected = expected_embedded_migrations();
+    let mut expected_rows = expected.iter();
+    let mut previous = None;
+    for (version, checksum, _) in rows {
+        if let Some(previous) = previous {
+            if *version < previous {
+                return Err(MigrationVerificationError::NotStrictlyOrdered {
+                    previous,
+                    current: *version,
+                });
+            }
+            if *version == previous {
+                return Err(MigrationVerificationError::DuplicateApplied(*version));
+            }
+        }
+        let Some((expected_version, expected_checksum)) = expected_rows.next() else {
+            return Err(MigrationVerificationError::UnexpectedApplied(*version));
+        };
+        if version != expected_version {
+            return if expected.contains_key(version) {
+                Err(MigrationVerificationError::NonPrefixApplied(*version))
+            } else {
+                Err(MigrationVerificationError::UnexpectedApplied(*version))
+            };
+        }
+        if checksum.as_slice() != *expected_checksum {
+            return Err(MigrationVerificationError::ChecksumMismatch(*version));
+        }
+        previous = Some(*version);
+    }
+    Ok(())
+}
+
+async fn read_preflight_migration_ledger(
+    connection: &mut PgConnection,
+    migration_role: &str,
+) -> Result<Vec<(i64, Vec<u8>, bool)>, MigrationVerificationError> {
+    let ledger_exists: bool =
+        sqlx::query_scalar("SELECT pg_catalog.to_regclass('public._sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(MigrationVerificationError::Metadata)?;
+    if !ledger_exists {
+        return Ok(Vec::new());
+    }
+    attest_sqlx_migrations_table(connection, migration_role).await?;
+    sqlx::query_as(
+        "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(MigrationVerificationError::Metadata)
+}
+
+async fn attest_sqlx_migrations_table(
+    connection: &mut PgConnection,
+    migration_role: &str,
+) -> Result<(), MigrationVerificationError> {
+    let exact: bool = sqlx::query_scalar(
+        r#"
+        WITH migration AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1::name
+        ),
+        ledger AS (
+            SELECT class.*
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND class.relname = '_sqlx_migrations'
+        ),
+        expected_columns(name, type_name, not_null, default_expression) AS (
+            VALUES
+                ('version'::text, 'bigint'::text, TRUE, NULL::text),
+                ('description'::text, 'text'::text, TRUE, NULL::text),
+                ('installed_on'::text, 'timestamp with time zone'::text, TRUE, 'now()'::text),
+                ('success'::text, 'boolean'::text, TRUE, NULL::text),
+                ('checksum'::text, 'bytea'::text, TRUE, NULL::text),
+                ('execution_time'::text, 'bigint'::text, TRUE, NULL::text)
+        ),
+        actual_columns AS (
+            SELECT attribute.attname::text AS name,
+                   pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                       AS type_name,
+                   attribute.attnotnull AS not_null,
+                   pg_catalog.pg_get_expr(default_value.adbin, default_value.adrelid)
+                       AS default_expression,
+                   attribute.attidentity,
+                   attribute.attgenerated
+            FROM ledger
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = ledger.oid
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+        ),
+        primary_key AS (
+            SELECT constraint.*
+            FROM ledger
+            JOIN pg_catalog.pg_constraint AS constraint
+              ON constraint.conrelid = ledger.oid
+             AND constraint.contype = 'p'
+        )
+        SELECT COALESCE((
+            SELECT ledger.relkind = 'r'
+               AND ledger.relpersistence = 'p'
+               AND NOT ledger.relispartition
+               AND NOT ledger.relrowsecurity
+               AND NOT ledger.relforcerowsecurity
+               AND ledger.relreplident = 'd'
+               AND ledger.relowner = migration.oid
+               AND ledger.relam = (
+                    SELECT access_method.oid
+                    FROM pg_catalog.pg_am AS access_method
+                    WHERE access_method.amname = 'heap'
+               )
+               AND (SELECT count(*) FROM actual_columns) = 6
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM expected_columns
+                    FULL JOIN actual_columns USING (name)
+                    WHERE expected_columns.name IS NULL
+                       OR actual_columns.name IS NULL
+                       OR expected_columns.type_name <> actual_columns.type_name
+                       OR expected_columns.not_null <> actual_columns.not_null
+                       OR expected_columns.default_expression
+                            IS DISTINCT FROM actual_columns.default_expression
+                       OR actual_columns.attidentity <> ''
+                       OR actual_columns.attgenerated <> ''
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_attribute AS attribute
+                    WHERE attribute.attrelid = ledger.oid
+                      AND attribute.attnum > 0
+                      AND attribute.attisdropped
+               )
+               AND (SELECT count(*) FROM primary_key) = 1
+               AND (SELECT conkey FROM primary_key) = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = ledger.oid
+                          AND attribute.attname = 'version'
+                    )
+               ]::smallint[]
+               AND NOT (SELECT condeferrable FROM primary_key)
+               AND NOT (SELECT condeferred FROM primary_key)
+               AND (SELECT convalidated FROM primary_key)
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_constraint AS constraint
+                    WHERE constraint.conrelid = ledger.oid
+                      AND constraint.contype <> 'p'
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_trigger AS trigger
+                    WHERE trigger.tgrelid = ledger.oid
+                      AND NOT trigger.tgisinternal
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_policy AS policy
+                    WHERE policy.polrelid = ledger.oid
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_inherits AS inheritance
+                    WHERE inheritance.inhrelid = ledger.oid
+                       OR inheritance.inhparent = ledger.oid
+               )
+            FROM ledger
+            CROSS JOIN migration
+        ), FALSE)
+        "#,
+    )
+    .bind(migration_role)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(MigrationVerificationError::Metadata)?;
+    if !exact {
+        return Err(MigrationVerificationError::Metadata(role_protocol_error(
+            "public._sqlx_migrations is not the exact owned SQLx ledger table",
+        )));
+    }
+    Ok(())
 }
 
 /// Read-only verification of the database migration ledger. This deliberately
@@ -1548,6 +2101,233 @@ struct RawPostgresqlRuntimeFacts {
     tls_bits: Option<i32>,
     client_distinguished_name: Option<String>,
     issuer_distinguished_name: Option<String>,
+}
+
+/// SQL-visible identity of the exact, direct migration backend. Every field is
+/// read from one joined catalog row for `pg_backend_pid()`, then projected into
+/// the closed core preimage that the independent infrastructure authority must
+/// sign. The raw form keeps fallible PostgreSQL integer/NULL values out of the
+/// trusted type until local validation succeeds.
+struct RawPostgresqlMigrationSessionBinding {
+    server_version_num: i32,
+    database_name: String,
+    database_oid: i64,
+    datid: Option<i64>,
+    server_address: Option<String>,
+    server_port: Option<i32>,
+    primary: bool,
+    transaction_writable: bool,
+    default_transaction_writable: bool,
+    client_address: Option<String>,
+    client_port: Option<i32>,
+    backend_process_id: i32,
+    backend_start: DateTime<Utc>,
+    backend_type: String,
+    application_name: String,
+    session_login_role: String,
+    session_user_oid: Option<i64>,
+    current_role: String,
+    selected_role: String,
+    tls_enabled: Option<bool>,
+    tls_protocol: Option<String>,
+    tls_cipher: Option<String>,
+    tls_bits: Option<i32>,
+    client_distinguished_name: Option<String>,
+    issuer_distinguished_name: Option<String>,
+}
+
+fn migration_session_contract_error(message: impl Into<String>) -> String {
+    format!(
+        "production migration session contract was not proven: {}",
+        message.into()
+    )
+}
+
+fn validate_migration_optional_distinguished_name(
+    label: &str,
+    value: Option<String>,
+) -> Result<Option<String>, String> {
+    match value {
+        Some(value)
+            if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) =>
+        {
+            Err(migration_session_contract_error(format!(
+                "TLS {label} is empty, oversized, or contains control characters"
+            )))
+        }
+        value => Ok(value),
+    }
+}
+
+fn validate_postgresql_migration_session_binding(
+    raw: RawPostgresqlMigrationSessionBinding,
+    application_name: &str,
+    contract: &MigrationRoleContract,
+    tls_channel_binding: &PostgresqlTlsChannelBinding,
+) -> Result<PostgresqlSessionBinding, String> {
+    let server_version_num = u32::try_from(raw.server_version_num).map_err(|_| {
+        migration_session_contract_error("server_version_num is not a positive integer")
+    })?;
+    let server_major_version = u16::try_from(server_version_num / 10_000)
+        .map_err(|_| migration_session_contract_error("server major version is out of range"))?;
+    if server_major_version != REQUIRED_PRODUCTION_POSTGRESQL_MAJOR_VERSION {
+        return Err(migration_session_contract_error(format!(
+            "PostgreSQL major version must equal {REQUIRED_PRODUCTION_POSTGRESQL_MAJOR_VERSION}"
+        )));
+    }
+    canonical_database_role_name("database_name", raw.database_name.clone())
+        .map_err(migration_session_contract_error)?;
+    if raw.database_name == "postgres" {
+        return Err(migration_session_contract_error(
+            "the administrative postgres database is not a production migration target",
+        ));
+    }
+    let database_oid = u32::try_from(raw.database_oid)
+        .ok()
+        .filter(|oid| *oid != 0)
+        .ok_or_else(|| migration_session_contract_error("current database OID is invalid"))?;
+    let datid = raw
+        .datid
+        .and_then(|oid| u32::try_from(oid).ok())
+        .filter(|oid| *oid != 0)
+        .ok_or_else(|| migration_session_contract_error("backend datid is invalid"))?;
+    if datid != database_oid {
+        return Err(migration_session_contract_error(
+            "backend datid does not equal the current database OID",
+        ));
+    }
+    let server_address = raw
+        .server_address
+        .ok_or_else(|| migration_session_contract_error("TCP session has no server address"))?
+        .parse::<IpAddr>()
+        .map_err(|_| migration_session_contract_error("server address is not a canonical IP"))?;
+    let server_address = server_address.to_string();
+    let server_port = raw
+        .server_port
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| migration_session_contract_error("server port is invalid"))?;
+    let client_address = raw
+        .client_address
+        .ok_or_else(|| migration_session_contract_error("TCP session has no client address"))?
+        .parse::<IpAddr>()
+        .map_err(|_| migration_session_contract_error("client address is not a canonical IP"))?;
+    let client_address = client_address.to_string();
+    let client_port = raw
+        .client_port
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| migration_session_contract_error("client port is invalid"))?;
+    let backend_process_id = u32::try_from(raw.backend_process_id)
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| migration_session_contract_error("backend process ID is invalid"))?;
+    if raw.backend_type != "client backend" {
+        return Err(migration_session_contract_error(
+            "backend_type is not client backend",
+        ));
+    }
+    if raw.application_name != application_name {
+        return Err(migration_session_contract_error(
+            "live application_name does not equal the nonce-derived request tag",
+        ));
+    }
+    if raw.current_role != contract.expected || raw.selected_role != contract.expected {
+        return Err(migration_session_contract_error(
+            "current and selected roles do not equal the receipt-bound migration role",
+        ));
+    }
+    canonical_database_role_name("session_login_role", raw.session_login_role.clone())
+        .map_err(migration_session_contract_error)?;
+    if raw.session_login_role == contract.expected
+        || raw.session_login_role == contract.application
+        || raw.session_login_role == "postgres"
+    {
+        return Err(migration_session_contract_error(
+            "session login role is not distinct from stable production roles",
+        ));
+    }
+    let session_user_oid = raw
+        .session_user_oid
+        .and_then(|oid| u32::try_from(oid).ok())
+        .filter(|oid| *oid != 0)
+        .ok_or_else(|| migration_session_contract_error("backend usesysid is invalid"))?;
+    if !raw.primary || !raw.transaction_writable || !raw.default_transaction_writable {
+        return Err(migration_session_contract_error(
+            "database must be a primary with current and default transactions writable",
+        ));
+    }
+    if raw.tls_enabled != Some(true) {
+        return Err(migration_session_contract_error(
+            "database transport is not an observed TLS session",
+        ));
+    }
+    let tls_protocol = raw
+        .tls_protocol
+        .filter(|protocol| matches!(protocol.as_str(), "TLSv1.2" | "TLSv1.3"))
+        .ok_or_else(|| migration_session_contract_error("TLS protocol must be 1.2 or 1.3"))?
+        .to_ascii_lowercase();
+    let tls_cipher_suite = raw
+        .tls_cipher
+        .filter(|cipher| {
+            !cipher.is_empty() && cipher.len() <= 256 && !cipher.chars().any(char::is_control)
+        })
+        .ok_or_else(|| migration_session_contract_error("TLS cipher is missing or invalid"))?
+        .to_ascii_lowercase();
+    let tls_cipher_bits = raw
+        .tls_bits
+        .and_then(|bits| u16::try_from(bits).ok())
+        .filter(|bits| *bits >= 128)
+        .ok_or_else(|| migration_session_contract_error("TLS cipher strength is below 128 bits"))?;
+    // Kubernetes Services and reviewed provider load balancers legitimately
+    // expose an entry address that differs from PostgreSQL's backend address.
+    // Both addresses are retained in the signed session/channel preimage; the
+    // authority's endpoint-derived exporter proves they belong to this exact
+    // TLS session. Requiring IP equality would reject ordinary DNAT while
+    // adding no cryptographic binding.
+    if tls_protocol != tls_channel_binding.tls_protocol
+        || tls_cipher_suite != tls_channel_binding.tls_cipher_suite
+        || tls_cipher_bits != tls_channel_binding.tls_cipher_bits
+    {
+        return Err(migration_session_contract_error(
+            "SQL-visible TLS endpoint or cipher differs from the caller-observed direct channel",
+        ));
+    }
+
+    Ok(PostgresqlSessionBinding {
+        application_name: raw.application_name,
+        database_name: raw.database_name,
+        database_oid,
+        datid,
+        server_address,
+        server_port,
+        server_major_version,
+        primary: raw.primary,
+        transaction_writable: raw.transaction_writable,
+        default_transaction_writable: raw.default_transaction_writable,
+        client_address,
+        client_port,
+        backend_process_id,
+        backend_start: raw.backend_start,
+        backend_type: raw.backend_type,
+        session_login_role: raw.session_login_role,
+        session_user_oid,
+        current_role: raw.current_role,
+        selected_role: raw.selected_role,
+        tls_enabled: true,
+        tls_protocol,
+        tls_cipher_suite,
+        tls_cipher_bits,
+        client_distinguished_name: validate_migration_optional_distinguished_name(
+            "client distinguished name",
+            raw.client_distinguished_name,
+        )?,
+        issuer_distinguished_name: validate_migration_optional_distinguished_name(
+            "issuer distinguished name",
+            raw.issuer_distinguished_name,
+        )?,
+        tls_channel_binding: tls_channel_binding.clone(),
+    })
 }
 
 fn observation_contract_error(message: impl Into<String>) -> PostgresqlRuntimeObservationError {
@@ -1764,6 +2544,149 @@ async fn read_postgresql_runtime_facts(
         client_distinguished_name: row.try_get("client_distinguished_name")?,
         issuer_distinguished_name: row.try_get("issuer_distinguished_name")?,
     })
+}
+
+async fn read_postgresql_migration_session_binding(
+    connection: &mut PgConnection,
+    application_name: &str,
+    contract: &MigrationRoleContract,
+    tls_channel_binding: &PostgresqlTlsChannelBinding,
+) -> Result<PostgresqlSessionBinding, String> {
+    let row = sqlx::query(
+        r#"
+            SELECT
+                pg_catalog.current_setting('server_version_num')::integer
+                    AS server_version_num,
+                pg_catalog.current_database()::text AS database_name,
+                database.oid::bigint AS database_oid,
+                activity.datid::bigint AS datid,
+                pg_catalog.inet_server_addr()::text AS server_address,
+                pg_catalog.inet_server_port() AS server_port,
+                NOT pg_catalog.pg_is_in_recovery() AS is_primary,
+                NOT pg_catalog.current_setting('transaction_read_only')::boolean
+                    AS transaction_writable,
+                NOT pg_catalog.current_setting('default_transaction_read_only')::boolean
+                    AS default_transaction_writable,
+                activity.client_addr::text AS client_address,
+                activity.client_port AS client_port,
+                activity.pid AS backend_process_id,
+                activity.backend_start AS backend_start,
+                activity.backend_type AS backend_type,
+                activity.application_name AS application_name,
+                session_user::text AS session_login_role,
+                activity.usesysid::bigint AS session_user_oid,
+                current_user::text AS current_role,
+                pg_catalog.current_setting('role') AS selected_role,
+                tls.ssl AS tls_enabled,
+                tls.version AS tls_protocol,
+                tls.cipher AS tls_cipher,
+                tls.bits AS tls_bits,
+                tls.client_dn AS client_distinguished_name,
+                tls.issuer_dn AS issuer_distinguished_name
+            FROM pg_catalog.pg_database AS database
+            JOIN pg_catalog.pg_stat_activity AS activity
+              ON activity.pid = pg_catalog.pg_backend_pid()
+             AND activity.datid = database.oid
+            LEFT JOIN pg_catalog.pg_stat_ssl AS tls
+              ON tls.pid = activity.pid
+            WHERE database.datname = pg_catalog.current_database()
+              AND activity.usesysid = (
+                    SELECT role.oid
+                    FROM pg_catalog.pg_roles AS role
+                    WHERE role.rolname = session_user
+              )
+            "#,
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|_| {
+        migration_session_contract_error(
+            "exact pg_stat_activity/pg_stat_ssl backend row could not be read",
+        )
+    })?;
+    let raw = RawPostgresqlMigrationSessionBinding {
+        server_version_num: row
+            .try_get("server_version_num")
+            .map_err(|_| migration_session_contract_error("server_version_num is invalid"))?,
+        database_name: row
+            .try_get("database_name")
+            .map_err(|_| migration_session_contract_error("database_name is invalid"))?,
+        database_oid: row
+            .try_get("database_oid")
+            .map_err(|_| migration_session_contract_error("database_oid is invalid"))?,
+        datid: row
+            .try_get("datid")
+            .map_err(|_| migration_session_contract_error("backend datid is invalid"))?,
+        server_address: row
+            .try_get("server_address")
+            .map_err(|_| migration_session_contract_error("server_address is invalid"))?,
+        server_port: row
+            .try_get("server_port")
+            .map_err(|_| migration_session_contract_error("server_port is invalid"))?,
+        primary: row
+            .try_get("is_primary")
+            .map_err(|_| migration_session_contract_error("primary state is invalid"))?,
+        transaction_writable: row
+            .try_get("transaction_writable")
+            .map_err(|_| migration_session_contract_error("transaction writability is invalid"))?,
+        default_transaction_writable: row.try_get("default_transaction_writable").map_err(
+            |_| migration_session_contract_error("default transaction writability is invalid"),
+        )?,
+        client_address: row
+            .try_get("client_address")
+            .map_err(|_| migration_session_contract_error("client_address is invalid"))?,
+        client_port: row
+            .try_get("client_port")
+            .map_err(|_| migration_session_contract_error("client_port is invalid"))?,
+        backend_process_id: row
+            .try_get("backend_process_id")
+            .map_err(|_| migration_session_contract_error("backend process ID is invalid"))?,
+        backend_start: row
+            .try_get("backend_start")
+            .map_err(|_| migration_session_contract_error("backend start time is invalid"))?,
+        backend_type: row
+            .try_get("backend_type")
+            .map_err(|_| migration_session_contract_error("backend_type is invalid"))?,
+        application_name: row
+            .try_get("application_name")
+            .map_err(|_| migration_session_contract_error("application_name is invalid"))?,
+        session_login_role: row
+            .try_get("session_login_role")
+            .map_err(|_| migration_session_contract_error("session login role is invalid"))?,
+        session_user_oid: row
+            .try_get("session_user_oid")
+            .map_err(|_| migration_session_contract_error("session user OID is invalid"))?,
+        current_role: row
+            .try_get("current_role")
+            .map_err(|_| migration_session_contract_error("current role is invalid"))?,
+        selected_role: row
+            .try_get("selected_role")
+            .map_err(|_| migration_session_contract_error("selected role is invalid"))?,
+        tls_enabled: row
+            .try_get("tls_enabled")
+            .map_err(|_| migration_session_contract_error("TLS state is invalid"))?,
+        tls_protocol: row
+            .try_get("tls_protocol")
+            .map_err(|_| migration_session_contract_error("TLS protocol is invalid"))?,
+        tls_cipher: row
+            .try_get("tls_cipher")
+            .map_err(|_| migration_session_contract_error("TLS cipher is invalid"))?,
+        tls_bits: row
+            .try_get("tls_bits")
+            .map_err(|_| migration_session_contract_error("TLS cipher bits are invalid"))?,
+        client_distinguished_name: row
+            .try_get("client_distinguished_name")
+            .map_err(|_| migration_session_contract_error("TLS client DN is invalid"))?,
+        issuer_distinguished_name: row
+            .try_get("issuer_distinguished_name")
+            .map_err(|_| migration_session_contract_error("TLS issuer DN is invalid"))?,
+    };
+    validate_postgresql_migration_session_binding(
+        raw,
+        application_name,
+        contract,
+        tls_channel_binding,
+    )
 }
 
 async fn observe_postgresql_runtime(
@@ -3407,14 +4330,11 @@ async fn attest_safe_default_privileges(
     Ok(())
 }
 
-async fn reconcile_application_privileges(
-    pool: &PgPool,
+async fn reconcile_application_privileges_in_transaction(
+    connection: &mut PgConnection,
     contract: &MigrationRoleContract,
 ) -> Result<(), sqlx::Error> {
-    {
-        let mut connection = pool.acquire().await?;
-        attest_public_table_inventory(&mut connection).await?;
-    }
+    attest_public_table_inventory(connection).await?;
 
     let app = quoted_identifier(&contract.application);
     let migration = quoted_identifier(&contract.expected);
@@ -3441,10 +4361,9 @@ async fn reconcile_application_privileges(
         ORDER BY procedure.oid
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
-    let mut transaction = pool.begin().await?;
     for statement in [
         format!("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM PUBLIC, {app}"),
         format!("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC, {app}"),
@@ -3473,7 +4392,7 @@ async fn reconcile_application_privileges(
              REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC, {app}"
         ),
     ] {
-        sqlx::query(&statement).execute(&mut *transaction).await?;
+        sqlx::query(&statement).execute(&mut *connection).await?;
     }
 
     // Trigger and validation functions are invoked by PostgreSQL and do not
@@ -3482,7 +4401,7 @@ async fn reconcile_application_privileges(
     for (object_kind, signature) in public_routines {
         let statement =
             format!("REVOKE ALL PRIVILEGES ON {object_kind} {signature} FROM PUBLIC, {app}");
-        sqlx::query(&statement).execute(&mut *transaction).await?;
+        sqlx::query(&statement).execute(&mut *connection).await?;
     }
 
     let column_acl_tables: Vec<(String, Vec<String>)> = sqlx::query_as(
@@ -3511,7 +4430,7 @@ async fn reconcile_application_privileges(
         "#,
     )
     .bind(&contract.application)
-    .fetch_all(&mut *transaction)
+    .fetch_all(&mut *connection)
     .await?;
     for (table, columns) in column_acl_tables {
         let columns = columns
@@ -3523,7 +4442,7 @@ async fn reconcile_application_privileges(
             "REVOKE ALL PRIVILEGES ({columns}) ON TABLE public.{} FROM PUBLIC, {app}",
             quoted_identifier(&table),
         );
-        sqlx::query(&statement).execute(&mut *transaction).await?;
+        sqlx::query(&statement).execute(&mut *connection).await?;
     }
 
     for ((insert, update, delete), policies) in groups {
@@ -3542,43 +4461,1827 @@ async fn reconcile_application_privileges(
             privileges.join(", "),
             qualified_policy_tables(&policies),
         );
-        sqlx::query(&statement).execute(&mut *transaction).await?;
+        sqlx::query(&statement).execute(&mut *connection).await?;
     }
     sqlx::query(&format!(
         "GRANT SELECT ON TABLE public._sqlx_migrations TO {app}"
     ))
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await?;
     sqlx::query(&format!(
         "GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO {app}"
     ))
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await?;
     sqlx::query(&format!(
         "GRANT EXECUTE ON FUNCTION public.reconcile_noisy_trigger_sites(integer) TO {app}"
     ))
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await?;
     sqlx::query(&format!(
         "GRANT EXECUTE ON FUNCTION \
          public.append_audit_log(uuid,text,text,text[],text,text,text,text,text,text,jsonb,text) \
          TO {app}"
     ))
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await?;
-    transaction.commit().await?;
 
-    let mut connection = pool.acquire().await?;
-    // `after_connect` already selected the stable migrator role on this
-    // physical connection. Re-establish the authenticated login identity
+    // The migration bootstrap already selected the stable migrator role on
+    // this physical connection. Re-establish the authenticated login identity
     // before replaying the exact membership attestation; otherwise the
-    // intentional `current_user = session_user` precondition fails on a safe
-    // pooled connection after migration work.
+    // intentional `current_user = session_user` precondition fails after
+    // migration work on either the local pool or production direct path.
     sqlx::query("RESET ROLE").execute(&mut *connection).await?;
-    attest_migration_connection(&mut connection, contract).await?;
-    attest_safe_default_privileges(&mut connection, &contract.expected).await?;
-    attest_application_routine_acl(&mut connection, &contract.application).await?;
-    attest_application_acl(&mut connection, &contract.application).await
+    attest_migration_connection(connection, contract).await?;
+    attest_safe_default_privileges(connection, &contract.expected).await?;
+    attest_application_routine_acl(connection, &contract.application).await?;
+    attest_application_acl(connection, &contract.application).await
+}
+
+async fn reconcile_application_privileges(
+    pool: &PgPool,
+    contract: &MigrationRoleContract,
+) -> Result<(), sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    let mut transaction = connection.begin().await?;
+    let result = reconcile_application_privileges_in_transaction(&mut transaction, contract).await;
+    match result {
+        Ok(()) => transaction.commit().await,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+const PRODUCTION_MIGRATION_PROOF_SAFETY_MARGIN_SECS: i64 = 30;
+const PRODUCTION_MIGRATION_PREFLIGHT_TIMEOUT_MILLIS: u64 = 30_000;
+const PRODUCTION_MIGRATION_COMMIT_ACK_TIMEOUT_SECS: u64 = 30;
+const PRODUCTION_MIGRATION_SESSION_LOCK_ID: i64 = 0x7279_756b_695f_6d67;
+const PRODUCTION_MIGRATION_RELEASE_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-production-migration-release-binding-v1";
+const PRODUCTION_MIGRATION_TARGET_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-production-migration-target-binding-v1";
+const PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT: &str =
+    "ryuki-production-migration-operation-id-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionMigrationWaveLimits {
+    deadline_at: DateTime<Utc>,
+    whole_wave_timeout: Duration,
+    statement_timeout_millis: u64,
+    lock_timeout_millis: u64,
+}
+
+fn canonical_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn framed_migration_digest(contract: &str, fields: &[(&str, &str)]) -> String {
+    let mut digest = Sha256::new();
+    for bytes in std::iter::once(contract.as_bytes()).chain(
+        fields
+            .iter()
+            .flat_map(|(label, value)| [label.as_bytes(), value.as_bytes()]),
+    ) {
+        digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn production_database_provider_id(provider: ProductionDatabaseProvider) -> &'static str {
+    match provider {
+        ProductionDatabaseProvider::CloudNativePg => "cloudnativepg",
+        ProductionDatabaseProvider::AwsRds => "aws-rds",
+        ProductionDatabaseProvider::AzurePostgresql => "azure-postgresql",
+        ProductionDatabaseProvider::GcpCloudSql => "gcp-cloud-sql",
+    }
+}
+
+fn production_migration_target_binding_digest(
+    database_provider: ProductionDatabaseProvider,
+    provider_route_binding_digest: &str,
+    server_major_version: u16,
+    database_identity_digest: &str,
+    storage_binding_digest: &str,
+    application_role: &str,
+    migration_role: &str,
+) -> String {
+    let server_major_version = server_major_version.to_string();
+    framed_migration_digest(
+        PRODUCTION_MIGRATION_TARGET_BINDING_DIGEST_CONTRACT,
+        &[
+            (
+                "database_provider",
+                production_database_provider_id(database_provider),
+            ),
+            (
+                "provider_route_binding_digest",
+                provider_route_binding_digest,
+            ),
+            ("server_major_version", &server_major_version),
+            ("database_identity_digest", database_identity_digest),
+            ("storage_binding_digest", storage_binding_digest),
+            ("application_role", application_role),
+            ("migration_role", migration_role),
+        ],
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionMigrationSnapshotState {
+    Connected,
+    SessionLocked,
+    RepeatableReadStarted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionMigrationSnapshotEvent {
+    SessionLockAcquired,
+    RepeatableReadStarted,
+}
+
+fn advance_production_migration_snapshot_state(
+    state: ProductionMigrationSnapshotState,
+    event: ProductionMigrationSnapshotEvent,
+) -> Result<ProductionMigrationSnapshotState, String> {
+    match (state, event) {
+        (
+            ProductionMigrationSnapshotState::Connected,
+            ProductionMigrationSnapshotEvent::SessionLockAcquired,
+        ) => Ok(ProductionMigrationSnapshotState::SessionLocked),
+        (
+            ProductionMigrationSnapshotState::SessionLocked,
+            ProductionMigrationSnapshotEvent::RepeatableReadStarted,
+        ) => Ok(ProductionMigrationSnapshotState::RepeatableReadStarted),
+        _ => Err(
+            "production migration repeatable-read snapshot requires the pre-BEGIN session lock"
+                .into(),
+        ),
+    }
+}
+
+fn production_migration_operation_marker(
+    execution: &crate::security_contracts::VerifiedProductionMigrationExecution,
+) -> ProductionMigrationOperationMarker {
+    let proof = execution.verified_infrastructure();
+    let profile_version = proof.attestation_profile_version().to_string();
+    // Workload-instance and authority-key identity are intentionally excluded:
+    // a new one-shot pod and a rotated authority must be able to reconcile the
+    // same release operation after a lost COMMIT acknowledgement. Source,
+    // artifact, profile, namespace, exact database/storage identity, roles, and
+    // final inventory remain fixed and independently re-attested.
+    let release_binding_digest = framed_migration_digest(
+        PRODUCTION_MIGRATION_RELEASE_BINDING_DIGEST_CONTRACT,
+        &[
+            ("deployment_id", proof.deployment_id()),
+            ("trust_domain_id", proof.trust_domain_id()),
+            ("workload_id", proof.workload_id()),
+            ("source_revision", proof.source_revision()),
+            ("artifact_digest", proof.artifact_digest()),
+            ("attestation_profile_id", proof.attestation_profile_id()),
+            ("attestation_profile_version", &profile_version),
+            (
+                "attestation_profile_digest",
+                proof.attestation_profile_digest(),
+            ),
+        ],
+    );
+    let target_binding_digest = production_migration_target_binding_digest(
+        proof.database_provider(),
+        proof.provider_route_binding_digest(),
+        proof.server_major_version(),
+        proof.database_identity_digest(),
+        proof.storage_binding_digest(),
+        proof.application_role(),
+        proof.migration_role(),
+    );
+    let migration_inventory_digest = execution.expected_migration_inventory_digest().to_owned();
+    let operation_id = framed_migration_digest(
+        PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
+        &[
+            ("release_binding_digest", &release_binding_digest),
+            ("target_binding_digest", &target_binding_digest),
+            ("migration_inventory_digest", &migration_inventory_digest),
+        ],
+    );
+    ProductionMigrationOperationMarker {
+        operation_id,
+        release_binding_digest,
+        target_binding_digest,
+        migration_inventory_digest,
+        attestation_response_digest: proof.response_digest().to_owned(),
+        session_binding_digest: proof.session_binding_digest().to_owned(),
+    }
+}
+
+fn production_migration_preflight_timeouts(
+    configured: MigrationTimeouts,
+) -> Result<(u64, u64), String> {
+    if configured.statement_timeout_secs != REVIEWED_PRODUCTION_MIGRATION_STATEMENT_TIMEOUT_SECS
+        || configured.lock_timeout_secs != REVIEWED_PRODUCTION_MIGRATION_LOCK_TIMEOUT_SECS
+        || !(MIN_MIGRATION_STATEMENT_TIMEOUT_SECS..=MAX_MIGRATION_STATEMENT_TIMEOUT_SECS)
+            .contains(&configured.statement_timeout_secs)
+        || !(MIN_MIGRATION_LOCK_TIMEOUT_SECS..=MAX_MIGRATION_LOCK_TIMEOUT_SECS)
+            .contains(&configured.lock_timeout_secs)
+        || configured.lock_timeout_secs >= configured.statement_timeout_secs
+    {
+        return Err(
+            "production migration timeouts must equal the reviewed 180-second statement and 30-second lock contract"
+                .into(),
+        );
+    }
+    let statement_timeout_millis = configured
+        .statement_timeout_secs
+        .checked_mul(1_000)
+        .ok_or_else(|| "production migration statement timeout is out of range".to_owned())?
+        .min(PRODUCTION_MIGRATION_PREFLIGHT_TIMEOUT_MILLIS);
+    let lock_timeout_millis = configured
+        .lock_timeout_secs
+        .checked_mul(1_000)
+        .ok_or_else(|| "production migration lock timeout is out of range".to_owned())?
+        .min(statement_timeout_millis.saturating_sub(1));
+    if statement_timeout_millis == 0 || lock_timeout_millis == 0 {
+        return Err("production migration preflight timeouts cannot be disabled".into());
+    }
+    Ok((statement_timeout_millis, lock_timeout_millis))
+}
+
+fn production_migration_wave_limits(
+    now: DateTime<Utc>,
+    proof_valid_until: DateTime<Utc>,
+    configured: MigrationTimeouts,
+) -> Result<ProductionMigrationWaveLimits, String> {
+    let deadline_at = proof_valid_until
+        .checked_sub_signed(chrono::TimeDelta::seconds(
+            PRODUCTION_MIGRATION_PROOF_SAFETY_MARGIN_SECS,
+        ))
+        .ok_or_else(|| "PostgreSQL proof validity cannot provide a safe DDL deadline".to_owned())?;
+    let remaining_millis = deadline_at.signed_duration_since(now).num_milliseconds();
+    if remaining_millis < 2_000 {
+        return Err(
+            "PostgreSQL proof expires too soon to start an atomic production migration".into(),
+        );
+    }
+    let remaining_millis = u64::try_from(remaining_millis)
+        .map_err(|_| "PostgreSQL proof deadline is out of range".to_owned())?;
+    let configured_statement_millis = configured
+        .statement_timeout_secs
+        .checked_mul(1_000)
+        .ok_or_else(|| "production migration statement timeout is out of range".to_owned())?;
+    let configured_lock_millis = configured
+        .lock_timeout_secs
+        .checked_mul(1_000)
+        .ok_or_else(|| "production migration lock timeout is out of range".to_owned())?;
+    let statement_timeout_millis =
+        configured_statement_millis.min(remaining_millis.saturating_sub(1_000));
+    let lock_timeout_millis =
+        configured_lock_millis.min(statement_timeout_millis.saturating_sub(1));
+    if statement_timeout_millis == 0 || lock_timeout_millis == 0 {
+        return Err("PostgreSQL proof window cannot contain the configured DDL timeouts".into());
+    }
+    Ok(ProductionMigrationWaveLimits {
+        deadline_at,
+        whole_wave_timeout: Duration::from_millis(remaining_millis),
+        statement_timeout_millis,
+        lock_timeout_millis,
+    })
+}
+
+async fn set_local_migration_timeouts(
+    connection: &mut PgConnection,
+    statement_timeout_millis: u64,
+    lock_timeout_millis: u64,
+) -> Result<(), sqlx::Error> {
+    let statement_timeout = format!("{statement_timeout_millis}ms");
+    let lock_timeout = format!("{lock_timeout_millis}ms");
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+                pg_catalog.set_config('lock_timeout', $2, true), \
+                pg_catalog.set_config('standard_conforming_strings', 'on', true)",
+    )
+    .bind(statement_timeout)
+    .bind(lock_timeout)
+    .execute(&mut *connection)
+    .await?;
+    let observed: (i64, i64, bool) = sqlx::query_as(
+        "SELECT \
+             (SELECT setting::bigint FROM pg_catalog.pg_settings \
+              WHERE name = 'statement_timeout' AND unit = 'ms'), \
+             (SELECT setting::bigint FROM pg_catalog.pg_settings \
+              WHERE name = 'lock_timeout' AND unit = 'ms'), \
+             pg_catalog.current_setting('standard_conforming_strings') = 'on'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if observed
+        != (
+            i64::try_from(statement_timeout_millis)
+                .map_err(|_| role_protocol_error("statement timeout is out of range"))?,
+            i64::try_from(lock_timeout_millis)
+                .map_err(|_| role_protocol_error("lock timeout is out of range"))?,
+            true,
+        )
+    {
+        return Err(role_protocol_error(
+            "migration transaction did not retain the exact bounded timeouts and parser mode",
+        ));
+    }
+    Ok(())
+}
+
+async fn establish_exact_migration_role(
+    connection: &mut PgConnection,
+    contract: &MigrationRoleContract,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("RESET ROLE").execute(&mut *connection).await?;
+    attest_migration_connection(connection, contract).await?;
+    attest_safe_default_privileges(connection, &contract.expected).await?;
+    let search_path: String =
+        sqlx::query_scalar("SELECT pg_catalog.set_config('search_path', 'public', true)")
+            .fetch_one(&mut *connection)
+            .await?;
+    let exact: bool = sqlx::query_scalar(
+        "SELECT $1 = 'public' \
+                AND pg_catalog.current_setting('search_path') = 'public' \
+                AND current_user = $2::name \
+                AND pg_catalog.current_setting('role') = $2",
+    )
+    .bind(search_path)
+    .bind(&contract.expected)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "migration transaction did not establish the exact role and search_path",
+        ));
+    }
+    Ok(())
+}
+
+async fn acquire_bounded_session_migration_lock(
+    connection: &mut PgConnection,
+    lock_timeout_millis: u64,
+) -> Result<(), sqlx::Error> {
+    let timeout = Duration::from_millis(lock_timeout_millis);
+    let started = Instant::now();
+    loop {
+        let elapsed = started.elapsed();
+        let remaining = timeout.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            return Err(role_protocol_error(
+                "production migration session advisory-lock deadline elapsed",
+            ));
+        }
+        let acquired: bool = tokio::time::timeout(
+            remaining,
+            sqlx::query_scalar("SELECT pg_catalog.pg_try_advisory_lock($1)")
+                .bind(PRODUCTION_MIGRATION_SESSION_LOCK_ID)
+                .fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|_| {
+            role_protocol_error("production migration session advisory-lock query deadline elapsed")
+        })??;
+        if acquired {
+            return Ok(());
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(role_protocol_error(
+                "production migration session advisory-lock deadline elapsed",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50).min(timeout.saturating_sub(elapsed))).await;
+    }
+}
+
+/// Replace the pre-BEGIN session lock with an unreleaseable transaction lock
+/// before embedded migration SQL can run. Holding the session lock while the
+/// transaction lock is acquired makes this promotion non-blocking with respect
+/// to other migration runners. PostgreSQL exposes no transaction-advisory-lock
+/// unlock operation, so raw migration SQL cannot drop the serialization fence.
+async fn promote_to_transaction_migration_lock(
+    connection: &mut PgConnection,
+    lock_timeout_millis: u64,
+) -> Result<(), sqlx::Error> {
+    let timeout = Duration::from_millis(lock_timeout_millis);
+    let transaction_lock_acquired: bool = tokio::time::timeout(
+        timeout,
+        sqlx::query_scalar("SELECT pg_catalog.pg_try_advisory_xact_lock($1)")
+            .bind(PRODUCTION_MIGRATION_SESSION_LOCK_ID)
+            .fetch_one(&mut *connection),
+    )
+    .await
+    .map_err(|_| {
+        role_protocol_error(
+            "production migration transaction advisory-lock promotion deadline elapsed",
+        )
+    })??;
+    if !transaction_lock_acquired {
+        return Err(role_protocol_error(
+            "production migration transaction advisory-lock promotion failed while the session lock was held",
+        ));
+    }
+
+    let session_lock_released: bool = tokio::time::timeout(
+        timeout,
+        sqlx::query_scalar("SELECT pg_catalog.pg_advisory_unlock($1)")
+            .bind(PRODUCTION_MIGRATION_SESSION_LOCK_ID)
+            .fetch_one(&mut *connection),
+    )
+    .await
+    .map_err(|_| {
+        role_protocol_error(
+            "production migration session advisory-lock release deadline elapsed after promotion",
+        )
+    })??;
+    if !session_lock_released {
+        return Err(role_protocol_error(
+            "production migration session advisory lock was not retained through transaction-lock promotion",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_atomic_migration_shape(entries: &[(i64, bool, bool)]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err("atomic production migration inventory is empty".into());
+    }
+    let mut previous = None;
+    for (version, is_down, no_tx) in entries {
+        if *version <= 0 || previous.is_some_and(|previous| *version <= previous) {
+            return Err("atomic production migration versions are not strictly increasing".into());
+        }
+        if *is_down {
+            return Err("atomic production migration inventory contains a down migration".into());
+        }
+        if *no_tx {
+            return Err(
+                "atomic production migration inventory contains a no-transaction migration".into(),
+            );
+        }
+        previous = Some(*version);
+    }
+    Ok(())
+}
+
+const MAX_ATOMIC_MIGRATION_SQL_BYTES: usize = 1024 * 1024;
+const MAX_ATOMIC_MIGRATION_STATEMENTS: usize = 4_096;
+const MAX_ATOMIC_MIGRATION_TOKENS: usize = 65_536;
+const MAX_ATOMIC_MIGRATION_TOKENS_PER_STATEMENT: usize = 8_192;
+const MAX_ATOMIC_MIGRATION_PAREN_DEPTH: usize = 128;
+const MAX_ATOMIC_MIGRATION_BLOCK_COMMENT_DEPTH: usize = 64;
+const MAX_ATOMIC_MIGRATION_DOLLAR_TAG_BYTES: usize = 128;
+const MAX_ATOMIC_MIGRATION_IDENTIFIER_BYTES: usize = 128;
+const MAX_ATOMIC_MIGRATION_CAPTURED_LITERAL_BYTES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AtomicMigrationSqlToken {
+    Identifier { normalized: String, quoted: bool },
+    StringLiteral(Option<String>),
+    Equals,
+    Other,
+}
+
+impl AtomicMigrationSqlToken {
+    fn is_keyword(&self, expected: &str) -> bool {
+        matches!(
+            self,
+            Self::Identifier {
+                normalized,
+                quoted: false,
+            } if normalized == expected
+        )
+    }
+}
+
+fn atomic_migration_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || !byte.is_ascii()
+}
+
+fn atomic_migration_identifier_continue(byte: u8) -> bool {
+    atomic_migration_identifier_start(byte) || byte.is_ascii_digit() || byte == b'$'
+}
+
+fn atomic_migration_contains_forbidden_lock_release(sql: &str) -> bool {
+    let normalized = sql.to_ascii_uppercase();
+    let bytes = normalized.as_bytes();
+    ["PG_ADVISORY_UNLOCK", "PG_ADVISORY_UNLOCK_ALL"]
+        .into_iter()
+        .any(|forbidden| {
+            bytes
+                .windows(forbidden.len())
+                .enumerate()
+                .any(|(start, candidate)| {
+                    candidate == forbidden.as_bytes()
+                        && start
+                            .checked_sub(1)
+                            .and_then(|before| bytes.get(before))
+                            .is_none_or(|byte| !atomic_migration_identifier_continue(*byte))
+                        && bytes
+                            .get(start + forbidden.len())
+                            .is_none_or(|byte| !atomic_migration_identifier_continue(*byte))
+                })
+        })
+}
+
+fn atomic_migration_dollar_delimiter(bytes: &[u8], start: usize) -> Result<Option<&[u8]>, String> {
+    if bytes.get(start) != Some(&b'$') {
+        return Ok(None);
+    }
+    let Some(next) = bytes.get(start + 1).copied() else {
+        return Ok(None);
+    };
+    if next == b'$' {
+        return Ok(Some(&bytes[start..start + 2]));
+    }
+    if !(next.is_ascii_alphabetic() || next == b'_') {
+        return Ok(None);
+    }
+    let mut cursor = start + 2;
+    while let Some(byte) = bytes.get(cursor).copied() {
+        if byte == b'$' {
+            let delimiter = &bytes[start..=cursor];
+            if delimiter.len() > MAX_ATOMIC_MIGRATION_DOLLAR_TAG_BYTES + 2 {
+                return Err("contains an overlong dollar-quote tag".into());
+            }
+            return Ok(Some(delimiter));
+        }
+        if !(byte.is_ascii_alphanumeric() || byte == b'_') {
+            return Ok(None);
+        }
+        if cursor - start > MAX_ATOMIC_MIGRATION_DOLLAR_TAG_BYTES {
+            return Err("contains an overlong dollar-quote tag".into());
+        }
+        cursor += 1;
+    }
+    Ok(None)
+}
+
+fn scan_atomic_migration_single_quote(
+    sql: &str,
+    quote_start: usize,
+    backslash_escapes: bool,
+) -> Result<(usize, Option<String>), String> {
+    let bytes = sql.as_bytes();
+    let mut cursor = quote_start + 1;
+    let content_start = cursor;
+    let mut simple_literal = true;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\'' if bytes.get(cursor + 1) == Some(&b'\'') => {
+                simple_literal = false;
+                cursor += 2;
+            }
+            b'\'' => {
+                let captured = if simple_literal
+                    && cursor - content_start <= MAX_ATOMIC_MIGRATION_CAPTURED_LITERAL_BYTES
+                {
+                    Some(sql[content_start..cursor].to_owned())
+                } else {
+                    None
+                };
+                return Ok((cursor + 1, captured));
+            }
+            b'\\' if backslash_escapes => {
+                simple_literal = false;
+                cursor = cursor
+                    .checked_add(2)
+                    .ok_or_else(|| "contains an overlong escape string".to_owned())?;
+            }
+            b'\\' if bytes.get(cursor + 1) == Some(&b'\'') => {
+                return Err(
+                    "contains a backslash-quote sequence whose parse depends on standard_conforming_strings"
+                        .into(),
+                );
+            }
+            _ => cursor += 1,
+        }
+    }
+    Err("contains an unterminated string literal".into())
+}
+
+fn scan_atomic_migration_quoted_identifier(
+    sql: &str,
+    quote_start: usize,
+) -> Result<(usize, String), String> {
+    let bytes = sql.as_bytes();
+    let mut cursor = quote_start + 1;
+    let mut decoded = Vec::new();
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            if bytes.get(cursor + 1) == Some(&b'"') {
+                decoded.push(b'"');
+                cursor += 2;
+            } else {
+                let decoded = String::from_utf8(decoded)
+                    .map_err(|_| "contains a malformed quoted identifier".to_owned())?;
+                return Ok((cursor + 1, decoded.to_ascii_uppercase()));
+            }
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+        if decoded.len() > MAX_ATOMIC_MIGRATION_IDENTIFIER_BYTES {
+            return Err("contains an overlong quoted identifier".into());
+        }
+    }
+    Err("contains an unterminated quoted identifier".into())
+}
+
+fn is_reviewed_atomic_migration_set_exception(tokens: &[AtomicMigrationSqlToken]) -> bool {
+    // Six reviewed migrations deliberately cap ACCESS EXCLUSIVE waits at 30
+    // seconds. This exact transaction-local, finite setting is dominated by
+    // the proof-bounded whole-wave deadline. No other SET form is admitted.
+    tokens.len() == 5
+        && tokens[0].is_keyword("SET")
+        && tokens[1].is_keyword("LOCAL")
+        && tokens[2].is_keyword("LOCK_TIMEOUT")
+        && tokens[3] == AtomicMigrationSqlToken::Equals
+        && matches!(
+            &tokens[4],
+            AtomicMigrationSqlToken::StringLiteral(Some(value)) if value == "30s"
+        )
+}
+
+fn validate_atomic_migration_statement(tokens: &[AtomicMigrationSqlToken]) -> Result<(), String> {
+    let Some(first) = tokens.first() else {
+        return Ok(());
+    };
+    for forbidden in [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "ABORT",
+        "SAVEPOINT",
+        "RELEASE",
+        "DISCARD",
+        "LOAD",
+    ] {
+        if first.is_keyword(forbidden) {
+            return Err(format!(
+                "contains forbidden top-level {forbidden} statement"
+            ));
+        }
+    }
+    if first.is_keyword("START")
+        && tokens
+            .get(1)
+            .is_some_and(|token| token.is_keyword("TRANSACTION"))
+    {
+        return Err("contains forbidden top-level START TRANSACTION statement".into());
+    }
+    if first.is_keyword("PREPARE")
+        && tokens
+            .get(1)
+            .is_some_and(|token| token.is_keyword("TRANSACTION"))
+    {
+        return Err("contains forbidden top-level PREPARE TRANSACTION statement".into());
+    }
+    if first.is_keyword("RESET") {
+        return Err("contains forbidden top-level RESET statement".into());
+    }
+    if first.is_keyword("SET") {
+        if is_reviewed_atomic_migration_set_exception(tokens) {
+            return Ok(());
+        }
+        if tokens
+            .get(1)
+            .is_some_and(|token| token.is_keyword("CONSTRAINTS"))
+        {
+            return Ok(());
+        }
+        return Err("contains forbidden top-level SET outside the reviewed allowlist".into());
+    }
+    if first.is_keyword("COPY") {
+        let direction = tokens
+            .iter()
+            .position(|token| token.is_keyword("FROM") || token.is_keyword("TO"));
+        if direction.is_some_and(|direction| {
+            tokens[direction + 1..]
+                .iter()
+                .any(|token| token.is_keyword("PROGRAM"))
+        }) {
+            return Err("contains forbidden top-level COPY PROGRAM statement".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_atomic_migration_sql(sql: &str) -> Result<(), String> {
+    if sql.len() > MAX_ATOMIC_MIGRATION_SQL_BYTES {
+        return Err(format!(
+            "exceeds the {MAX_ATOMIC_MIGRATION_SQL_BYTES}-byte lexical validation bound"
+        ));
+    }
+    if atomic_migration_contains_forbidden_lock_release(sql) {
+        return Err(
+            "contains a forbidden session advisory-lock release primitive anywhere in the migration source"
+                .into(),
+        );
+    }
+    let bytes = sql.as_bytes();
+    let mut cursor = 0;
+    let mut paren_depth = 0;
+    let mut token_count = 0;
+    let mut statement_count = 0;
+    let mut statement = Vec::new();
+
+    let push_token = |statement: &mut Vec<AtomicMigrationSqlToken>,
+                      token_count: &mut usize,
+                      token: AtomicMigrationSqlToken|
+     -> Result<(), String> {
+        *token_count = token_count
+            .checked_add(1)
+            .ok_or_else(|| "contains too many lexical tokens".to_owned())?;
+        if *token_count > MAX_ATOMIC_MIGRATION_TOKENS
+            || statement.len() >= MAX_ATOMIC_MIGRATION_TOKENS_PER_STATEMENT
+        {
+            return Err("contains too many top-level lexical tokens".into());
+        }
+        statement.push(token);
+        Ok(())
+    };
+
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte.is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if byte == b'-' && bytes.get(cursor + 1) == Some(&b'-') {
+            cursor += 2;
+            while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                cursor += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+            cursor += 2;
+            let mut depth = 1;
+            while cursor < bytes.len() && depth > 0 {
+                if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+                    depth += 1;
+                    if depth > MAX_ATOMIC_MIGRATION_BLOCK_COMMENT_DEPTH {
+                        return Err("exceeds the nested block-comment depth bound".into());
+                    }
+                    cursor += 2;
+                } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            if depth != 0 {
+                return Err("contains an unterminated block comment".into());
+            }
+            continue;
+        }
+        if matches!(byte, b'e' | b'E') && bytes.get(cursor + 1) == Some(&b'\'') {
+            let (end, _) = scan_atomic_migration_single_quote(sql, cursor + 1, true)?;
+            if paren_depth == 0 {
+                push_token(
+                    &mut statement,
+                    &mut token_count,
+                    AtomicMigrationSqlToken::StringLiteral(None),
+                )?;
+            }
+            cursor = end;
+            continue;
+        }
+        if byte == b'\'' {
+            let (end, literal) = scan_atomic_migration_single_quote(sql, cursor, false)?;
+            if paren_depth == 0 {
+                push_token(
+                    &mut statement,
+                    &mut token_count,
+                    AtomicMigrationSqlToken::StringLiteral(literal),
+                )?;
+            }
+            cursor = end;
+            continue;
+        }
+        if byte == b'"' {
+            let (end, normalized) = scan_atomic_migration_quoted_identifier(sql, cursor)?;
+            if paren_depth == 0 {
+                push_token(
+                    &mut statement,
+                    &mut token_count,
+                    AtomicMigrationSqlToken::Identifier {
+                        normalized,
+                        quoted: true,
+                    },
+                )?;
+            }
+            cursor = end;
+            continue;
+        }
+        if byte == b'$' {
+            if let Some(delimiter) = atomic_migration_dollar_delimiter(bytes, cursor)? {
+                let body_start = cursor + delimiter.len();
+                let Some(relative_end) = bytes[body_start..]
+                    .windows(delimiter.len())
+                    .position(|window| window == delimiter)
+                else {
+                    return Err("contains an unterminated dollar-quoted body".into());
+                };
+                cursor = body_start + relative_end + delimiter.len();
+                if paren_depth == 0 {
+                    push_token(
+                        &mut statement,
+                        &mut token_count,
+                        AtomicMigrationSqlToken::StringLiteral(None),
+                    )?;
+                }
+                continue;
+            }
+        }
+        if atomic_migration_identifier_start(byte) {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len() && atomic_migration_identifier_continue(bytes[cursor]) {
+                cursor += 1;
+            }
+            if cursor - start > MAX_ATOMIC_MIGRATION_IDENTIFIER_BYTES {
+                return Err("contains an overlong unquoted identifier".into());
+            }
+            if paren_depth == 0 {
+                push_token(
+                    &mut statement,
+                    &mut token_count,
+                    AtomicMigrationSqlToken::Identifier {
+                        normalized: sql[start..cursor].to_ascii_uppercase(),
+                        quoted: false,
+                    },
+                )?;
+            }
+            continue;
+        }
+        match byte {
+            b'(' => {
+                paren_depth += 1;
+                if paren_depth > MAX_ATOMIC_MIGRATION_PAREN_DEPTH {
+                    return Err("exceeds the parenthesis depth bound".into());
+                }
+                cursor += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "contains an unmatched closing parenthesis".to_owned())?;
+                cursor += 1;
+            }
+            b';' => {
+                if paren_depth != 0 {
+                    cursor += 1;
+                    continue;
+                }
+                if !statement.is_empty() {
+                    statement_count += 1;
+                    if statement_count > MAX_ATOMIC_MIGRATION_STATEMENTS {
+                        return Err("contains too many top-level statements".into());
+                    }
+                    validate_atomic_migration_statement(&statement)
+                        .map_err(|error| format!("statement {statement_count} {error}"))?;
+                    statement.clear();
+                }
+                cursor += 1;
+            }
+            b'=' => {
+                if paren_depth == 0 {
+                    push_token(
+                        &mut statement,
+                        &mut token_count,
+                        AtomicMigrationSqlToken::Equals,
+                    )?;
+                }
+                cursor += 1;
+            }
+            _ => {
+                if paren_depth == 0 {
+                    push_token(
+                        &mut statement,
+                        &mut token_count,
+                        AtomicMigrationSqlToken::Other,
+                    )?;
+                }
+                cursor += 1;
+            }
+        }
+    }
+    if paren_depth != 0 {
+        return Err("contains an unterminated parenthesized expression".into());
+    }
+    if !statement.is_empty() {
+        statement_count += 1;
+        if statement_count > MAX_ATOMIC_MIGRATION_STATEMENTS {
+            return Err("contains too many top-level statements".into());
+        }
+        validate_atomic_migration_statement(&statement)
+            .map_err(|error| format!("statement {statement_count} {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_atomic_embedded_migration_plan() -> Result<(), String> {
+    let entries = EMBEDDED_MIGRATOR
+        .iter()
+        .map(|migration| {
+            (
+                migration.version,
+                migration.migration_type.is_down_migration(),
+                migration.no_tx,
+            )
+        })
+        .collect::<Vec<_>>();
+    validate_atomic_migration_shape(&entries)?;
+    if EMBEDDED_MIGRATOR
+        .iter()
+        .any(|migration| migration.sql.trim().is_empty() || migration.checksum.is_empty())
+    {
+        return Err("atomic production migration inventory contains empty content".into());
+    }
+    for migration in EMBEDDED_MIGRATOR.iter() {
+        validate_atomic_migration_sql(migration.sql.as_ref()).map_err(|error| {
+            format!(
+                "atomic production migration {} failed lexical validation: {error}",
+                migration.version
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AtomicMigrationTransactionGuard {
+    backend_process_id: i32,
+    transaction_id: i64,
+}
+
+async fn establish_atomic_migration_transaction_guard(
+    connection: &mut PgConnection,
+) -> Result<AtomicMigrationTransactionGuard, sqlx::Error> {
+    let observed: (i32, i64, bool, bool, bool) = sqlx::query_as(
+        "SELECT pg_catalog.pg_backend_pid(), \
+                pg_catalog.txid_current(), \
+                pg_catalog.current_setting('transaction_isolation') = 'repeatable read', \
+                pg_catalog.current_setting('transaction_read_only') = 'off', \
+                pg_catalog.current_setting('standard_conforming_strings') = 'on'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !observed.2 || !observed.3 || !observed.4 {
+        return Err(role_protocol_error(
+            "atomic migration transaction/parser settings were not pinned before raw SQL",
+        ));
+    }
+    Ok(AtomicMigrationTransactionGuard {
+        backend_process_id: observed.0,
+        transaction_id: observed.1,
+    })
+}
+
+async fn verify_atomic_migration_transaction_guard(
+    connection: &mut PgConnection,
+    expected: AtomicMigrationTransactionGuard,
+) -> Result<(), sqlx::Error> {
+    let exact: bool = sqlx::query_scalar(
+        "SELECT COALESCE(\
+             pg_catalog.pg_backend_pid() = $1 \
+             AND pg_catalog.txid_current_if_assigned() = $2 \
+             AND pg_catalog.current_setting('transaction_isolation') = 'repeatable read' \
+             AND pg_catalog.current_setting('transaction_read_only') = 'off' \
+             AND pg_catalog.current_setting('standard_conforming_strings') = 'on', \
+             FALSE\
+         )",
+    )
+    .bind(expected.backend_process_id)
+    .bind(expected.transaction_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "embedded migration changed the backend, transaction identity, isolation, writability, or parser mode",
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_atomic_embedded_migrations(
+    connection: &mut PgConnection,
+    contract: &MigrationRoleContract,
+    preflight_ledger: &[(i64, Vec<u8>, bool)],
+) -> Result<(), MigrationRunError> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS public._sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+            success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL,
+            execution_time BIGINT NOT NULL
+        )
+        "#,
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|source| MigrationRunError::AtomicApply { version: 0, source })?;
+    attest_sqlx_migrations_table(connection, &contract.expected).await?;
+    let retained_ledger = read_preflight_migration_ledger(connection, &contract.expected).await?;
+    if retained_ledger != preflight_ledger {
+        return Err(MigrationRunError::Preflight(
+            "migration ledger changed between signed preflight and atomic execution".into(),
+        ));
+    }
+
+    let transaction_guard = establish_atomic_migration_transaction_guard(connection)
+        .await
+        .map_err(|source| MigrationRunError::AtomicApply { version: 0, source })?;
+
+    for migration in EMBEDDED_MIGRATOR.iter().skip(preflight_ledger.len()) {
+        verify_atomic_migration_transaction_guard(connection, transaction_guard)
+            .await
+            .map_err(|source| MigrationRunError::AtomicApply {
+                version: migration.version,
+                source,
+            })?;
+        let started = Instant::now();
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&mut *connection)
+            .await
+            .map_err(|source| MigrationRunError::AtomicApply {
+                version: migration.version,
+                source,
+            })?;
+        verify_atomic_migration_transaction_guard(connection, transaction_guard)
+            .await
+            .map_err(|source| MigrationRunError::AtomicApply {
+                version: migration.version,
+                source,
+            })?;
+        let elapsed_nanos = i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX);
+        sqlx::query(
+            "INSERT INTO public._sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES ($1, $2, TRUE, $3, $4)",
+        )
+        .bind(migration.version)
+        .bind(migration.description.as_ref())
+        .bind(migration.checksum.as_ref())
+        .bind(elapsed_nanos)
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| MigrationRunError::AtomicApply {
+            version: migration.version,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+async fn attest_production_migration_operations_table(
+    connection: &mut PgConnection,
+    migration_role: &str,
+) -> Result<(), sqlx::Error> {
+    let exact: bool = sqlx::query_scalar(
+        r#"
+        WITH migration AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1::name
+        ),
+        marker AS (
+            SELECT class.*
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND class.relname = 'production_migration_operations'
+        ),
+        expected_columns(name, type_name, not_null) AS (
+            VALUES
+                ('operation_id'::text, 'text'::text, TRUE),
+                ('release_binding_digest'::text, 'text'::text, TRUE),
+                ('target_binding_digest'::text, 'text'::text, TRUE),
+                ('migration_inventory_digest'::text, 'text'::text, TRUE),
+                ('attestation_response_digest'::text, 'text'::text, TRUE),
+                ('session_binding_digest'::text, 'text'::text, TRUE),
+                ('completed_at'::text, 'timestamp with time zone'::text, TRUE)
+        ),
+        actual_columns AS (
+            SELECT attribute.attname::text AS name,
+                   pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                       AS type_name,
+                   attribute.attnotnull AS not_null,
+                   default_value.oid IS NOT NULL AS has_default,
+                   attribute.attidentity,
+                   attribute.attgenerated
+            FROM marker
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = marker.oid
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+        ),
+        primary_key AS (
+            SELECT constraint.*
+            FROM marker
+            JOIN pg_catalog.pg_constraint AS constraint
+              ON constraint.conrelid = marker.oid
+             AND constraint.contype = 'p'
+        ),
+        expected_triggers(name, trigger_type) AS (
+            VALUES
+                ('production_migration_operations_no_mutation'::text, 27::smallint),
+                ('production_migration_operations_no_truncate'::text, 34::smallint)
+        ),
+        actual_triggers AS (
+            SELECT trigger.tgname::text AS name,
+                   trigger.tgtype AS trigger_type,
+                   trigger.tgenabled,
+                   trigger.tgdeferrable,
+                   trigger.tginitdeferred,
+                   trigger.tgconstraint,
+                   procedure.proowner,
+                   procedure.prorettype,
+                   procedure.prosecdef,
+                   procedure.proleakproof,
+                   procedure.proconfig,
+                   procedure.prosrc,
+                   procedure.proname,
+                   procedure_namespace.nspname AS procedure_namespace,
+                   language.lanname
+            FROM marker
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = marker.oid
+             AND NOT trigger.tgisinternal
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid = trigger.tgfoid
+            JOIN pg_catalog.pg_namespace AS procedure_namespace
+              ON procedure_namespace.oid = procedure.pronamespace
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+        )
+        SELECT COALESCE((
+            SELECT marker.relkind = 'r'
+               AND marker.relpersistence = 'p'
+               AND NOT marker.relispartition
+               AND NOT marker.relrowsecurity
+               AND NOT marker.relforcerowsecurity
+               AND marker.relreplident = 'd'
+               AND marker.relowner = migration.oid
+               AND marker.relam = (
+                    SELECT access_method.oid
+                    FROM pg_catalog.pg_am AS access_method
+                    WHERE access_method.amname = 'heap'
+               )
+               AND (SELECT count(*) FROM actual_columns) = 7
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM expected_columns
+                    FULL JOIN actual_columns USING (name)
+                    WHERE expected_columns.name IS NULL
+                       OR actual_columns.name IS NULL
+                       OR expected_columns.type_name <> actual_columns.type_name
+                       OR expected_columns.not_null <> actual_columns.not_null
+                       OR actual_columns.has_default
+                       OR actual_columns.attidentity <> ''
+                       OR actual_columns.attgenerated <> ''
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_attribute AS attribute
+                    WHERE attribute.attrelid = marker.oid
+                      AND attribute.attnum > 0
+                      AND attribute.attisdropped
+               )
+               AND (SELECT count(*) FROM primary_key) = 1
+               AND (SELECT conkey FROM primary_key) = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = marker.oid
+                          AND attribute.attname = 'operation_id'
+                    )
+               ]::smallint[]
+               AND NOT (SELECT condeferrable FROM primary_key)
+               AND NOT (SELECT condeferred FROM primary_key)
+               AND (SELECT convalidated FROM primary_key)
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_constraint AS constraint
+                    WHERE constraint.conrelid = marker.oid
+                      AND constraint.contype <> 'p'
+               )
+               AND (SELECT count(*) FROM actual_triggers) = 2
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM expected_triggers
+                    FULL JOIN actual_triggers USING (name, trigger_type)
+                    WHERE expected_triggers.name IS NULL
+                       OR actual_triggers.name IS NULL
+                       OR actual_triggers.tgenabled <> 'O'
+                       OR actual_triggers.tgdeferrable
+                       OR actual_triggers.tginitdeferred
+                       OR actual_triggers.tgconstraint <> 0
+                       OR actual_triggers.proowner <> migration.oid
+                       OR actual_triggers.prorettype <>
+                          'pg_catalog.trigger'::regtype
+                       OR actual_triggers.prosecdef
+                       OR actual_triggers.proleakproof
+                       OR actual_triggers.proconfig IS DISTINCT FROM
+                          ARRAY['search_path=pg_catalog']::text[]
+                       OR actual_triggers.proname <>
+                          'prevent_production_migration_operation_mutation'
+                       OR actual_triggers.procedure_namespace <> 'public'
+                       OR actual_triggers.lanname <> 'plpgsql'
+                       OR actual_triggers.prosrc <> E'\nBEGIN\n    RAISE EXCEPTION ''production migration operation markers are permanent and append-only''\n        USING ERRCODE = ''23514'';\nEND;\n'
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_policy AS policy
+                    WHERE policy.polrelid = marker.oid
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_inherits AS inheritance
+                    WHERE inheritance.inhrelid = marker.oid
+                       OR inheritance.inhparent = marker.oid
+               )
+            FROM marker
+            CROSS JOIN migration
+        ), FALSE)
+        "#,
+    )
+    .bind(migration_role)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "production migration operation marker table is not the exact owner-protected append-only ledger",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_production_migration_operation_marker(
+    marker: &ProductionMigrationOperationMarker,
+) -> Result<(), String> {
+    if [
+        marker.operation_id.as_str(),
+        marker.release_binding_digest.as_str(),
+        marker.target_binding_digest.as_str(),
+        marker.migration_inventory_digest.as_str(),
+        marker.attestation_response_digest.as_str(),
+        marker.session_binding_digest.as_str(),
+    ]
+    .into_iter()
+    .any(|value| !canonical_sha256_digest(value))
+    {
+        return Err("production migration operation marker contains a noncanonical digest".into());
+    }
+    let expected_operation_id = framed_migration_digest(
+        PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
+        &[
+            ("release_binding_digest", &marker.release_binding_digest),
+            ("target_binding_digest", &marker.target_binding_digest),
+            (
+                "migration_inventory_digest",
+                &marker.migration_inventory_digest,
+            ),
+        ],
+    );
+    if marker.operation_id != expected_operation_id {
+        return Err(
+            "production migration operation id differs from its exact release/target/inventory projection"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn marker_reconciles_exact_operation(
+    observed: &ProductionMigrationOperationMarker,
+    expected: &ProductionMigrationOperationMarker,
+) -> Result<bool, String> {
+    validate_production_migration_operation_marker(observed)?;
+    validate_production_migration_operation_marker(expected)?;
+    Ok(observed.operation_id == expected.operation_id
+        && observed.release_binding_digest == expected.release_binding_digest
+        && observed.target_binding_digest == expected.target_binding_digest
+        && observed.migration_inventory_digest == expected.migration_inventory_digest)
+}
+
+async fn read_production_migration_operation_marker(
+    connection: &mut PgConnection,
+    operation_id: &str,
+) -> Result<Option<ProductionMigrationOperationMarker>, sqlx::Error> {
+    let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT operation_id, release_binding_digest, target_binding_digest, \
+                migration_inventory_digest, attestation_response_digest, session_binding_digest \
+         FROM public.production_migration_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(row.map(
+        |(
+            operation_id,
+            release_binding_digest,
+            target_binding_digest,
+            migration_inventory_digest,
+            attestation_response_digest,
+            session_binding_digest,
+        )| ProductionMigrationOperationMarker {
+            operation_id,
+            release_binding_digest,
+            target_binding_digest,
+            migration_inventory_digest,
+            attestation_response_digest,
+            session_binding_digest,
+        },
+    ))
+}
+
+async fn insert_production_migration_operation_marker(
+    connection: &mut PgConnection,
+    marker: &ProductionMigrationOperationMarker,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO public.production_migration_operations (\
+             operation_id, release_binding_digest, target_binding_digest, \
+             migration_inventory_digest, attestation_response_digest, \
+             session_binding_digest, completed_at\
+         ) VALUES ($1, $2, $3, $4, $5, $6, pg_catalog.clock_timestamp())",
+    )
+    .bind(&marker.operation_id)
+    .bind(&marker.release_binding_digest)
+    .bind(&marker.target_binding_digest)
+    .bind(&marker.migration_inventory_digest)
+    .bind(&marker.attestation_response_digest)
+    .bind(&marker.session_binding_digest)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+fn verify_attested_migration_session_projection(
+    execution: &crate::security_contracts::VerifiedProductionMigrationExecution,
+    binding: &PostgresqlSessionBinding,
+) -> Result<(), String> {
+    if execution.session_binding() != binding {
+        return Err("execution capability retained a different PostgreSQL session".into());
+    }
+    let proof = execution.verified_infrastructure();
+    proof
+        .verify_integrity()
+        .map_err(|error| format!("PostgreSQL infrastructure proof lost integrity: {error}"))?;
+    if proof.session_binding() != binding || proof.request_tag() != binding.application_name {
+        return Err("signed infrastructure proof retained a different PostgreSQL session".into());
+    }
+    let binding_digest = postgresql_session_binding_digest(binding)
+        .map_err(|error| format!("PostgreSQL session digest projection failed: {error}"))?;
+    if binding_digest != proof.session_binding_digest() {
+        return Err("signed PostgreSQL session digest differs from the exact local session".into());
+    }
+
+    let identity = proof.database_identity();
+    if proof.database_provider() != identity.database_provider
+        || proof.server_major_version() != binding.server_major_version
+        || identity.database_name != binding.database_name
+        || identity.database_oid != binding.database_oid
+        || identity.server_address != binding.server_address
+        || identity.server_port != binding.server_port
+        || identity.server_major_version != binding.server_major_version
+        || identity.primary != binding.primary
+        || identity.writable
+            != (binding.transaction_writable && binding.default_transaction_writable)
+        || identity.tls_enabled != binding.tls_enabled
+        || identity.tls_protocol != binding.tls_protocol
+        || identity.tls_cipher_suite != binding.tls_cipher_suite
+        || identity.tls_cipher_bits != binding.tls_cipher_bits
+        || proof.application_role() != execution.role_contract().application
+        || proof.migration_role() != execution.role_contract().expected
+    {
+        return Err(
+            "signed database identity/provider/role projection differs from the exact migration session"
+                .into(),
+        );
+    }
+    let identity_digest = postgresql_database_identity_digest(identity)
+        .map_err(|error| format!("PostgreSQL database identity projection failed: {error}"))?;
+    let storage_digest = postgresql_storage_binding_digest(proof.storage_bindings())
+        .map_err(|error| format!("PostgreSQL storage projection failed: {error}"))?;
+    if identity_digest != proof.database_identity_digest()
+        || storage_digest != proof.storage_binding_digest()
+        || proof.storage_bindings().iter().any(|binding| {
+            binding.provider_cluster_uid_digest != proof.provider_cluster_uid_digest()
+        })
+        || proof.migration_inventory_digest() != execution.expected_migration_inventory_digest()
+    {
+        return Err(
+            "signed database identity, storage, or migration digest is not self-consistent".into(),
+        );
+    }
+    Ok(())
+}
+
+async fn run_atomic_production_migration(
+    connection: &mut PgConnection,
+    tls_channel_binding: &PostgresqlTlsChannelBinding,
+    timeouts: MigrationTimeouts,
+    pending: crate::security_contracts::PendingProductionMigrationTarget,
+) -> Result<MigrationInventory, MigrationRunError> {
+    let application_name = pending
+        .request_tag_for_channel(tls_channel_binding)
+        .map_err(MigrationRunError::Target)?;
+    let role_contract = pending.migration_role_contract().clone();
+    let (configured_statement_millis, configured_lock_millis) =
+        production_migration_preflight_timeouts(timeouts).map_err(MigrationRunError::Admission)?;
+    // Serialize on the physical backend session before BEGIN. As the first
+    // command in the transaction, promote that ownership to the same
+    // transaction-scoped advisory key before releasing the session lock. Raw
+    // migration SQL never receives a session lock it can release, and
+    // PostgreSQL provides no transaction-advisory-lock unlock primitive.
+    let mut snapshot_state = ProductionMigrationSnapshotState::Connected;
+    acquire_bounded_session_migration_lock(connection, configured_lock_millis)
+        .await
+        .map_err(MigrationRunError::Connect)?;
+    snapshot_state = advance_production_migration_snapshot_state(
+        snapshot_state,
+        ProductionMigrationSnapshotEvent::SessionLockAcquired,
+    )
+    .map_err(MigrationRunError::Admission)?;
+    let mut transaction = connection
+        .begin_with("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE")
+        .await
+        .map_err(MigrationRunError::Connect)?;
+    promote_to_transaction_migration_lock(&mut transaction, configured_lock_millis)
+        .await
+        .map_err(MigrationRunError::Connect)?;
+    snapshot_state = advance_production_migration_snapshot_state(
+        snapshot_state,
+        ProductionMigrationSnapshotEvent::RepeatableReadStarted,
+    )
+    .map_err(MigrationRunError::Admission)?;
+    debug_assert_eq!(
+        snapshot_state,
+        ProductionMigrationSnapshotState::RepeatableReadStarted
+    );
+    set_local_migration_timeouts(
+        &mut transaction,
+        configured_statement_millis,
+        configured_lock_millis,
+    )
+    .await
+    .map_err(MigrationRunError::Connect)?;
+    establish_exact_migration_role(&mut transaction, &role_contract)
+        .await
+        .map_err(MigrationRunError::Connect)?;
+    let initial = read_postgresql_migration_session_binding(
+        &mut transaction,
+        &application_name,
+        &role_contract,
+        tls_channel_binding,
+    )
+    .await
+    .map_err(MigrationRunError::Preflight)?;
+    let preflight_ledger =
+        read_preflight_migration_ledger(&mut transaction, &role_contract.expected).await?;
+    verify_preflight_migration_inventory(&preflight_ledger)?;
+
+    let execution = pending
+        .attest_exact_session(initial.clone(), Utc::now())
+        .await
+        .map_err(MigrationRunError::Admission)?;
+    // Re-run the full role, ownership, schema, and default-ACL proof inside
+    // the same snapshot immediately before releasing any DDL authority.
+    establish_exact_migration_role(&mut transaction, &role_contract)
+        .await
+        .map_err(MigrationRunError::Connect)?;
+    let repeated = read_postgresql_migration_session_binding(
+        &mut transaction,
+        &application_name,
+        &role_contract,
+        tls_channel_binding,
+    )
+    .await
+    .map_err(MigrationRunError::Preflight)?;
+    if repeated != initial {
+        return Err(MigrationRunError::Preflight(
+            "exact PostgreSQL backend row changed during infrastructure attestation".into(),
+        ));
+    }
+    verify_attested_migration_session_projection(&execution, &initial)
+        .map_err(MigrationRunError::Preflight)?;
+    execution
+        .ensure_fresh(Utc::now())
+        .map_err(MigrationRunError::Admission)?;
+    let proof_valid_until = execution.valid_until();
+    let limits = production_migration_wave_limits(Utc::now(), proof_valid_until, timeouts)
+        .map_err(MigrationRunError::Admission)?;
+    let operation_marker = production_migration_operation_marker(&execution);
+    validate_production_migration_operation_marker(&operation_marker)
+        .map_err(MigrationRunError::Preflight)?;
+
+    // A fresh independently attested attempt first checks whether an earlier
+    // attempt with the same release/target/inventory projection already left
+    // its atomic completion witness. This is the only automatic path after a
+    // lost COMMIT acknowledgement: it performs no migration or marker write.
+    if preflight_ledger.len() == expected_embedded_migrations().len() {
+        attest_production_migration_operations_table(&mut transaction, &role_contract.expected)
+            .await
+            .map_err(MigrationRunError::Connect)?;
+        if let Some(committed_marker) = read_production_migration_operation_marker(
+            &mut transaction,
+            &operation_marker.operation_id,
+        )
+        .await
+        .map_err(MigrationRunError::Connect)?
+        {
+            if !marker_reconciles_exact_operation(&committed_marker, &operation_marker)
+                .map_err(MigrationRunError::Preflight)?
+            {
+                return Err(MigrationRunError::Preflight(
+                    "durable production migration marker does not match the freshly attested release, target, and inventory"
+                        .into(),
+                ));
+            }
+            attest_application_acl(&mut transaction, &role_contract.application)
+                .await
+                .map_err(MigrationRunError::Privileges)?;
+            let mut inventory = verify_embedded_migrations_on_connection(&mut transaction).await?;
+            if inventory.content_digest != execution.expected_migration_inventory_digest() {
+                return Err(MigrationRunError::Admission(
+                    "durable operation marker exists but the exact final migration inventory differs"
+                        .into(),
+                ));
+            }
+            let final_binding = read_postgresql_migration_session_binding(
+                &mut transaction,
+                &application_name,
+                execution.role_contract(),
+                tls_channel_binding,
+            )
+            .await
+            .map_err(MigrationRunError::Preflight)?;
+            if final_binding != initial {
+                return Err(MigrationRunError::Preflight(
+                    "exact PostgreSQL backend row changed during commit reconciliation".into(),
+                ));
+            }
+            verify_attested_migration_session_projection(&execution, &final_binding)
+                .map_err(MigrationRunError::Preflight)?;
+            execution
+                .ensure_fresh(Utc::now())
+                .map_err(MigrationRunError::Admission)?;
+            let completion = execution.completion_evidence();
+            // The pre-BEGIN session lock was explicitly replaced by an
+            // advisory xact lock before this reconciliation path ran. A lost
+            // ROLLBACK response cannot invalidate the already-read durable
+            // commit witness.
+            let _ = transaction.rollback().await;
+            inventory.production_attestation = Some(completion);
+            inventory.production_operation = Some(ProductionMigrationOperationReceipt {
+                operation_id: operation_marker.operation_id,
+                reconciled_after_prior_attempt: true,
+            });
+            return Ok(inventory);
+        }
+    }
+
+    let remaining_ddl_timeout = limits
+        .deadline_at
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .map_err(|_| {
+            MigrationRunError::Admission(
+                "PostgreSQL proof safety deadline elapsed before the DDL wave".into(),
+            )
+        })?
+        .min(limits.whole_wave_timeout);
+    let wave = async move {
+        set_local_migration_timeouts(
+            &mut transaction,
+            limits.statement_timeout_millis,
+            limits.lock_timeout_millis,
+        )
+        .await
+        .map_err(MigrationRunError::Connect)?;
+        apply_atomic_embedded_migrations(
+            &mut transaction,
+            execution.role_contract(),
+            &preflight_ledger,
+        )
+        .await?;
+        reconcile_application_privileges_in_transaction(
+            &mut transaction,
+            execution.role_contract(),
+        )
+        .await
+        .map_err(MigrationRunError::Privileges)?;
+        attest_sqlx_migrations_table(&mut transaction, &role_contract.expected).await?;
+        let inventory = verify_embedded_migrations_on_connection(&mut transaction).await?;
+        if inventory.content_digest != execution.expected_migration_inventory_digest() {
+            return Err(MigrationRunError::Admission(
+                "verified post-migration ledger differs from the admitted inventory".into(),
+            ));
+        }
+        attest_production_migration_operations_table(&mut transaction, &role_contract.expected)
+            .await
+            .map_err(MigrationRunError::Connect)?;
+        let final_binding = read_postgresql_migration_session_binding(
+            &mut transaction,
+            &application_name,
+            execution.role_contract(),
+            tls_channel_binding,
+        )
+        .await
+        .map_err(MigrationRunError::Preflight)?;
+        if final_binding != initial {
+            return Err(MigrationRunError::Preflight(
+                "exact PostgreSQL backend row changed during atomic migration execution".into(),
+            ));
+        }
+        verify_attested_migration_session_projection(&execution, &final_binding)
+            .map_err(MigrationRunError::Preflight)?;
+        execution
+            .ensure_fresh(Utc::now())
+            .map_err(MigrationRunError::Admission)?;
+        if Utc::now() >= limits.deadline_at {
+            return Err(MigrationRunError::Admission(
+                "atomic migration reached the proof safety margin before commit".into(),
+            ));
+        }
+        insert_production_migration_operation_marker(&mut transaction, &operation_marker)
+            .await
+            .map_err(MigrationRunError::Connect)?;
+        let retained_marker = read_production_migration_operation_marker(
+            &mut transaction,
+            &operation_marker.operation_id,
+        )
+        .await
+        .map_err(MigrationRunError::Connect)?
+        .ok_or_else(|| {
+            MigrationRunError::Preflight(
+                "production migration operation marker was not retained in the atomic transaction"
+                    .into(),
+            )
+        })?;
+        if retained_marker != operation_marker {
+            return Err(MigrationRunError::Preflight(
+                "production migration operation marker changed before commit".into(),
+            ));
+        }
+        execution
+            .ensure_fresh(Utc::now())
+            .map_err(MigrationRunError::Admission)?;
+        if Utc::now() >= limits.deadline_at {
+            return Err(MigrationRunError::Admission(
+                "atomic migration reached the proof safety margin before commit dispatch".into(),
+            ));
+        }
+        Ok::<_, MigrationRunError>((transaction, inventory, execution, operation_marker))
+    };
+    let (transaction, mut inventory, execution, operation_marker) =
+        tokio::time::timeout(remaining_ddl_timeout, wave)
+            .await
+            .map_err(|_| {
+                MigrationRunError::Admission(
+                    "atomic production migration exceeded the proof-bounded whole-wave deadline"
+                        .into(),
+                )
+            })??;
+
+    // Every DDL statement, ledger row, ACL reconciliation, final inventory
+    // check, and durable operation marker is complete before COMMIT is sent.
+    // COMMIT acknowledgement is deliberately outside the proof-bounded DDL
+    // future: once dispatched, timeout or connection error is not evidence of
+    // rollback and must never be mapped to the ordinary pre-commit error path.
+    let commit_dispatch_check_at = Utc::now();
+    execution
+        .ensure_fresh(commit_dispatch_check_at)
+        .map_err(MigrationRunError::Admission)?;
+    if commit_dispatch_check_at >= limits.deadline_at {
+        return Err(MigrationRunError::Admission(
+            "atomic migration reached the proof safety margin before COMMIT dispatch".into(),
+        ));
+    }
+    let completion = execution.completion_evidence();
+    let remaining_commit_millis = proof_valid_until
+        .signed_duration_since(Utc::now())
+        .num_milliseconds();
+    if remaining_commit_millis < 2 {
+        return Err(MigrationRunError::Admission(
+            "PostgreSQL proof expired before COMMIT could be dispatched".into(),
+        ));
+    }
+    let commit_ack_timeout = Duration::from_millis(
+        u64::try_from(remaining_commit_millis - 1)
+            .unwrap_or(0)
+            .min(PRODUCTION_MIGRATION_COMMIT_ACK_TIMEOUT_SECS * 1_000),
+    );
+    match tokio::time::timeout(commit_ack_timeout, transaction.commit()).await {
+        Ok(Ok(())) => {
+            inventory.production_attestation = Some(completion);
+            inventory.production_operation = Some(ProductionMigrationOperationReceipt {
+                operation_id: operation_marker.operation_id,
+                reconciled_after_prior_attempt: false,
+            });
+            Ok(inventory)
+        }
+        Ok(Err(source)) => Err(MigrationRunError::CommitOutcomeUnknown {
+            operation_id: operation_marker.operation_id,
+            reason: "PostgreSQL returned an error after COMMIT was dispatched",
+            source: Some(source),
+        }),
+        Err(_) => Err(MigrationRunError::CommitOutcomeUnknown {
+            operation_id: operation_marker.operation_id,
+            reason: "the bounded COMMIT acknowledgement deadline elapsed",
+            source: None,
+        }),
+    }
+}
+
+async fn apply_embedded_production_migrations(
+    url: &str,
+    timeouts: MigrationTimeouts,
+    pending: crate::security_contracts::PendingProductionMigrationTarget,
+) -> Result<MigrationInventory, MigrationRunError> {
+    validate_atomic_embedded_migration_plan().map_err(MigrationRunError::Preflight)?;
+    // Reject an unreviewed production timeout profile before DNS, TLS, or
+    // database authentication touches the selected target.
+    production_migration_preflight_timeouts(timeouts).map_err(MigrationRunError::Admission)?;
+    let target = production_migration_target(url).map_err(MigrationRunError::Target)?;
+    let (database_provider, expected_route_digest) = pending
+        .database_provider_and_route_digest()
+        .map_err(MigrationRunError::Admission)?;
+    let established = target
+        .establish(
+            database_provider,
+            expected_route_digest,
+            pending.tls_exporter_context(),
+        )
+        .await
+        .map_err(|error| MigrationRunError::Target(error.to_string()))?;
+    let application_name = pending
+        .request_tag_for_channel(established.binding())
+        .map_err(MigrationRunError::Admission)?;
+    let mut channel = established
+        .connect_sqlx(&application_name)
+        .await
+        .map_err(|error| MigrationRunError::Target(error.to_string()))?;
+    if !channel.relay_is_active() {
+        channel.close_hard().await;
+        return Err(MigrationRunError::Target(
+            "direct PostgreSQL TLS relay terminated before migration preflight".into(),
+        ));
+    }
+    let tls_channel_binding = channel.binding().clone();
+    let result = run_atomic_production_migration(
+        channel.connection_mut(),
+        &tls_channel_binding,
+        timeouts,
+        pending,
+    )
+    .await;
+    match result {
+        Ok(inventory) => {
+            // Commit already succeeded; a graceful-close transport error
+            // cannot retroactively turn the atomic database outcome partial.
+            channel.close().await;
+            Ok(inventory)
+        }
+        Err(error) => {
+            let failure_boundary = if error.commit_outcome_unknown() {
+                ProductionMigrationFailureBoundary::CommitDispatched
+            } else {
+                ProductionMigrationFailureBoundary::BeforeCommitDispatch
+            };
+            match classify_production_migration_failure(failure_boundary) {
+                ProductionMigrationFailureDisposition::RollbackExpected => {
+                    // Before COMMIT dispatch, dropping the outer transaction
+                    // and terminating the backend is the cancellation fence.
+                    channel.close_hard().await;
+                }
+                ProductionMigrationFailureDisposition::OutcomeUnknown => {
+                    // COMMIT was already sent. Hard-closing bounds the broken
+                    // transport but is not, and must never be reported as, a
+                    // rollback. A fresh run can only reconcile the durable
+                    // marker and exact final inventory for this operation id.
+                    channel.close_hard().await;
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Apply and immediately read back the exact embedded inventory through one
@@ -3631,17 +6334,38 @@ pub(crate) async fn apply_embedded_migrations_with_admission(
     timeouts: MigrationTimeouts,
     admission: crate::security_contracts::VerifiedApplyOnlyMigrationAdmission,
 ) -> Result<MigrationInventory, MigrationRunError> {
-    let (role_contract, expected_inventory_digest) = admission
-        .into_database_execution(chrono::Utc::now())
-        .map_err(MigrationRunError::Admission)?;
-    let inventory = apply_embedded_migrations_inner(url, timeouts, Some(role_contract)).await?;
-    if inventory.content_digest != expected_inventory_digest {
-        set_migration_status(MigrationStatus::Failed);
-        return Err(MigrationRunError::Admission(
-            "verified post-migration ledger differs from the admitted inventory".into(),
-        ));
+    let result = async {
+        let preflight = admission
+            .into_database_preflight(Utc::now())
+            .map_err(MigrationRunError::Admission)?;
+        match preflight {
+            crate::security_contracts::MigrationDatabasePreflight::NonProduction {
+                role_contract,
+                expected_migration_inventory_digest,
+            } => {
+                // Preserve the existing local/nonproduction pool path exactly;
+                // the direct no-reconnect protocol is a production boundary.
+                let inventory =
+                    apply_embedded_migrations_inner(url, timeouts, Some(role_contract)).await?;
+                if inventory.content_digest != expected_migration_inventory_digest {
+                    return Err(MigrationRunError::Admission(
+                        "verified post-migration ledger differs from the admitted inventory".into(),
+                    ));
+                }
+                Ok(inventory)
+            }
+            crate::security_contracts::MigrationDatabasePreflight::Production(pending) => {
+                apply_embedded_production_migrations(url, timeouts, *pending).await
+            }
+        }
     }
-    Ok(inventory)
+    .await;
+    set_migration_status(if result.is_ok() {
+        MigrationStatus::Applied
+    } else {
+        MigrationStatus::Failed
+    });
+    result
 }
 
 /// Whether a failed database connection is fatal instead of falling back to
@@ -3810,6 +6534,10 @@ mod tests {
         deployment_id: String,
         trust_domain_id: String,
         database_provider: ryuki_core::security_profile::ProductionDatabaseProvider,
+        attestation_profile_id: String,
+        attestation_profile_version: u64,
+        attestation_profile_digest: String,
+        provider_route_binding_digest: String,
         cluster_system_identifier: String,
         storage_bindings: Vec<ryuki_core::security_profile::PostgresqlStorageBinding>,
     }
@@ -3817,8 +6545,11 @@ mod tests {
     impl super::VerifiedPostgresqlInfrastructureEvidence
         for TestVerifiedPostgresqlInfrastructureEvidence
     {
-        fn verify_integrity(&self) -> bool {
-            self.valid.load(std::sync::atomic::Ordering::Acquire)
+        fn verify_integrity(&self) -> Result<(), String> {
+            self.valid
+                .load(std::sync::atomic::Ordering::Acquire)
+                .then_some(())
+                .ok_or_else(|| "test evidence invalidated".into())
         }
 
         fn deployment_id(&self) -> &str {
@@ -3831,6 +6562,22 @@ mod tests {
 
         fn database_provider(&self) -> ryuki_core::security_profile::ProductionDatabaseProvider {
             self.database_provider
+        }
+
+        fn attestation_profile_id(&self) -> &str {
+            &self.attestation_profile_id
+        }
+
+        fn attestation_profile_version(&self) -> u64 {
+            self.attestation_profile_version
+        }
+
+        fn attestation_profile_digest(&self) -> &str {
+            &self.attestation_profile_digest
+        }
+
+        fn provider_route_binding_digest(&self) -> &str {
+            &self.provider_route_binding_digest
         }
 
         fn cluster_system_identifier(&self) -> &str {
@@ -3918,6 +6665,11 @@ mod tests {
             deployment_id: "deployment:production".into(),
             trust_domain_id: "trust-domain:production".into(),
             database_provider: ProductionDatabaseProvider::CloudNativePg,
+            attestation_profile_id: "postgresql-infrastructure-attestation-profile:production-v1"
+                .into(),
+            attestation_profile_version: 1,
+            attestation_profile_digest: digest('9'),
+            provider_route_binding_digest: digest('8'),
             cluster_system_identifier: "7482247594438774091".into(),
             storage_bindings: storage_bindings.clone(),
         });
@@ -3945,6 +6697,10 @@ mod tests {
         let expected = RuntimeGuardExpectedValue::DurablePostgresql {
             database_provider: ProductionDatabaseProvider::CloudNativePg,
             server_major_version: 18,
+            attestation_profile_id: evidence.attestation_profile_id.clone(),
+            attestation_profile_version: evidence.attestation_profile_version,
+            attestation_profile_digest: evidence.attestation_profile_digest.clone(),
+            provider_route_binding_digest: evidence.provider_route_binding_digest.clone(),
             database_identity_digest: postgresql_database_identity_digest(&identity).unwrap(),
             storage_binding_digest: postgresql_storage_binding_digest(&storage_bindings).unwrap(),
             migration_inventory_digest: postgresql_migration_inventory_digest(&migrations).unwrap(),
@@ -4038,6 +6794,571 @@ mod tests {
     }
 
     #[test]
+    fn production_migration_url_requires_one_dns_tls_target() {
+        let target = super::production_migration_target(
+            "postgresql://ephemeral_login:fixture%2Dvalue@postgresql.database.svc:6432/ryuki?sslmode=verify-full&sslrootcert=/var/run/ryuki/postgresql-ca.pem",
+        )
+        .expect("canonical DNS target with explicit credential, port, database, and CA");
+        let (hostname, port, username, database, root_certificate_path) = target.test_projection();
+        assert_eq!(hostname, "postgresql.database.svc");
+        assert_eq!(port, 6432);
+        assert_eq!(username, "ephemeral_login");
+        assert_eq!(database, "ryuki");
+        assert_eq!(
+            root_certificate_path,
+            std::path::Path::new("/var/run/ryuki/postgresql-ca.pem")
+        );
+
+        for invalid in [
+            // Credentials and target selection must never fall back to ambient
+            // libpq defaults or a pgpass file.
+            "postgresql://login@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc/ryuki?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@192.0.2.10:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@[2001:db8::10]:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc:5432/?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc:5432/postgres?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki/other?sslmode=verify-full&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=require&sslrootcert=/ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=relative-ca.pem",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem&host=/var/run/postgresql",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem&hostaddr=192.0.2.10",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem&dbname=substitute",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem&password=x",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem&options=-c%20search_path%3Devil",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslrootcert=/ca.pem&application_name=override",
+            "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslmode=disable&sslrootcert=/ca.pem",
+        ] {
+            assert!(
+                super::production_migration_target(invalid).is_err(),
+                "unsafe migration target was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_migration_deadline_preserves_proof_safety_margin() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-20T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let valid_until = now + chrono::TimeDelta::seconds(300);
+        let limits = super::production_migration_wave_limits(
+            now,
+            valid_until,
+            super::MigrationTimeouts {
+                statement_timeout_secs: super::REVIEWED_PRODUCTION_MIGRATION_STATEMENT_TIMEOUT_SECS,
+                lock_timeout_secs: super::REVIEWED_PRODUCTION_MIGRATION_LOCK_TIMEOUT_SECS,
+            },
+        )
+        .expect("five-minute proof window");
+        assert_eq!(
+            limits.deadline_at,
+            valid_until - chrono::TimeDelta::seconds(30)
+        );
+        assert_eq!(
+            limits.whole_wave_timeout,
+            std::time::Duration::from_secs(270)
+        );
+        assert_eq!(limits.statement_timeout_millis, 180_000);
+        assert_eq!(limits.lock_timeout_millis, 30_000);
+        assert!(limits.statement_timeout_millis < 270_000);
+        assert!(limits.lock_timeout_millis < limits.statement_timeout_millis);
+
+        assert!(super::production_migration_wave_limits(
+            now,
+            now + chrono::TimeDelta::seconds(31),
+            super::MigrationTimeouts {
+                statement_timeout_secs: super::REVIEWED_PRODUCTION_MIGRATION_STATEMENT_TIMEOUT_SECS,
+                lock_timeout_secs: super::REVIEWED_PRODUCTION_MIGRATION_LOCK_TIMEOUT_SECS,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn atomic_migration_shape_rejects_down_no_tx_and_order_anomalies() {
+        assert!(
+            super::validate_atomic_migration_shape(&[(1, false, false), (2, false, false)]).is_ok()
+        );
+        for invalid in [
+            vec![],
+            vec![(0, false, false)],
+            vec![(2, false, false), (1, false, false)],
+            vec![(1, false, false), (1, false, false)],
+            vec![(1, true, false)],
+            vec![(1, false, true)],
+        ] {
+            assert!(
+                super::validate_atomic_migration_shape(&invalid).is_err(),
+                "unsafe migration shape was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_migration_sql_scanner_rejects_outer_transaction_escape() {
+        for unsafe_sql in [
+            "BEGIN; SELECT 1;",
+            "START/**/TRANSACTION;",
+            "START-- split keyword\nTRANSACTION;",
+            "SELECT 1; COMMIT;",
+            "SELECT 1; END WORK;",
+            "ROLLBACK TO SAVEPOINT before_ddl;",
+            "ABORT;",
+            "SAVEPOINT before_ddl;",
+            "RELEASE SAVEPOINT before_ddl;",
+            "PREPARE TRANSACTION 'partial-ddl';",
+            "SET TRANSACTION READ ONLY;",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;",
+            "SET SESSION AUTHORIZATION 'untrusted';",
+            "SET LOCAL SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;",
+            "SET LOCAL SESSION AUTHORIZATION 'untrusted';",
+            "SET LOCAL ROLE untrusted;",
+            "sEt/**/\"statement_timeout\" = 0;",
+            "SET search_path = untrusted, public;",
+            "SET statement_timeout = 0;",
+            "SET LOCAL lock_timeout = '31s';",
+            "SET LOCAL lock_timeout = E'30s';",
+            "SET LOCAL \"lock_timeout\" = '30s';",
+            "SET SESSION idle_in_transaction_session_timeout = 0;",
+            "SET default_transaction_read_only = on;",
+            "SET standard_conforming_strings = off;",
+            "RESET ALL;",
+            "RESET statement_timeout;",
+            "DISCARD ALL;",
+            "LOAD '/tmp/unreviewed-extension.so';",
+            "COPY public.audit_log TO PROGRAM 'id';",
+            "COPY (SELECT 'PROGRAM') TO/**/PROGRAM E'id';",
+            "SET LOCAL lock_timeout = '30s'; COMMIT;",
+            r"SELECT 'a\'b'; COMMIT; SELECT 'c\'d';",
+        ] {
+            assert!(
+                super::validate_atomic_migration_sql(unsafe_sql).is_err(),
+                "outer-transaction escape was accepted: {unsafe_sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_migration_sql_scanner_rejects_session_lock_release_anywhere() {
+        for unsafe_sql in [
+            "SELECT pg_catalog.pg_advisory_unlock_all();",
+            "SELECT pg_catalog.pg_advisory_unlock(8248622371235458407::bigint);",
+            "DO $$ BEGIN PERFORM pg_catalog.pg_advisory_unlock_all(); END $$;",
+            "DO $body$ BEGIN PERFORM \"pg_advisory_unlock\"(1::bigint); END $body$;",
+        ] {
+            assert!(
+                super::validate_atomic_migration_sql(unsafe_sql).is_err(),
+                "session advisory-lock release was accepted: {unsafe_sql}"
+            );
+        }
+
+        assert!(super::validate_atomic_migration_sql(
+            "SELECT pg_catalog.pg_advisory_xact_lock(1::bigint);"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn atomic_migration_sql_scanner_rejects_parser_mode_hidden_commit() {
+        assert!(
+            super::validate_atomic_migration_sql("SET standard_conforming_strings = off;").is_err()
+        );
+        assert!(
+            super::validate_atomic_migration_sql(r"SELECT 'a\'b'; COMMIT; SELECT 'c\'d';").is_err()
+        );
+    }
+
+    #[test]
+    fn atomic_migration_sql_scanner_ignores_quoted_and_nested_decoys() {
+        for safe_sql in [
+            "-- COMMIT; SET ROLE untrusted;\nSELECT 1;",
+            "/* COMMIT; /* ROLLBACK; */ SET statement_timeout = 0; */ SELECT 1;",
+            "SELECT 'COMMIT; SET ROLE untrusted; COPY t TO PROGRAM ''id''';",
+            r"SELECT E'escaped quote \' ; COMMIT; SET ROLE untrusted';",
+            "CREATE TABLE \"COMMIT;ROLLBACK\" (id bigint PRIMARY KEY);",
+            "DO $body$ BEGIN PERFORM 1; END $body$;",
+            "DO $tag_1$ BEGIN COPY t TO PROGRAM 'id'; END $tag_1$;",
+            "CREATE FUNCTION public.decoy() RETURNS text AS 'BEGIN; COMMIT; END' LANGUAGE sql;",
+            "UPDATE public.jobs SET role_name = 'migration' WHERE id = 1;",
+            "CREATE FUNCTION public.pinned() RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$ BEGIN NULL; END $$;",
+            "COPY (SELECT 'PROGRAM') TO STDOUT;",
+            "PREPARE reviewed_query AS SELECT 1;",
+            "SET CONSTRAINTS ALL IMMEDIATE;",
+            "SET LOCAL lock_timeout = '30s';",
+        ] {
+            assert!(
+                super::validate_atomic_migration_sql(safe_sql).is_ok(),
+                "quoted or legitimate SQL was rejected: {safe_sql}"
+            );
+        }
+
+        super::validate_atomic_embedded_migration_plan()
+            .expect("current embedded migrations remain atomically admissible");
+    }
+
+    #[test]
+    fn atomic_migration_sql_scanner_enforces_lexical_bounds() {
+        for malformed in [
+            "SELECT 'unterminated",
+            "SELECT E'unterminated\\'",
+            "SELECT \"unterminated",
+            "SELECT $body$ unterminated",
+            "SELECT 1 /* unterminated",
+            "SELECT (1;",
+            "SELECT 1);",
+        ] {
+            assert!(
+                super::validate_atomic_migration_sql(malformed).is_err(),
+                "malformed SQL escaped lexical validation: {malformed}"
+            );
+        }
+
+        let overlong = " ".repeat(super::MAX_ATOMIC_MIGRATION_SQL_BYTES + 1);
+        assert!(super::validate_atomic_migration_sql(&overlong).is_err());
+
+        let mut nested_comment = String::new();
+        for _ in 0..=super::MAX_ATOMIC_MIGRATION_BLOCK_COMMENT_DEPTH {
+            nested_comment.push_str("/*");
+        }
+        for _ in 0..=super::MAX_ATOMIC_MIGRATION_BLOCK_COMMENT_DEPTH {
+            nested_comment.push_str("*/");
+        }
+        assert!(super::validate_atomic_migration_sql(&nested_comment).is_err());
+    }
+
+    #[test]
+    fn production_preflight_timeouts_cannot_be_disabled_or_inverted() {
+        assert_eq!(
+            super::production_migration_preflight_timeouts(super::MigrationTimeouts {
+                statement_timeout_secs: super::REVIEWED_PRODUCTION_MIGRATION_STATEMENT_TIMEOUT_SECS,
+                lock_timeout_secs: super::REVIEWED_PRODUCTION_MIGRATION_LOCK_TIMEOUT_SECS,
+            })
+            .unwrap(),
+            (30_000, 29_999)
+        );
+        for invalid in [
+            super::MigrationTimeouts::default(),
+            super::MigrationTimeouts {
+                statement_timeout_secs: 0,
+                lock_timeout_secs: 0,
+            },
+            super::MigrationTimeouts {
+                statement_timeout_secs: 60,
+                lock_timeout_secs: 60,
+            },
+            super::MigrationTimeouts {
+                statement_timeout_secs: 7_201,
+                lock_timeout_secs: 1,
+            },
+        ] {
+            assert!(super::production_migration_preflight_timeouts(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn commit_dispatch_failures_are_never_classified_as_rollback() {
+        assert_eq!(
+            super::classify_production_migration_failure(
+                super::ProductionMigrationFailureBoundary::BeforeCommitDispatch,
+            ),
+            super::ProductionMigrationFailureDisposition::RollbackExpected,
+        );
+        assert_eq!(
+            super::classify_production_migration_failure(
+                super::ProductionMigrationFailureBoundary::CommitDispatched,
+            ),
+            super::ProductionMigrationFailureDisposition::OutcomeUnknown,
+        );
+    }
+
+    #[test]
+    fn session_lock_must_precede_repeatable_read_snapshot() {
+        use super::{
+            ProductionMigrationSnapshotEvent as Event, ProductionMigrationSnapshotState as State,
+        };
+
+        let locked = super::advance_production_migration_snapshot_state(
+            State::Connected,
+            Event::SessionLockAcquired,
+        )
+        .expect("session lock is the first transition");
+        assert_eq!(
+            super::advance_production_migration_snapshot_state(
+                locked,
+                Event::RepeatableReadStarted,
+            ),
+            Ok(State::RepeatableReadStarted)
+        );
+        assert!(super::advance_production_migration_snapshot_state(
+            State::Connected,
+            Event::RepeatableReadStarted,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_operation_marker_is_stable_across_fresh_attestation_readback() {
+        fn digest(character: char) -> String {
+            format!("sha256:{}", character.to_string().repeat(64))
+        }
+
+        fn marker(response: char, session: char) -> super::ProductionMigrationOperationMarker {
+            let release_binding_digest = digest('1');
+            let target_binding_digest = digest('2');
+            let migration_inventory_digest = digest('3');
+            let operation_id = super::framed_migration_digest(
+                super::PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
+                &[
+                    ("release_binding_digest", &release_binding_digest),
+                    ("target_binding_digest", &target_binding_digest),
+                    ("migration_inventory_digest", &migration_inventory_digest),
+                ],
+            );
+            super::ProductionMigrationOperationMarker {
+                operation_id,
+                release_binding_digest,
+                target_binding_digest,
+                migration_inventory_digest,
+                attestation_response_digest: digest(response),
+                session_binding_digest: digest(session),
+            }
+        }
+
+        let committed = marker('4', '5');
+        let freshly_attested = marker('6', '7');
+        assert!(super::validate_production_migration_operation_marker(&committed).is_ok());
+        assert!(
+            super::marker_reconciles_exact_operation(&committed, &freshly_attested)
+                .expect("canonical marker projection")
+        );
+
+        let mut different_target = freshly_attested.clone();
+        different_target.target_binding_digest = digest('8');
+        different_target.operation_id = super::framed_migration_digest(
+            super::PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
+            &[
+                (
+                    "release_binding_digest",
+                    &different_target.release_binding_digest,
+                ),
+                (
+                    "target_binding_digest",
+                    &different_target.target_binding_digest,
+                ),
+                (
+                    "migration_inventory_digest",
+                    &different_target.migration_inventory_digest,
+                ),
+            ],
+        );
+        assert!(
+            !super::marker_reconciles_exact_operation(&committed, &different_target)
+                .expect("canonical substituted target projection")
+        );
+
+        let mut forged = committed;
+        forged.operation_id = digest('f');
+        assert!(super::validate_production_migration_operation_marker(&forged).is_err());
+    }
+
+    #[test]
+    fn production_operation_target_binding_includes_provider_route() {
+        fn digest(character: char) -> String {
+            format!("sha256:{}", character.to_string().repeat(64))
+        }
+
+        let first_route = super::production_migration_target_binding_digest(
+            ryuki_core::security_profile::ProductionDatabaseProvider::CloudNativePg,
+            &digest('1'),
+            18,
+            &digest('2'),
+            &digest('3'),
+            "ryuki_app_runtime",
+            "ryuki_schema_migrator",
+        );
+        let substituted_route = super::production_migration_target_binding_digest(
+            ryuki_core::security_profile::ProductionDatabaseProvider::CloudNativePg,
+            &digest('4'),
+            18,
+            &digest('2'),
+            &digest('3'),
+            "ryuki_app_runtime",
+            "ryuki_schema_migrator",
+        );
+        assert_ne!(first_route, substituted_route);
+    }
+
+    #[test]
+    fn migration_session_binding_validation_rejects_substitution() {
+        fn valid_channel() -> ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding {
+            ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding {
+                provider_route_binding_digest: format!("sha256:{}", "1".repeat(64)),
+                server_name: "postgresql.database.svc".into(),
+                peer_address: "192.0.2.10".into(),
+                peer_port: 5432,
+                trust_anchor_bundle_digest: format!("sha256:{}", "2".repeat(64)),
+                peer_leaf_certificate_digest: format!("sha256:{}", "3".repeat(64)),
+                peer_certificate_chain_digest: format!("sha256:{}", "4".repeat(64)),
+                exporter_digest: format!("sha256:{}", "5".repeat(64)),
+                tls_protocol: "tlsv1.3".into(),
+                tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
+                tls_cipher_bits: 256,
+            }
+        }
+
+        fn valid_raw() -> super::RawPostgresqlMigrationSessionBinding {
+            super::RawPostgresqlMigrationSessionBinding {
+                server_version_num: 180_002,
+                database_name: "ryuki".into(),
+                database_oid: 16_384,
+                datid: Some(16_384),
+                server_address: Some("192.0.2.10".into()),
+                server_port: Some(5432),
+                primary: true,
+                transaction_writable: true,
+                default_transaction_writable: true,
+                client_address: Some("192.0.2.20".into()),
+                client_port: Some(42_424),
+                backend_process_id: 8123,
+                backend_start: chrono::DateTime::parse_from_rfc3339("2026-07-20T08:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                backend_type: "client backend".into(),
+                application_name: "ryuki-pg-attest-0123456789abcdef0123456789abcdef01234567".into(),
+                session_login_role: "ryuki_login_20260720".into(),
+                session_user_oid: Some(32_768),
+                current_role: "ryuki_schema_migrator".into(),
+                selected_role: "ryuki_schema_migrator".into(),
+                tls_enabled: Some(true),
+                tls_protocol: Some("TLSv1.3".into()),
+                tls_cipher: Some("TLS_AES_256_GCM_SHA384".into()),
+                tls_bits: Some(256),
+                client_distinguished_name: None,
+                issuer_distinguished_name: None,
+            }
+        }
+
+        let tag = "ryuki-pg-attest-0123456789abcdef0123456789abcdef01234567";
+        let contract = super::MigrationRoleContract::from_values(
+            "ryuki_schema_migrator".into(),
+            "ryuki_app_runtime".into(),
+        )
+        .unwrap();
+        let channel = valid_channel();
+        let binding = super::validate_postgresql_migration_session_binding(
+            valid_raw(),
+            tag,
+            &contract,
+            &channel,
+        )
+        .expect("exact migration backend session");
+        assert_eq!(binding.tls_protocol, "tlsv1.3");
+        assert_eq!(binding.tls_cipher_suite, "tls_aes_256_gcm_sha384");
+        assert!(
+            ryuki_core::postgresql_infrastructure::postgresql_session_binding_digest(&binding)
+                .is_ok()
+        );
+
+        let mut dnat_channel = valid_channel();
+        dnat_channel.peer_address = "192.0.2.11".into();
+        assert!(
+            super::validate_postgresql_migration_session_binding(
+                valid_raw(),
+                tag,
+                &contract,
+                &dnat_channel,
+            )
+            .is_ok(),
+            "the signed channel entry address may differ from the PostgreSQL backend behind reviewed DNAT"
+        );
+
+        let mut wrong_tag = valid_raw();
+        wrong_tag.application_name =
+            "ryuki-pg-attest-ffffffffffffffffffffffffffffffffffffffff".into();
+        assert!(super::validate_postgresql_migration_session_binding(
+            wrong_tag, tag, &contract, &channel,
+        )
+        .is_err());
+        let mut wrong_database = valid_raw();
+        wrong_database.datid = Some(16_385);
+        assert!(super::validate_postgresql_migration_session_binding(
+            wrong_database,
+            tag,
+            &contract,
+            &channel,
+        )
+        .is_err());
+        let mut unix = valid_raw();
+        unix.client_address = None;
+        assert!(super::validate_postgresql_migration_session_binding(
+            unix, tag, &contract, &channel
+        )
+        .is_err());
+        let mut standby = valid_raw();
+        standby.primary = false;
+        assert!(super::validate_postgresql_migration_session_binding(
+            standby, tag, &contract, &channel,
+        )
+        .is_err());
+        let mut wrong_role = valid_raw();
+        wrong_role.selected_role = "ryuki_app_runtime".into();
+        assert!(super::validate_postgresql_migration_session_binding(
+            wrong_role, tag, &contract, &channel,
+        )
+        .is_err());
+        let mut weak_tls = valid_raw();
+        weak_tls.tls_bits = Some(64);
+        assert!(super::validate_postgresql_migration_session_binding(
+            weak_tls, tag, &contract, &channel,
+        )
+        .is_err());
+
+        let mut wrong_channel = channel;
+        wrong_channel.tls_cipher_suite = "tls_aes_128_gcm_sha256".into();
+        wrong_channel.tls_cipher_bits = 128;
+        assert!(super::validate_postgresql_migration_session_binding(
+            valid_raw(),
+            tag,
+            &contract,
+            &wrong_channel,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_preflight_ledger_accepts_only_an_exact_embedded_prefix() {
+        let expected = expected_embedded_migrations();
+        assert!(expected.len() > 1);
+        let complete = expected
+            .iter()
+            .map(|(version, checksum)| (*version, checksum.to_vec(), true))
+            .collect::<Vec<_>>();
+        assert!(super::verify_preflight_migration_inventory(&[]).is_ok());
+        assert!(super::verify_preflight_migration_inventory(&complete[..2]).is_ok());
+        assert!(super::verify_preflight_migration_inventory(&complete).is_ok());
+
+        let gap = vec![complete[1].clone()];
+        assert!(matches!(
+            super::verify_preflight_migration_inventory(&gap),
+            Err(MigrationVerificationError::NonPrefixApplied(_))
+        ));
+        let mut dirty = complete[..2].to_vec();
+        dirty[1].2 = false;
+        assert!(matches!(
+            super::verify_preflight_migration_inventory(&dirty),
+            Err(MigrationVerificationError::Dirty(_))
+        ));
+        let mut substituted = complete[..2].to_vec();
+        substituted[0].1[0] ^= 0xff;
+        assert!(matches!(
+            super::verify_preflight_migration_inventory(&substituted),
+            Err(MigrationVerificationError::ChecksumMismatch(_))
+        ));
+    }
+
+    #[test]
     fn production_role_names_and_protected_table_policies_fail_closed() {
         assert!(super::ApplicationRoleContract::from_values(
             "ryuki_app_runtime".into(),
@@ -4093,6 +7414,7 @@ mod tests {
             "k8s_cluster_registry",
             "k8s_cluster_environment_scopes",
             "noisy_trigger_site_authority",
+            "production_migration_operations",
             "scheduler_protocol_versions",
         ] {
             assert_eq!(policies.get(name), Some(&(false, false, false)));

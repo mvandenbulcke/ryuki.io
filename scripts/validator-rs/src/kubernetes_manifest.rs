@@ -1,6 +1,11 @@
 use crate::yaml_utils::validate_yaml_duplicate_keys_text;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use chrono::Utc;
+use ed25519_dalek::{Signature, VerifyingKey};
+use ryuki_core::conformance_trust::canonical_json_bytes;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -24,6 +29,54 @@ const CNPG_CA_SECRET_NAME: &str = "ryuki-platform-db-ca";
 const CNPG_CA_VOLUME_NAME: &str = "cnpg-ca";
 const CNPG_CA_SECRET_KEY: &str = "ca.crt";
 const CNPG_CA_MOUNT_PATH: &str = "/var/run/secrets/ryuki/cnpg";
+const POSTGRESQL_RELAY_VOLUME_NAME: &str = "postgresql-relay-workspace";
+const POSTGRESQL_RELAY_MOUNT_PATH: &str = "/run/ryuki-postgresql-relay";
+const POSTGRESQL_RELAY_SIZE_LIMIT: &str = "1Mi";
+const FINAL_RENDER_CONTRACT: &str = "migration-final-render-v1";
+const SOURCE_TEMPLATE_MODE: &str = "source-template";
+const FINAL_RENDER_MODE: &str = "final-render";
+const FINAL_RENDER_REQUIRED_RUNTIME_CAPABILITY: &str =
+    "in-cluster-final-render-admission-and-runtime-freshness-v1";
+const FINAL_RENDER_RUNTIME_ADMISSION_UNAVAILABLE_ERROR: &str = "final-render production execution is disabled: in-cluster-final-render-admission-and-runtime-freshness-v1 is unavailable; offline snapshot validation cannot fence ConfigMap deletion/recreation through Pod materialization, consume a one-shot execution attempt, or enforce receipt expiry at Pod start and runtime";
+const MANIFEST_SELECTED_TRUST_ANCHOR_FORBIDDEN_ERROR: &str = "production Kubernetes validation does not accept a manifest-selected socket-projection trust anchor; the required in-cluster admission capability must receive an independently provisioned anchor outside the render request";
+const RENDER_REQUIRED_SENTINEL: &str = "RENDER_REQUIRED";
+const SOCKET_CONTRACT_DIGEST: &str =
+    "sha256:369bca5b159d7535a2b3523796ff3632e9e7ca44f9a94b4140cc572163767697";
+const RELEASE_DIGEST_PREFIX_ANNOTATION: &str = "ryuki.io/release-digest-prefix";
+const CONTENT_DIGEST_ANNOTATION: &str = "ryuki.io/content-digest";
+const RENDER_CONTRACT_ANNOTATION: &str = "ryuki.io/render-contract";
+const RENDER_MODE_ANNOTATION: &str = "ryuki.io/render-mode";
+const SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION: &str =
+    "ryuki.io/socket-projection-receipt-digest";
+const SOCKET_CONTRACT_DIGEST_ANNOTATION: &str = "ryuki.io/socket-contract-digest";
+const SOCKET_PROJECTION_RECEIPT_RAW_DIGEST_ANNOTATION: &str =
+    "ryuki.io/socket-projection-receipt-raw-digest";
+const SOCKET_PROJECTION_RECEIPT_CONTRACT: &str = "migration-socket-projection-receipt-v1";
+const SOCKET_PROJECTION_TRUST_ANCHOR_CONTRACT: &str = "migration-socket-projection-trust-anchor-v1";
+const SOCKET_PROJECTION_SIGNATURE_DOMAIN: &str = "ryuki-v1/migration-socket-projection-receipt";
+const SOCKET_PROJECTION_RECEIPT_CONFIG_MAP_PREFIX: &str = "platform-socket-projection-receipt-";
+const SOCKET_PROJECTION_RECEIPT_DATA_KEY: &str = "receipt.json";
+const SOCKET_PROJECTION_MAX_RECEIPT_BYTES: usize = 64 * 1024;
+const SOCKET_PROJECTION_MAX_AUTHORIZATION_SECONDS: i64 = 300;
+const AUTHORITY_SOCKET_CSI_DRIVER: &str = "authority-socket-projection.ryuki.io";
+const AUTHORITY_SOCKET_CSI_ATTRIBUTE_KEYS: &[&str] =
+    &["environmentVariable", "authorityClass", "socketPath"];
+const MIGRATION_JOB_RYUKI_ANNOTATIONS: &[&str] = &[
+    "ryuki.io/cutover-contract",
+    "ryuki.io/release-image",
+    RENDER_CONTRACT_ANNOTATION,
+    RENDER_MODE_ANNOTATION,
+    "ryuki.io/pin-migration-config-receipt",
+    "ryuki.io/pin-security-admission-receipt",
+    "ryuki.io/pin-production-build-manifest-receipt",
+    "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+    "ryuki.io/pin-deployed-workload-attestation-receipt",
+    "ryuki.io/pin-public-ingress-attestation-receipt",
+    "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    "ryuki.io/pin-socket-projection-authority-receipt",
+    SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION,
+    SOCKET_CONTRACT_DIGEST_ANNOTATION,
+];
 const VAULT_WORKLOAD_AUTH_MANIFEST_PATH: &str = "deploy/kubernetes/vault/workload-auth.yaml";
 const VAULT_KUBERNETES_AUTH_CONFIG_PATH: &str =
     "deploy/kubernetes/vault/kubernetes-auth-config.json";
@@ -163,6 +216,184 @@ const SECURITY_ADMISSION_KEYS: &[&str] = &[
     "RYUKI_EXPECTED_DEPLOYMENT_ID",
     "RYUKI_SECURITY_PROFILE",
 ];
+const PRODUCTION_BUILD_MANIFEST_CONFIG_MAP: &str = "platform-production-build-manifest-pins";
+const PRODUCTION_BUILD_MANIFEST_KEYS: &[&str] = &[
+    "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH",
+    "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST",
+];
+const CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP: &str = "platform-conformance-trust-checkpoint-pins";
+const CONFORMANCE_TRUST_CHECKPOINT_KEYS: &[&str] = &[
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH",
+];
+const DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP: &str =
+    "platform-deployed-workload-attestation-pins";
+const DEPLOYED_WORKLOAD_ATTESTATION_KEYS: &[&str] = &[
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION",
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST",
+    "RYUKI_EXPECTED_WORKLOAD_ID",
+];
+const PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP: &str = "platform-public-ingress-attestation-pins";
+const PUBLIC_INGRESS_ATTESTATION_KEYS: &[&str] = &[
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION",
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST",
+];
+const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP: &str =
+    "platform-postgresql-infrastructure-attestation-pins";
+const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS: &[&str] = &[
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION",
+    "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST",
+];
+const SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP: &str =
+    "platform-migration-socket-projection-authority-pins";
+const SOCKET_PROJECTION_AUTHORITY_KEYS: &[&str] = &[
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_AUTHORITY_ID",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_KEY_ID",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_BASE64",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_MIN_AUTHORITY_EPOCH",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_ID",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_VERSION",
+    "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_DIGEST",
+];
+const MIGRATION_APP_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
+    (
+        SECURITY_ADMISSION_CONFIG_MAP,
+        SECURITY_ADMISSION_KEYS,
+        "ryuki.io/pin-security-admission-receipt",
+    ),
+    (
+        PRODUCTION_BUILD_MANIFEST_CONFIG_MAP,
+        PRODUCTION_BUILD_MANIFEST_KEYS,
+        "ryuki.io/pin-production-build-manifest-receipt",
+    ),
+    (
+        CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP,
+        CONFORMANCE_TRUST_CHECKPOINT_KEYS,
+        "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+    ),
+    (
+        DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP,
+        DEPLOYED_WORKLOAD_ATTESTATION_KEYS,
+        "ryuki.io/pin-deployed-workload-attestation-receipt",
+    ),
+    (
+        PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP,
+        PUBLIC_INGRESS_ATTESTATION_KEYS,
+        "ryuki.io/pin-public-ingress-attestation-receipt",
+    ),
+    (
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
+        "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    ),
+];
+const MIGRATION_RENDER_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
+    (
+        "platform-api-migration-config",
+        PLATFORM_API_MIGRATION_CONFIG_KEYS,
+        "ryuki.io/pin-migration-config-receipt",
+    ),
+    (
+        SECURITY_ADMISSION_CONFIG_MAP,
+        SECURITY_ADMISSION_KEYS,
+        "ryuki.io/pin-security-admission-receipt",
+    ),
+    (
+        PRODUCTION_BUILD_MANIFEST_CONFIG_MAP,
+        PRODUCTION_BUILD_MANIFEST_KEYS,
+        "ryuki.io/pin-production-build-manifest-receipt",
+    ),
+    (
+        CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP,
+        CONFORMANCE_TRUST_CHECKPOINT_KEYS,
+        "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+    ),
+    (
+        DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP,
+        DEPLOYED_WORKLOAD_ATTESTATION_KEYS,
+        "ryuki.io/pin-deployed-workload-attestation-receipt",
+    ),
+    (
+        PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP,
+        PUBLIC_INGRESS_ATTESTATION_KEYS,
+        "ryuki.io/pin-public-ingress-attestation-receipt",
+    ),
+    (
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP,
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
+        "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    ),
+    (
+        SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP,
+        SOCKET_PROJECTION_AUTHORITY_KEYS,
+        "ryuki.io/pin-socket-projection-authority-receipt",
+    ),
+];
+const MIGRATION_AUTHORITY_SOCKET_PROJECTIONS: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
+    (
+        CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP,
+        "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET",
+        "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID",
+        "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID",
+        "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT",
+        "conformance-trust-checkpoint-socket",
+        "conformance-trust-checkpoint",
+    ),
+    (
+        DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP,
+        "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET",
+        "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID",
+        "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID",
+        "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+        "deployed-workload-attestation-socket",
+        "deployed-workload-attestation",
+    ),
+    (
+        PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP,
+        "RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET",
+        "RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID",
+        "RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID",
+        "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+        "public-ingress-attestation-socket",
+        "public-ingress-attestation",
+    ),
+    (
+        POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP,
+        "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET",
+        "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID",
+        "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID",
+        "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT",
+        "postgresql-infrastructure-attestation-socket",
+        "postgresql-infrastructure-attestation",
+    ),
+];
+const MIGRATION_JOB_ENV_COUNT: usize = 44;
 const EXPECTED_SERVICE_ACCOUNTS: &[&str] = &[
     "portal-ui",
     "platform-api",
@@ -230,6 +461,7 @@ const APPROVED_KEYS: &[&str] = &[
     "ryuki.io/cutover-contract",
     "ryuki.io/release-image",
     "ryuki.io/release-digest-prefix",
+    "ryuki.io/socket-projection-receipt-raw-digest",
     "spec",
     "replicas",
     "selector",
@@ -349,6 +581,19 @@ impl MigrationIdentity {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SocketProjectionTrustAnchor {
+    authority_id: String,
+    key_id: String,
+    public_key: [u8; 32],
+    public_key_base64: String,
+    public_key_fingerprint: String,
+    min_authority_epoch: u64,
+    profile_id: String,
+    profile_version: u64,
+    profile_digest: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SourceText {
     path: String,
@@ -362,11 +607,15 @@ struct Context {
     source_texts: Vec<SourceText>,
     #[serde(default, rename = "cutoverContract")]
     cutover_contract: Value,
+    #[serde(default, rename = "socketProjectionTrustAnchorPath")]
+    untrusted_socket_projection_trust_anchor_path: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DocumentsInput {
     manifests: Vec<Value>,
+    #[serde(default, rename = "socketProjectionTrustAnchor")]
+    untrusted_socket_projection_trust_anchor: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,7 +631,13 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let context: Context = serde_json::from_str(&payload)
         .map_err(|error| format!("invalid kubernetes manifest context JSON: {error}"))?;
-    let mut errors = validate_documents(&context.manifests);
+    let mut errors = validate_documents(&context.manifests, None);
+    if context
+        .untrusted_socket_projection_trust_anchor_path
+        .is_some()
+    {
+        errors.push(MANIFEST_SELECTED_TRUST_ANCHOR_FORBIDDEN_ERROR.to_string());
+    }
     validate_cutover_contract(&context.cutover_contract, &context.manifests, &mut errors);
     validate_vault_external_auth_files(&context.source_texts, &mut errors);
     validate_source_texts(&context.source_texts, &mut errors);
@@ -392,7 +647,11 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
 pub fn validate_values_json(input: &str) -> Result<Vec<String>, String> {
     let payload: DocumentsInput = serde_json::from_str(input)
         .map_err(|error| format!("invalid kubernetes manifest documents JSON: {error}"))?;
-    Ok(validate_documents(&payload.manifests))
+    let mut errors = validate_documents(&payload.manifests, None);
+    if payload.untrusted_socket_projection_trust_anchor.is_some() {
+        errors.push(MANIFEST_SELECTED_TRUST_ANCHOR_FORBIDDEN_ERROR.to_string());
+    }
+    Ok(errors)
 }
 
 pub fn scan_prohibited_json(input: &str) -> Result<Vec<String>, String> {
@@ -408,7 +667,10 @@ pub fn scan_prohibited_json(input: &str) -> Result<Vec<String>, String> {
     Ok(errors)
 }
 
-fn validate_documents(manifests: &[Value]) -> Vec<String> {
+fn validate_documents(
+    manifests: &[Value],
+    socket_projection_trust_anchor: Option<&Value>,
+) -> Vec<String> {
     let mut errors = Vec::new();
     expect(
         !manifests.is_empty(),
@@ -422,7 +684,7 @@ fn validate_documents(manifests: &[Value]) -> Vec<String> {
     validate_config_maps(manifests, &mut errors);
     validate_components(manifests, &mut errors);
     validate_secret_reference_fingerprint_keyring_exposure(manifests, &mut errors);
-    validate_migration_job(manifests, &mut errors);
+    validate_migration_job(manifests, socket_projection_trust_anchor, &mut errors);
     validate_services(manifests, &mut errors);
     validate_ingress(manifests, &mut errors);
     validate_network_policies(manifests, &mut errors);
@@ -562,13 +824,45 @@ fn validate_standard_metadata(manifests: &[Value], errors: &mut Vec<String>) {
 
 fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
     let names = names_for(manifests, "ConfigMap");
-    push_diff_error(EXPECTED_CONFIG_MAPS, &names, errors, "missing ConfigMaps");
-    push_unexpected_error(
-        &names,
-        EXPECTED_CONFIG_MAPS,
-        errors,
-        "unexpected ConfigMaps",
-    );
+    let job = manifests
+        .iter()
+        .find(|manifest| str_at(manifest, &["kind"]) == Some("Job"));
+    let final_render = job.is_some_and(|job| {
+        str_at(job, &["metadata", "annotations", RENDER_MODE_ANNOTATION]) == Some(FINAL_RENDER_MODE)
+    });
+    let release_identity = job
+        .and_then(|job| str_at(job, &["metadata", "annotations", "ryuki.io/release-image"]))
+        .and_then(MigrationIdentity::from_image);
+    let mut expected_names: Vec<String> = EXPECTED_CONFIG_MAPS
+        .iter()
+        .filter(|name| !final_render || **name != "platform-api-migration-config")
+        .map(|name| (*name).to_string())
+        .collect();
+    if final_render {
+        if let Some(identity) = &release_identity {
+            expected_names.extend(MIGRATION_RENDER_PIN_GROUPS.iter().map(|(base_name, _, _)| {
+                digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix)
+            }));
+            if let Some(receipt_name) = job
+                .and_then(|job| {
+                    str_at(
+                        job,
+                        &[
+                            "metadata",
+                            "annotations",
+                            SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION,
+                        ],
+                    )
+                })
+                .and_then(socket_projection_receipt_config_map_name)
+            {
+                expected_names.push(receipt_name);
+            }
+        }
+    }
+    let expected_name_refs: Vec<&str> = expected_names.iter().map(String::as_str).collect();
+    push_diff_error(&expected_name_refs, &names, errors, "missing ConfigMaps");
+    push_unexpected_error(&names, &expected_name_refs, errors, "unexpected ConfigMaps");
 
     let find = |name: &str| {
         manifests
@@ -599,7 +893,20 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
         "platform-api-config must contain only the exact reviewed keys, require the database, use verify-only ryuki_app_runtime, forbid migrator membership, bind the exact value-free Vault workload-auth settings, and point to the exact projected SecretRef fingerprint keyring",
     );
 
-    let migration = find("platform-api-migration-config");
+    let migration_config_name = if final_render {
+        release_identity
+            .as_ref()
+            .map(|identity| {
+                digest_scoped_pin_config_map_name(
+                    "platform-api-migration-config",
+                    &identity.digest_prefix,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        "platform-api-migration-config".to_string()
+    };
+    let migration = find(&migration_config_name);
     let migration_data = object_at(migration, &["data"]);
     expect(
         migration_data
@@ -608,14 +915,14 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
             && str_at(
                 migration,
                 &["data", "RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS"],
-            ) == Some("1800")
-            && str_at(migration, &["data", "RYUKI_MIGRATION_LOCK_TIMEOUT_SECS"]) == Some("60")
+            ) == Some("180")
+            && str_at(migration, &["data", "RYUKI_MIGRATION_LOCK_TIMEOUT_SECS"]) == Some("30")
             && str_at(migration, &["data", "RYUKI_MIGRATION_EXPECTED_ROLE"])
                 == Some("ryuki_schema_migrator")
             && str_at(migration, &["data", "RYUKI_APPLICATION_DATABASE_ROLE"])
                 == Some("ryuki_app_runtime"),
         errors,
-        "platform-api-migration-config must contain only the exact reviewed keys with apply-only mode, 1800/60 timeouts, and exact migrator/application roles",
+        "platform-api-migration-config must contain only the exact reviewed keys with apply-only mode, 180/30 timeouts inside the 300-second proof lifetime, and exact migrator/application roles",
     );
 
     let portal = find("portal-ui-config");
@@ -786,7 +1093,11 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
     }
 }
 
-fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
+fn validate_migration_job(
+    manifests: &[Value],
+    socket_projection_trust_anchor: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
     let jobs: Vec<&Value> = manifests
         .iter()
         .filter(|manifest| str_at(manifest, &["kind"]) == Some("Job"))
@@ -822,6 +1133,7 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
             object_has_exact_keys(
                 spec,
                 &[
+                    "suspend",
                     "completions",
                     "parallelism",
                     "backoffLimit",
@@ -834,10 +1146,10 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
         "migration Job spec must contain only the reviewed one-shot fields; podFailurePolicy and all retry/replacement policy extensions are forbidden",
     );
     expect(
-        int_at(job, &["spec", "activeDeadlineSeconds"]) == Some(2400)
+        int_at(job, &["spec", "activeDeadlineSeconds"]) == Some(300)
             && value_at(job, &["spec", "ttlSecondsAfterFinished"]).is_none(),
         errors,
-        "migration Job must use the reviewed 2400-second deadline and forbid automatic TTL deletion/recreation",
+        "migration Job must use the proof-bounded 300-second deadline and forbid automatic TTL deletion/recreation",
     );
 
     let pod_template = value_at(job, &["spec", "template"]).unwrap_or(&Value::Null);
@@ -886,12 +1198,26 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
     );
     let pod_security = value_at(pod_spec, &["securityContext"]).unwrap_or(&Value::Null);
     expect(
-        bool_at(pod_security, &["runAsNonRoot"]) == Some(true)
+        object(pod_security).is_some_and(|security| {
+            object_has_exact_keys(
+                security,
+                &[
+                    "runAsNonRoot",
+                    "runAsUser",
+                    "runAsGroup",
+                    "fsGroup",
+                    "fsGroupChangePolicy",
+                    "seccompProfile",
+                ],
+            )
+        }) && bool_at(pod_security, &["runAsNonRoot"]) == Some(true)
             && int_at(pod_security, &["runAsUser"]) == Some(10001)
             && int_at(pod_security, &["runAsGroup"]) == Some(10001)
+            && int_at(pod_security, &["fsGroup"]) == Some(10001)
+            && str_at(pod_security, &["fsGroupChangePolicy"]) == Some("OnRootMismatch")
             && str_at(pod_security, &["seccompProfile", "type"]) == Some("RuntimeDefault"),
         errors,
-        "migration Job pod must use the reviewed non-root identity and RuntimeDefault seccomp",
+        "migration Job pod must use the reviewed non-root identity, relay workspace group, and RuntimeDefault seccomp",
     );
 
     let containers = array_at(pod_spec, &["containers"]);
@@ -937,6 +1263,13 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
         errors,
         "migration Job must set imagePullPolicy to IfNotPresent",
     );
+    validate_migration_render_binding(
+        manifests,
+        job,
+        migration_identity.as_ref(),
+        socket_projection_trust_anchor,
+        errors,
+    );
 
     for prohibited in [
         "command",
@@ -955,12 +1288,23 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
     }
 
     let env_from = array_at_path(container, &["envFrom"]);
+    let migration_config_name = if str_at(job, &["metadata", "annotations", RENDER_MODE_ANNOTATION])
+        == Some(FINAL_RENDER_MODE)
+    {
+        migration_identity.as_ref().map(|identity| {
+            digest_scoped_pin_config_map_name(
+                "platform-api-migration-config",
+                &identity.digest_prefix,
+            )
+        })
+    } else {
+        Some("platform-api-migration-config".to_string())
+    };
     let exact_config_ref = env_from.iter().any(|entry| {
         object(entry).is_some_and(|map| map.len() == 1)
             && object_at(entry, &["configMapRef"]).is_some_and(|reference| {
                 reference.len() == 1
-                    && str_at(entry, &["configMapRef", "name"])
-                        == Some("platform-api-migration-config")
+                    && str_at(entry, &["configMapRef", "name"]) == migration_config_name.as_deref()
             })
     });
     expect(
@@ -970,12 +1314,12 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
                 .iter()
                 .all(|entry| value_at(entry, &["secretRef"]).is_none()),
         errors,
-        "migration Job envFrom must contain only platform-api-migration-config and no whole-Secret import",
+        "migration Job envFrom must contain only the source or immutable digest-scoped migration ConfigMap required by its render mode and no whole-Secret import",
     );
     let env = array_at_path(container, &["env"]);
     let migration_url = env.first().copied().unwrap_or(&Value::Null);
     expect(
-        env.len() == SECURITY_ADMISSION_KEYS.len() + 1
+        env.len() == MIGRATION_JOB_ENV_COUNT
             && object(migration_url).is_some_and(|entry| entry.len() == 2)
             && str_at(migration_url, &["name"]) == Some("RYUKI_MIGRATION_DATABASE_URL")
             && object_at(migration_url, &["valueFrom"])
@@ -990,23 +1334,1226 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
                 == Some("RYUKI_MIGRATION_DATABASE_URL")
             && value_at(migration_url, &["value"]).is_none(),
         errors,
-        "migration Job must import the digest-scoped migrator URL key plus seven security-admission keys",
+        "migration Job must import the digest-scoped migrator URL key plus all 43 production pin keys",
     );
     expect(
-        env.get(1..)
-            .is_some_and(exact_security_admission_env_entries),
+        migration_identity.as_ref().is_some_and(|identity| {
+            env.get(1..).is_some_and(|entries| {
+                exact_migration_production_pin_env_entries(entries, &identity.digest_prefix)
+            })
+        }),
         errors,
-        "migration Job must import the exact seven security-admission ConfigMap keys",
+        "migration Job must import the exact ordered, unique production pin keys from their independently governed ConfigMaps",
     );
 
-    validate_cnpg_ca_mount("migration Job", pod_spec, container, 1, errors);
+    let expected_volume_count = if str_at(job, &["metadata", "annotations", RENDER_MODE_ANNOTATION])
+        == Some(FINAL_RENDER_MODE)
+    {
+        2 + MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+    } else {
+        2
+    };
+    validate_cnpg_ca_mount(
+        "migration Job",
+        pod_spec,
+        container,
+        expected_volume_count,
+        errors,
+    );
+    validate_migration_relay_workspace(pod_spec, container, errors);
     validate_migration_job_resources(container, errors);
     validate_migration_job_security(container, errors);
+}
+
+fn validate_migration_render_binding(
+    manifests: &[Value],
+    job: &Value,
+    migration_identity: Option<&MigrationIdentity>,
+    socket_projection_trust_anchor: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    let annotations = object_at(job, &["metadata", "annotations"]);
+    expect(
+        annotations.is_some_and(|annotations| {
+            let ryuki_annotations: Vec<&str> = annotations
+                .keys()
+                .filter(|key| key.starts_with("ryuki.io/"))
+                .map(String::as_str)
+                .collect();
+            ryuki_annotations.len() == MIGRATION_JOB_RYUKI_ANNOTATIONS.len()
+                && MIGRATION_JOB_RYUKI_ANNOTATIONS
+                    .iter()
+                    .all(|expected| ryuki_annotations.contains(expected))
+                && str_at(
+                    job,
+                    &["metadata", "annotations", RENDER_CONTRACT_ANNOTATION],
+                ) == Some(FINAL_RENDER_CONTRACT)
+                && str_at(
+                    job,
+                    &["metadata", "annotations", SOCKET_CONTRACT_DIGEST_ANNOTATION],
+                ) == Some(SOCKET_CONTRACT_DIGEST)
+        }),
+        errors,
+        "migration Job must bind the exact final-render and closed socket-projection contracts",
+    );
+
+    match str_at(job, &["metadata", "annotations", RENDER_MODE_ANNOTATION]) {
+        Some(SOURCE_TEMPLATE_MODE) => {
+            let pin_receipts_are_unresolved =
+                MIGRATION_RENDER_PIN_GROUPS
+                    .iter()
+                    .all(|(_, _, annotation)| {
+                        str_at(job, &["metadata", "annotations", annotation])
+                            == Some(RENDER_REQUIRED_SENTINEL)
+                    });
+            let socket_receipts_are_unresolved = str_at(
+                job,
+                &[
+                    "metadata",
+                    "annotations",
+                    SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION,
+                ],
+            ) == Some(RENDER_REQUIRED_SENTINEL);
+            expect(
+                pin_receipts_are_unresolved
+                    && socket_receipts_are_unresolved
+                    && bool_at(job, &["spec", "suspend"]) == Some(true),
+                errors,
+                "source-template migration Job must remain suspended and retain every RENDER_REQUIRED receipt sentinel; no final render is currently executable",
+            );
+        }
+        Some(FINAL_RENDER_MODE) => {
+            // Offline validation cannot close the time-of-check/time-of-use
+            // boundary. Keep this unconditional until the named in-cluster
+            // admission and runtime capability is implemented and reviewed.
+            errors.push(FINAL_RENDER_RUNTIME_ADMISSION_UNAVAILABLE_ERROR.to_string());
+            expect(
+                annotations.is_some_and(|annotations| {
+                    !annotations
+                        .values()
+                        .any(|value| value.as_str() == Some(RENDER_REQUIRED_SENTINEL))
+                }) && bool_at(job, &["spec", "suspend"]) == Some(false),
+                errors,
+                "final-render migration Job must resolve every RENDER_REQUIRED sentinel and explicitly clear source suspension",
+            );
+            validate_final_render_pin_config_maps(manifests, job, migration_identity, errors);
+            validate_final_render_socket_receipt(
+                manifests,
+                job,
+                migration_identity,
+                socket_projection_trust_anchor,
+                errors,
+            );
+            validate_final_render_socket_projections(manifests, job, migration_identity, errors);
+        }
+        _ => expect(
+            false,
+            errors,
+            "migration Job render mode must be exactly source-template or final-render",
+        ),
+    }
+}
+
+fn validate_final_render_pin_config_maps(
+    manifests: &[Value],
+    job: &Value,
+    migration_identity: Option<&MigrationIdentity>,
+    errors: &mut Vec<String>,
+) {
+    let Some(identity) = migration_identity else {
+        errors.push(
+            "final-render migration Job requires one valid release image identity".to_string(),
+        );
+        return;
+    };
+
+    for (base_name, expected_keys, receipt_annotation) in MIGRATION_RENDER_PIN_GROUPS {
+        let expected_name = digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix);
+        let matching: Vec<&Value> = manifests
+            .iter()
+            .filter(|manifest| {
+                str_at(manifest, &["kind"]) == Some("ConfigMap")
+                    && str_at(manifest, &["metadata", "name"]) == Some(expected_name.as_str())
+            })
+            .collect();
+        let config_map = matching.first().copied().unwrap_or(&Value::Null);
+        let data = object_at(config_map, &["data"]);
+        let content_digest = data.and_then(canonical_config_map_data_digest);
+        let uid = str_at(config_map, &["metadata", "uid"]);
+        let resource_version = str_at(config_map, &["metadata", "resourceVersion"]);
+        let annotation_digest = str_at(
+            config_map,
+            &["metadata", "annotations", CONTENT_DIGEST_ANNOTATION],
+        );
+        let expected_receipt = match (&content_digest, uid, resource_version) {
+            (Some(content_digest), Some(uid), Some(resource_version)) => Some(format!(
+                "{{\"configMapName\":\"{expected_name}\",\"uid\":\"{uid}\",\"resourceVersion\":\"{resource_version}\",\"contentDigest\":\"{content_digest}\"}}"
+            )),
+            _ => None,
+        };
+
+        expect(
+            matching.len() == 1
+                && bool_at(config_map, &["immutable"]) == Some(true)
+                && value_at(config_map, &["binaryData"]).is_none()
+                && data.is_some_and(|data| object_has_exact_keys(data, expected_keys))
+                && data.is_some_and(|data| {
+                    data.values().all(|value| {
+                        value.as_str().is_some_and(|value| {
+                            value != RENDER_REQUIRED_SENTINEL && !value.is_empty()
+                        })
+                    })
+                })
+                && str_at(
+                    config_map,
+                    &["metadata", "annotations", RELEASE_DIGEST_PREFIX_ANNOTATION],
+                ) == Some(identity.digest_prefix.as_str())
+                && content_digest.as_deref() == annotation_digest
+                && uid.is_some_and(is_canonical_kubernetes_uid)
+                && resource_version.is_some_and(is_canonical_resource_version)
+                && expected_receipt.as_deref()
+                    == str_at(job, &["metadata", "annotations", receipt_annotation]),
+            errors,
+            format!(
+                "final-render migration Job must bind immutable ConfigMap {expected_name} by exact keys, canonical content digest, UID, resourceVersion, and receipt annotation"
+            ),
+        );
+    }
+}
+
+fn validate_final_render_socket_receipt(
+    manifests: &[Value],
+    job: &Value,
+    migration_identity: Option<&MigrationIdentity>,
+    trust_anchor: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    if let Err(error) =
+        validate_final_render_socket_receipt_inner(manifests, job, migration_identity, trust_anchor)
+    {
+        errors.push(format!(
+            "final-render socket-projection receipt verification failed: {error}"
+        ));
+    }
+}
+
+fn validate_final_render_socket_receipt_inner(
+    manifests: &[Value],
+    job: &Value,
+    migration_identity: Option<&MigrationIdentity>,
+    trust_anchor: Option<&Value>,
+) -> Result<(), String> {
+    let identity = migration_identity
+        .ok_or_else(|| "release image identity is missing or invalid".to_string())?;
+    let anchor = parse_socket_projection_trust_anchor(trust_anchor.ok_or_else(|| {
+        "diagnostic receipt verification has no injected test trust anchor; production trust-anchor inputs are forbidden until runtime admission exists"
+            .to_string()
+    })?)?;
+    let authority_config_map_name = digest_scoped_pin_config_map_name(
+        SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP,
+        &identity.digest_prefix,
+    );
+    let authority_config_map = exactly_one_named_config_map(manifests, &authority_config_map_name)?;
+    let min_authority_epoch = anchor.min_authority_epoch.to_string();
+    let profile_version = anchor.profile_version.to_string();
+    let expected_authority_data = [
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[0],
+            anchor.authority_id.as_str(),
+        ),
+        (SOCKET_PROJECTION_AUTHORITY_KEYS[1], anchor.key_id.as_str()),
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[2],
+            anchor.public_key_base64.as_str(),
+        ),
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[3],
+            anchor.public_key_fingerprint.as_str(),
+        ),
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[4],
+            min_authority_epoch.as_str(),
+        ),
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[5],
+            anchor.profile_id.as_str(),
+        ),
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[6],
+            profile_version.as_str(),
+        ),
+        (
+            SOCKET_PROJECTION_AUTHORITY_KEYS[7],
+            anchor.profile_digest.as_str(),
+        ),
+    ];
+    if !expected_authority_data
+        .iter()
+        .all(|(key, expected)| str_at(authority_config_map, &["data", key]) == Some(*expected))
+    {
+        return Err(
+            "manifest socket-projection authority pins do not exactly match the independent trust anchor"
+                .to_string(),
+        );
+    }
+
+    let receipt_digest = str_at(
+        job,
+        &[
+            "metadata",
+            "annotations",
+            SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION,
+        ],
+    )
+    .filter(|value| is_nonzero_sha256_digest(value))
+    .ok_or_else(|| "Job receipt digest annotation is missing or invalid".to_string())?;
+    let receipt_config_map_name = socket_projection_receipt_config_map_name(receipt_digest)
+        .ok_or_else(|| "Job receipt digest cannot form the content-addressed name".to_string())?;
+    let receipt_config_map = exactly_one_named_config_map(manifests, &receipt_config_map_name)?;
+    let data = object_at(receipt_config_map, &["data"])
+        .ok_or_else(|| "receipt ConfigMap data is missing".to_string())?;
+    if !object_has_exact_keys(data, &[SOCKET_PROJECTION_RECEIPT_DATA_KEY])
+        || bool_at(receipt_config_map, &["immutable"]) != Some(true)
+        || value_at(receipt_config_map, &["binaryData"]).is_some()
+    {
+        return Err(
+            "receipt ConfigMap must be immutable with only canonical receipt.json data and no binaryData"
+                .to_string(),
+        );
+    }
+    let raw_receipt = str_at(
+        receipt_config_map,
+        &["data", SOCKET_PROJECTION_RECEIPT_DATA_KEY],
+    )
+    .ok_or_else(|| "receipt.json must be a string".to_string())?;
+    if raw_receipt.len() > SOCKET_PROJECTION_MAX_RECEIPT_BYTES {
+        return Err("receipt.json exceeds the 64 KiB limit".to_string());
+    }
+    let content_digest = canonical_config_map_data_digest(data)
+        .ok_or_else(|| "receipt ConfigMap data cannot be canonicalized".to_string())?;
+    let annotations = object_at(receipt_config_map, &["metadata", "annotations"])
+        .ok_or_else(|| "receipt ConfigMap annotations are missing".to_string())?;
+    if !object_has_exact_keys(
+        annotations,
+        &[
+            RELEASE_DIGEST_PREFIX_ANNOTATION,
+            CONTENT_DIGEST_ANNOTATION,
+            SOCKET_PROJECTION_RECEIPT_RAW_DIGEST_ANNOTATION,
+        ],
+    ) || str_at(
+        receipt_config_map,
+        &["metadata", "annotations", RELEASE_DIGEST_PREFIX_ANNOTATION],
+    ) != Some(identity.digest_prefix.as_str())
+        || str_at(
+            receipt_config_map,
+            &["metadata", "annotations", CONTENT_DIGEST_ANNOTATION],
+        ) != Some(content_digest.as_str())
+        || str_at(
+            receipt_config_map,
+            &[
+                "metadata",
+                "annotations",
+                SOCKET_PROJECTION_RECEIPT_RAW_DIGEST_ANNOTATION,
+            ],
+        ) != Some(receipt_digest)
+    {
+        return Err("receipt ConfigMap metadata does not bind its exact raw/content digests and release prefix".to_string());
+    }
+    if sha256_prefixed(raw_receipt.as_bytes()) != receipt_digest {
+        return Err("receipt.json raw SHA-256 does not match the Job annotation".to_string());
+    }
+
+    let receipt = crate::security_conformance::parse_json_strict(raw_receipt.as_bytes())
+        .map_err(|error| format!("receipt.json is not strict JSON: {error}"))?;
+    let canonical_receipt = canonical_json_bytes(&receipt)
+        .map_err(|error| format!("receipt canonicalization failed: {error}"))?;
+    if canonical_receipt.as_slice() != raw_receipt.as_bytes() {
+        return Err("receipt.json is not exact ryuki-canonical-json-v1".to_string());
+    }
+    let receipt_object =
+        object(&receipt).ok_or_else(|| "receipt root must be an object".to_string())?;
+    if !object_has_exact_keys(receipt_object, &["payload", "signature"]) {
+        return Err("receipt root must contain only payload and signature".to_string());
+    }
+    let payload =
+        value_at(&receipt, &["payload"]).ok_or_else(|| "receipt payload is missing".to_string())?;
+    let payload_object =
+        object(payload).ok_or_else(|| "receipt payload must be an object".to_string())?;
+    if !object_has_exact_keys(
+        payload_object,
+        &[
+            "canonicalization",
+            "contractId",
+            "expiresAtUnixSeconds",
+            "notBeforeUnixSeconds",
+            "pinConfigMapReceipts",
+            "receiptAuthority",
+            "releaseDigestPrefix",
+            "releaseImage",
+            "renderedJobPreimageDigest",
+            "socketContractDigest",
+            "socketProjections",
+        ],
+    ) {
+        return Err("receipt payload has an unknown or missing v1 field".to_string());
+    }
+    let not_before = value_at(payload, &["notBeforeUnixSeconds"])
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "notBeforeUnixSeconds must be an integer".to_string())?;
+    let expires_at = value_at(payload, &["expiresAtUnixSeconds"])
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "expiresAtUnixSeconds must be an integer".to_string())?;
+    let now = Utc::now().timestamp();
+    if not_before < 1
+        || expires_at <= not_before
+        || expires_at - not_before > SOCKET_PROJECTION_MAX_AUTHORIZATION_SECONDS
+        || now < not_before
+        || now >= expires_at
+    {
+        return Err(
+            "receipt validity must be current in [notBefore, expiresAt) and no longer than 300 seconds"
+                .to_string(),
+        );
+    }
+    let receipt_authority = value_at(payload, &["receiptAuthority"])
+        .ok_or_else(|| "receiptAuthority is missing".to_string())?;
+    let receipt_authority_object = object(receipt_authority)
+        .ok_or_else(|| "receiptAuthority must be an object".to_string())?;
+    if !object_has_exact_keys(
+        receipt_authority_object,
+        &[
+            "authorityEpoch",
+            "authorityId",
+            "keyId",
+            "minAuthorityEpoch",
+            "profileDigest",
+            "profileId",
+            "profileVersion",
+            "publicKeyFingerprint",
+        ],
+    ) {
+        return Err("receiptAuthority has an unknown or missing field".to_string());
+    }
+    let authority_epoch = value_at(receipt_authority, &["authorityEpoch"])
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch >= anchor.min_authority_epoch)
+        .ok_or_else(|| "receipt authority epoch is below the independent minimum".to_string())?;
+    let expected_payload = serde_json::json!({
+        "canonicalization": "ryuki-canonical-json-v1",
+        "contractId": SOCKET_PROJECTION_RECEIPT_CONTRACT,
+        "expiresAtUnixSeconds": expires_at,
+        "notBeforeUnixSeconds": not_before,
+        "pinConfigMapReceipts": expected_socket_receipt_pin_receipts(job)?,
+        "receiptAuthority": {
+            "authorityEpoch": authority_epoch,
+            "authorityId": anchor.authority_id.as_str(),
+            "keyId": anchor.key_id.as_str(),
+            "minAuthorityEpoch": anchor.min_authority_epoch,
+            "profileDigest": anchor.profile_digest.as_str(),
+            "profileId": anchor.profile_id.as_str(),
+            "profileVersion": anchor.profile_version,
+            "publicKeyFingerprint": anchor.public_key_fingerprint.as_str(),
+        },
+        "releaseDigestPrefix": identity.digest_prefix.as_str(),
+        "releaseImage": str_at(job, &["metadata", "annotations", "ryuki.io/release-image"])
+            .ok_or_else(|| "Job release image annotation is missing".to_string())?,
+        "renderedJobPreimageDigest": rendered_job_preimage_digest(job)?,
+        "socketContractDigest": SOCKET_CONTRACT_DIGEST,
+        "socketProjections": expected_socket_receipt_projections(manifests, identity)?,
+    });
+    if payload != &expected_payload {
+        return Err("signed receipt payload does not exactly bind the rendered Job, eight ConfigMap receipts, authority pins, and four socket projections".to_string());
+    }
+
+    let signature = value_at(&receipt, &["signature"])
+        .ok_or_else(|| "receipt signature is missing".to_string())?;
+    if !object(signature).is_some_and(|signature| {
+        object_has_exact_keys(signature, &["algorithm", "signatureBase64"])
+    }) || str_at(signature, &["algorithm"]) != Some("ed25519")
+    {
+        return Err("receipt signature must be the exact Ed25519 v1 object".to_string());
+    }
+    let signature_bytes = decode_canonical_base64::<64>(
+        str_at(signature, &["signatureBase64"])
+            .ok_or_else(|| "signatureBase64 is missing".to_string())?,
+        "receipt signature",
+    )?;
+    let canonical_payload = canonical_json_bytes(payload)
+        .map_err(|error| format!("receipt payload canonicalization failed: {error}"))?;
+    let signed = socket_projection_signing_bytes(&canonical_payload);
+    let verifying_key = VerifyingKey::from_bytes(&anchor.public_key)
+        .map_err(|_| "independent trust anchor contains an invalid Ed25519 key".to_string())?;
+    if verifying_key.is_weak() {
+        return Err("independent trust anchor contains a weak Ed25519 key".to_string());
+    }
+    verifying_key
+        .verify_strict(&signed, &Signature::from_bytes(&signature_bytes))
+        .map_err(|_| "Ed25519 receipt signature verification failed".to_string())
+}
+
+fn parse_socket_projection_trust_anchor(
+    value: &Value,
+) -> Result<SocketProjectionTrustAnchor, String> {
+    let anchor = object(value).ok_or_else(|| "trust anchor must be an object".to_string())?;
+    if !object_has_exact_keys(
+        anchor,
+        &[
+            "authorityId",
+            "contractId",
+            "keyId",
+            "minAuthorityEpoch",
+            "profileDigest",
+            "profileId",
+            "profileVersion",
+            "publicKeyBase64",
+            "publicKeyFingerprint",
+        ],
+    ) || str_at(value, &["contractId"]) != Some(SOCKET_PROJECTION_TRUST_ANCHOR_CONTRACT)
+    {
+        return Err("trust anchor has an unknown, missing, or invalid v1 field".to_string());
+    }
+    let authority_id = str_at(value, &["authorityId"])
+        .filter(|value| is_render_identifier(value))
+        .ok_or_else(|| "trust-anchor authorityId is invalid".to_string())?;
+    let key_id = str_at(value, &["keyId"])
+        .filter(|value| is_render_identifier(value))
+        .ok_or_else(|| "trust-anchor keyId is invalid".to_string())?;
+    let profile_id = str_at(value, &["profileId"])
+        .filter(|value| is_render_identifier(value))
+        .ok_or_else(|| "trust-anchor profileId is invalid".to_string())?;
+    let profile_version = value_at(value, &["profileVersion"])
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "trust-anchor profileVersion must be a positive integer".to_string())?;
+    let profile_digest = str_at(value, &["profileDigest"])
+        .filter(|value| is_nonzero_sha256_digest(value))
+        .ok_or_else(|| "trust-anchor profileDigest is invalid".to_string())?;
+    let min_authority_epoch = value_at(value, &["minAuthorityEpoch"])
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "trust-anchor minAuthorityEpoch must be a positive integer".to_string())?;
+    let public_key_base64 = str_at(value, &["publicKeyBase64"])
+        .ok_or_else(|| "trust-anchor publicKeyBase64 is missing".to_string())?;
+    let public_key = decode_canonical_base64::<32>(public_key_base64, "trust-anchor public key")?;
+    let public_key_fingerprint = str_at(value, &["publicKeyFingerprint"])
+        .filter(|value| is_nonzero_sha256_digest(value))
+        .ok_or_else(|| "trust-anchor publicKeyFingerprint is invalid".to_string())?;
+    if sha256_prefixed(&public_key) != public_key_fingerprint {
+        return Err("trust-anchor public-key fingerprint does not match its raw key".to_string());
+    }
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| "trust anchor contains an invalid Ed25519 public key".to_string())?;
+    if verifying_key.is_weak() {
+        return Err("trust anchor contains a weak Ed25519 public key".to_string());
+    }
+    Ok(SocketProjectionTrustAnchor {
+        authority_id: authority_id.to_string(),
+        key_id: key_id.to_string(),
+        public_key,
+        public_key_base64: public_key_base64.to_string(),
+        public_key_fingerprint: public_key_fingerprint.to_string(),
+        min_authority_epoch,
+        profile_id: profile_id.to_string(),
+        profile_version,
+        profile_digest: profile_digest.to_string(),
+    })
+}
+
+fn exactly_one_named_config_map<'a>(
+    manifests: &'a [Value],
+    name: &str,
+) -> Result<&'a Value, String> {
+    let matches: Vec<&Value> = manifests
+        .iter()
+        .filter(|manifest| {
+            str_at(manifest, &["kind"]) == Some("ConfigMap")
+                && str_at(manifest, &["metadata", "name"]) == Some(name)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err(format!("expected exactly one ConfigMap {name}"));
+    }
+    Ok(matches[0])
+}
+
+fn expected_socket_receipt_pin_receipts(job: &Value) -> Result<Value, String> {
+    MIGRATION_RENDER_PIN_GROUPS
+        .iter()
+        .map(|(_, _, annotation)| {
+            let raw = str_at(job, &["metadata", "annotations", annotation])
+                .filter(|value| is_canonical_pin_config_map_receipt(value))
+                .ok_or_else(|| format!("Job pin receipt {annotation} is missing or invalid"))?;
+            let receipt = crate::security_conformance::parse_json_strict(raw.as_bytes())
+                .map_err(|error| format!("Job pin receipt {annotation} is invalid: {error}"))?;
+            Ok(serde_json::json!({
+                "annotation": annotation,
+                "receipt": receipt,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Value::Array)
+}
+
+fn expected_socket_receipt_projections(
+    manifests: &[Value],
+    identity: &MigrationIdentity,
+) -> Result<Value, String> {
+    MIGRATION_AUTHORITY_SOCKET_PROJECTIONS
+        .iter()
+        .map(
+            |(
+                base_name,
+                socket_key,
+                authority_id_key,
+                key_id_key,
+                fingerprint_key,
+                volume_name,
+                authority_class,
+            )| {
+                let name = digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix);
+                let config_map = exactly_one_named_config_map(manifests, &name)?;
+                let socket_path = str_at(config_map, &["data", socket_key])
+                    .filter(|value| is_normalized_absolute_socket_path(value))
+                    .ok_or_else(|| format!("{name} socket path is invalid"))?;
+                let mount_path = normalized_socket_mount_parent(socket_path)
+                    .ok_or_else(|| format!("{name} socket mount path is invalid"))?;
+                let authority_id = str_at(config_map, &["data", authority_id_key])
+                    .filter(|value| is_render_identifier(value))
+                    .ok_or_else(|| format!("{name} authority id is invalid"))?;
+                let key_id = str_at(config_map, &["data", key_id_key])
+                    .filter(|value| is_render_identifier(value))
+                    .ok_or_else(|| format!("{name} key id is invalid"))?;
+                let fingerprint = str_at(config_map, &["data", fingerprint_key])
+                    .filter(|value| is_nonzero_sha256_digest(value))
+                    .ok_or_else(|| format!("{name} public-key fingerprint is invalid"))?;
+                Ok(serde_json::json!({
+                    "authorityClass": authority_class,
+                    "authorityId": authority_id,
+                    "csiDriver": AUTHORITY_SOCKET_CSI_DRIVER,
+                    "environmentVariable": socket_key,
+                    "keyId": key_id,
+                    "mountPath": mount_path,
+                    "publicKeyFingerprint": fingerprint,
+                    "readOnly": true,
+                    "socketPath": socket_path,
+                    "volumeName": volume_name,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()
+        .map(Value::Array)
+}
+
+fn rendered_job_preimage_digest(job: &Value) -> Result<String, String> {
+    let mut preimage = job.clone();
+    preimage
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Job annotations are missing".to_string())?
+        .remove(SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION)
+        .ok_or_else(|| "Job receipt digest annotation is missing".to_string())?;
+    canonical_json_bytes(&preimage)
+        .map(|bytes| sha256_prefixed(&bytes))
+        .map_err(|error| format!("rendered Job canonicalization failed: {error}"))
+}
+
+fn socket_projection_signing_bytes(canonical_payload: &[u8]) -> Vec<u8> {
+    let mut signed =
+        Vec::with_capacity(16 + SOCKET_PROJECTION_SIGNATURE_DOMAIN.len() + canonical_payload.len());
+    write_frame(&mut signed, SOCKET_PROJECTION_SIGNATURE_DOMAIN.as_bytes());
+    write_frame(&mut signed, canonical_payload);
+    signed
+}
+
+fn write_frame(buffer: &mut Vec<u8>, value: &[u8]) {
+    buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    buffer.extend_from_slice(value);
+}
+
+fn decode_canonical_base64<const N: usize>(value: &str, label: &str) -> Result<[u8; N], String> {
+    let decoded = BASE64_STANDARD
+        .decode(value)
+        .map_err(|_| format!("{label} is not valid standard base64"))?;
+    let decoded: [u8; N] = decoded
+        .try_into()
+        .map_err(|_| format!("{label} has the wrong decoded length"))?;
+    if BASE64_STANDARD.encode(decoded) != value {
+        return Err(format!("{label} is not canonical padded standard base64"));
+    }
+    Ok(decoded)
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn socket_projection_receipt_config_map_name(digest: &str) -> Option<String> {
+    is_nonzero_sha256_digest(digest).then(|| {
+        format!(
+            "{SOCKET_PROJECTION_RECEIPT_CONFIG_MAP_PREFIX}{}",
+            &digest["sha256:".len()..]
+        )
+    })
+}
+
+fn validate_final_render_socket_projections(
+    manifests: &[Value],
+    job: &Value,
+    migration_identity: Option<&MigrationIdentity>,
+    errors: &mut Vec<String>,
+) {
+    let Some(identity) = migration_identity else {
+        errors.push(
+            "final-render socket projections require one valid release image identity".to_string(),
+        );
+        return;
+    };
+    let pod_spec = value_at(job, &["spec", "template", "spec"]).unwrap_or(&Value::Null);
+    let container = array_at_path(pod_spec, &["containers"])
+        .first()
+        .copied()
+        .unwrap_or(&Value::Null);
+    let volumes = array_at_path(pod_spec, &["volumes"]);
+    let mounts = array_at_path(container, &["volumeMounts"]);
+    let mut socket_paths = Vec::new();
+    let mut mount_paths = Vec::new();
+    let mut fingerprints = Vec::new();
+    let mut all_projections_match = true;
+
+    for (base_name, socket_key, _, _, fingerprint_key, volume_name, authority_class) in
+        MIGRATION_AUTHORITY_SOCKET_PROJECTIONS
+    {
+        let config_map_name = digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix);
+        let config_maps: Vec<&Value> = manifests
+            .iter()
+            .filter(|manifest| {
+                str_at(manifest, &["kind"]) == Some("ConfigMap")
+                    && str_at(manifest, &["metadata", "name"]) == Some(config_map_name.as_str())
+            })
+            .collect();
+        let config_map = config_maps.first().copied().unwrap_or(&Value::Null);
+        let socket_path = str_at(config_map, &["data", socket_key]);
+        let fingerprint = str_at(config_map, &["data", fingerprint_key]);
+        let mount_path = socket_path.and_then(normalized_socket_mount_parent);
+        if let Some(socket_path) = socket_path {
+            socket_paths.push(socket_path.to_string());
+        }
+        if let Some(mount_path) = mount_path {
+            mount_paths.push(mount_path.to_string());
+        }
+        if let Some(fingerprint) = fingerprint {
+            fingerprints.push(fingerprint.to_string());
+        }
+
+        let matching_volumes: Vec<&Value> = volumes
+            .iter()
+            .copied()
+            .filter(|volume| str_at(volume, &["name"]) == Some(*volume_name))
+            .collect();
+        let volume = matching_volumes.first().copied().unwrap_or(&Value::Null);
+        let csi = value_at(volume, &["csi"]).unwrap_or(&Value::Null);
+        let attributes = object_at(csi, &["volumeAttributes"]);
+        let matching_mounts: Vec<&Value> = mounts
+            .iter()
+            .copied()
+            .filter(|mount| str_at(mount, &["name"]) == Some(*volume_name))
+            .collect();
+        let mount = matching_mounts.first().copied().unwrap_or(&Value::Null);
+
+        all_projections_match &= config_maps.len() == 1
+            && socket_path.is_some_and(is_normalized_absolute_socket_path)
+            && fingerprint.is_some_and(is_nonzero_sha256_digest)
+            && matching_volumes.len() == 1
+            && object(volume).is_some_and(|volume| object_has_exact_keys(volume, &["name", "csi"]))
+            && object(csi).is_some_and(|csi| {
+                object_has_exact_keys(csi, &["driver", "readOnly", "volumeAttributes"])
+            })
+            && str_at(csi, &["driver"]) == Some(AUTHORITY_SOCKET_CSI_DRIVER)
+            && bool_at(csi, &["readOnly"]) == Some(true)
+            && attributes.is_some_and(|attributes| {
+                object_has_exact_keys(attributes, AUTHORITY_SOCKET_CSI_ATTRIBUTE_KEYS)
+            })
+            && str_at(csi, &["volumeAttributes", "environmentVariable"]) == Some(*socket_key)
+            && str_at(csi, &["volumeAttributes", "authorityClass"]) == Some(*authority_class)
+            && str_at(csi, &["volumeAttributes", "socketPath"]) == socket_path
+            && matching_mounts.len() == 1
+            && object(mount).is_some_and(|mount| {
+                object_has_exact_keys(mount, &["name", "mountPath", "readOnly"])
+            })
+            && str_at(mount, &["mountPath"]) == mount_path
+            && bool_at(mount, &["readOnly"]) == Some(true);
+    }
+
+    let expected_volume_names: BTreeSet<&str> = MIGRATION_AUTHORITY_SOCKET_PROJECTIONS
+        .iter()
+        .map(|(_, _, _, _, _, volume_name, _)| *volume_name)
+        .chain(std::iter::once(CNPG_CA_VOLUME_NAME))
+        .chain(std::iter::once(POSTGRESQL_RELAY_VOLUME_NAME))
+        .collect();
+    let actual_volume_names: BTreeSet<&str> = volumes
+        .iter()
+        .filter_map(|volume| str_at(volume, &["name"]))
+        .collect();
+    let actual_mount_names: BTreeSet<&str> = mounts
+        .iter()
+        .filter_map(|mount| str_at(mount, &["name"]))
+        .collect();
+    let distinct_socket_paths: BTreeSet<&str> = socket_paths.iter().map(String::as_str).collect();
+    let distinct_mount_paths: BTreeSet<&str> = mount_paths.iter().map(String::as_str).collect();
+    let postgresql_fingerprint = fingerprints.last();
+
+    expect(
+        all_projections_match
+            && volumes.len() == 2 + MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && mounts.len() == 2 + MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && actual_volume_names == expected_volume_names
+            && actual_mount_names == expected_volume_names
+            && socket_paths.len() == MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && distinct_socket_paths.len() == MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && mount_paths.len() == MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && distinct_mount_paths.len() == MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && fingerprints.len() == MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len()
+            && postgresql_fingerprint.is_some_and(|postgresql| {
+                fingerprints[..fingerprints.len() - 1]
+                    .iter()
+                    .all(|fingerprint| fingerprint != postgresql)
+            }),
+        errors,
+        "final-render migration Job must carry exactly four receipt-bound, read-only inline CSI authority socket projections with distinct normalized paths and an independent PostgreSQL key fingerprint",
+    );
+}
+
+fn is_normalized_absolute_socket_path(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() <= 255
+        && value.ends_with(".sock")
+        && !value.contains("//")
+        && value.split('/').skip(1).all(|segment| {
+            !segment.is_empty()
+                && !matches!(segment, "." | "..")
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_uppercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+        })
+}
+
+fn normalized_socket_mount_parent(value: &str) -> Option<&str> {
+    if !is_normalized_absolute_socket_path(value) {
+        return None;
+    }
+    let (parent, file_name) = value.rsplit_once('/')?;
+    (!parent.is_empty() && parent != "/" && !file_name.is_empty()).then_some(parent)
+}
+
+fn canonical_config_map_data_digest(data: &Map<String, Value>) -> Option<String> {
+    let sorted: BTreeMap<&str, &str> = data
+        .iter()
+        .map(|(key, value)| Some((key.as_str(), value.as_str()?)))
+        .collect::<Option<_>>()?;
+    let bytes = serde_json::to_vec(&sorted).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn is_nonzero_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && hex.bytes().any(|byte| byte != b'0')
+}
+
+fn is_canonical_kubernetes_uid(value: &str) -> bool {
+    is_canonical_kubernetes_readback_token(value)
+}
+
+fn is_canonical_resource_version(value: &str) -> bool {
+    is_canonical_kubernetes_readback_token(value)
+}
+
+fn is_canonical_kubernetes_readback_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn is_render_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value.trim() == value
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b':' | b'.' | b'_' | b'-' | b'/')
+        })
+}
+
+fn validate_final_render_cutover_contract(contract: &Value, errors: &mut Vec<String>) {
+    let runtime_admission = value_at(contract, &["runtimeAdmission"]).unwrap_or(&Value::Null);
+    expect(
+        bool_at(contract, &["productionExecutionEnabled"]) == Some(false)
+            && object(runtime_admission).is_some_and(|runtime_admission| {
+                object_has_exact_keys(
+                    runtime_admission,
+                    &[
+                        "requiredCapability",
+                        "capabilityAvailable",
+                        "offlineSnapshotValidationOnly",
+                        "snapshotAuthorizesJobCreation",
+                        "snapshotFencesConfigMapDeleteRecreate",
+                        "snapshotConsumesExecutionAttempt",
+                        "snapshotEnforcesReceiptExpiryAtPodStartOrRuntime",
+                    ],
+                )
+            })
+            && str_at(runtime_admission, &["requiredCapability"])
+                == Some(FINAL_RENDER_REQUIRED_RUNTIME_CAPABILITY)
+            && bool_at(runtime_admission, &["capabilityAvailable"]) == Some(false)
+            && bool_at(runtime_admission, &["offlineSnapshotValidationOnly"]) == Some(true)
+            && [
+                "snapshotAuthorizesJobCreation",
+                "snapshotFencesConfigMapDeleteRecreate",
+                "snapshotConsumesExecutionAttempt",
+                "snapshotEnforcesReceiptExpiryAtPodStartOrRuntime",
+            ]
+            .iter()
+            .all(|field| bool_at(runtime_admission, &[field]) == Some(false)),
+        errors,
+        "cutover production execution must remain disabled until the exact in-cluster admission and runtime-freshness capability exists; snapshot validation cannot authorize Job creation, fence ConfigMap recreation, consume an attempt, or enforce runtime expiry",
+    );
+
+    let final_render = value_at(contract, &["finalRender"]).unwrap_or(&Value::Null);
+    expect(
+        object(final_render).is_some_and(|final_render| {
+            object_has_exact_keys(
+                final_render,
+                &[
+                    "contractId",
+                    "sourceMode",
+                    "finalMode",
+                    "unresolvedSentinel",
+                    "atomicRewriteRequired",
+                    "unresolvedSentinelForbiddenInFinal",
+                    "exactReleaseDigestPrefixRequired",
+                    "sourceSuspendRequired",
+                    "finalSuspendExplicitlyFalseRequired",
+                    "jobAnnotations",
+                    "pinConfigMapReceipt",
+                    "socketProjectionReceipt",
+                    "closedSocketContract",
+                    "closedSocketContractDigestAlgorithm",
+                    "closedSocketContractDigestPreimage",
+                    "closedSocketContractDigest",
+                ],
+            )
+        }) && str_at(final_render, &["contractId"]) == Some(FINAL_RENDER_CONTRACT)
+            && str_at(final_render, &["sourceMode"]) == Some(SOURCE_TEMPLATE_MODE)
+            && str_at(final_render, &["finalMode"]) == Some(FINAL_RENDER_MODE)
+            && str_at(final_render, &["unresolvedSentinel"]) == Some(RENDER_REQUIRED_SENTINEL)
+            && [
+                "atomicRewriteRequired",
+                "unresolvedSentinelForbiddenInFinal",
+                "exactReleaseDigestPrefixRequired",
+                "sourceSuspendRequired",
+                "finalSuspendExplicitlyFalseRequired",
+            ]
+            .iter()
+            .all(|field| bool_at(final_render, &[field]) == Some(true)),
+        errors,
+        "cutover finalRender must be the exact atomic source-template to final-render contract",
+    );
+
+    let job_annotations = value_at(final_render, &["jobAnnotations"]).unwrap_or(&Value::Null);
+    expect(
+        object(job_annotations).is_some_and(|annotations| {
+            object_has_exact_keys(
+                annotations,
+                &["exactKeys", "unknownRyukiAnnotationsForbidden"],
+            )
+        }) && string_array_matches_exact(
+            job_annotations,
+            &["exactKeys"],
+            MIGRATION_JOB_RYUKI_ANNOTATIONS,
+        ) && bool_at(job_annotations, &["unknownRyukiAnnotationsForbidden"]) == Some(true),
+        errors,
+        "cutover finalRender must close the migration Job ryuki.io annotation inventory",
+    );
+
+    let pin_receipt = value_at(final_render, &["pinConfigMapReceipt"]).unwrap_or(&Value::Null);
+    expect(
+        object(pin_receipt).is_some_and(|receipt| {
+            object_has_exact_keys(
+                receipt,
+                &[
+                    "exactCanonicalJsonFields",
+                    "unknownFieldsForbidden",
+                    "contentDigestAlgorithm",
+                    "contentDigestPreimage",
+                    "binaryDataForbidden",
+                    "configMapAnnotationsRequired",
+                    "immutableRequired",
+                    "receiptMustExactlyMatchApiReadback",
+                    "uidAndResourceVersionAreOpaqueStrings",
+                    "offlineSnapshotFencesEnvironmentConfigMapDeleteRecreate",
+                    "offlineSnapshotFencesNonEnvironmentAuthorityDeleteRecreate",
+                ],
+            )
+        }) && string_array_matches_exact(
+            pin_receipt,
+            &["exactCanonicalJsonFields"],
+            &["configMapName", "uid", "resourceVersion", "contentDigest"],
+        ) && string_array_matches_exact(
+            pin_receipt,
+            &["configMapAnnotationsRequired"],
+            &[RELEASE_DIGEST_PREFIX_ANNOTATION, CONTENT_DIGEST_ANNOTATION],
+        ) && str_at(pin_receipt, &["contentDigestAlgorithm"]) == Some("sha256")
+            && str_at(pin_receipt, &["contentDigestPreimage"])
+                == Some("canonical-sorted-json-data-object")
+            && [
+                "unknownFieldsForbidden",
+                "binaryDataForbidden",
+                "immutableRequired",
+                "receiptMustExactlyMatchApiReadback",
+                "uidAndResourceVersionAreOpaqueStrings",
+            ]
+            .iter()
+            .all(|field| bool_at(pin_receipt, &[field]) == Some(true))
+            && bool_at(
+                pin_receipt,
+                &["offlineSnapshotFencesEnvironmentConfigMapDeleteRecreate"],
+            ) == Some(false)
+            && bool_at(
+                pin_receipt,
+                &["offlineSnapshotFencesNonEnvironmentAuthorityDeleteRecreate"],
+            ) == Some(false),
+        errors,
+        "cutover finalRender snapshot must bind immutable pin ConfigMaps by exact canonical content digest and API readback identity without claiming a post-validation deletion/recreation fence",
+    );
+
+    let socket_receipt =
+        value_at(final_render, &["socketProjectionReceipt"]).unwrap_or(&Value::Null);
+    expect(
+        object(socket_receipt).is_some_and(|receipt| {
+            object_has_exact_keys(
+                receipt,
+                &[
+                    "sourceTemplateMayOmitDynamicSocketMounts",
+                    "sourceTemplateExecutable",
+                    "finalRenderMustCarryExactSocketProjections",
+                    "exactSocketCount",
+                    "inlineCsiDriver",
+                    "inlineCsiReadOnlyRequired",
+                    "exactVolumeAttributeKeys",
+                    "deterministicVolumeNames",
+                    "mountsAreSocketParentDirectories",
+                    "socketPathsDistinctRequired",
+                    "mountParentPathsDistinctRequired",
+                    "postgresqlFingerprintDistinctFromOtherAuthoritiesRequired",
+                    "authorityConfigMapContract",
+                    "receiptConfigMapContract",
+                    "strictSignedEnvelopeContract",
+                    "receiptRawDigestAlgorithm",
+                    "jobCarriesReceiptDigestOnly",
+                    "renderedJobPreimageExcludesOnlyReceiptDigestAnnotation",
+                    "receiptDigestForbiddenInCsiAttributes",
+                    "receiptBindsReleaseImageAndAllEightPinConfigMapReceipts",
+                    "receiptBindsExactRenderedJobPreimageDigest",
+                    "receiptBindsExactSocketPathsAuthoritiesKeysAndFingerprints",
+                    "receiptMaximumAuthorizationSeconds",
+                    "finalSocketsReachableBeforeRunnerStartRequired",
+                    "receiptAnnotations",
+                ],
+            )
+        }) && bool_at(
+            socket_receipt,
+            &["sourceTemplateMayOmitDynamicSocketMounts"],
+        ) == Some(true)
+            && bool_at(socket_receipt, &["sourceTemplateExecutable"]) == Some(false)
+            && int_at(socket_receipt, &["exactSocketCount"]) == Some(4)
+            && str_at(socket_receipt, &["inlineCsiDriver"]) == Some(AUTHORITY_SOCKET_CSI_DRIVER)
+            && string_array_matches_exact(
+                socket_receipt,
+                &["exactVolumeAttributeKeys"],
+                AUTHORITY_SOCKET_CSI_ATTRIBUTE_KEYS,
+            )
+            && object_at(socket_receipt, &["deterministicVolumeNames"]).is_some_and(|names| {
+                object_has_exact_keys(
+                    names,
+                    &[
+                        "conformanceTrustCheckpoint",
+                        "deployedWorkloadAttestation",
+                        "publicIngressAttestation",
+                        "postgresqlInfrastructureAttestation",
+                    ],
+                )
+            })
+            && str_at(
+                socket_receipt,
+                &["deterministicVolumeNames", "conformanceTrustCheckpoint"],
+            ) == Some("conformance-trust-checkpoint-socket")
+            && str_at(
+                socket_receipt,
+                &["deterministicVolumeNames", "deployedWorkloadAttestation"],
+            ) == Some("deployed-workload-attestation-socket")
+            && str_at(
+                socket_receipt,
+                &["deterministicVolumeNames", "publicIngressAttestation"],
+            ) == Some("public-ingress-attestation-socket")
+            && str_at(
+                socket_receipt,
+                &[
+                    "deterministicVolumeNames",
+                    "postgresqlInfrastructureAttestation",
+                ],
+            ) == Some("postgresql-infrastructure-attestation-socket")
+            && int_at(socket_receipt, &["receiptMaximumAuthorizationSeconds"]) == Some(300)
+            && str_at(socket_receipt, &["receiptRawDigestAlgorithm"]) == Some("sha256")
+            && str_at(socket_receipt, &["authorityConfigMapContract"])
+                == Some("socketProjectionAuthority")
+            && str_at(socket_receipt, &["receiptConfigMapContract"])
+                == Some("socketProjectionReceiptResource")
+            && str_at(socket_receipt, &["strictSignedEnvelopeContract"])
+                == Some(SOCKET_PROJECTION_RECEIPT_CONTRACT)
+            && [
+                "finalRenderMustCarryExactSocketProjections",
+                "inlineCsiReadOnlyRequired",
+                "mountsAreSocketParentDirectories",
+                "socketPathsDistinctRequired",
+                "mountParentPathsDistinctRequired",
+                "postgresqlFingerprintDistinctFromOtherAuthoritiesRequired",
+                "jobCarriesReceiptDigestOnly",
+                "renderedJobPreimageExcludesOnlyReceiptDigestAnnotation",
+                "receiptDigestForbiddenInCsiAttributes",
+                "receiptBindsReleaseImageAndAllEightPinConfigMapReceipts",
+                "receiptBindsExactRenderedJobPreimageDigest",
+                "receiptBindsExactSocketPathsAuthoritiesKeysAndFingerprints",
+                "finalSocketsReachableBeforeRunnerStartRequired",
+            ]
+            .iter()
+            .all(|field| bool_at(socket_receipt, &[field]) == Some(true)),
+        errors,
+        "cutover finalRender must require one external signed four-socket projection receipt with a 300-second authorization lifetime",
+    );
+
+    let receipt_annotations =
+        value_at(socket_receipt, &["receiptAnnotations"]).unwrap_or(&Value::Null);
+    expect(
+        object(receipt_annotations).is_some_and(|annotations| {
+            object_has_exact_keys(
+                annotations,
+                &["digest", "authorityConfigMapReceipt", "contractDigest"],
+            )
+        }) && str_at(receipt_annotations, &["digest"])
+            == Some(SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION)
+            && str_at(receipt_annotations, &["authorityConfigMapReceipt"])
+                == Some("ryuki.io/pin-socket-projection-authority-receipt")
+            && str_at(receipt_annotations, &["contractDigest"])
+                == Some(SOCKET_CONTRACT_DIGEST_ANNOTATION),
+        errors,
+        "cutover finalRender must map the signed socket receipt to the exact closed Job annotations",
+    );
+
+    let socket_contract = value_at(final_render, &["closedSocketContract"]).unwrap_or(&Value::Null);
+    let expected_sockets = [
+        (
+            "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET",
+            "conformance-trust-checkpoint",
+        ),
+        (
+            "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET",
+            "deployed-workload-attestation",
+        ),
+        (
+            "RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET",
+            "public-ingress-attestation",
+        ),
+        (
+            "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET",
+            "postgresql-infrastructure-attestation",
+        ),
+    ];
+    let required_sockets = array_at_path(socket_contract, &["requiredSockets"]);
+    let socket_digest = serde_json::to_vec(socket_contract)
+        .ok()
+        .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
+    expect(
+        object(socket_contract).is_some_and(|contract| {
+            object_has_exact_keys(
+                contract,
+                &[
+                    "contractId",
+                    "requiredSockets",
+                    "exactSocketCount",
+                    "unixSocketsOnly",
+                    "normalizedAbsolutePinnedPathsRequired",
+                    "liveReachabilityBeforeRunnerStartRequired",
+                    "privateAuthorityKeyInJobForbidden",
+                    "inImageAuthorityFallbackForbidden",
+                    "hostPathFallbackForbidden",
+                    "postgresqlSocketDistinctFromEveryOtherSocket",
+                    "postgresqlKeyFingerprintDistinctFromEveryOtherAuthority",
+                ],
+            )
+        }) && str_at(socket_contract, &["contractId"])
+            == Some("migration-authority-socket-projection-v1")
+            && int_at(socket_contract, &["exactSocketCount"]) == Some(4)
+            && required_sockets.len() == expected_sockets.len()
+            && required_sockets.iter().zip(expected_sockets).all(
+                |(socket, (environment, authority))| {
+                    object(socket).is_some_and(|socket| {
+                        object_has_exact_keys(socket, &["environmentVariable", "authorityClass"])
+                    }) && str_at(socket, &["environmentVariable"]) == Some(environment)
+                        && str_at(socket, &["authorityClass"]) == Some(authority)
+                },
+            )
+            && [
+                "unixSocketsOnly",
+                "normalizedAbsolutePinnedPathsRequired",
+                "liveReachabilityBeforeRunnerStartRequired",
+                "privateAuthorityKeyInJobForbidden",
+                "inImageAuthorityFallbackForbidden",
+                "hostPathFallbackForbidden",
+                "postgresqlSocketDistinctFromEveryOtherSocket",
+                "postgresqlKeyFingerprintDistinctFromEveryOtherAuthority",
+            ]
+            .iter()
+            .all(|field| bool_at(socket_contract, &[field]) == Some(true))
+            && str_at(final_render, &["closedSocketContractDigestAlgorithm"]) == Some("sha256")
+            && str_at(final_render, &["closedSocketContractDigestPreimage"])
+                == Some("canonical-sorted-json-finalRender.closedSocketContract")
+            && str_at(final_render, &["closedSocketContractDigest"])
+                == Some(SOCKET_CONTRACT_DIGEST)
+            && socket_digest.as_deref() == Some(SOCKET_CONTRACT_DIGEST),
+        errors,
+        "cutover finalRender must retain the exact canonical four-socket contract and matching SHA-256 digest",
+    );
 }
 
 fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut Vec<String>) {
     let api_image = platform_api_image(manifests);
     let migration_identity = api_image.and_then(MigrationIdentity::from_image);
+    let scoped_pin_config_map = |base_name: &str| {
+        migration_identity
+            .as_ref()
+            .map(|identity| digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix))
+            .unwrap_or_default()
+    };
+    let security_admission_config_map = scoped_pin_config_map(SECURITY_ADMISSION_CONFIG_MAP);
+    let migration_config_map = scoped_pin_config_map("platform-api-migration-config");
+    let production_build_config_map = scoped_pin_config_map(PRODUCTION_BUILD_MANIFEST_CONFIG_MAP);
+    let checkpoint_config_map = scoped_pin_config_map(CONFORMANCE_TRUST_CHECKPOINT_CONFIG_MAP);
+    let workload_config_map = scoped_pin_config_map(DEPLOYED_WORKLOAD_ATTESTATION_CONFIG_MAP);
+    let ingress_config_map = scoped_pin_config_map(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP);
+    let postgresql_config_map =
+        scoped_pin_config_map(POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP);
     expect(
         str_at(contract, &["contractVersion"]) == Some("migration-cutover-v1")
             && str_at(contract, &["release", "namespace"]) == Some(NAMESPACE)
@@ -1026,6 +2573,7 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
             "{MIGRATION_CUTOVER_CONTRACT_PATH} must bind the exact namespace, operation template, digest, and startup modes"
         ),
     );
+    validate_final_render_cutover_contract(contract, errors);
 
     let job = manifests
         .iter()
@@ -1125,38 +2673,290 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
     );
 
     expect(
+        object_at(contract, &["productionPinProjections"]).is_some_and(|projections| {
+            object_has_exact_keys(
+                projections,
+                &[
+                    "migrationConfig",
+                    "baselineAdmission",
+                    "buildManifest",
+                    "conformanceTrustCheckpoint",
+                    "deployedWorkloadAttestation",
+                    "publicIngressAttestation",
+                    "completeGroupsRequired",
+                    "exactPinConfigMapReceiptCount",
+                    "releaseDigestPrefixBoundNamesRequired",
+                    "immutableConfigMapsRequired",
+                    "contentDigestAnnotationsRequired",
+                    "uidAndResourceVersionReadbackRequired",
+                    "jobReceiptAnnotationsRequired",
+                    "inlineValuesForbidden",
+                    "independentlyGovernedConfigMapsRequired",
+                    "renderedUnixSocketProjectionsRequired",
+                    "renderedSocketPathsMustEqualPins",
+                    "socketAvailabilityBeforeRunnerStartRequired",
+                    "hostPathFallbackForbidden",
+                ],
+            )
+        }) && object_at(contract, &["productionPinProjections", "migrationConfig"]).is_some_and(
+            |group| {
+                object_has_exact_keys(
+                    group,
+                    &[
+                        "sourceTemplateConfigMapName",
+                        "finalConfigMapName",
+                        "contentDigest",
+                        "uid",
+                        "resourceVersion",
+                        "jobReceiptAnnotation",
+                        "configKeys",
+                        "sourceTemplateStableReferenceAllowed",
+                        "finalRenderMustRewriteEnvFromReference",
+                        "finalRenderDigestPrefixBoundNameRequired",
+                        "immutableConfigMapRequired",
+                        "contentDigestAnnotationRequired",
+                        "uidAndResourceVersionReadbackRequired",
+                        "exactKeyInventoryRequired",
+                        "exactReviewedValuesRequired",
+                    ],
+                )
+            },
+        ) && str_at(
+            contract,
+            &[
+                "productionPinProjections",
+                "migrationConfig",
+                "sourceTemplateConfigMapName",
+            ],
+        ) == Some("platform-api-migration-config")
+            && str_at(
+                contract,
+                &[
+                    "productionPinProjections",
+                    "migrationConfig",
+                    "finalConfigMapName",
+                ],
+            ) == Some(migration_config_map.as_str())
+            && string_array_matches_exact(
+                contract,
+                &["productionPinProjections", "migrationConfig", "configKeys"],
+                PLATFORM_API_MIGRATION_CONFIG_KEYS,
+            )
+            && str_at(
+                contract,
+                &[
+                    "productionPinProjections",
+                    "migrationConfig",
+                    "jobReceiptAnnotation",
+                ],
+            ) == Some("ryuki.io/pin-migration-config-receipt")
+            && [
+                "sourceTemplateStableReferenceAllowed",
+                "finalRenderMustRewriteEnvFromReference",
+                "finalRenderDigestPrefixBoundNameRequired",
+                "immutableConfigMapRequired",
+                "contentDigestAnnotationRequired",
+                "uidAndResourceVersionReadbackRequired",
+                "exactKeyInventoryRequired",
+                "exactReviewedValuesRequired",
+            ]
+            .iter()
+            .all(|flag| {
+                bool_at(
+                    contract,
+                    &["productionPinProjections", "migrationConfig", flag],
+                ) == Some(true)
+            })
+            && exact_cutover_pin_group(
+                contract,
+                &["productionPinProjections", "baselineAdmission"],
+                &security_admission_config_map,
+                SECURITY_ADMISSION_KEYS,
+                "ryuki.io/pin-security-admission-receipt",
+            )
+            && exact_cutover_pin_group(
+                contract,
+                &["productionPinProjections", "buildManifest"],
+                &production_build_config_map,
+                PRODUCTION_BUILD_MANIFEST_KEYS,
+                "ryuki.io/pin-production-build-manifest-receipt",
+            )
+            && exact_cutover_pin_group(
+                contract,
+                &["productionPinProjections", "conformanceTrustCheckpoint"],
+                &checkpoint_config_map,
+                CONFORMANCE_TRUST_CHECKPOINT_KEYS,
+                "ryuki.io/pin-conformance-trust-checkpoint-receipt",
+            )
+            && exact_cutover_pin_group(
+                contract,
+                &["productionPinProjections", "deployedWorkloadAttestation"],
+                &workload_config_map,
+                DEPLOYED_WORKLOAD_ATTESTATION_KEYS,
+                "ryuki.io/pin-deployed-workload-attestation-receipt",
+            )
+            && exact_cutover_pin_group(
+                contract,
+                &["productionPinProjections", "publicIngressAttestation"],
+                &ingress_config_map,
+                PUBLIC_INGRESS_ATTESTATION_KEYS,
+                "ryuki.io/pin-public-ingress-attestation-receipt",
+            )
+            && [
+                "completeGroupsRequired",
+                "releaseDigestPrefixBoundNamesRequired",
+                "immutableConfigMapsRequired",
+                "contentDigestAnnotationsRequired",
+                "uidAndResourceVersionReadbackRequired",
+                "jobReceiptAnnotationsRequired",
+                "inlineValuesForbidden",
+                "independentlyGovernedConfigMapsRequired",
+                "renderedUnixSocketProjectionsRequired",
+                "renderedSocketPathsMustEqualPins",
+                "socketAvailabilityBeforeRunnerStartRequired",
+                "hostPathFallbackForbidden",
+            ]
+            .iter()
+            .all(|flag| bool_at(contract, &["productionPinProjections", flag]) == Some(true))
+            && int_at(
+                contract,
+                &["productionPinProjections", "exactPinConfigMapReceiptCount"],
+            ) == Some(8),
+        errors,
+        "cutover contract must retain complete independently governed production pin groups, file bindings, and exact pre-start Unix-socket projection gates without hostPath fallback",
+    );
+
+    expect(
+        object_at(contract, &["postgresqlInfrastructureAttestation"]).is_some_and(|attestation| {
+            object_has_exact_keys(
+                attestation,
+                &[
+                    "configMapName",
+                    "contentDigest",
+                    "uid",
+                    "resourceVersion",
+                    "jobReceiptAnnotation",
+                    "configKeys",
+                    "completeGroupRequired",
+                    "productionOnly",
+                    "releaseDigestPrefixBoundNameRequired",
+                    "immutableConfigMapRequired",
+                    "contentDigestAnnotationRequired",
+                    "uidAndResourceVersionReadbackRequired",
+                    "inlineValuesForbidden",
+                    "independentlyGovernedConfigMapRequired",
+                    "independentlyGovernedAuthorityRequired",
+                    "ed25519Required",
+                    "privateKeyInWorkloadForbidden",
+                    "preprovisionedUnixSocketRequired",
+                    "renderedSocketPathMustEqualPin",
+                    "socketAvailabilityBeforeRunnerStartRequired",
+                    "hostPathFallbackForbidden",
+                    "receiptBoundTargetAndStorageRequired",
+                    "freshNonceRequired",
+                    "singleExchangeWithoutRetry",
+                    "maximumAuthorizationSeconds",
+                    "socketDistinctFromCheckpointWorkloadAndIngressRequired",
+                    "keyFingerprintDistinctFromCheckpointWorkloadAndIngressRequired",
+                    "sqlVisibleFactsObservedLocallyRequired",
+                    "providerClusterAndStorageSignedEvidenceRequired",
+                    "directPgConnectionRequired",
+                    "sameVerifiedConnectionForDdlRequired",
+                    "sameVerifiedConnectionForPostflightRequired",
+                    "exactPostflightLedgerRequired",
+                ],
+            )
+        }) && cutover_pin_group_fields_match(
+            contract,
+            &["postgresqlInfrastructureAttestation"],
+            &postgresql_config_map,
+            POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
+            "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+        ) && [
+            "completeGroupRequired",
+            "productionOnly",
+            "releaseDigestPrefixBoundNameRequired",
+            "immutableConfigMapRequired",
+            "contentDigestAnnotationRequired",
+            "uidAndResourceVersionReadbackRequired",
+            "inlineValuesForbidden",
+            "independentlyGovernedConfigMapRequired",
+            "independentlyGovernedAuthorityRequired",
+            "ed25519Required",
+            "privateKeyInWorkloadForbidden",
+            "preprovisionedUnixSocketRequired",
+            "renderedSocketPathMustEqualPin",
+            "socketAvailabilityBeforeRunnerStartRequired",
+            "hostPathFallbackForbidden",
+            "receiptBoundTargetAndStorageRequired",
+            "freshNonceRequired",
+            "singleExchangeWithoutRetry",
+            "socketDistinctFromCheckpointWorkloadAndIngressRequired",
+            "keyFingerprintDistinctFromCheckpointWorkloadAndIngressRequired",
+            "sqlVisibleFactsObservedLocallyRequired",
+            "providerClusterAndStorageSignedEvidenceRequired",
+            "directPgConnectionRequired",
+            "sameVerifiedConnectionForDdlRequired",
+            "sameVerifiedConnectionForPostflightRequired",
+            "exactPostflightLedgerRequired",
+        ]
+        .iter()
+        .all(|flag| {
+            bool_at(contract, &["postgresqlInfrastructureAttestation", flag]) == Some(true)
+        }) && int_at(
+            contract,
+            &[
+                "postgresqlInfrastructureAttestation",
+                "maximumAuthorizationSeconds",
+            ],
+        ) == Some(300),
+        errors,
+        "cutover contract must retain the closed PostgreSQL infrastructure attestation group and its receipt-bound same-session DDL/postflight gates",
+    );
+
+    expect(
         int_at(contract, &["execution", "completions"]) == Some(1)
             && int_at(contract, &["execution", "parallelism"]) == Some(1)
             && int_at(contract, &["execution", "backoffLimit"]) == Some(0)
-            && int_at(contract, &["execution", "activeDeadlineSeconds"]) == Some(2400)
-            && str_at(contract, &["execution", "createSemantics"]) == Some("create-once")
+            && int_at(contract, &["execution", "activeDeadlineSeconds"]) == Some(300)
+            && int_at(contract, &["execution", "maximumProofAuthorizationSeconds"]) == Some(300)
+            && int_at(contract, &["execution", "statementTimeoutSeconds"]) == Some(180)
+            && int_at(contract, &["execution", "lockTimeoutSeconds"]) == Some(30)
+            && [
+                "directPgConnectionRequired",
+                "singleDatabaseTransactionRequired",
+                "sessionScopedAdvisoryLockBeforeBeginRequired",
+                "transactionScopedAdvisoryLockPromotionFirstStatementRequired",
+                "sessionScopedAdvisoryLockReleasedAfterPromotionRequired",
+                "migrationSqlCannotReleaseTransactionLockRequired",
+                "localSqlVisibleFactsOnlyFromDirectConnection",
+                "providerClusterAndStorageOnlyFromSignedEvidence",
+                "exactReceiptCompositionRequired",
+                "preDdlRecheckInsideTransactionRequired",
+                "allPendingMigrationsInsideTransactionRequired",
+                "exactLedgerPostflightInsideTransactionRequired",
+                "commitDispatchBeforeProofSafetyDeadlineRequired",
+                "rollbackWholeWaveBeforeCommitDispatchRequired",
+                "commitOutcomeUnknownReconciliationRequired",
+            ]
+            .iter()
+            .all(|field| bool_at(contract, &["execution", field]) == Some(true))
+            && str_at(contract, &["execution", "createSemantics"])
+                == Some("disabled-until-runtime-admission")
             && bool_at(contract, &["execution", "automaticTtlForbidden"]) == Some(true),
         errors,
-        "cutover contract must create one non-retrying, non-TTL Job with the reviewed deadline",
+        "cutover contract must keep Job creation disabled while retaining the future non-retrying, single-transaction, bounded-deadline execution shape",
     );
 
-    let expected_sequence: Vec<String> = [
-        "freeze-render-and-digest",
-        "withdraw-traffic",
-        "stop-and-drain-all-writers",
-        "readback-zero-database-sessions",
-        "create-jit-migration-credential",
-        "create-generated-job-once",
-        "wait-for-single-completion",
-        "readback-role-and-migration-ledger",
-        "revoke-jit-migration-credential",
-        "start-matching-verify-only-api",
-        "require-readiness",
-        "enable-matching-workers",
-        "restore-traffic",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    let expected_sequence: Vec<String> =
+        ["stop-production-execution-runtime-admission-unavailable"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
     expect(
         string_array_at(contract, &["sequence"]) == expected_sequence,
         errors,
-        "cutover contract sequence must drain, run/read back once, revoke migration credentials, and only then start the matching verify-only API/workers",
+        "cutover contract sequence must stop before draining, issuing credentials, or creating a Job while runtime admission is unavailable",
     );
 
     expect(
@@ -1166,18 +2966,78 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
             && bool_at(contract, &["readback", "requireEmbeddedInventoryMatch"]) == Some(true)
             && bool_at(contract, &["readback", "requireNoDirtyMigration"]) == Some(true)
             && bool_at(contract, &["readback", "requireDatabaseRoleEvidence"]) == Some(true)
+            && bool_at(
+                contract,
+                &["readback", "requireAttestedDatabaseIdentityEvidence"],
+            ) == Some(true)
+            && bool_at(
+                contract,
+                &["readback", "requireAttestedDurableStorageEvidence"],
+            ) == Some(true)
+            && bool_at(
+                contract,
+                &["readback", "requireExactPostflightLedgerEvidence"],
+            ) == Some(true)
             && bool_at(contract, &["restart", "requireMatchingApiImage"]) == Some(true)
             && bool_at(contract, &["restart", "requireVerifyOnlyStartup"]) == Some(true)
             && bool_at(contract, &["restart", "requireReadyBeforeTraffic"]) == Some(true)
+            && bool_at(contract, &["restart", "requireMatchingWorkersBeforeEnable"]) == Some(true)
             && bool_at(contract, &["failure", "keepTrafficAndWritersStopped"]) == Some(true)
             && bool_at(contract, &["failure", "automaticRetryForbidden"]) == Some(true)
             && bool_at(
                 contract,
                 &["failure", "olderBinaryAgainstNewSchemaForbidden"],
-            ) == Some(true),
+            ) == Some(true)
+            && bool_at(contract, &["failure", "forwardFixOrCoupledRestoreRequired"]) == Some(true),
         errors,
-        "cutover readback/restart/failure gates must fail closed before traffic returns",
+        "cutover attestation readback/restart/failure gates must fail closed before traffic returns",
     );
+}
+
+fn exact_cutover_pin_group(
+    contract: &Value,
+    path: &[&str],
+    expected_config_map: &str,
+    expected_keys: &[&str],
+    expected_receipt_annotation: &str,
+) -> bool {
+    object_at(contract, path).is_some_and(|group| {
+        object_has_exact_keys(
+            group,
+            &[
+                "configMapName",
+                "contentDigest",
+                "uid",
+                "resourceVersion",
+                "jobReceiptAnnotation",
+                "configKeys",
+            ],
+        )
+    }) && cutover_pin_group_fields_match(
+        contract,
+        path,
+        expected_config_map,
+        expected_keys,
+        expected_receipt_annotation,
+    )
+}
+
+fn cutover_pin_group_fields_match(
+    contract: &Value,
+    path: &[&str],
+    expected_config_map: &str,
+    expected_keys: &[&str],
+    expected_receipt_annotation: &str,
+) -> bool {
+    let Some(group) = value_at(contract, path) else {
+        return false;
+    };
+    str_at(group, &["configMapName"]) == Some(expected_config_map)
+        && string_array_matches_exact(group, &["configKeys"], expected_keys)
+        && str_at(group, &["contentDigest"]) == Some(RENDER_REQUIRED_SENTINEL)
+        && str_at(group, &["uid"]) == Some(RENDER_REQUIRED_SENTINEL)
+        && str_at(group, &["resourceVersion"]) == Some(RENDER_REQUIRED_SENTINEL)
+        && str_at(group, &["jobReceiptAnnotation"]) == Some(expected_receipt_annotation)
 }
 
 fn validate_migration_job_resources(container: &Value, errors: &mut Vec<String>) {
@@ -1457,6 +3317,50 @@ fn exact_security_admission_env_entries(entries: &[&Value]) -> bool {
             })
 }
 
+fn exact_migration_production_pin_env_entries(
+    entries: &[&Value],
+    release_digest_prefix: &str,
+) -> bool {
+    let expected_len = MIGRATION_APP_PIN_GROUPS
+        .iter()
+        .map(|(_, keys, _)| keys.len())
+        .sum::<usize>();
+    if entries.len() != expected_len || expected_len + 1 != MIGRATION_JOB_ENV_COUNT {
+        return false;
+    }
+
+    let mut seen_names = BTreeSet::new();
+    let mut entries = entries.iter();
+    for (config_map_base_name, expected_keys, _) in MIGRATION_APP_PIN_GROUPS {
+        let expected_config_map =
+            digest_scoped_pin_config_map_name(config_map_base_name, release_digest_prefix);
+        for expected_key in *expected_keys {
+            let Some(entry) = entries.next() else {
+                return false;
+            };
+            if !object(entry).is_some_and(|map| object_has_exact_keys(map, &["name", "valueFrom"]))
+                || str_at(entry, &["name"]) != Some(*expected_key)
+                || !seen_names.insert(*expected_key)
+                || !object_at(entry, &["valueFrom"])
+                    .is_some_and(|map| object_has_exact_keys(map, &["configMapKeyRef"]))
+                || !object_at(entry, &["valueFrom", "configMapKeyRef"])
+                    .is_some_and(|map| object_has_exact_keys(map, &["name", "key"]))
+                || str_at(entry, &["valueFrom", "configMapKeyRef", "name"])
+                    != Some(expected_config_map.as_str())
+                || str_at(entry, &["valueFrom", "configMapKeyRef", "key"]) != Some(*expected_key)
+            {
+                return false;
+            }
+        }
+    }
+
+    entries.next().is_none() && seen_names.len() == expected_len
+}
+
+fn digest_scoped_pin_config_map_name(base_name: &str, release_digest_prefix: &str) -> String {
+    format!("{base_name}-{release_digest_prefix}")
+}
+
 fn validate_cnpg_ca_mount(
     owner: &str,
     pod_spec: &Value,
@@ -1484,7 +3388,7 @@ fn validate_cnpg_ca_mount(
             && str_at(item, &["key"]) == Some(CNPG_CA_SECRET_KEY)
             && str_at(item, &["path"]) == Some(CNPG_CA_SECRET_KEY),
         errors,
-        format!("{owner} must project only the exact CNPG CA volume"),
+        format!("{owner} must retain the exact CNPG CA volume and reviewed total volume inventory"),
     );
 
     let mounts = array_at_path(container, &["volumeMounts"]);
@@ -1501,7 +3405,47 @@ fn validate_cnpg_ca_mount(
             && str_at(mount, &["mountPath"]) == Some(CNPG_CA_MOUNT_PATH)
             && bool_at(mount, &["readOnly"]) == Some(true),
         errors,
-        format!("{owner} must mount only the CNPG CA read-only"),
+        format!(
+            "{owner} must retain the exact read-only CNPG CA mount and reviewed total mount inventory"
+        ),
+    );
+}
+
+fn validate_migration_relay_workspace(
+    pod_spec: &Value,
+    container: &Value,
+    errors: &mut Vec<String>,
+) {
+    let volumes = array_at_path(pod_spec, &["volumes"]);
+    let matching_volumes: Vec<&Value> = volumes
+        .iter()
+        .copied()
+        .filter(|volume| str_at(volume, &["name"]) == Some(POSTGRESQL_RELAY_VOLUME_NAME))
+        .collect();
+    let volume = matching_volumes.first().copied().unwrap_or(&Value::Null);
+    let empty_dir = value_at(volume, &["emptyDir"]).unwrap_or(&Value::Null);
+    let mounts = array_at_path(container, &["volumeMounts"]);
+    let matching_mounts: Vec<&Value> = mounts
+        .iter()
+        .copied()
+        .filter(|mount| str_at(mount, &["name"]) == Some(POSTGRESQL_RELAY_VOLUME_NAME))
+        .collect();
+    let mount = matching_mounts.first().copied().unwrap_or(&Value::Null);
+
+    expect(
+        matching_volumes.len() == 1
+            && object(volume).is_some_and(|map| object_has_exact_keys(map, &["name", "emptyDir"]))
+            && object(empty_dir)
+                .is_some_and(|map| object_has_exact_keys(map, &["medium", "sizeLimit"]))
+            && str_at(empty_dir, &["medium"]) == Some("Memory")
+            && str_at(empty_dir, &["sizeLimit"]) == Some(POSTGRESQL_RELAY_SIZE_LIMIT)
+            && matching_mounts.len() == 1
+            && object(mount)
+                .is_some_and(|map| object_has_exact_keys(map, &["name", "mountPath", "readOnly"]))
+            && str_at(mount, &["mountPath"]) == Some(POSTGRESQL_RELAY_MOUNT_PATH)
+            && bool_at(mount, &["readOnly"]) == Some(false),
+        errors,
+        "migration Job must provide exactly one 1Mi memory-backed writable PostgreSQL relay workspace",
     );
 }
 
@@ -3213,6 +5157,15 @@ fn ingress_schema_key_allowed(key: &str, path: &str) -> bool {
 
 fn safe_manifest_value(path: &str, value: &str) -> bool {
     path.ends_with(".__file")
+        || (path.ends_with(".data.receipt.json")
+            && is_canonical_socket_projection_receipt_json(value))
+        || (path.ends_with(".metadata.uid") && is_canonical_kubernetes_uid(value))
+        || (path.contains(".metadata.annotations.ryuki.io/pin-")
+            && path.ends_with("-receipt")
+            && is_canonical_pin_config_map_receipt(value))
+        || (path.contains(".spec.template.spec.volumes[")
+            && path.ends_with(".csi.driver")
+            && value == AUTHORITY_SOCKET_CSI_DRIVER)
         || APPROVED_SCHEMA_VALUES.contains(&value)
         || value == "0.0.0.0:8080"
         || value == format!("https://{APPROVED_HOST}")
@@ -3228,6 +5181,55 @@ fn safe_manifest_value(path: &str, value: &str) -> bool {
             && is_qualified_immutable_image(value))
         || (value == APPROVED_HOST
             && (path_matches_ingress_host(path) || path_matches_ingress_tls_host_value(path)))
+}
+
+fn is_canonical_socket_projection_receipt_json(value: &str) -> bool {
+    if value.len() > SOCKET_PROJECTION_MAX_RECEIPT_BYTES {
+        return false;
+    }
+    let Ok(receipt) = crate::security_conformance::parse_json_strict(value.as_bytes()) else {
+        return false;
+    };
+    object(&receipt)
+        .is_some_and(|receipt| object_has_exact_keys(receipt, &["payload", "signature"]))
+        && canonical_json_bytes(&receipt).is_ok_and(|canonical| canonical == value.as_bytes())
+}
+
+fn is_canonical_pin_config_map_receipt(value: &str) -> bool {
+    let Ok(receipt) = serde_json::from_str::<Value>(value) else {
+        return false;
+    };
+    let Some(receipt_object) = object(&receipt) else {
+        return false;
+    };
+    object_has_exact_keys(
+        receipt_object,
+        &["configMapName", "uid", "resourceVersion", "contentDigest"],
+    ) && str_at(&receipt, &["configMapName"]).is_some_and(|name| {
+        MIGRATION_RENDER_PIN_GROUPS.iter().any(|(base_name, _, _)| {
+            name.strip_prefix(&format!("{base_name}-"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 12
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        })
+    }) && str_at(&receipt, &["uid"]).is_some_and(is_canonical_kubernetes_uid)
+        && str_at(&receipt, &["resourceVersion"]).is_some_and(is_canonical_resource_version)
+        && str_at(&receipt, &["contentDigest"]).is_some_and(is_nonzero_sha256_digest)
+        && matches!(
+            (
+                str_at(&receipt, &["configMapName"]),
+                str_at(&receipt, &["uid"]),
+                str_at(&receipt, &["resourceVersion"]),
+                str_at(&receipt, &["contentDigest"]),
+            ),
+            (Some(name), Some(uid), Some(resource_version), Some(content_digest))
+                if value == format!(
+                    "{{\"configMapName\":\"{name}\",\"uid\":\"{uid}\",\"resourceVersion\":\"{resource_version}\",\"contentDigest\":\"{content_digest}\"}}"
+                )
+        )
 }
 
 fn path_matches_ingress_host(path: &str) -> bool {
@@ -3463,6 +5465,8 @@ fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
     use serde_json::{json, Value};
 
     #[test]
@@ -4249,7 +6253,7 @@ mod tests {
             serde_yaml::from_str(&job_raw).expect("checked-in migration Job YAML must parse");
 
         let mut errors = Vec::new();
-        validate_migration_job(&[platform_api, job], &mut errors);
+        validate_migration_job(&[platform_api, job], None, &mut errors);
         assert!(
             errors.is_empty(),
             "checked-in migration Job must retain the reviewed one-shot contract: {errors:?}"
@@ -4362,7 +6366,7 @@ mod tests {
 
         let mut errors = Vec::new();
         validate_config_maps(&manifests, &mut errors);
-        validate_migration_job(&manifests, &mut errors);
+        validate_migration_job(&manifests, None, &mut errors);
         validate_cutover_contract(&contract, &manifests, &mut errors);
         let policies: Vec<&Value> = manifests
             .iter()
@@ -4423,6 +6427,45 @@ mod tests {
                 "stale digest-scoped contract identity {pointer} must be rejected"
             );
         }
+
+        for (pointer, replacement, expected_error) in [
+            (
+                "/productionPinProjections/buildManifest/configMapName",
+                json!(SECURITY_ADMISSION_CONFIG_MAP),
+                "production pin groups",
+            ),
+            (
+                "/productionPinProjections/renderedUnixSocketProjectionsRequired",
+                json!(false),
+                "production pin groups",
+            ),
+            (
+                "/productionPinProjections/hostPathFallbackForbidden",
+                json!(false),
+                "production pin groups",
+            ),
+            (
+                "/postgresqlInfrastructureAttestation/configMapName",
+                json!(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP),
+                "PostgreSQL infrastructure attestation",
+            ),
+            (
+                "/postgresqlInfrastructureAttestation/sameVerifiedConnectionForDdlRequired",
+                json!(false),
+                "PostgreSQL infrastructure attestation",
+            ),
+        ] {
+            let mut weakened = contract.clone();
+            *weakened
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing contract pointer {pointer}")) = replacement;
+            let mut errors = Vec::new();
+            validate_cutover_contract(&weakened, &manifests, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "weakened cutover pin projection {pointer} must fail closed: {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -4476,7 +6519,7 @@ mod tests {
         let job = migration_job_fixture(&image);
 
         let mut errors = Vec::new();
-        validate_migration_job(&[api.clone(), job.clone()], &mut errors);
+        validate_migration_job(&[api.clone(), job.clone()], None, &mut errors);
         assert!(
             errors.is_empty(),
             "reviewed migration Job should pass: {errors:?}"
@@ -4485,7 +6528,7 @@ mod tests {
         let mut retrying = job.clone();
         retrying["spec"]["backoffLimit"] = json!(1);
         let mut errors = Vec::new();
-        validate_migration_job(&[api.clone(), retrying], &mut errors);
+        validate_migration_job(&[api.clone(), retrying], None, &mut errors);
         assert!(errors.iter().any(|error| error.contains("exactly once")));
 
         for (field, value) in [
@@ -4508,7 +6551,7 @@ mod tests {
             let mut policy_extended = job.clone();
             policy_extended["spec"][field] = value;
             let mut errors = Vec::new();
-            validate_migration_job(&[api.clone(), policy_extended], &mut errors);
+            validate_migration_job(&[api.clone(), policy_extended], None, &mut errors);
             assert!(
                 errors
                     .iter()
@@ -4520,7 +6563,7 @@ mod tests {
         let mut stale_identity = job.clone();
         stale_identity["metadata"]["generateName"] = json!("platform-api-migrations-111111111111-");
         let mut errors = Vec::new();
-        validate_migration_job(&[api.clone(), stale_identity], &mut errors);
+        validate_migration_job(&[api.clone(), stale_identity], None, &mut errors);
         assert!(
             errors.iter().any(|error| error.contains("derived")),
             "a stale release identity must not survive an admitted digest change: {errors:?}"
@@ -4529,7 +6572,7 @@ mod tests {
         let mut missing_ca = job.clone();
         missing_ca["spec"]["template"]["spec"]["volumes"] = json!([]);
         let mut errors = Vec::new();
-        validate_migration_job(&[api.clone(), missing_ca], &mut errors);
+        validate_migration_job(&[api.clone(), missing_ca], None, &mut errors);
         assert!(
             errors.iter().any(|error| error.contains("CNPG CA")),
             "the migration client must retain its authenticated CA mount: {errors:?}"
@@ -4538,7 +6581,7 @@ mod tests {
         let mut custom_command = job.clone();
         custom_command["spec"]["template"]["spec"]["containers"][0]["args"] = json!(["migrate"]);
         let mut errors = Vec::new();
-        validate_migration_job(&[api.clone(), custom_command], &mut errors);
+        validate_migration_job(&[api.clone(), custom_command], None, &mut errors);
         assert!(errors
             .iter()
             .any(|error| error.contains("must not define args")));
@@ -4550,33 +6593,337 @@ mod tests {
         )
         .into();
         let mut errors = Vec::new();
-        validate_migration_job(&[api, different_image], &mut errors);
+        validate_migration_job(&[api, different_image], None, &mut errors);
         assert!(errors
             .iter()
             .any(|error| error.contains("exact digest-only platform-api")));
     }
 
+    #[test]
+    fn migration_job_production_pins_reject_missing_duplicate_miswired_and_inline_entries() {
+        let image = format!(
+            "registry.example.invalid/ryuki/platform-api@sha256:{}",
+            "e".repeat(64)
+        );
+        let api = json!({
+            "kind": "Deployment",
+            "metadata": { "name": "platform-api" },
+            "spec": { "template": { "spec": { "containers": [{
+                "name": "platform-api",
+                "image": image
+            }] } } }
+        });
+        let job = migration_job_fixture(&image);
+
+        let mut mutations = Vec::new();
+
+        let mut missing_postgresql_pin = job.clone();
+        let env = missing_postgresql_pin["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .expect("migration env");
+        let index = env
+            .iter()
+            .position(|entry| {
+                str_at(entry, &["name"])
+                    == Some("RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST")
+            })
+            .expect("PostgreSQL profile digest pin");
+        env.remove(index);
+        mutations.push(("missing PostgreSQL pin", missing_postgresql_pin));
+
+        let mut duplicate_postgresql_pin = job.clone();
+        let env = duplicate_postgresql_pin["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .expect("migration env");
+        let duplicate = env[env.len() - 2].clone();
+        let last = env.len() - 1;
+        env[last] = duplicate;
+        mutations.push(("duplicate PostgreSQL pin", duplicate_postgresql_pin));
+
+        let mut miswired_postgresql_pin = job.clone();
+        let env = miswired_postgresql_pin["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .expect("migration env");
+        let socket = env
+            .iter_mut()
+            .find(|entry| {
+                str_at(entry, &["name"])
+                    == Some("RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET")
+            })
+            .expect("PostgreSQL socket pin");
+        socket["valueFrom"]["configMapKeyRef"]["name"] =
+            json!(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP);
+        mutations.push(("miswired PostgreSQL pin", miswired_postgresql_pin));
+
+        for (config_map, keys, _) in MIGRATION_APP_PIN_GROUPS {
+            let first_key = keys
+                .first()
+                .copied()
+                .expect("nonempty production pin group");
+            let mut miswired_group = job.clone();
+            let env = miswired_group["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array_mut()
+                .expect("migration env");
+            let entry = env
+                .iter_mut()
+                .find(|entry| str_at(entry, &["name"]) == Some(first_key))
+                .unwrap_or_else(|| panic!("missing first pin for {config_map}"));
+            entry["valueFrom"]["configMapKeyRef"]["name"] = json!("unreviewed-pin-source");
+            mutations.push(("miswired production pin group", miswired_group));
+
+            if *config_map != POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP {
+                let mut missing_group = job.clone();
+                let env = missing_group["spec"]["template"]["spec"]["containers"][0]["env"]
+                    .as_array_mut()
+                    .expect("migration env");
+                let index = env
+                    .iter()
+                    .position(|entry| str_at(entry, &["name"]) == Some(first_key))
+                    .unwrap_or_else(|| panic!("missing first pin for {config_map}"));
+                env.remove(index);
+                mutations.push(("missing existing production pin", missing_group));
+
+                let mut duplicate_group = job.clone();
+                let env = duplicate_group["spec"]["template"]["spec"]["containers"][0]["env"]
+                    .as_array_mut()
+                    .expect("migration env");
+                let index = env
+                    .iter()
+                    .position(|entry| str_at(entry, &["name"]) == Some(first_key))
+                    .unwrap_or_else(|| panic!("missing first pin for {config_map}"));
+                env[index + 1] = env[index].clone();
+                mutations.push(("duplicate existing production pin", duplicate_group));
+            }
+        }
+
+        let mut inline_postgresql_pin = job.clone();
+        let env = inline_postgresql_pin["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .expect("migration env");
+        let key = POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS[1];
+        let entry = env
+            .iter_mut()
+            .find(|entry| str_at(entry, &["name"]) == Some(key))
+            .expect("PostgreSQL authority pin");
+        *entry = json!({ "name": key, "value": "inline-authority" });
+        mutations.push(("inline PostgreSQL pin", inline_postgresql_pin));
+
+        for (label, invalid) in mutations {
+            let mut errors = Vec::new();
+            validate_migration_job(&[api.clone(), invalid], None, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains("production pin")),
+                "{label} must fail closed: {errors:?}"
+            );
+        }
+
+        let mut host_path = job;
+        host_path["spec"]["template"]["spec"]["volumes"] = json!([{
+            "name": "authority-socket",
+            "hostPath": { "path": "/var/run/unreviewed.sock", "type": "Socket" }
+        }]);
+        let mut errors = Vec::new();
+        validate_migration_job(&[api, host_path], None, &mut errors);
+        assert!(
+            errors.iter().any(|error| error.contains("host paths")),
+            "a hostPath authority socket fallback must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn migration_final_render_is_contained_even_with_valid_receipts_and_socket_contract() {
+        let image = format!(
+            "registry.example.invalid/ryuki/platform-api@sha256:{}",
+            "f".repeat(64)
+        );
+        let (api, job, config_maps, trust_anchor) = final_render_migration_fixture(&image);
+        let mut manifests = vec![api.clone(), job.clone()];
+        manifests.extend(config_maps.clone());
+
+        let mut errors = Vec::new();
+        validate_migration_job(&manifests, Some(&trust_anchor), &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error == FINAL_RENDER_RUNTIME_ADMISSION_UNAVAILABLE_ERROR }),
+            "a structurally valid final render must still fail closed on unavailable runtime admission: {errors:?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.as_str() != FINAL_RENDER_RUNTIME_ADMISSION_UNAVAILABLE_ERROR)
+                .count(),
+            0,
+            "the valid diagnostic fixture should fail only because production execution is contained: {errors:?}"
+        );
+        assert_eq!(
+            array_at_path(&job, &["spec", "template", "spec", "volumes"]).len(),
+            2 + MIGRATION_AUTHORITY_SOCKET_PROJECTIONS.len(),
+            "the final render must carry only the CNPG CA, bounded relay workspace, and four pinned inline CSI sockets"
+        );
+
+        let mut mutations = Vec::new();
+        let mut missing_anchor = Vec::new();
+        validate_migration_job(&manifests, None, &mut missing_anchor);
+        assert!(
+            missing_anchor
+                .iter()
+                .any(|error| error.contains("injected test trust anchor")),
+            "final render must reject manifest-only self trust: {missing_anchor:?}"
+        );
+
+        let mut changed_pin = manifests.clone();
+        changed_pin[2]["data"][PLATFORM_API_MIGRATION_CONFIG_KEYS[1]] = json!("299");
+        mutations.push(("migration config substitution", changed_pin));
+
+        let mut changed_job = manifests.clone();
+        changed_job[1]["spec"]["activeDeadlineSeconds"] = json!(299);
+        mutations.push(("post-sign Job substitution", changed_job));
+
+        let mut changed_socket = manifests.clone();
+        changed_socket[1]["spec"]["template"]["spec"]["volumes"][2]["csi"]["volumeAttributes"]
+            ["socketPath"] = json!("/var/run/substituted/authority.sock");
+        mutations.push(("socket projection substitution", changed_socket));
+
+        let receipt_index = manifests.len() - 1;
+        let mut changed_content_digest = manifests.clone();
+        changed_content_digest[receipt_index]["metadata"]["annotations"]
+            [CONTENT_DIGEST_ANNOTATION] = json!(format!("sha256:{}", "1".repeat(64)));
+        mutations.push((
+            "receipt content digest substitution",
+            changed_content_digest,
+        ));
+
+        let mut changed_raw_receipt = manifests.clone();
+        let raw = changed_raw_receipt[receipt_index]["data"][SOCKET_PROJECTION_RECEIPT_DATA_KEY]
+            .as_str()
+            .expect("raw receipt")
+            .to_string();
+        changed_raw_receipt[receipt_index]["data"][SOCKET_PROJECTION_RECEIPT_DATA_KEY] =
+            json!(raw.replace("ed25519", "ed25518"));
+        mutations.push(("raw receipt substitution", changed_raw_receipt));
+
+        for (label, invalid) in mutations {
+            let mut errors = Vec::new();
+            validate_migration_job(&invalid, Some(&trust_anchor), &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.as_str() != FINAL_RENDER_RUNTIME_ADMISSION_UNAVAILABLE_ERROR),
+                "final render must report {label} in addition to runtime containment: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_documents_reject_manifest_selected_socket_trust_anchor() {
+        let input = json!({
+            "manifests": [],
+            "socketProjectionTrustAnchor": {
+                "contractId": SOCKET_PROJECTION_TRUST_ANCHOR_CONTRACT
+            }
+        });
+        let errors = validate_values_json(&input.to_string())
+            .expect("production documents input must parse");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == MANIFEST_SELECTED_TRUST_ANCHOR_FORBIDDEN_ERROR),
+            "inline trust-anchor input must be rejected explicitly: {errors:?}"
+        );
+
+        let context: Context = serde_json::from_value(json!({
+            "manifests": [],
+            "socketProjectionTrustAnchorPath": "/tmp/render-selected-anchor.json"
+        }))
+        .expect("context must parse to expose the forbidden field");
+        assert!(
+            context
+                .untrusted_socket_projection_trust_anchor_path
+                .is_some(),
+            "a context-selected anchor path must never be silently ignored"
+        );
+    }
+
+    #[test]
+    fn source_template_migration_job_is_ca_only_and_remains_suspended() {
+        let image = format!(
+            "registry.example.invalid/ryuki/platform-api@sha256:{}",
+            "9".repeat(64)
+        );
+        let job = migration_job_fixture(&image);
+        let volumes = array_at_path(&job, &["spec", "template", "spec", "volumes"]);
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(str_at(volumes[0], &["name"]), Some(CNPG_CA_VOLUME_NAME));
+        assert_eq!(
+            str_at(volumes[1], &["name"]),
+            Some(POSTGRESQL_RELAY_VOLUME_NAME)
+        );
+        assert_eq!(str_at(volumes[1], &["emptyDir", "medium"]), Some("Memory"));
+        assert_eq!(
+            str_at(&job, &["metadata", "annotations", RENDER_MODE_ANNOTATION]),
+            Some(SOURCE_TEMPLATE_MODE)
+        );
+        let mut errors = Vec::new();
+        let api = json!({
+            "kind": "Deployment",
+            "metadata": { "name": "platform-api" },
+            "spec": { "template": { "spec": { "containers": [{
+                "name": "platform-api",
+                "image": image
+            }] } } }
+        });
+        validate_migration_job(&[api, job.clone()], None, &mut errors);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error == FINAL_RENDER_RUNTIME_ADMISSION_UNAVAILABLE_ERROR),
+            "the suspended source template must remain structurally valid: {errors:?}"
+        );
+        for (_, _, receipt_annotation) in MIGRATION_RENDER_PIN_GROUPS {
+            assert_eq!(
+                str_at(&job, &["metadata", "annotations", receipt_annotation]),
+                Some(RENDER_REQUIRED_SENTINEL)
+            );
+        }
+    }
+
     fn migration_job_fixture(image: &str) -> Value {
         let identity = MigrationIdentity::from_image(image)
             .expect("test image must produce a migration identity");
-        json!({
+        let secret_name = identity.secret_name.clone();
+        let release_digest_prefix = identity.digest_prefix.clone();
+        let mut job = json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
             "metadata": {
                 "generateName": identity.job_generate_name,
                 "annotations": {
                     "ryuki.io/cutover-contract": "migration-cutover-v1",
-                    "ryuki.io/release-image": image
+                    "ryuki.io/release-image": image,
+                    "ryuki.io/render-contract": FINAL_RENDER_CONTRACT,
+                    "ryuki.io/render-mode": SOURCE_TEMPLATE_MODE,
+                    "ryuki.io/pin-migration-config-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-security-admission-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-production-build-manifest-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-conformance-trust-checkpoint-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-deployed-workload-attestation-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-public-ingress-attestation-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-postgresql-infrastructure-attestation-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-socket-projection-authority-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/socket-projection-receipt-digest": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/socket-contract-digest": SOCKET_CONTRACT_DIGEST
                 },
                 "labels": {
                     "ryuki.io/release-digest-prefix": identity.digest_prefix
                 }
             },
             "spec": {
+                "suspend": true,
                 "completions": 1,
                 "parallelism": 1,
                 "backoffLimit": 0,
-                "activeDeadlineSeconds": 2400,
+                "activeDeadlineSeconds": 300,
                 "template": {
                     "metadata": {
                         "labels": {
@@ -4591,31 +6938,49 @@ mod tests {
                         "enableServiceLinks": false,
                         "restartPolicy": "Never",
                         "terminationGracePeriodSeconds": 30,
-                        "volumes": [{
-                            "name": CNPG_CA_VOLUME_NAME,
-                            "secret": {
-                                "secretName": CNPG_CA_SECRET_NAME,
-                                "items": [{
-                                    "key": CNPG_CA_SECRET_KEY,
-                                    "path": CNPG_CA_SECRET_KEY
-                                }]
+                        "volumes": [
+                            {
+                                "name": CNPG_CA_VOLUME_NAME,
+                                "secret": {
+                                    "secretName": CNPG_CA_SECRET_NAME,
+                                    "items": [{
+                                        "key": CNPG_CA_SECRET_KEY,
+                                        "path": CNPG_CA_SECRET_KEY
+                                    }]
+                                }
+                            },
+                            {
+                                "name": POSTGRESQL_RELAY_VOLUME_NAME,
+                                "emptyDir": {
+                                    "medium": "Memory",
+                                    "sizeLimit": POSTGRESQL_RELAY_SIZE_LIMIT
+                                }
                             }
-                        }],
+                        ],
                         "securityContext": {
                             "runAsNonRoot": true,
                             "runAsUser": 10001,
                             "runAsGroup": 10001,
+                            "fsGroup": 10001,
+                            "fsGroupChangePolicy": "OnRootMismatch",
                             "seccompProfile": { "type": "RuntimeDefault" }
                         },
                         "containers": [{
                             "name": MIGRATION_JOB,
                             "image": image,
                             "imagePullPolicy": "IfNotPresent",
-                            "volumeMounts": [{
-                                "name": CNPG_CA_VOLUME_NAME,
-                                "mountPath": CNPG_CA_MOUNT_PATH,
-                                "readOnly": true
-                            }],
+                            "volumeMounts": [
+                                {
+                                    "name": CNPG_CA_VOLUME_NAME,
+                                    "mountPath": CNPG_CA_MOUNT_PATH,
+                                    "readOnly": true
+                                },
+                                {
+                                    "name": POSTGRESQL_RELAY_VOLUME_NAME,
+                                    "mountPath": POSTGRESQL_RELAY_MOUNT_PATH,
+                                    "readOnly": false
+                                }
+                            ],
                             "envFrom": [
                                 {
                                     "configMapRef": {
@@ -4700,7 +7065,313 @@ mod tests {
                     }
                 }
             }
-        })
+        });
+        let mut env = vec![json!({
+            "name": "RYUKI_MIGRATION_DATABASE_URL",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": secret_name,
+                    "key": "RYUKI_MIGRATION_DATABASE_URL"
+                }
+            }
+        })];
+        env.extend(migration_production_pin_entries(&release_digest_prefix));
+        *job.pointer_mut("/spec/template/spec/containers/0/env")
+            .expect("migration Job fixture env") = Value::Array(env);
+        job
+    }
+
+    fn final_render_migration_fixture(image: &str) -> (Value, Value, Vec<Value>, Value) {
+        let identity = MigrationIdentity::from_image(image)
+            .expect("test image must produce a migration identity");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_base64 = BASE64_STANDARD.encode(public_key);
+        let public_key_fingerprint = sha256_prefixed(&public_key);
+        let authority_id = "socket-projection-authority:release-renderer";
+        let key_id = "socket-projection-key:release-renderer";
+        let profile_id = "socket-projection-profile:release-renderer";
+        let profile_version = 3_u64;
+        let profile_digest = format!("sha256:{}", "b".repeat(64));
+        let min_authority_epoch = 7_u64;
+        let authority_epoch = 9_u64;
+        let trust_anchor = json!({
+            "authorityId": authority_id,
+            "contractId": SOCKET_PROJECTION_TRUST_ANCHOR_CONTRACT,
+            "keyId": key_id,
+            "minAuthorityEpoch": min_authority_epoch,
+            "profileDigest": profile_digest,
+            "profileId": profile_id,
+            "profileVersion": profile_version,
+            "publicKeyBase64": public_key_base64,
+            "publicKeyFingerprint": public_key_fingerprint,
+        });
+        let api = json!({
+            "kind": "Deployment",
+            "metadata": { "name": "platform-api" },
+            "spec": { "template": { "spec": { "containers": [{
+                "name": "platform-api",
+                "image": image
+            }] } } }
+        });
+        let mut job = migration_job_fixture(image);
+        job["metadata"]["annotations"][RENDER_MODE_ANNOTATION] = json!(FINAL_RENDER_MODE);
+        job["spec"]["suspend"] = json!(false);
+        job["spec"]["template"]["spec"]["containers"][0]["envFrom"][0]["configMapRef"]["name"] =
+            json!(digest_scoped_pin_config_map_name(
+                "platform-api-migration-config",
+                &identity.digest_prefix,
+            ));
+
+        let mut config_maps = Vec::new();
+        for (index, (base_name, keys, receipt_annotation)) in
+            MIGRATION_RENDER_PIN_GROUPS.iter().enumerate()
+        {
+            let name = digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix);
+            let uid = format!("00000000-0000-4000-8000-{index:012}");
+            let resource_version = (index + 101).to_string();
+            let projection_index = MIGRATION_AUTHORITY_SOCKET_PROJECTIONS
+                .iter()
+                .position(|(projection_base, _, _, _, _, _, _)| projection_base == base_name);
+            let data: Map<String, Value> = keys
+                .iter()
+                .enumerate()
+                .map(|(key_index, key)| {
+                    let value = if *base_name == "platform-api-migration-config" {
+                        match *key {
+                            "RYUKI_MIGRATION_MODE" => "apply-only".to_string(),
+                            "RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS" => "180".to_string(),
+                            "RYUKI_MIGRATION_LOCK_TIMEOUT_SECS" => "30".to_string(),
+                            "RYUKI_MIGRATION_EXPECTED_ROLE" => "ryuki_schema_migrator".to_string(),
+                            "RYUKI_APPLICATION_DATABASE_ROLE" => "ryuki_app_runtime".to_string(),
+                            _ => unreachable!("closed migration config key inventory"),
+                        }
+                    } else if *base_name == SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP {
+                        match *key {
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_AUTHORITY_ID" => {
+                                authority_id.to_string()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_KEY_ID" => {
+                                key_id.to_string()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_BASE64" => {
+                                public_key_base64.clone()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PUBLIC_KEY_FINGERPRINT" => {
+                                public_key_fingerprint.clone()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_MIN_AUTHORITY_EPOCH" => {
+                                min_authority_epoch.to_string()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_ID" => {
+                                profile_id.to_string()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_VERSION" => {
+                                profile_version.to_string()
+                            }
+                            "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_DIGEST" => {
+                                profile_digest.clone()
+                            }
+                            _ => unreachable!("closed socket authority key inventory"),
+                        }
+                    } else {
+                        projection_index
+                            .and_then(|projection_index| {
+                                let (
+                                    _,
+                                    socket_key,
+                                    authority_id_key,
+                                    key_id_key,
+                                    fingerprint_key,
+                                    _,
+                                    authority_class,
+                                ) = MIGRATION_AUTHORITY_SOCKET_PROJECTIONS[projection_index];
+                                if *key == socket_key {
+                                    Some(format!(
+                                    "/var/run/ryuki-authorities/{authority_class}/authority.sock"
+                                ))
+                                } else if *key == authority_id_key {
+                                    Some(format!("authority:{authority_class}"))
+                                } else if *key == key_id_key {
+                                    Some(format!("key:{authority_class}"))
+                                } else if *key == fingerprint_key {
+                                    Some(format!(
+                                        "sha256:{}",
+                                        char::from(b'c' + projection_index as u8)
+                                            .to_string()
+                                            .repeat(64)
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| format!("pin-{index}-{key_index}"))
+                    };
+                    ((*key).to_string(), json!(value))
+                })
+                .collect();
+            let content_digest =
+                canonical_config_map_data_digest(&data).expect("string-only ConfigMap data");
+            let config_map = json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": name,
+                    "namespace": NAMESPACE,
+                    "uid": uid,
+                    "resourceVersion": resource_version,
+                    "labels": { "app.kubernetes.io/part-of": PART_OF },
+                    "annotations": {
+                        (RELEASE_DIGEST_PREFIX_ANNOTATION): identity.digest_prefix,
+                        (CONTENT_DIGEST_ANNOTATION): content_digest
+                    }
+                },
+                "immutable": true,
+                "data": Value::Object(data)
+            });
+            job["metadata"]["annotations"][*receipt_annotation] = json!(format!(
+                "{{\"configMapName\":\"{name}\",\"uid\":\"{uid}\",\"resourceVersion\":\"{resource_version}\",\"contentDigest\":\"{content_digest}\"}}"
+            ));
+            config_maps.push(config_map);
+        }
+
+        let mut volumes = array_at_path(&job, &["spec", "template", "spec", "volumes"])
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let fixture_container = array_at_path(&job, &["spec", "template", "spec", "containers"])[0];
+        let mut mounts = array_at_path(fixture_container, &["volumeMounts"])
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for (base_name, socket_key, _, _, _, volume_name, authority_class) in
+            MIGRATION_AUTHORITY_SOCKET_PROJECTIONS
+        {
+            let config_map_name =
+                digest_scoped_pin_config_map_name(base_name, &identity.digest_prefix);
+            let config_map = config_maps
+                .iter()
+                .find(|config_map| {
+                    str_at(config_map, &["metadata", "name"]) == Some(config_map_name.as_str())
+                })
+                .expect("rendered socket pin ConfigMap");
+            let socket_path = str_at(config_map, &["data", socket_key])
+                .expect("rendered socket path")
+                .to_string();
+            let mount_path = normalized_socket_mount_parent(&socket_path)
+                .expect("normalized socket parent")
+                .to_string();
+            volumes.push(json!({
+                "name": volume_name,
+                "csi": {
+                    "driver": AUTHORITY_SOCKET_CSI_DRIVER,
+                    "readOnly": true,
+                    "volumeAttributes": {
+                        "environmentVariable": socket_key,
+                        "authorityClass": authority_class,
+                        "socketPath": socket_path
+                    }
+                }
+            }));
+            mounts.push(json!({
+                "name": volume_name,
+                "mountPath": mount_path,
+                "readOnly": true
+            }));
+        }
+        *job.pointer_mut("/spec/template/spec/volumes")
+            .expect("migration Job fixture volumes") = Value::Array(volumes);
+        *job.pointer_mut("/spec/template/spec/containers/0/volumeMounts")
+            .expect("migration Job fixture volume mounts") = Value::Array(mounts);
+
+        let now = Utc::now().timestamp();
+        let payload = json!({
+            "canonicalization": "ryuki-canonical-json-v1",
+            "contractId": SOCKET_PROJECTION_RECEIPT_CONTRACT,
+            "expiresAtUnixSeconds": now + 295,
+            "notBeforeUnixSeconds": now - 5,
+            "pinConfigMapReceipts": expected_socket_receipt_pin_receipts(&job)
+                .expect("fixture pin receipts"),
+            "receiptAuthority": {
+                "authorityEpoch": authority_epoch,
+                "authorityId": authority_id,
+                "keyId": key_id,
+                "minAuthorityEpoch": min_authority_epoch,
+                "profileDigest": profile_digest,
+                "profileId": profile_id,
+                "profileVersion": profile_version,
+                "publicKeyFingerprint": public_key_fingerprint,
+            },
+            "releaseDigestPrefix": identity.digest_prefix,
+            "releaseImage": image,
+            "renderedJobPreimageDigest": rendered_job_preimage_digest(&job)
+                .expect("fixture Job preimage"),
+            "socketContractDigest": SOCKET_CONTRACT_DIGEST,
+            "socketProjections": expected_socket_receipt_projections(&config_maps, &identity)
+                .expect("fixture socket projections"),
+        });
+        let canonical_payload = canonical_json_bytes(&payload).expect("canonical fixture payload");
+        let signature = signing_key.sign(&socket_projection_signing_bytes(&canonical_payload));
+        let receipt = json!({
+            "payload": payload,
+            "signature": {
+                "algorithm": "ed25519",
+                "signatureBase64": BASE64_STANDARD.encode(signature.to_bytes()),
+            }
+        });
+        let raw_receipt =
+            String::from_utf8(canonical_json_bytes(&receipt).expect("canonical fixture receipt"))
+                .expect("canonical JSON is UTF-8");
+        let receipt_digest = sha256_prefixed(raw_receipt.as_bytes());
+        job["metadata"]["annotations"][SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION] =
+            json!(receipt_digest);
+        let receipt_name = socket_projection_receipt_config_map_name(&receipt_digest)
+            .expect("content-addressed receipt name");
+        let receipt_data = Map::from_iter([(
+            SOCKET_PROJECTION_RECEIPT_DATA_KEY.to_string(),
+            json!(raw_receipt),
+        )]);
+        let receipt_content_digest =
+            canonical_config_map_data_digest(&receipt_data).expect("receipt content digest");
+        config_maps.push(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": receipt_name,
+                "namespace": NAMESPACE,
+                "labels": { "app.kubernetes.io/part-of": PART_OF },
+                "annotations": {
+                    (RELEASE_DIGEST_PREFIX_ANNOTATION): identity.digest_prefix,
+                    (CONTENT_DIGEST_ANNOTATION): receipt_content_digest,
+                    (SOCKET_PROJECTION_RECEIPT_RAW_DIGEST_ANNOTATION): receipt_digest,
+                }
+            },
+            "immutable": true,
+            "data": Value::Object(receipt_data),
+        }));
+
+        (api, job, config_maps, trust_anchor)
+    }
+
+    fn migration_production_pin_entries(release_digest_prefix: &str) -> Vec<Value> {
+        MIGRATION_APP_PIN_GROUPS
+            .iter()
+            .flat_map(|(config_map, keys, _)| {
+                let config_map =
+                    digest_scoped_pin_config_map_name(config_map, release_digest_prefix);
+                keys.iter().map(move |key| {
+                    json!({
+                        "name": key,
+                        "valueFrom": {
+                            "configMapKeyRef": {
+                                "name": config_map,
+                                "key": key
+                            }
+                        }
+                    })
+                })
+            })
+            .collect()
     }
 
     fn hardened_target_deployment(name: &str, security_context: Value) -> Value {

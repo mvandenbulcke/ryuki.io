@@ -22,7 +22,7 @@
   "boundary_fixture_catalog_ref": {
     "document_id": "boundary-fixture-catalog:security-limit-repository-v1",
     "document_version": 1,
-    "content_digest": "sha256:eca12824f8d084b699df2d449e6661eb77938b049c45168b12041e1f00bd19aa",
+    "content_digest": "sha256:1cfc05fc38039081bf0a532237a1f541a20a39db606223a3c7b231320ed1a14b",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "immutable": true,

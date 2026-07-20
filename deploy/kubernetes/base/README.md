@@ -6,7 +6,7 @@ Base manifests define the portable Kubernetes skeleton for Ryuki Infrastructure 
 |---|---|
 | `namespace.yaml` | `ryuki-platform` namespace. |
 | `serviceaccounts.yaml` | One ServiceAccount per serving component, a dedicated one-shot migration identity, and four non-auto-mounted TokenRequest identities that separate database owner, backup, API runtime, and migration secret materialization. |
-| `configmap.yaml` | Non-secret runtime settings: verify-only `platform-api-config`, including the fixed path to the projected SecretRef fingerprint keyring; apply-only `platform-api-migration-config` with bounded DDL timeouts; and a fail-closed, static-dry-run `portal-ui-config` with non-resolving HTTPS placeholders. |
+| `configmap.yaml` | Non-secret runtime settings: verify-only `platform-api-config`, including the fixed path to the projected SecretRef fingerprint keyring; apply-only `platform-api-migration-config` with 180-second statement and 30-second lock deadlines inside the 300-second infrastructure-proof lifetime; and a fail-closed, static-dry-run `portal-ui-config` with non-resolving HTTPS placeholders. |
 | `deployments.yaml` | `portal-ui` and `platform-api` deployments with HTTP probes on port 8080, conservative resource requests/limits, non-root security contexts, digest-only non-resolving image placeholders, exact allowlisted ConfigMap-only `envFrom`, exact database/admission key references, CA-only CloudNativePG and Vault trust mounts, one 600-second `vault`-audience projected API token, and the one-key SecretRef fingerprint-keyring projection. |
 | `services.yaml` | Internal ClusterIP services for `portal-ui` and `platform-api`. |
 | `ingress.yaml` | Dedicated `ryuki-platform` NGINX IngressClass placeholder for `platform.example.invalid` and same-origin `/api`. |
@@ -14,15 +14,33 @@ Base manifests define the portable Kubernetes skeleton for Ryuki Infrastructure 
 
 ## Database configuration delivery
 
-The API Deployment and one-shot migration Job both require an operator-owned
-`platform-security-admission-config`. Seven individual `configMapKeyRef`
-entries import the absolute image path `/app/security-contract`, relative
-profile path, raw-byte SHA-256 profile digest, expected deployment id, explicit
-production profile, and the normalized relative `.json` path plus independently
-pinned nonzero raw-byte SHA-256 digest for the conformance trust-root registry;
-the latter use `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` and
+Production migration Job creation is currently disabled. The checked-in
+validator performs offline snapshot validation only and rejects every
+`final-render` with the
+`in-cluster-final-render-admission-and-runtime-freshness-v1` unavailable error.
+Snapshot validation cannot fence a ConfigMap delete/recreate between readback
+and Pod materialization, consume a unique execution attempt, or enforce receipt
+expiry when the Pod starts and while it runs. Do not clear `spec.suspend`, mint
+a migration credential, or create this Job until those in-cluster admission and
+runtime gates are implemented and independently reviewed.
+
+The API Deployment requires the operator-owned stable
+`platform-security-admission-config`. The one-shot migration source template is
+suspended and cannot start a Pod if submitted accidentally. Its signed final
+render shape would explicitly clear suspension, reference the immutable
+`platform-security-admission-config-<digest-prefix>` and seven other
+digest-scoped pin ConfigMaps, and bind every exact content digest, UID, and
+resourceVersion in Job annotations and its signed socket-projection receipt.
+That shape is retained for diagnostic validation; it is not executable and is
+always rejected.
+Seven individual `configMapKeyRef` entries import the absolute image path
+`/app/security-contract`, relative profile path, raw-byte SHA-256 profile
+digest, expected deployment id, explicit production profile, and the normalized
+relative `.json` path plus independently pinned nonzero raw-byte SHA-256 digest
+for the conformance trust-root registry; the latter use
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` and
 `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. Whole-ConfigMap import is
-forbidden. The release image must bake the
+forbidden for that group. The release image must bake the
 exact reviewed contract tree into `/app/security-contract` as root-owned regular
 files, including every content-addressed predecessor from the selected trust
 registry head back to version 1. Startup rejects missing, gapped, relabeled,
@@ -62,14 +80,46 @@ contains only that non-secret path. The keyring payload format and overlapping
 rotation procedure are defined in `../vault/bootstrap-runbook.md`. Do not add
 this material to an environment variable, manifest, log, or evidence bundle.
 
-The one-shot Job instead reads `platform-api-migration-config` and only
-`RYUKI_MIGRATION_DATABASE_URL` from the distinct
-digest-scoped `ryuki-platform-api-migrator-db-<digest-prefix>` Secret. The API
-runtime lease and the two CNPG-referenced static Secrets
+The checked-in one-shot source Job names `platform-api-migration-config`, but
+that source mode is not admissible for execution. The diagnostic final-render
+shape rewrites `envFrom` to immutable
+`platform-api-migration-config-<digest-prefix>` and receipt-binds its exact five
+reviewed keys and API identity. The other six application/security pin groups
+are imported key-by-key from their immutable digest-scoped ConfigMaps. The
+eighth, non-environment pin ConfigMap describes the socket-projection receipt
+authority. Its key is not a trust anchor merely because the manifest supplies
+it, and the production validator no longer accepts an inline or context-selected
+anchor. A future in-cluster admission capability must receive its independently
+provisioned anchor through a trust channel outside the render request. The strict
+signed envelope is the sole `receipt.json` value in an immutable ConfigMap whose
+name contains the complete 64-hex raw digest. Its metadata separately binds the
+canonical `data`-object digest and raw receipt digest. It is neither mounted nor
+imported as application environment; within the rendered Job and CSI graph,
+only the excluded Job annotation carries the raw digest. See
+`../operations/migration-cutover-contract.yaml` and
+`../../../docs/runbooks/database-migration-cutover.md` for the eight pin receipts,
+signed-envelope diagnostic validation, socket CSI projection shape, and the
+currently unavailable runtime fences.
+
+The Job reads only `RYUKI_MIGRATION_DATABASE_URL` from the distinct digest-
+scoped `ryuki-platform-api-migrator-db-<digest-prefix>` Secret. The API runtime
+lease and the two CNPG-referenced static Secrets
 (`ryuki-platform-db-superuser` and `ryuki-platform-db-backup-s3`) are described
 in `../vault/vso-secrets.yaml`. The operations-only migration lease and Job are
 templates in `../operations/`; they are never part of the continuously
 reconciled base. Secret values live only in Vault.
+
+The migration container keeps `readOnlyRootFilesystem: true`. Its source Pod
+has exactly two volumes and mounts: the read-only CloudNativePG CA and a
+memory-backed `emptyDir` named `postgresql-relay-workspace`, bounded to `1Mi`
+and mounted read-write at `/run/ryuki-postgresql-relay`. Pod `fsGroup: 10001`
+with `fsGroupChangePolicy: OnRootMismatch` makes that directory available to
+the non-root migration process solely for its owner-only, one-use local relay
+socket; no credential or durable state belongs there. The rejected final-render
+shape preserves those two entries and adds exactly four read-only authority-
+socket CSI volumes and mounts, for a closed total of six. It must not
+substitute a disk-backed workspace, widen the size limit, or reuse the relay
+mount as an authority transport.
 
 Both generated database URLs use `sslmode=verify-full` with
 `sslrootcert=/var/run/secrets/ryuki/cnpg/ca.crt`. The API and one-shot Job
@@ -118,12 +168,15 @@ not replace this with `RollingUpdate` during that cutover. The migration's
 trigger is defense-in-depth against an accidental legacy write; it is not a
 license for mixed-version request handling.
 
-## Remediation migration cutover (158-184)
+## Remediation migration cutover design (158-184; production blocked)
 
-Migrations 158 through 184 are a traffic-off, non-overlap release boundary, not
-a rolling compatibility window. `Recreate` prevents overlap while Kubernetes
-replaces the Deployment, but it does not stop API pods before an independently
-started migration Job. The release operator must execute this order:
+Migrations 158 through 184 require a traffic-off, non-overlap release boundary,
+not a rolling compatibility window. The sequence below is retained as future
+design context only. It is not an executable runbook while production migration
+execution is disabled; operators must stop before step 1 rather than draining
+traffic, issuing a credential, or creating a Job. After the missing in-cluster
+admission and runtime-freshness capability is implemented, the full sequence
+requires a new review before use:
 
 1. Freeze one rendered release: the `platform-api` Deployment and
    `platform-api-migrations` Job must reference the same approved image digest.
@@ -137,17 +190,23 @@ started migration Job. The release operator must execute this order:
    verifier, migration 181 reconciliation worker, and migration 183 metric/SLO
    breach loops; zero API pods alone does not prove an external worker is idle.
 3. Review database capacity, WAL headroom, lock wait, and the dedicated Job's
-   statement/lock deadlines. Migrations 163 and 170 take explicit offline table
+   180-second statement and 30-second lock deadlines. Both must remain inside
+   the 300-second PostgreSQL infrastructure-attestation lifetime; a migration
+   that cannot fit must be decomposed and reviewed rather than granted a longer
+   stale-proof window. Migrations 163 and 170 take explicit offline table
    locks, while migration 183 builds nine ordinary, non-concurrent indexes. Do not
    apply this wave during request traffic or background execution.
 4. Only after the drain and independent zero-session readback, create the
    digest-scoped VaultAuth/VaultDynamicSecret and then create the generated
    one-shot migration Job once. Require one successful completion
-   with no retry, then read `_sqlx_migrations` back and compare every installed
-   version and checksum with the versions embedded in that exact image. A
-   missing, dirty, extra, or checksum-mismatched row fails the release closed;
-   do not start the API and do not rerun the Job speculatively. Revoke and
-   delete the migration lease after role/ledger readback and before API start.
+   with no automatic retry, then read the exact
+   `production_migration_operations` marker and `_sqlx_migrations` inventory
+   back. Compare every installed version and checksum with the versions embedded
+   in that exact image. A missing, dirty, extra, or checksum-mismatched row fails
+   the release closed. `CommitOutcomeUnknown` is not a rollback signal: retain
+   its operation id and use only an explicitly approved fresh attested marker
+   reconciliation, never speculative DDL replay. Revoke and delete the migration
+   lease after role/ledger readback and before API start.
 5. Start only the matching new `Recreate` API image, initially with traffic
    still withdrawn. Its verify-only startup must independently accept the same
    dynamic `_sqlx_migrations` readback before `/ready` can succeed. Never let an

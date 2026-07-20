@@ -21,6 +21,7 @@ mod inbound_webhooks;
 mod integration;
 mod oidc_callback;
 mod openapi;
+mod postgresql_tls_channel;
 mod repos;
 mod scheduler;
 mod secret_provider_runtime;
@@ -3054,11 +3055,13 @@ async fn main() {
         // Apply-only intentionally does not load the API configuration needed
         // by serving guards. Production instead validates a narrower one-shot
         // prerequisite derived from the sealed DurablePostgresql requirement.
-        // DDL remains blocked until independently authenticated database-target
-        // evidence is implemented; this path can never publish an application
+        // The returned one-shot capability retains the independently pinned
+        // PostgreSQL-infrastructure authority and cannot release DDL authority
+        // until that authority authenticates the exact connected target and
+        // durable-storage binding. This path can never publish an application
         // pool, initialize workers, build a router, or serve.
         let migration_admission = security_contract
-            .into_apply_only_migration_admission(migration_mode, chrono::Utc::now())
+            .into_apply_only_migration_admission(migration_mode, &security_pins, chrono::Utc::now())
             .unwrap_or_else(|error| {
                 eprintln!("migration admission failed: {error}");
                 std::process::exit(1);
@@ -3089,6 +3092,29 @@ async fn main() {
                     inventory.latest_version,
                     inventory.content_digest,
                 );
+                if let Some(operation) = inventory.production_operation.as_ref() {
+                    eprintln!(
+                        "production migration operation confirmed (operation_id={}, reconciled_after_prior_attempt={})",
+                        operation.operation_id(),
+                        operation.reconciled_after_prior_attempt(),
+                    );
+                }
+                if let Some(attestation) = inventory.production_attestation.as_ref() {
+                    eprintln!(
+                        "production migration attestation verified (authority={}, epoch={}, revision={}, profile={}, profile_version={}, profile_digest={}, measurement_sequence={}, response_digest={}, session_digest={}, database_digest={}, storage_digest={})",
+                        attestation.authority_id(),
+                        attestation.authority_epoch(),
+                        attestation.authority_revision(),
+                        attestation.attestation_profile_id(),
+                        attestation.attestation_profile_version(),
+                        attestation.attestation_profile_digest(),
+                        attestation.measurement_sequence(),
+                        attestation.response_digest(),
+                        attestation.session_binding_digest(),
+                        attestation.database_identity_digest(),
+                        attestation.storage_binding_digest(),
+                    );
+                }
                 return;
             }
             Err(error) => {
@@ -3432,6 +3458,7 @@ async fn main() {
                 Ok(inventory) => tracing::info!(
                     embedded_count = inventory.embedded_count,
                     latest_version = ?inventory.latest_version,
+                    inventory_digest = %inventory.content_digest,
                     "verify-only startup accepted the complete embedded migration inventory"
                 ),
                 Err(error) => {

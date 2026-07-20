@@ -49,10 +49,10 @@ Startup now derives the complete implementation-plus-deployment applicability
 inventory, verifies the exact semantic receipt closure, and consumes the
 checkpoint, current SB-9 root, authenticated documents, pinned profile/build,
 and workload proof into one non-cloneable production-boundary proof. Production
-now retains verified `HttpsPublicUrls`, `SecureCookies`, and
-`ApprovedSecretProvider` witnesses, but still exits before migrations, workers,
-routing, or listeners until the remaining five receipt-bound live runtime
-guards are implemented and verified: `durable-postgresql`,
+serving now retains verified `HttpsPublicUrls`, `SecureCookies`, and
+`ApprovedSecretProvider` witnesses, but still exits before database publication,
+workers, routing, or listeners until the remaining five receipt-bound live
+runtime guards are implemented and verified: `durable-postgresql`,
 `non-development-authenticator`, `external-signing-key-material`,
 `mock-dependencies-disabled`, and `first-owner-path-closed`. The overall
 normative production boundary is not complete.
@@ -133,6 +133,68 @@ signed `HttpsPublicUrls` expectation. Because the expected ingress digest is
 receipt-bound, its workload-instance binding is a stable provisioned deployment
 identity known when that receipt is issued; a newly randomized identity cannot
 satisfy a pre-existing receipt.
+
+Production also requires this independently pinned PostgreSQL infrastructure
+attestation binding:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET` | Absolute, lexically normalized Unix-socket path with a file name, no NUL, and at most 103 path bytes |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID` | Independently pinned canonical id beginning `postgresql-infrastructure-attestation-authority:` |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID` | Independently pinned canonical Ed25519 key id beginning `postgresql-infrastructure-attestation-key:` |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64` | Canonical Base64 of exactly 32 raw Ed25519 public-key bytes |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT` | Nonzero `sha256:<64 lowercase hex>` digest of those decoded public-key bytes |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH` | Canonical positive base-10 independently held minimum authority fencing epoch, at most 9,007,199,254,740,991 |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID` | Independently pinned canonical id beginning `postgresql-infrastructure-attestation-profile:` |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION` | Canonical positive base-10 independently pinned profile version, at most 9,007,199,254,740,991 |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the approved attestation profile |
+
+These nine variables are one complete-or-none group. They are mandatory for
+every production process and forbidden in development/test. Provision the
+authority, public key, epoch floor, profile, and Unix-socket projection through
+an independently governed deployment channel; none may be inferred from the
+rollbackable contract tree, build manifest, migration credential, connection
+URL, PostgreSQL server, or attestation response. The PostgreSQL authority's
+socket path and decoded-public-key fingerprint must each differ from the
+checkpoint, deployed-workload, and public-ingress authorities.
+
+The lower-level production `apply-only` protocol performs one bounded exchange
+without retry. A fresh
+nonce and exact request digest bind the domain-separated Ed25519 response to the
+receipt's `durable-postgresql` requirement, deployment/trust/workload namespace,
+expected provider and PostgreSQL major version, exact receipt-bound provider
+route, database-identity digest, and durable-storage digest. The proof
+authorization is at most 300 seconds. The runner establishes one exclusive-CA
+TLS 1.3 channel, requires its exact peer leaf-certificate digest to match the
+receipt-bound route before releasing credentials, permits only SCRAM-SHA-256,
+binds the exporter into the request tag, and relays only that channel into one
+direct PgConnection. The authority must independently derive
+the same exporter at the database endpoint. Provider identity, cluster system
+identity, and durable-storage bindings come only from signed authority
+evidence; the runner recomputes their typed digests and requires exact receipt
+equality.
+
+Production execution is currently contained: `apply-only` exits before reading
+the migration credential until live Kubernetes render admission, one-use
+attempt consumption, materialized-pin binding, and runtime receipt freshness
+are implemented. Offline manifest validation is not execution authority.
+
+Immediately before mutation, the runner acquires the reviewed bounded
+session-level advisory lock and only then begins one repeatable-read database
+transaction. As the transaction's first statement it acquires the same
+transaction-scoped advisory lock, then releases the session-scoped copy. This
+preserves a fresh pre-lock snapshot while making the serialization fence
+unreleaseable by migration SQL. The runner rechecks proof
+integrity/freshness and the local SQL-visible facts, applies every pending
+embedded migration, exact-compares the complete resulting ledger, and inserts a
+content-addressed non-secret operation marker. It dispatches `COMMIT` only while
+the proof remains current and never reconnects or selects another target before
+that boundary. Failures before dispatch roll back the wave. A timeout or error
+after `COMMIT` was sent is instead `CommitOutcomeUnknown`: closing the
+connection is not proof of rollback. Startup never retries automatically; an
+explicitly approved fresh attempt must independently attest the target and
+reconcile the exact durable marker plus final inventory before it can report
+the prior operation complete.
 
 The deployment, profile, and trust-root-registry pins come from process
 configuration, not from the documents being admitted. Preflight verifies the

@@ -698,16 +698,21 @@ mod entra_sso_db_tests {
     use axum::routing::{get, post};
     use axum::Router;
     use jsonwebtoken::{Algorithm, Header};
+    use rand::{rngs::OsRng, RngCore};
     use sqlx::PgPool;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
     use tower::ServiceExt;
 
     const TEST_TENANT: &str = "stub-tenant";
     const TEST_CLIENT: &str = "entra-sso-client-test";
     const TEST_REDIRECT: &str = "http://127.0.0.1:9/api/auth/entra/callback";
     const TEST_KID: &str = "entra-sso-test-kid";
-    const OTHER_TEST_BINDING: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+    static TEST_SESSION_HMAC_KEY: LazyLock<String> = LazyLock::new(|| {
+        let mut key = [0_u8; 32];
+        OsRng.fill_bytes(&mut key);
+        b64url(key.to_vec())
+    });
 
     fn authorize_request() -> Request<Body> {
         Request::builder()
@@ -721,8 +726,19 @@ mod entra_sso_db_tests {
 
     fn test_session_config() -> ryuki_core::config::SessionConfig {
         ryuki_core::config::SessionConfig {
-            credential_hmac_key: "k".repeat(32),
+            credential_hmac_key: TEST_SESSION_HMAC_KEY.clone(),
             ..Default::default()
+        }
+    }
+
+    fn other_test_binding(binding: &str) -> String {
+        loop {
+            let mut bytes = [0_u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            let candidate = b64url(bytes.to_vec());
+            if candidate != binding {
+                return candidate;
+            }
         }
     }
 
@@ -1284,7 +1300,7 @@ mod entra_sso_db_tests {
         // A DIFFERENT browser (wrong binding cookie) presents a valid state.
         let resp = app
             .clone()
-            .oneshot(callback_req(&state, OTHER_TEST_BINDING))
+            .oneshot(callback_req(&state, &other_test_binding(&binding)))
             .await
             .expect("callback");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

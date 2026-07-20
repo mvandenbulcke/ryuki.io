@@ -276,6 +276,15 @@ for explicit local dry-run compatibility and are rejected in production. See
 | `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID` | Production-only independently pinned id beginning `ingress-attestation-profile:` |
 | `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION` | Production-only canonical positive base-10 independently pinned attestation-profile version |
 | `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the independently approved attestation profile |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET` | Production-only normalized absolute Unix-socket path; configure with the complete nine-value PostgreSQL infrastructure authority binding |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_AUTHORITY_ID` | Production-only independently pinned id beginning `postgresql-infrastructure-attestation-authority:` |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEY_ID` | Production-only independently pinned Ed25519 key id beginning `postgresql-infrastructure-attestation-key:` |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_BASE64` | Production-only canonical Base64 of exactly 32 raw Ed25519 authority public-key bytes |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT` | Production-only nonzero `sha256:<64 lowercase hex>` fingerprint of those decoded public-key bytes |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_MIN_AUTHORITY_EPOCH` | Production-only canonical positive base-10 independently accepted authority fencing epoch, at most 9,007,199,254,740,991 |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID` | Production-only independently pinned id beginning `postgresql-infrastructure-attestation-profile:` |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION` | Production-only canonical positive base-10 independently pinned attestation-profile version, at most 9,007,199,254,740,991 |
+| `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the independently approved attestation profile |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
@@ -320,12 +329,32 @@ SB-9 root, authenticated receipts and evidence, ControlTrace, pinned profile
 bytes, provider and security-limit claims, and build manifest. It independently
 derives the complete implementation-plus-deployment applicability inventory,
 verifies semantic closure, and seals the result into one non-cloneable
-production-boundary proof. Startup now retains independently verified
+production-boundary proof. Production `apply-only` migration admission also
+requires the complete PostgreSQL infrastructure attestation pin group. Its
+socket and decoded-key fingerprint must differ from the checkpoint, workload,
+and ingress authorities. One no-retry, nonce-bound Ed25519 proof authorizes at
+most 300 seconds. The runner establishes one exclusive-CA TLS 1.3 channel,
+requires its peer leaf-certificate digest to match the receipt-bound provider
+route before releasing credentials, permits only SCRAM-SHA-256 authentication,
+binds the exporter and provider route into the request tag, and relays only that
+channel into one direct PgConnection. The authority must
+derive the same exporter at the database endpoint; echoing the tag is not
+proof. Independently signed evidence supplies provider, cluster, and
+durable-storage identity. After exact receipt matching, the runner
+performs pre-DDL recheck, every pending migration, and exact ledger postflight
+plus a durable operation marker in one transaction on that connection. It
+dispatches `COMMIT` before the proof safety deadline; a lost acknowledgement is
+reported as outcome-unknown and can only be resolved by a fresh independently
+attested marker-and-inventory reconciliation, never by assuming rollback or
+blindly replaying DDL. This repository does not yet contain the live Kubernetes
+admission/attempt-consumption and runtime receipt verifier needed to make the
+offline signed render authoritative, so production `apply-only` exits before
+reading the migration credential. Serving startup now retains independently verified
 `HttpsPublicUrls`, exact-runtime `SecureCookies`, and exact retained
-`ApprovedSecretProvider` witnesses, but still exits before migrations, workers,
-routing, or listeners until the remaining five receipt-bound live runtime
-guards and normative boundary work packages are implemented and verified. The
-five outstanding guards are `durable-postgresql`,
+`ApprovedSecretProvider` witnesses, but still exits before workers, routing, or
+listeners until the remaining five receipt-bound live runtime guards and
+normative boundary work packages are implemented and verified. The five
+outstanding serving guards are `durable-postgresql`,
 `non-development-authenticator`, `external-signing-key-material`,
 `mock-dependencies-disabled`, and `first-owner-path-closed`; the overall
 normative production boundary is not complete.

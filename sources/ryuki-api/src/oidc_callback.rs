@@ -2167,16 +2167,17 @@ mod oidc_callback_db_tests {
             return;
         };
 
-        let nonce = "test-nonce-alg";
+        let nonce = Uuid::new_v4().to_string();
         let state = format!("st-alg-{}", Uuid::new_v4());
 
-        insert_test_state(pool, &state, nonce)
+        insert_test_state(pool, &state, &nonce)
             .await
             .expect("insert state");
 
         // Sign with HS256 instead of RS256.
-        let claims = valid_id_token_claims(nonce);
-        let hs_key = EncodingKey::from_secret(b"test-secret");
+        let claims = valid_id_token_claims(&nonce);
+        let hs_secret = Uuid::new_v4().to_string();
+        let hs_key = EncodingKey::from_secret(hs_secret.as_bytes());
         let hs_token =
             jsonwebtoken::encode(&Header::new(Algorithm::HS256), &claims, &hs_key).unwrap();
 

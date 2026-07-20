@@ -731,6 +731,43 @@ controls are part of the boundary rather than optional operational guidance.
   recovery path. Wall-clock rollback must
   not revive expired credentials, grants, leases, replay windows, or step-up.
 
+### Production PostgreSQL migration boundary
+
+- Production schema changes use an isolated `apply-only` process and one
+  explicit migration credential. The normal serving pool cannot perform DDL,
+  and the migration process never starts listeners, workers, or application
+  routing.
+- The deployment receipt binds a direct PostgreSQL provider route consisting of
+  provider, canonical DNS name and port, exclusive CA-bundle digest, and exact
+  peer leaf-certificate digest. The runner establishes TLS 1.3 itself, checks
+  that route before releasing credentials, permits only SCRAM-SHA-256 startup
+  authentication, disables TLS resumption, derives an exporter-bound request
+  tag, and exposes the measured stream to exactly one process-owned SQLx
+  connection through a bounded owner-only Unix relay.
+- An independently governed PostgreSQL infrastructure authority must derive the
+  same TLS exporter at the database endpoint and sign the exact provider,
+  cluster, durable-storage, database, role, migration-inventory, and backend-
+  session projection. A client-echoed tag or local SQL observation is not
+  independent evidence.
+- Serialization is acquired on the backend before `BEGIN`, promoted to the
+  same transaction-scoped advisory lock as the first transactional statement,
+  and then removed from session scope. Migration SQL cannot release the
+  transaction fence. Parser settings, backend PID, transaction identity,
+  isolation, and writability are pinned and rechecked around every raw
+  migration.
+- Pending DDL, privilege reconciliation, exact ledger verification, and a
+  deterministic append-only operation marker commit atomically. A timeout or
+  transport loss after `COMMIT` dispatch is `CommitOutcomeUnknown`; only a new
+  independently attested run may reconcile the exact marker and final
+  inventory. It must never assume rollback or blindly replay DDL.
+- The checked-in Kubernetes validator currently authenticates only an offline
+  snapshot. It cannot atomically consume an attempt, prevent ConfigMap
+  deletion/recreation before Pod materialization, or enforce receipt freshness
+  in the running process. Consequently production `apply-only` remains
+  fail-closed before the database credential is read. Re-enabling it requires a
+  live admission authority plus a non-cloneable runtime receipt capability that
+  binds the materialized pins and constrains DDL and commit by its expiry.
+
 ### Adapter trust and conformance
 
 - First-party adapters are compiled, version-pinned parts of the trusted
