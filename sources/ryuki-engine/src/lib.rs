@@ -8,6 +8,7 @@ pub mod app_environment;
 pub mod approval_quorum;
 pub mod audit_retention;
 pub mod auth;
+pub mod authorization;
 pub mod backup_engine;
 pub mod backup_recency;
 pub mod certificate_lifecycle;

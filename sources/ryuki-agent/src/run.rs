@@ -22,7 +22,8 @@
 //! 1. `!allow_live` → refuse WITHOUT planning (fail-closed, no platform contact).
 //! 2. `live_exec.plan(spec)` → `LivePlanOutcome { evidence, raw_plan_digest }`.
 //! 3. `evaluate_live_execution(job, cp_key, allow_live, Some(&raw_plan_digest))` —
-//!    checks allow_live, grant signature, request_id, expiry, digest match.
+//!    checks the complete signed grant/spec/request-version binding, expiry,
+//!    and digest match.
 //! 4. `Refused` → `build_refused_result` (apply is NEVER called).
 //! 5. `Proceed` → `live_exec.apply(spec)` → `Evidence { Applied/Failed }`.
 //! 6. `build_signed_result(.., Some(grant.approved_plan_digest))` — the digest
@@ -40,8 +41,8 @@
 //!
 //! 1. No pinned CP key → refuse (the gate's grant-signature check needs it).
 //! 2. `evaluate_live_execution(job, cp_key, allow_live, None)` — checks
-//!    allow_live, grant signature, request_id, REQUIRED step binding (an
-//!    unbound legacy grant is refused), expiry.  No digest check by design.
+//!    the complete signed grant/spec/request-version binding, REQUIRED step
+//!    binding, and expiry. No digest check by design.
 //! 3. `Refused` → `build_refused_result` (destroy is NEVER called).
 //! 4. `Proceed` → `live_exec.destroy(spec)` → `Evidence { Applied/Failed }`
 //!    (`Applied` → CP marks the step `ToreDown`; `Failed` → CP halts the
@@ -421,7 +422,8 @@ fn evidence_or_deterministic_failure_with_cancellation(
 /// 1. `!allow_live` → refuse immediately WITHOUT calling `plan()`.
 /// 2. `cp_verifying_key` is `None` → refuse immediately WITHOUT calling `plan()`.
 /// 3. `plan()` → `plan_digest`.
-/// 4. Gate checks (allow_live, grant sig, request_id, expiry, digest).
+/// 4. Gate checks the complete signed grant/spec/request-version binding,
+///    expiry, and digest.
 /// 5. Gate `Refused` → refuse, `apply()` is NEVER called.
 /// 6. Gate `Proceed` → `apply()`.
 /// 7. `build_signed_result(.., Some(grant.approved_plan_digest))` — the digest
@@ -438,9 +440,9 @@ fn evidence_or_deterministic_failure_with_cancellation(
 ///
 /// 1. `cp_verifying_key` is `None` → refuse immediately (the gate's grant
 ///    signature check requires the pinned key; a destroy grant is mandatory).
-/// 2. Gate checks (allow_live, grant sig, request_id, REQUIRED step binding,
-///    expiry — no plan digest: the destruction set comes from the step's own
-///    backend state, not from an approved plan).
+/// 2. Gate checks the complete signed grant/spec/request-version binding,
+///    REQUIRED step binding, and expiry — no plan digest: the destruction set
+///    comes from the step's own backend state, not from an approved plan.
 /// 3. Gate `Refused` → refuse, `destroy()` is NEVER called.
 /// 4. Gate `Proceed` → `destroy()`.
 /// 5. `build_signed_result(.., None)` (LiveDestroy never carries a digest).
@@ -481,9 +483,9 @@ pub async fn process_job_live(
         // -- LiveDestroy ----------------------------------------------------
         // #42 slice B2-3: gated terraform-destroy execution. The trust gate
         // (evaluate_live_destroy, B2-1) is the ONLY path to execution: it
-        // requires --allow-live, a CP-signed grant, request binding, a
-        // REQUIRED step binding (legacy unbound grants are rejected — the step
-        // binding IS a destroy's safety bound), and an unexpired grant. There
+        // requires --allow-live, a CP-signed grant, exact request/version
+        // binding, a REQUIRED step binding (unbound grants are rejected — the
+        // step binding IS a destroy's safety bound), and an unexpired grant. There
         // is deliberately NO plan-digest check: a destroy has no saved plan —
         // it removes whatever the step's own apply recorded in the durable
         // backend state (state is the source of truth for the destruction set).
@@ -524,7 +526,7 @@ pub async fn process_job_live(
                 }
             };
 
-            // Gate: checks 1-6 (no digest for a destroy — pass None).
+            // Full grant/spec/request-version gate (no digest for a destroy).
             match evaluate_live_execution(job, vk, allow_live, None) {
                 crate::live::LiveDecision::Refused(reason) => {
                     warn!(
@@ -749,8 +751,8 @@ pub async fn process_job_live(
                 }
             };
 
-            // Verify signature, exact JobSpec/request binding, step binding,
-            // and expiry before Terraform can contact the backend/provider.
+            // Verify signature, exact JobSpec/request/version binding, step
+            // binding, and expiry before Terraform can contact the backend/provider.
             // The full gate is repeated after planning to bind the digest and
             // re-check expiry at the mutation boundary.
             if let crate::live::LiveDecision::Refused(reason) =
@@ -832,7 +834,8 @@ pub async fn process_job_live(
             };
             let raw_plan_digest = &plan_outcome.raw_plan_digest;
 
-            // Gate: all six checks (allow_live, grant sig, request_id, expiry, digest).
+            // Repeat the complete grant/spec/request-version gate with the
+            // newly computed raw-plan digest immediately before mutation.
             match evaluate_live_execution(job, vk, allow_live, Some(raw_plan_digest.as_str())) {
                 crate::live::LiveDecision::Refused(reason) => {
                     warn!(
@@ -1549,6 +1552,8 @@ mod tests {
         let result_id = Uuid::new_v4();
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "test@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -1568,6 +1573,7 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -1844,6 +1850,7 @@ mod tests {
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            request_resource_version: spec.request_resource_version,
             platform: "test-platform".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
@@ -1947,6 +1954,8 @@ mod tests {
     fn make_leased_job_mode(mode: JobMode) -> Job {
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),
@@ -2058,6 +2067,8 @@ mod tests {
 
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),
@@ -2354,6 +2365,8 @@ mod tests {
         let wrong_digest = sha256_hex(b"a-different-approved-plan");
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),
@@ -2702,6 +2715,7 @@ mod tests {
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            request_resource_version: spec.request_resource_version,
             platform: "test-platform".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             // The digest of the plan the step APPLIED — present in the grant but
@@ -2724,6 +2738,8 @@ mod tests {
         let job_id = Uuid::new_v4();
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "request-preflight@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),

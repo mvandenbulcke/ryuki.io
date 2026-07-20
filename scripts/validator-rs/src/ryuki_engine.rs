@@ -18,6 +18,7 @@ const DECLARED_MODULES: &[&str] = &[
     "approval_quorum",
     "audit_retention",
     "auth",
+    "authorization",
     "backup_engine",
     "backup_recency",
     "certificate_lifecycle",

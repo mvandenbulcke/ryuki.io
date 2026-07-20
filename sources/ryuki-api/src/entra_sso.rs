@@ -1345,9 +1345,15 @@ mod entra_sso_db_tests {
         let stub = start_stub_idp().await;
         let app = test_router(stub_deps(&stub));
 
-        let (state, _nonce, _challenge, binding) = begin_login(&app).await;
+        let (state, nonce, _challenge, binding) = begin_login(&app).await;
         // The stub issues an id_token with a DIFFERENT nonce.
-        stub.set_nonce("a-nonce-that-was-never-requested");
+        let mismatched_nonce = loop {
+            let candidate = Uuid::new_v4().to_string();
+            if candidate != nonce {
+                break candidate;
+            }
+        };
+        stub.set_nonce(&mismatched_nonce);
 
         let resp = app
             .clone()

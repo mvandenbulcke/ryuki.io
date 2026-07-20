@@ -510,7 +510,9 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("quarantine_log", true, true, true),
     TablePolicy::new("recertification_campaigns", true, true, true),
     TablePolicy::new("request_approval_decisions", true, false, false),
-    TablePolicy::new("requests", true, true, true),
+    // Request identity and its monotonic resource_version are permanent. The
+    // runtime can conclude a request, but cannot delete and later reuse its id.
+    TablePolicy::new("requests", true, true, false),
     TablePolicy::new("restore_requests", true, true, true),
     TablePolicy::new("restore_scheduler_system_summary", true, true, true),
     TablePolicy::new("rotation_runs", true, true, true),
@@ -2022,11 +2024,351 @@ async fn attest_application_routine_acl(
     Ok(())
 }
 
+/// Prove that the four request resource-version invariants still target the
+/// reviewed trigger functions and fire even in replica sessions. This is a
+/// startup schema attestation, not just a privilege check: disabling a trigger,
+/// changing its event/column scope, or replacing a function body must fail the
+/// application connection before it can serve traffic.
+async fn attest_request_resource_version_triggers(
+    connection: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    let exact: bool = sqlx::query_scalar(
+        r#"
+        WITH request_table AS (
+            SELECT class.oid,
+                   resource_version.attnum AS resource_version_attnum
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            JOIN pg_catalog.pg_attribute AS resource_version
+              ON resource_version.attrelid = class.oid
+             AND resource_version.attname = 'resource_version'
+             AND resource_version.attnum > 0
+             AND NOT resource_version.attisdropped
+            WHERE namespace.nspname = 'public'
+              AND class.relname = 'requests'
+              AND class.relkind = 'r'
+        ),
+        expected(
+            trigger_name,
+            function_signature,
+            trigger_type,
+            column_specific,
+            function_source_sha256
+        ) AS (
+            VALUES
+                (
+                    'trg_requests_resource_version_owned'::text,
+                    'public.reject_caller_managed_request_resource_version()'::text,
+                    19::smallint,
+                    true,
+                    '8398ad738d888fbe104696423676e61ea3fd579222ad775830c1a0ae056531cd'::text
+                ),
+                (
+                    'trg_requests_zz_resource_version'::text,
+                    'public.advance_request_resource_version()'::text,
+                    23::smallint,
+                    false,
+                    '275aec932a2e02510bbc9dc6fb17bb392412dcb592d7fe33d30904472efeb8fe'::text
+                ),
+                (
+                    'trg_requests_resource_version_no_delete'::text,
+                    'public.reject_runtime_request_resource_deletion()'::text,
+                    11::smallint,
+                    false,
+                    '42ca6bd64968c7bf9cd303a32fc2b2e33d4b14d8427cf8664c177947b0800fe4'::text
+                ),
+                (
+                    'trg_requests_resource_version_no_truncate'::text,
+                    'public.reject_runtime_request_resource_deletion()'::text,
+                    34::smallint,
+                    false,
+                    '42ca6bd64968c7bf9cd303a32fc2b2e33d4b14d8427cf8664c177947b0800fe4'::text
+                )
+        ),
+        matching AS (
+            SELECT expected.trigger_name
+            FROM expected
+            CROSS JOIN request_table
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = request_table.oid
+             AND trigger.tgname = expected.trigger_name
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid = trigger.tgfoid
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE trigger.tgfoid =
+                      pg_catalog.to_regprocedure(expected.function_signature)
+              AND trigger.tgtype = expected.trigger_type
+              AND trigger.tgenabled = 'A'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgparentid = 0
+              AND trigger.tgconstraint = 0
+              AND trigger.tgconstrrelid = 0
+              AND trigger.tgconstrindid = 0
+              AND NOT trigger.tgdeferrable
+              AND NOT trigger.tginitdeferred
+              AND trigger.tgnargs = 0
+              AND pg_catalog.octet_length(trigger.tgargs) = 0
+              AND trigger.tgqual IS NULL
+              AND trigger.tgoldtable IS NULL
+              AND trigger.tgnewtable IS NULL
+              AND (
+                   (
+                       expected.column_specific
+                       AND trigger.tgattr::text =
+                           request_table.resource_version_attnum::text
+                   )
+                   OR (
+                       NOT expected.column_specific
+                       AND trigger.tgattr::text = ''
+                   )
+              )
+              AND procedure.prokind = 'f'
+              AND procedure.prorettype = 'pg_catalog.trigger'::regtype
+              AND procedure.pronargs = 0
+              AND NOT procedure.prosecdef
+              AND NOT procedure.proleakproof
+              AND procedure.provolatile = 'v'
+              AND procedure.proparallel = 'u'
+              AND procedure.proconfig IS NULL
+              AND language.lanname = 'plpgsql'
+              AND pg_catalog.encode(
+                      pg_catalog.sha256(
+                          pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                      ),
+                      'hex'
+                  ) = expected.function_source_sha256
+        )
+        SELECT (SELECT COUNT(*) FROM request_table) = 1
+           AND (SELECT COUNT(*) FROM matching) = 4
+           AND NOT EXISTS (
+               SELECT 1
+               FROM expected
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM matching
+                   WHERE matching.trigger_name = expected.trigger_name
+               )
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "request resource-version trigger definitions are not canonical and always enabled",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that approval evidence and dispatched agent work remain bound to the
+/// exact request authority version selected by migration 196. These guards are
+/// part of the startup schema contract: changing a target table, trigger event
+/// or column set, execution mode, or function body must prevent the application
+/// connection from serving traffic.
+async fn attest_request_authority_version_binding_triggers(
+    connection: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    let exact: bool = sqlx::query_scalar(
+        r#"
+        WITH target_tables AS (
+            SELECT class.oid,
+                   class.relname::text AS table_name
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND class.relname IN (
+                    'request_approval_decisions',
+                    'agent_jobs'
+                  )
+              AND class.relkind = 'r'
+        ),
+        expected(
+            table_name,
+            trigger_name,
+            function_signature,
+            trigger_type,
+            column_names,
+            function_source_sha256
+        ) AS (
+            VALUES
+                (
+                    'request_approval_decisions'::text,
+                    'trg_request_approval_decision_basis_version'::text,
+                    'public.bind_request_approval_basis_resource_version()'::text,
+                    7::smallint,
+                    ARRAY[]::text[],
+                    'e2579634b52772f8523057618254b0c000db9ad99026c7fd6f5ff1bd670b4822'::text
+                ),
+                (
+                    'request_approval_decisions'::text,
+                    'trg_request_approval_decision_basis_version_owned'::text,
+                    'public.reject_request_approval_basis_version_update()'::text,
+                    19::smallint,
+                    ARRAY['approval_basis_resource_version']::text[],
+                    '7b412cf35870cd0ebc625e44758d279745553ae4783bc7920761a6c22522fe3f'::text
+                ),
+                (
+                    'agent_jobs'::text,
+                    'trg_agent_jobs_request_resource_version'::text,
+                    'public.bind_agent_job_request_resource_version()'::text,
+                    7::smallint,
+                    ARRAY[]::text[],
+                    'd26216065dfbd4f9fcdc00a5a9cfd1d0422499863109a05fc4690c5413d59d58'::text
+                ),
+                (
+                    'agent_jobs'::text,
+                    'trg_agent_jobs_request_resource_version_owned'::text,
+                    'public.reject_agent_job_request_binding_update()'::text,
+                    19::smallint,
+                    ARRAY[
+                        'id',
+                        'request_id',
+                        'platform',
+                        'spec',
+                        'mode',
+                        'live_context',
+                        'origin',
+                        'step_scoped',
+                        'request_resource_version'
+                    ]::text[],
+                    '5b6979234abd8ad135cd5f7d4125c6e2b0444139ddf88a560951d2581376db19'::text
+                )
+        ),
+        resolved_expected AS (
+            SELECT expected.*,
+                   target_tables.oid AS table_oid,
+                   resolved_columns.resolved_count,
+                   resolved_columns.trigger_columns
+            FROM expected
+            JOIN target_tables
+              ON target_tables.table_name = expected.table_name
+            CROSS JOIN LATERAL (
+                SELECT COUNT(attribute.attnum)::integer AS resolved_count,
+                       COALESCE(
+                           pg_catalog.string_agg(
+                               attribute.attnum::text,
+                               ' ' ORDER BY column_name.ordinality
+                           ),
+                           ''
+                       ) AS trigger_columns
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS column_name(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = target_tables.oid
+                 AND attribute.attname = column_name.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved_columns
+        ),
+        matching AS (
+            SELECT expected.trigger_name
+            FROM resolved_expected AS expected
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = expected.table_oid
+             AND trigger.tgname = expected.trigger_name
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid = trigger.tgfoid
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE expected.resolved_count =
+                      pg_catalog.cardinality(expected.column_names)
+              AND trigger.tgfoid =
+                      pg_catalog.to_regprocedure(expected.function_signature)
+              AND trigger.tgtype = expected.trigger_type
+              AND trigger.tgattr::text = expected.trigger_columns
+              AND trigger.tgenabled = 'A'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgparentid = 0
+              AND trigger.tgconstraint = 0
+              AND trigger.tgconstrrelid = 0
+              AND trigger.tgconstrindid = 0
+              AND NOT trigger.tgdeferrable
+              AND NOT trigger.tginitdeferred
+              AND trigger.tgnargs = 0
+              AND pg_catalog.octet_length(trigger.tgargs) = 0
+              AND trigger.tgqual IS NULL
+              AND trigger.tgoldtable IS NULL
+              AND trigger.tgnewtable IS NULL
+              AND procedure.prokind = 'f'
+              AND procedure.prorettype = 'pg_catalog.trigger'::regtype
+              AND procedure.pronargs = 0
+              AND NOT procedure.prosecdef
+              AND NOT procedure.proleakproof
+              AND procedure.provolatile = 'v'
+              AND procedure.proparallel = 'u'
+              AND procedure.proconfig IS NULL
+              AND language.lanname = 'plpgsql'
+              AND pg_catalog.encode(
+                      pg_catalog.sha256(
+                          pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                      ),
+                      'hex'
+                  ) = expected.function_source_sha256
+        )
+        SELECT (SELECT COUNT(*) FROM target_tables) = 2
+           AND (SELECT COUNT(*) FROM resolved_expected) = 4
+           AND (SELECT COUNT(*) FROM matching) = 4
+           AND NOT EXISTS (
+               SELECT 1
+               FROM expected
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM matching
+                   WHERE matching.trigger_name = expected.trigger_name
+               )
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "request authority-version binding trigger definitions are not canonical and always enabled",
+        ));
+    }
+    Ok(())
+}
+
 async fn attest_application_connection(
     connection: &mut PgConnection,
     contract: &ApplicationRoleContract,
 ) -> Result<(), sqlx::Error> {
     assume_and_attest_database_role(connection, &contract.expected, &contract.forbidden).await?;
+    let trigger_enforcement_is_fixed: bool = sqlx::query_scalar(
+        r#"
+        WITH app AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1::name
+        ),
+        login AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = session_user
+        )
+        SELECT pg_catalog.current_setting('session_replication_role') = 'origin'
+           AND NOT EXISTS (
+               SELECT 1
+               FROM pg_catalog.pg_parameter_acl AS parameter_acl
+               CROSS JOIN LATERAL pg_catalog.aclexplode(parameter_acl.paracl) AS acl
+               CROSS JOIN app
+               CROSS JOIN login
+               WHERE parameter_acl.parname = 'session_replication_role'
+                 AND acl.grantee IN (0, app.oid, login.oid)
+                 AND acl.privilege_type IN ('SET', 'ALTER SYSTEM')
+           )
+        "#,
+    )
+    .bind(&contract.expected)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !trigger_enforcement_is_fixed {
+        return Err(role_protocol_error(
+            "application or login role can disable database trigger enforcement",
+        ));
+    }
+    attest_request_resource_version_triggers(connection).await?;
+    attest_request_authority_version_binding_triggers(connection).await?;
     let safe_boundary: bool = sqlx::query_scalar(
         r#"
         WITH app AS (
@@ -3534,6 +3876,437 @@ mod tests {
             verify_migration_inventory(&out_of_order, None),
             Err(MigrationVerificationError::NotStrictlyOrdered { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn request_resource_version_triggers_are_attested_and_fire_in_replica_mode() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut connection = PgConnection::connect(&url)
+            .await
+            .expect("connect request resource-version trigger test");
+        super::EMBEDDED_MIGRATOR
+            .run(&mut connection)
+            .await
+            .expect("apply request resource-version migrations");
+
+        super::attest_request_resource_version_triggers(&mut connection)
+            .await
+            .expect("canonical request resource-version triggers");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin trigger drift fixture");
+        sqlx::query(
+            "ALTER TABLE public.requests DISABLE TRIGGER \
+             trg_requests_resource_version_owned",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("disable one invariant trigger inside rollback-only fixture");
+        let drift_error = super::attest_request_resource_version_triggers(&mut connection)
+            .await
+            .expect_err("disabled invariant trigger must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("trigger definitions are not canonical and always enabled"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical trigger state");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin replica-mode trigger fixture");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut connection)
+            .await
+            .expect("fixture role may enter replica mode");
+
+        let (request_id, inserted_version): (uuid::Uuid, i64) = sqlx::query_as(
+            "INSERT INTO public.requests (\
+                 request_type, status, stage, site, environment, name, \
+                 cpu, memory_gb, resource_version\
+             ) VALUES (\
+                 'server-deployment', 'intake', 'intake', \
+                 'resource-version-test', 'test', 'replica insert', 1, 1, 41\
+             ) RETURNING id, resource_version",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("insert request while origin triggers are suppressed");
+        assert_eq!(
+            inserted_version, 1,
+            "the ALWAYS insert trigger must normalize a caller-supplied version"
+        );
+
+        let updated_version: i64 = sqlx::query_scalar(
+            "UPDATE public.requests \
+             SET name = 'replica update' \
+             WHERE id = $1 \
+             RETURNING resource_version",
+        )
+        .bind(request_id)
+        .fetch_one(&mut connection)
+        .await
+        .expect("update request in replica mode");
+        assert_eq!(
+            updated_version, 2,
+            "the ALWAYS update trigger must advance the resource version"
+        );
+
+        sqlx::query("SAVEPOINT caller_managed_version")
+            .execute(&mut connection)
+            .await
+            .expect("save caller-managed version fixture");
+        let assignment_error =
+            sqlx::query("UPDATE public.requests SET resource_version = 1 WHERE id = $1")
+                .bind(request_id)
+                .execute(&mut connection)
+                .await
+                .expect_err("replica mode must not bypass caller-assignment rejection");
+        assert_eq!(
+            assignment_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("55000")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT caller_managed_version")
+            .execute(&mut connection)
+            .await
+            .expect("recover caller-managed version fixture");
+
+        sqlx::query("SET LOCAL ryuki.force_request_runtime_contract = 'runtime-v1'")
+            .execute(&mut connection)
+            .await
+            .expect("force runtime deletion policy in owner-backed fixture");
+        sqlx::query("SAVEPOINT request_delete")
+            .execute(&mut connection)
+            .await
+            .expect("save request deletion fixture");
+        let deletion_error = sqlx::query("DELETE FROM public.requests WHERE id = $1")
+            .bind(request_id)
+            .execute(&mut connection)
+            .await
+            .expect_err("replica mode must not bypass request deletion rejection");
+        assert_eq!(
+            deletion_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("55000")
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("discard replica-mode trigger fixture");
+    }
+
+    #[tokio::test]
+    async fn request_authority_version_binding_triggers_are_attested_and_must_stay_enabled() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut connection = PgConnection::connect(&url)
+            .await
+            .expect("connect request authority-version binding trigger test");
+        super::EMBEDDED_MIGRATOR
+            .run(&mut connection)
+            .await
+            .expect("apply request authority-version binding migrations");
+
+        super::attest_request_authority_version_binding_triggers(&mut connection)
+            .await
+            .expect("canonical request authority-version binding triggers");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin binding trigger drift fixture");
+        sqlx::query(
+            "ALTER TABLE public.agent_jobs DISABLE TRIGGER \
+             trg_agent_jobs_request_resource_version_owned",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("disable one request authority-version binding trigger");
+        let drift_error = super::attest_request_authority_version_binding_triggers(&mut connection)
+            .await
+            .expect_err("disabled binding trigger must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("binding trigger definitions are not canonical and always enabled"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical request authority-version binding trigger state");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin request authority-version binding fixture");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut connection)
+            .await
+            .expect("fixture role may enter replica mode");
+
+        let (request_id, request_resource_version): (uuid::Uuid, i64) = sqlx::query_as(
+            "INSERT INTO public.requests (\
+                 request_type, status, stage, site, environment, name, \
+                 cpu, memory_gb, resource_version\
+             ) VALUES (\
+                 'server-deployment', 'intake', 'intake', \
+                 'authority-version-test', 'test', 'binding fixture', 1, 1, 41\
+             ) RETURNING id, resource_version",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("insert request for authority-version binding fixture");
+        assert_eq!(
+            request_resource_version, 1,
+            "the request ALWAYS trigger must establish the canonical initial version"
+        );
+
+        let job_id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO public.agent_jobs (
+                request_id,
+                request_resource_version,
+                platform,
+                spec,
+                mode,
+                live_context,
+                origin,
+                step_scoped
+            ) VALUES (
+                $1,
+                $2,
+                'authority-version-test',
+                jsonb_build_object(
+                    'request_id', $1::uuid::text,
+                    'request_resource_version', $2::bigint,
+                    'offering_id', '00000000-0000-0000-0000-000000000196',
+                    'iac_ref', 'authority-version-test@v7',
+                    'iac_digest', repeat('0', 64),
+                    'vars', '{}'::jsonb,
+                    'state_key', 'authority-version-test',
+                    'mode', 'offline_dry_run'
+                ),
+                'OfflineDryRun',
+                NULL,
+                NULL,
+                FALSE
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(request_id)
+        .bind(request_resource_version)
+        .fetch_one(&mut connection)
+        .await
+        .expect("insert canonical protocol-v7 job bound to the current request version");
+
+        for (column, statement) in [
+            (
+                "id",
+                "UPDATE public.agent_jobs SET id = gen_random_uuid() WHERE id = $1",
+            ),
+            (
+                "request_id",
+                "UPDATE public.agent_jobs SET request_id = gen_random_uuid() WHERE id = $1",
+            ),
+            (
+                "platform",
+                "UPDATE public.agent_jobs SET platform = platform || '-tampered' WHERE id = $1",
+            ),
+            (
+                "spec",
+                "UPDATE public.agent_jobs \
+                 SET spec = jsonb_set(spec, '{iac_ref}', '\"tampered\"'::jsonb) \
+                 WHERE id = $1",
+            ),
+            (
+                "mode",
+                "UPDATE public.agent_jobs SET mode = 'LivePlan' WHERE id = $1",
+            ),
+            (
+                "live_context",
+                "UPDATE public.agent_jobs SET live_context = '{}'::jsonb WHERE id = $1",
+            ),
+            (
+                "origin",
+                "UPDATE public.agent_jobs SET origin = 'drift_recheck' WHERE id = $1",
+            ),
+            (
+                "step_scoped",
+                "UPDATE public.agent_jobs SET step_scoped = NOT step_scoped WHERE id = $1",
+            ),
+            (
+                "request_resource_version",
+                "UPDATE public.agent_jobs \
+                 SET request_resource_version = request_resource_version + 1 \
+                 WHERE id = $1",
+            ),
+        ] {
+            sqlx::query("SAVEPOINT authority_update")
+                .execute(&mut connection)
+                .await
+                .expect("save immutable authority update fixture");
+            let update_result = sqlx::query(statement)
+                .bind(job_id)
+                .execute(&mut connection)
+                .await;
+            let update_error = match update_result {
+                Ok(_) => {
+                    panic!("replica mode must not permit an agent_jobs.{column} authority update")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                update_error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("55000"),
+                "agent_jobs.{column} authority update returned the wrong SQLSTATE"
+            );
+            sqlx::query("ROLLBACK TO SAVEPOINT authority_update")
+                .execute(&mut connection)
+                .await
+                .expect("recover immutable authority update fixture");
+            sqlx::query("RELEASE SAVEPOINT authority_update")
+                .execute(&mut connection)
+                .await
+                .expect("release immutable authority update fixture");
+        }
+
+        sqlx::query("SAVEPOINT row_spec_mode_mismatch")
+            .execute(&mut connection)
+            .await
+            .expect("save row/spec mode mismatch fixture");
+        let mismatch_error = sqlx::query(
+            r#"
+            INSERT INTO public.agent_jobs (
+                request_id,
+                request_resource_version,
+                platform,
+                spec,
+                mode
+            ) VALUES (
+                $1,
+                $2,
+                'authority-version-test',
+                jsonb_build_object(
+                    'request_id', $1::uuid::text,
+                    'request_resource_version', $2::bigint,
+                    'offering_id', '00000000-0000-0000-0000-000000000196',
+                    'iac_ref', 'authority-version-test@v7',
+                    'iac_digest', repeat('0', 64),
+                    'vars', '{}'::jsonb,
+                    'state_key', 'authority-version-test',
+                    'mode', 'offline_dry_run'
+                ),
+                'LivePlan'
+            )
+            "#,
+        )
+        .bind(request_id)
+        .bind(request_resource_version)
+        .execute(&mut connection)
+        .await
+        .expect_err("replica mode must reject a row/spec mode mismatch");
+        assert_eq!(
+            mismatch_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT row_spec_mode_mismatch")
+            .execute(&mut connection)
+            .await
+            .expect("recover row/spec mode mismatch fixture");
+        sqlx::query("RELEASE SAVEPOINT row_spec_mode_mismatch")
+            .execute(&mut connection)
+            .await
+            .expect("release row/spec mode mismatch fixture");
+
+        for missing_field in ["request_id", "request_resource_version", "mode"] {
+            sqlx::query("SAVEPOINT missing_authority_field")
+                .execute(&mut connection)
+                .await
+                .expect("save missing authority field fixture");
+            let missing_error = sqlx::query(
+                r#"
+                INSERT INTO public.agent_jobs (
+                    request_id,
+                    request_resource_version,
+                    platform,
+                    spec,
+                    mode
+                ) VALUES (
+                    $1,
+                    $2,
+                    'authority-version-test',
+                    jsonb_build_object(
+                        'request_id', $1::uuid::text,
+                        'request_resource_version', $2::bigint,
+                        'offering_id', '00000000-0000-0000-0000-000000000196',
+                        'iac_ref', 'authority-version-test@v7',
+                        'iac_digest', repeat('0', 64),
+                        'vars', '{}'::jsonb,
+                        'state_key', 'authority-version-test',
+                        'mode', 'offline_dry_run'
+                    ) - $3::text,
+                    'OfflineDryRun'
+                )
+                "#,
+            )
+            .bind(request_id)
+            .bind(request_resource_version)
+            .bind(missing_field)
+            .execute(&mut connection)
+            .await
+            .expect_err("replica mode must reject a missing spec authority field");
+            assert_eq!(
+                missing_error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("23514"),
+                "missing spec authority field {missing_field} returned the wrong SQLSTATE"
+            );
+            sqlx::query("ROLLBACK TO SAVEPOINT missing_authority_field")
+                .execute(&mut connection)
+                .await
+                .expect("recover missing authority field fixture");
+            sqlx::query("RELEASE SAVEPOINT missing_authority_field")
+                .execute(&mut connection)
+                .await
+                .expect("release missing authority field fixture");
+        }
+
+        sqlx::query("SET LOCAL session_replication_role = 'origin'")
+            .execute(&mut connection)
+            .await
+            .expect("restore origin trigger mode before fixture rollback");
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("discard request authority-version binding fixture");
+        let replication_role: String = sqlx::query_scalar("SHOW session_replication_role")
+            .fetch_one(&mut connection)
+            .await
+            .expect("read restored session replication role");
+        assert_eq!(replication_role, "origin");
     }
 
     /// #12: every pooled connection must carry the per-statement timeout set in

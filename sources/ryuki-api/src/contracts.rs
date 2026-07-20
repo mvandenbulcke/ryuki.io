@@ -3244,6 +3244,7 @@ struct CreateRequest {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct DbRequestRow {
     pub(crate) id: Uuid,
+    pub(crate) resource_version: i64,
     pub(crate) request_type: String,
     pub(crate) status: String,
     pub(crate) stage: String,
@@ -3292,7 +3293,7 @@ pub(crate) const REQUEST_COLUMNS: &str =
     "id, request_type, status, stage, site, environment, name, cpu, \
      memory_gb, justification, created_by, created_at, updated_at, payload, stages, \
      approval_route, plan, validation_results, criticality, required_approval_roles, requester, \
-     owner, evidence_manifest_id, approval_epoch";
+     owner, evidence_manifest_id, approval_epoch, resource_version";
 
 // ─── Request store (in-memory fallback) ───
 
@@ -3317,10 +3318,13 @@ fn request_store() -> &'static Mutex<Vec<ryuki_engine::models::Request>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InMemoryRequestCapacityError {
+enum InMemoryRequestStoreError {
     RecordLimit,
     ByteLimit,
     RecordTooLarge,
+    InvalidResourceVersion,
+    StaleResourceVersion,
+    ResourceVersionOverflow,
 }
 
 fn retained_request_bytes(request: &ryuki_engine::models::Request) -> usize {
@@ -3351,19 +3355,22 @@ fn retain_request_in_memory_with_limits(
     max_records: usize,
     max_bytes: usize,
     max_record_bytes: usize,
-) -> Result<(), InMemoryRequestCapacityError> {
+) -> Result<(), InMemoryRequestStoreError> {
+    if request.resource_version <= 0 {
+        return Err(InMemoryRequestStoreError::InvalidResourceVersion);
+    }
     if store.len() >= max_records {
-        return Err(InMemoryRequestCapacityError::RecordLimit);
+        return Err(InMemoryRequestStoreError::RecordLimit);
     }
     let request_bytes = retained_request_bytes(&request);
     if request_bytes > max_record_bytes {
-        return Err(InMemoryRequestCapacityError::RecordTooLarge);
+        return Err(InMemoryRequestStoreError::RecordTooLarge);
     }
     let retained_bytes = store.iter().fold(0usize, |total, retained| {
         total.saturating_add(retained_request_bytes(retained))
     });
     if request_bytes > max_bytes || retained_bytes > max_bytes.saturating_sub(request_bytes) {
-        return Err(InMemoryRequestCapacityError::ByteLimit);
+        return Err(InMemoryRequestStoreError::ByteLimit);
     }
     // Keep the bounded fallback in the same deterministic `(created_at, id)`
     // order used by keyset pagination. Lifecycle transitions mutate records in
@@ -3378,7 +3385,7 @@ fn retain_request_in_memory_with_limits(
 fn retain_request_in_memory(
     store: &mut Vec<ryuki_engine::models::Request>,
     request: ryuki_engine::models::Request,
-) -> Result<(), InMemoryRequestCapacityError> {
+) -> Result<(), InMemoryRequestStoreError> {
     retain_request_in_memory_with_limits(
         store,
         request,
@@ -3392,18 +3399,33 @@ fn retain_request_in_memory(
 /// both byte budgets. Lifecycle evidence and free-text reasons grow after
 /// creation, so enforcing capacity only on `retain_request_in_memory` would let
 /// repeated transitions bypass the process-memory ceiling. The candidate is
-/// measured before assignment; on error the active lifecycle record is left
-/// byte-for-byte unchanged.
+/// accepted only at the currently retained resource version, advanced exactly
+/// once by this seam, and then measured before assignment. On stale-version,
+/// overflow, or capacity error the active record is left byte-for-byte
+/// unchanged.
 fn replace_request_in_memory_with_limits(
     store: &mut [ryuki_engine::models::Request],
     index: usize,
-    request: ryuki_engine::models::Request,
+    mut request: ryuki_engine::models::Request,
     max_bytes: usize,
     max_record_bytes: usize,
-) -> Result<(), InMemoryRequestCapacityError> {
+) -> Result<i64, InMemoryRequestStoreError> {
+    let current = &store[index];
+    if current.resource_version <= 0 || request.resource_version <= 0 {
+        return Err(InMemoryRequestStoreError::InvalidResourceVersion);
+    }
+    if request.resource_version != current.resource_version {
+        return Err(InMemoryRequestStoreError::StaleResourceVersion);
+    }
+    request.resource_version = current
+        .resource_version
+        .checked_add(1)
+        .filter(|version| *version > 0)
+        .ok_or(InMemoryRequestStoreError::ResourceVersionOverflow)?;
+
     let request_bytes = retained_request_bytes(&request);
     if request_bytes > max_record_bytes {
-        return Err(InMemoryRequestCapacityError::RecordTooLarge);
+        return Err(InMemoryRequestStoreError::RecordTooLarge);
     }
     let retained_bytes_without_replaced = store
         .iter()
@@ -3415,17 +3437,18 @@ fn replace_request_in_memory_with_limits(
     if request_bytes > max_bytes
         || retained_bytes_without_replaced > max_bytes.saturating_sub(request_bytes)
     {
-        return Err(InMemoryRequestCapacityError::ByteLimit);
+        return Err(InMemoryRequestStoreError::ByteLimit);
     }
+    let stored_version = request.resource_version;
     store[index] = request;
-    Ok(())
+    Ok(stored_version)
 }
 
 fn replace_request_in_memory(
     store: &mut [ryuki_engine::models::Request],
     index: usize,
     request: ryuki_engine::models::Request,
-) -> Result<(), InMemoryRequestCapacityError> {
+) -> Result<i64, InMemoryRequestStoreError> {
     replace_request_in_memory_with_limits(
         store,
         index,
@@ -3483,14 +3506,40 @@ fn local_request_input_rejection(
     None
 }
 
-fn local_request_capacity_response(
-    error: InMemoryRequestCapacityError,
+fn local_request_store_error_response(
+    error: InMemoryRequestStoreError,
 ) -> (StatusCode, Json<Value>) {
-    let reason = match error {
-        InMemoryRequestCapacityError::RecordLimit => "record_limit",
-        InMemoryRequestCapacityError::ByteLimit => "byte_limit",
-        InMemoryRequestCapacityError::RecordTooLarge => "record_too_large",
-    };
+    match error {
+        InMemoryRequestStoreError::RecordLimit => local_request_capacity_response("record_limit"),
+        InMemoryRequestStoreError::ByteLimit => local_request_capacity_response("byte_limit"),
+        InMemoryRequestStoreError::RecordTooLarge => {
+            local_request_capacity_response("record_too_large")
+        }
+        InMemoryRequestStoreError::InvalidResourceVersion => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "request resource version is invalid",
+                "reason": "invalid_resource_version",
+            })),
+        ),
+        InMemoryRequestStoreError::StaleResourceVersion => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "request resource version conflict",
+                "reason": "stale_resource_version",
+            })),
+        ),
+        InMemoryRequestStoreError::ResourceVersionOverflow => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "request resource version is exhausted",
+                "reason": "resource_version_exhausted",
+            })),
+        ),
+    }
+}
+
+fn local_request_capacity_response(reason: &'static str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -4956,6 +5005,7 @@ async fn approvals_pending(AuthExtractor(session): AuthExtractor) -> ApiResult {
             .map(|r| {
                 json!({
                     "request_id": r.id.to_string(),
+                    "resource_version": r.resource_version,
                     "request_type": r.request_type,
                     "status": r.status,
                     "name": r.name,
@@ -19298,10 +19348,11 @@ async fn apply_transition_audited(
     )?;
     let mut tx = pool.begin().await.map_err(db_error)?;
 
-    // The CAS binds both status and approval epoch, so a lifecycle transition
-    // can never land against a different approval cycle. Rework advances the
-    // epoch in this same UPDATE; the migration trigger independently enforces
-    // exactly-one advancement and upgrades old-replica rework writes.
+    // The CAS binds status, approval epoch, and the database-owned resource
+    // version, so a lifecycle transition can never land against a different
+    // approval cycle or a same-status mutation resolved earlier. Rework
+    // advances the epoch in this same UPDATE; the migration trigger
+    // independently enforces exactly-one version advancement.
     let update_sql = format!(
         "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, \
          plan = COALESCE($4::jsonb, plan), \
@@ -19310,6 +19361,7 @@ async fn apply_transition_audited(
          approval_epoch = CASE WHEN $7::boolean THEN approval_epoch + 1 ELSE approval_epoch END, \
          updated_at = NOW() \
          WHERE id = $8 AND status = $9 AND approval_epoch = $10 \
+           AND resource_version = $11 \
          RETURNING {REQUEST_COLUMNS}"
     );
     let maybe_row: Option<DbRequestRow> = sqlx::query_as(&update_sql)
@@ -19323,6 +19375,7 @@ async fn apply_transition_audited(
         .bind(uid)
         .bind(expected_from_status)
         .bind(current.approval_epoch)
+        .bind(current.resource_version)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -19434,6 +19487,9 @@ async fn apply_transition_audited(
         artifacts.approval_role.as_deref(),
         artifacts.approval_decision,
         artifacts.approval_reason.as_deref(),
+        artifacts
+            .approval_decision
+            .map(|_| current.resource_version),
         /* notify_owner */ true,
     )
     .await?;
@@ -19465,6 +19521,7 @@ async fn commit_transition_side_effects(
     approval_role: Option<&str>,
     approval_decision: Option<&str>,
     approval_reason: Option<&str>,
+    approval_basis_resource_version: Option<i64>,
     notify_owner: bool,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     audit::record_audit_tx(
@@ -19492,8 +19549,9 @@ async fn commit_transition_side_effects(
     if let (Some(role), Some(decision)) = (approval_role, approval_decision) {
         let inserted = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor, reason) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                 (request_id, approval_epoch, role, decision, actor, reason, \
+                  approval_basis_resource_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (request_id, approval_epoch, role) \
              DO NOTHING",
         )
@@ -19503,6 +19561,7 @@ async fn commit_transition_side_effects(
         .bind(decision)
         .bind(&session.user_id)
         .bind(approval_reason)
+        .bind(approval_basis_resource_version)
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -19596,6 +19655,7 @@ async fn apply_approval_decision_audited(
     session: &AuthSession,
     uid: Uuid,
     role: &str,
+    expected_resource_version: i64,
 ) -> Result<(DbRequestRow, ryuki_engine::approval_quorum::QuorumStatus), (StatusCode, Json<Value>)>
 {
     use ryuki_engine::approval_quorum::{evaluate_quorum, ApprovalDecision};
@@ -19626,6 +19686,12 @@ async fn apply_approval_decision_audited(
         tx.rollback().await.ok();
         return Err(transition_conflict_409(&request_id));
     };
+    if current.resource_version != expected_resource_version {
+        tx.rollback().await.ok();
+        return Err(status_409(
+            "the request changed after it was reviewed; refresh before approving",
+        ));
+    }
     // Validate the approval on the LOCKED row via the engine's from-status guard:
     // a non-Planned (terminal / already-decided) request yields the engine's clear
     // 400 ("Cannot approve request in status ..."), NOT a misleading 409. Running it
@@ -19645,7 +19711,8 @@ async fn apply_approval_decision_audited(
     let req = current.required_approval_roles.max(1) as usize;
 
     let decision_sql = "SELECT role, decision, actor FROM request_approval_decisions \
-         WHERE request_id = $1 AND approval_epoch = $2";
+         WHERE request_id = $1 AND approval_epoch = $2 \
+           AND approval_basis_resource_version = $3";
     let to_decisions = |rows: Vec<(String, String, String)>| -> Vec<ApprovalDecision> {
         // Destructure to distinct names so the per-decision role is never confused
         // with the session's `role` used in the short-circuit comparison below.
@@ -19663,6 +19730,7 @@ async fn apply_approval_decision_audited(
     let existing: Vec<(String, String, String)> = sqlx::query_as(decision_sql)
         .bind(uid)
         .bind(current.approval_epoch)
+        .bind(current.resource_version)
         .fetch_all(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -19685,8 +19753,9 @@ async fn apply_approval_decision_audited(
     // writer won after the read and must abort this whole transaction.
     let inserted = sqlx::query(
         "INSERT INTO request_approval_decisions \
-             (request_id, approval_epoch, role, decision, actor, reason) \
-         VALUES ($1, $2, $3, 'approved', $4, NULL) \
+             (request_id, approval_epoch, role, decision, actor, reason, \
+              approval_basis_resource_version) \
+         VALUES ($1, $2, $3, 'approved', $4, NULL, $5) \
          ON CONFLICT (request_id, approval_epoch, role) \
          DO NOTHING",
     )
@@ -19694,6 +19763,7 @@ async fn apply_approval_decision_audited(
     .bind(current.approval_epoch)
     .bind(role)
     .bind(&session.user_id)
+    .bind(current.resource_version)
     .execute(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -19710,6 +19780,7 @@ async fn apply_approval_decision_audited(
     let after: Vec<(String, String, String)> = sqlx::query_as(decision_sql)
         .bind(uid)
         .bind(current.approval_epoch)
+        .bind(current.resource_version)
         .fetch_all(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -19732,6 +19803,7 @@ async fn apply_approval_decision_audited(
             "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, \
              approval_route = COALESCE($4::jsonb, approval_route), updated_at = NOW() \
              WHERE id = $5 AND status = $6 AND approval_epoch = $7 \
+               AND resource_version = $8 \
              RETURNING {REQUEST_COLUMNS}"
         ))
         .bind(approved_db)
@@ -19741,6 +19813,7 @@ async fn apply_approval_decision_audited(
         .bind(uid)
         .bind(planned_db)
         .bind(current.approval_epoch)
+        .bind(current.resource_version)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -19764,34 +19837,19 @@ async fn apply_approval_decision_audited(
             None,
             None,
             None,
+            None,
             /* notify_owner */ true,
         )
         .await?;
         Ok((row, quorum))
     } else {
-        // PARTIAL approve: record the decision + stages/route, but the request
-        // STAYS at Planned. Audit as `request.approval_recorded` and emit a
-        // DISTINCT event; do NOT notify the owner of an approval that has not
-        // happened yet (codex fix #2). The UPDATE keeps status='planned' so a
-        // Planned->Planned write is not a false 409.
-        let row: Option<DbRequestRow> = sqlx::query_as(&format!(
-            "UPDATE requests SET stages = $1::jsonb, \
-             approval_route = COALESCE($2::jsonb, approval_route), updated_at = NOW() \
-             WHERE id = $3 AND status = $4 AND approval_epoch = $5 \
-             RETURNING {REQUEST_COLUMNS}"
-        ))
-        .bind(&stages_json)
-        .bind(&approval_route_json)
-        .bind(uid)
-        .bind(planned_db)
-        .bind(current.approval_epoch)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        let Some(row) = row else {
-            tx.rollback().await.ok();
-            return Err(transition_conflict_409(&request_id));
-        };
+        // PARTIAL approve records only the immutable decision, audit row, and
+        // event. It deliberately does not rewrite the request: all approvers in
+        // this quorum must review and sign the same `resource_version`, and an
+        // intermediate stages/route write would advance that database-owned
+        // version after the first signature. The final approver persists the
+        // engine-produced approval artifacts together with Planned->Approved.
+        let row = current.clone();
         commit_transition_side_effects(
             tx,
             pool,
@@ -19808,7 +19866,9 @@ async fn apply_approval_decision_audited(
                 "distinct_approvers": quorum.distinct_approvers,
                 "required_approvers": quorum.required_approvers,
                 "approval_epoch": current.approval_epoch,
+                "approval_basis_resource_version": current.resource_version,
             }),
+            None,
             None,
             None,
             None,
@@ -20044,6 +20104,7 @@ pub(crate) fn db_row_to_request(
     use ryuki_engine::models::{Request, Stage};
     Request {
         id: request_id.to_string(),
+        resource_version: row.resource_version,
         offering_id: row.request_type.clone(),
         request_type: parse_request_type(&row.request_type)
             .unwrap_or(ryuki_engine::models::RequestType::RequestPreflight),
@@ -20077,6 +20138,17 @@ pub(crate) fn db_row_to_request(
         // access to them without requiring a schema migration.
         metadata: payload_to_metadata(&row.payload),
     }
+}
+
+/// Copy database-owned mutation metadata onto an engine-produced response.
+/// Lifecycle helpers deliberately preserve the input resource version and
+/// timestamp; the database trigger owns their post-write values.
+fn apply_persisted_request_metadata(
+    request: &mut ryuki_engine::models::Request,
+    row: &DbRequestRow,
+) {
+    request.resource_version = row.resource_version;
+    request.updated_at = row.updated_at.to_rfc3339();
 }
 
 /// Build the per-type payload JSONB stored in `requests.payload`. For
@@ -20346,7 +20418,7 @@ async fn requests_create(
         let mut store = request_store().lock().await;
         prune_expired_local_terminal_requests(&mut store, chrono::Utc::now());
         retain_request_in_memory(&mut store, request.clone())
-            .map_err(local_request_capacity_response)?;
+            .map_err(local_request_store_error_response)?;
     }
     audit::record_audit_local(
         &session,
@@ -21135,10 +21207,16 @@ pub(crate) struct ReviewedLivePlanSelection {
     approved_plan_job_id: Uuid,
     approved_plan_attempt_id: Uuid,
     approved_plan_digest: String,
+    /// Exact request version visible alongside the reviewed plan. The minting
+    /// transaction locks the request and rejects any later version.
+    request_resource_version: i64,
 }
 
 impl ReviewedLivePlanSelection {
     fn validate(&self) -> Result<(), (StatusCode, Json<Value>)> {
+        if self.request_resource_version <= 0 {
+            return Err(status_400("request_resource_version must be positive"));
+        }
         if self.approved_plan_digest.len() != 64
             || !self
                 .approved_plan_digest
@@ -21176,17 +21254,36 @@ async fn requests_approve_live_apply(
     // branch below (no-double-apply / plan-state) can leak the request's existence.
     // requests is dual-axis (site, environment both NOT NULL), so the canonical
     // by-id guard applies. Admin permission alone does not imply unrestricted scope.
-    let (request_site, requester) = match sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT site, environment, requester FROM requests WHERE id = $1",
+    let (
+        request_site,
+        requester,
+        current_resource_version,
+        current_status,
+        current_stage,
+        current_stages,
+    ) = match sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+            sqlx::types::Json<serde_json::Value>,
+        ),
+    >(
+        "SELECT site, environment, requester, resource_version, status, stage, stages \
+             FROM requests WHERE id = $1",
     )
     .bind(uid)
     .fetch_optional(pool)
     .await
     .map_err(db_error)?
     {
-        Some((site, environment, requester)) => {
+        Some((site, environment, requester, resource_version, status, stage, stages)) => {
             scope_guard_or_404(&session, &site, &environment, &request_id)?;
-            (site, requester)
+            (site, requester, resource_version, status, stage, stages.0)
         }
         None => return Err(status_404(&request_id)),
     };
@@ -21199,6 +21296,11 @@ async fn requests_approve_live_apply(
         ));
     }
     reviewed_plan.validate()?;
+    if reviewed_plan.request_resource_version != current_resource_version {
+        return Err(status_409(
+            "the request changed after the live plan was reviewed; refresh before approving",
+        ));
+    }
 
     // No-double-apply: at most ONE LiveApply may ever be approved per request.
     // This pre-check returns a friendly 409 if ANY LiveApply already exists for
@@ -21233,6 +21335,8 @@ async fn requests_approve_live_apply(
         attempt_id: Option<Uuid>,
         platform: String,
         spec: serde_json::Value,
+        request_resource_version: i64,
+        result_status: String,
         evidence_digest: Option<String>,
         raw_plan_digest: Option<String>,
         req_status: String,
@@ -21243,13 +21347,13 @@ async fn requests_approve_live_apply(
     // even one with the same evidence digest, cannot silently replace the
     // reviewed execution authority.
     let plan: Option<PlanJobRow> = sqlx::query_as(
-        "SELECT j.id, j.attempt_id, j.platform, j.spec, j.evidence_digest, \
-                j.raw_plan_digest, \
+        "SELECT j.id, j.attempt_id, j.platform, j.spec, j.request_resource_version, \
+                j.result_status, j.evidence_digest, j.raw_plan_digest, \
                 r.status AS req_status, r.site AS site \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 AND j.mode = 'LivePlan' \
            AND j.status = 'Succeeded' \
-           AND j.result_status IN ('planned', 'check_ok') \
+           AND j.result_status = 'planned' \
            AND j.completed_at IS NOT NULL \
            AND j.evidence_digest IS NOT NULL \
          ORDER BY j.completed_at DESC, j.id DESC LIMIT 1",
@@ -21333,6 +21437,25 @@ async fn requests_approve_live_apply(
             "the reviewed live-plan spec does not belong to this request",
         ));
     }
+    crate::agents::validate_whole_request_live_plan_lineage(
+        crate::agents::WholeRequestLivePlanLineage {
+            request_status: &current_status,
+            request_stage: &current_stage,
+            request_resource_version: current_resource_version,
+            request_stages: &current_stages,
+            mutation_request_resource_version: ryuki_protocol::RequestResourceVersion::try_from(
+                current_resource_version,
+            )
+            .map_err(status_409)?,
+            plan_job_id: plan.id,
+            plan_row_request_resource_version: plan.request_resource_version,
+            plan_spec_request_resource_version: spec.request_resource_version,
+            plan_result_status: &plan.result_status,
+            plan_evidence_digest: &evidence_digest,
+            plan_raw_plan_digest: &raw_plan_digest,
+        },
+    )
+    .map_err(status_409)?;
     ryuki_runner::iac::validate_live_placement_vars(&spec.iac_ref, &spec.vars)
         .map_err(|error| status_400(&error.to_string()))?;
     // The first live-mutation contract supports only the two reviewed vSphere
@@ -21354,6 +21477,14 @@ async fn requests_approve_live_apply(
             "live apply currently requires a digest-verified, reviewed vSphere single-VM create plan",
         ));
     }
+    // The plan spec records the request version at plan dispatch. The mutation
+    // is separately authorized against the exact CURRENT request snapshot the
+    // human reviewed above, so rebind the mutation spec before its digest is
+    // signed. Carrying the older plan-dispatch version would split the job row,
+    // spec, and grant lineage.
+    spec.request_resource_version =
+        ryuki_protocol::RequestResourceVersion::try_from(current_resource_version)
+            .map_err(status_409)?;
     spec.mode = ryuki_protocol::JobMode::LiveApply;
 
     let cp_key = crate::cp_identity::cp_signing_key().ok_or_else(|| {
@@ -21367,6 +21498,7 @@ async fn requests_approve_live_apply(
         approved_plan_job_id: reviewed_plan.approved_plan_job_id,
         approved_plan_attempt_id: plan_attempt_id,
         request_id: uid,
+        request_resource_version: reviewed_plan.request_resource_version,
         platform: request_site,
         spec,
         approved_plan_digest: raw_plan_digest,
@@ -21572,6 +21704,7 @@ async fn requests_get(
             .collect();
         return Ok(Json(json!({
             "request_id": row.id.to_string(),
+            "resource_version": row.resource_version,
             "request_type": row.request_type,
             "status": row.status,
             "stage": row.stage,
@@ -21726,7 +21859,7 @@ async fn requests_validate(
         });
         validated.updated_at = now_iso();
         replace_request_in_memory(&mut store, idx, validated)
-            .map_err(local_request_capacity_response)?;
+            .map_err(local_request_store_error_response)?;
         return Err(validation_failed_response(&result));
     }
 
@@ -21745,7 +21878,7 @@ async fn requests_validate(
     });
     validated.updated_at = now_iso();
     replace_request_in_memory(&mut store, idx, validated)
-        .map_err(local_request_capacity_response)?;
+        .map_err(local_request_store_error_response)?;
     record_local_transition(
         &session,
         &request_id,
@@ -22408,7 +22541,9 @@ async fn requests_plan(
     // changed it between the clone and this re-lock, do NOT overwrite it —
     // return 409, mirroring the DB CAS path. (The store lock is released across
     // the subprocess, so this window is real.)
-    if store[idx].status != cloned_request.status {
+    if store[idx].status != cloned_request.status
+        || store[idx].resource_version != cloned_request.resource_version
+    {
         return Err(status_409(&format!(
             "request {request_id} was modified concurrently during planning; retry"
         )));
@@ -22421,7 +22556,8 @@ async fn requests_plan(
     planned.status = ryuki_engine::models::RequestStatus::Planned;
     planned.stages = stages.clone();
     planned.updated_at = now_iso();
-    replace_request_in_memory(&mut store, idx, planned).map_err(local_request_capacity_response)?;
+    replace_request_in_memory(&mut store, idx, planned)
+        .map_err(local_request_store_error_response)?;
     drop(store);
 
     record_local_transition(
@@ -22438,9 +22574,61 @@ async fn requests_plan(
     Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestApprovalBody {
+    /// Exact database-owned request version rendered on the human review
+    /// surface. The approval transaction rejects any later version.
+    request_resource_version: i64,
+}
+
+impl RequestApprovalBody {
+    fn validate(self) -> Result<i64, (StatusCode, Json<Value>)> {
+        if self.request_resource_version <= 0 {
+            return Err(status_400("request_resource_version must be positive"));
+        }
+        Ok(self.request_resource_version)
+    }
+}
+
+#[cfg(test)]
+async fn reviewed_request_approval_body(request_id: &str) -> Json<RequestApprovalBody> {
+    if let (Some(pool), Ok(uid)) = (get_db(), Uuid::parse_str(request_id)) {
+        if let Ok(Some(version)) =
+            sqlx::query_scalar::<_, i64>("SELECT resource_version FROM requests WHERE id = $1")
+                .bind(uid)
+                .fetch_optional(pool)
+                .await
+        {
+            return Json(RequestApprovalBody {
+                request_resource_version: version,
+            });
+        }
+    }
+    let store = request_store().lock().await;
+    let version = store
+        .iter()
+        .find(|request| request.id == request_id)
+        .map(|request| request.resource_version)
+        .unwrap_or(1);
+    Json(RequestApprovalBody {
+        request_resource_version: version,
+    })
+}
+
+#[cfg(test)]
+async fn reviewed_batch_approval_item(request_id: &str) -> BatchApprovalItem {
+    let Json(body) = reviewed_request_approval_body(request_id).await;
+    BatchApprovalItem {
+        id: request_id.to_string(),
+        request_resource_version: body.request_resource_version,
+    }
+}
+
 async fn requests_approve(
     Path(request_id): Path<String>,
     AuthExtractor(session): AuthExtractor,
+    Json(body): Json<RequestApprovalBody>,
 ) -> ApiResult {
     if !check_permission(&session, "approve") {
         record_transition_denied(&session, &request_id, "request.approve").await;
@@ -22450,7 +22638,10 @@ async fn requests_approve(
         record_transition_denied(&session, &request_id, "request.approve").await;
         return Err(ordinary_approval_role_required());
     };
-    approve_one(&session, &request_id, &role).await.map(Json)
+    let expected_resource_version = body.validate()?;
+    approve_one(&session, &request_id, &role, expected_resource_version)
+        .await
+        .map(Json)
 }
 
 /// Record THIS approver's decision on a SINGLE request and enforce the multi-role
@@ -22465,6 +22656,7 @@ async fn approve_one(
     session: &AuthSession,
     request_id: &str,
     role: &str,
+    expected_resource_version: i64,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     if approval_role_for(session).as_deref() != Some(role) {
         return Err(ordinary_approval_role_required());
@@ -22501,7 +22693,9 @@ async fn approve_one(
         // distinct roles+approvers have approved; otherwise it stays Planned and the
         // decision is recorded (200 with quorum_met=false). The engine does NOT
         // decide advancement — that is the quorum helper's job.
-        let (row, quorum) = apply_approval_decision_audited(pool, session, uid, role).await?;
+        let (row, quorum) =
+            apply_approval_decision_audited(pool, session, uid, role, expected_resource_version)
+                .await?;
 
         // 200 body = the request JSON (rehydrated from the post-state row) with a
         // `quorum` sibling key. Flattened (not a {request,quorum} envelope) so the
@@ -22515,6 +22709,7 @@ async fn approve_one(
         if let Some(obj) = request_json.as_object_mut() {
             let mut quorum_json = serde_json::to_value(&quorum).unwrap_or_else(|_| json!({}));
             quorum_json["approval_epoch"] = json!(row.approval_epoch);
+            quorum_json["approval_basis_resource_version"] = json!(expected_resource_version);
             obj.insert("quorum".to_string(), quorum_json);
         }
         return Ok(request_json);
@@ -22557,15 +22752,20 @@ async fn approve_one(
         .iter()
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(request_id))?;
+    if store[idx].resource_version != expected_resource_version {
+        return Err(status_409(
+            "the request changed after it was reviewed; refresh before approving",
+        ));
+    }
 
-    let approved = request_lifecycle::approve_request(&store[idx], &session.user_id)
+    let mut approved = request_lifecycle::approve_request(&store[idx], &session.user_id)
         .map_err(map_engine_error)?;
 
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
-    replace_request_in_memory(&mut store, idx, approved.clone())
-        .map_err(local_request_capacity_response)?;
+    approved.resource_version = replace_request_in_memory(&mut store, idx, approved.clone())
+        .map_err(local_request_store_error_response)?;
     record_local_transition(
         session,
         request_id,
@@ -22593,6 +22793,7 @@ async fn approve_one(
     if let Some(obj) = approved_json.as_object_mut() {
         let mut quorum_json = serde_json::to_value(&quorum).unwrap_or_else(|_| json!({}));
         quorum_json["approval_epoch"] = Value::Null;
+        quorum_json["approval_basis_resource_version"] = json!(expected_resource_version);
         obj.insert("quorum".to_string(), quorum_json);
     }
     Ok(approved_json)
@@ -22622,11 +22823,11 @@ async fn requests_lock(
         scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
-        let locked = request_lifecycle::lock_request(&request).map_err(map_engine_error)?;
+        let mut locked = request_lifecycle::lock_request(&request).map_err(map_engine_error)?;
 
         let stages_json = serde_json::to_value(&locked.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Locked);
-        apply_transition_audited(
+        let updated = apply_transition_audited(
             pool,
             &session,
             uid,
@@ -22639,6 +22840,8 @@ async fn requests_lock(
             TransitionArtifacts::stages_only(stages_json),
         )
         .await?;
+
+        apply_persisted_request_metadata(&mut locked, &updated);
 
         return Ok(Json(serde_json::to_value(&locked).unwrap_or_default()));
     }
@@ -22659,13 +22862,13 @@ async fn requests_lock(
         &request_id,
     )?;
 
-    let locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
+    let mut locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
 
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
-    replace_request_in_memory(&mut store, idx, locked.clone())
-        .map_err(local_request_capacity_response)?;
+    locked.resource_version = replace_request_in_memory(&mut store, idx, locked.clone())
+        .map_err(local_request_store_error_response)?;
     record_local_transition(
         &session,
         &request_id,
@@ -22755,10 +22958,12 @@ async fn requests_execute(
         let updated: Option<DbRequestRow> = sqlx::query_as(&format!(
             "UPDATE requests SET status = 'executing', stage = 'execute', \
              stages = $2::jsonb, updated_at = NOW() \
-             WHERE id = $1 AND status = 'locked' RETURNING {REQUEST_COLUMNS}"
+             WHERE id = $1 AND status = 'locked' AND resource_version = $3 \
+             RETURNING {REQUEST_COLUMNS}"
         ))
         .bind(uid)
         .bind(&stages_json)
+        .bind(current.resource_version)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -22768,7 +22973,7 @@ async fn requests_execute(
             return Err(transition_conflict_409(&request_id));
         };
 
-        let outcome = match materialize_execution(&mut tx, uid, &request, &current, mode).await {
+        let outcome = match materialize_execution(&mut tx, uid, &request, &row, mode).await {
             Ok(outcome) => outcome,
             Err(MaterializeError::InvalidPlan) => {
                 tx.rollback().await.ok();
@@ -22844,6 +23049,7 @@ async fn requests_execute(
         return Ok(Json(match outcome {
             MaterializeOutcome::SingleJob { job_id } => json!({
                 "request_id": request_id,
+                "resource_version": row.resource_version,
                 "agent_job_id": job_id,
                 "status": row.status,
                 "stage": "execute",
@@ -22854,6 +23060,7 @@ async fn requests_execute(
             }),
             MaterializeOutcome::StepJobs { job_ids } => json!({
                 "request_id": request_id,
+                "resource_version": row.resource_version,
                 "agent_job_ids": job_ids,
                 "status": row.status,
                 "stage": "execute",
@@ -22881,14 +23088,14 @@ async fn requests_execute(
         &request_id,
     )?;
 
-    let executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
+    let mut executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
 
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
     let to_status = executed.status.as_str();
-    replace_request_in_memory(&mut store, idx, executed.clone())
-        .map_err(local_request_capacity_response)?;
+    executed.resource_version = replace_request_in_memory(&mut store, idx, executed.clone())
+        .map_err(local_request_store_error_response)?;
     record_local_transition(
         &session,
         &request_id,
@@ -22961,8 +23168,9 @@ impl From<sqlx::Error> for MaterializeError {
 /// (see [`MaterializeError::ModeNotSupportedForStepPlan`]) — per-step
 /// LiveApply dispatch requires a step-scoped approval grant that does not
 /// exist yet (slice B1b). Next-ready-step dispatch on step-success is slice
-/// 2b/B1a's backlink, not here. `current` is the pre-transition row (used
-/// for the single-job spec's vars, mirroring the historical behavior).
+/// 2b/B1a's backlink, not here. `current` is the committed post-transition
+/// row: its database-owned `resource_version` is copied into every job spec
+/// and durable job binding before this transaction commits.
 async fn materialize_execution(
     tx: &mut sqlx::PgConnection,
     request_id: Uuid,
@@ -23016,8 +23224,17 @@ async fn materialize_execution(
                 .map_err(|error| MaterializeError::InvalidLivePlacement(error.to_string()))?;
         }
         let mode_label = job_mode_label(&mode);
+        let request_resource_version = ryuki_protocol::RequestResourceVersion::try_from(
+            current.resource_version,
+        )
+        .map_err(|_| {
+            MaterializeError::Db(sqlx::Error::Protocol(
+                "request resource_version is outside the protocol range".into(),
+            ))
+        })?;
         let spec = ryuki_protocol::JobSpec {
             request_id,
+            request_resource_version,
             offering_id: Uuid::new_v4(),
             iac_ref: offering,
             iac_digest,
@@ -23027,10 +23244,12 @@ async fn materialize_execution(
         };
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(request_id)
+        .bind(current.resource_version)
         .bind(&request.site)
         .bind(&spec_json)
         .bind(mode_label)
@@ -23109,13 +23328,15 @@ pub(crate) async fn dispatch_ready_steps(
             request,
             current,
             mode.clone(),
-        );
+        )?;
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(request_id)
+        .bind(current.resource_version)
         .bind(&request.site)
         .bind(&spec_json)
         .bind(mode_label)
@@ -23213,8 +23434,9 @@ pub(crate) async fn dispatch_teardown_steps(
         let apply_row: Option<(
             sqlx::types::Json<serde_json::Value>,
             sqlx::types::Json<serde_json::Value>,
+            i64,
         )> = sqlx::query_as(
-            "SELECT live_context, spec FROM agent_jobs \
+            "SELECT live_context, spec, request_resource_version FROM agent_jobs \
              WHERE id = $1 AND request_id = $2 AND platform = $3 \
                AND mode = 'LiveApply' AND step_scoped = TRUE \
                AND status = 'Succeeded' AND result_status IN ('applied', 'verified') \
@@ -23226,7 +23448,8 @@ pub(crate) async fn dispatch_teardown_steps(
         .bind(&current.site)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((apply_context_json, apply_spec_json)) = apply_row else {
+        let Some((apply_context_json, apply_spec_json, apply_row_resource_version)) = apply_row
+        else {
             return Err(sqlx::Error::Protocol(
                 "Applied step's exact LiveApply authority row is missing or incomplete".into(),
             ));
@@ -23245,6 +23468,9 @@ pub(crate) async fn dispatch_teardown_steps(
             || apply_grant.step_job_id != Some(apply_job_id)
             || apply_grant.approved_plan_digest != digest
             || apply_grant.job_spec_digest != ryuki_protocol::job_spec_digest(&apply_spec)
+            || apply_grant.request_resource_version != apply_spec.request_resource_version
+            || i64::try_from(apply_spec.request_resource_version.get()).ok()
+                != Some(apply_row_resource_version)
             || apply_spec.mode != ryuki_protocol::JobMode::LiveApply
             || apply_spec.request_id != request_id
             || apply_spec.iac_ref != step.iac_ref
@@ -23262,8 +23488,17 @@ pub(crate) async fn dispatch_teardown_steps(
         // Roll back the exact mutation that was approved and applied. Rebuilding
         // from mutable request data (or allocating a fresh offering identity)
         // can drift from the signed plan and must fail the plan-to-mutation
-        // authority check. The mode is the only intentional difference.
+        // authority check. Mode and the current request-version fence are the
+        // only intentional differences from the historical apply spec.
         let mut spec = apply_spec.clone();
+        spec.request_resource_version = ryuki_protocol::RequestResourceVersion::try_from(
+            current.resource_version,
+        )
+        .map_err(|_| {
+            sqlx::Error::Protocol(
+                "current request resource version is not a positive wire value".into(),
+            )
+        })?;
         spec.mode = ryuki_protocol::JobMode::LiveDestroy;
         let job_id = crate::agents::create_step_live_job(
             tx,
@@ -23334,7 +23569,7 @@ fn build_step_job_spec(
     request: &ryuki_engine::models::Request,
     current: &DbRequestRow,
     mode: ryuki_protocol::JobMode,
-) -> ryuki_protocol::JobSpec {
+) -> Result<ryuki_protocol::JobSpec, sqlx::Error> {
     let effective_mode = if matches!(mode, ryuki_protocol::JobMode::LiveApply) {
         // Fail-safe clamp; should be unreachable in production (every caller
         // is itself gated to OfflineDryRun/LivePlan) — log loudly rather than
@@ -23359,15 +23594,22 @@ fn build_step_job_spec(
         memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
         metadata: &request.metadata,
     });
-    ryuki_protocol::JobSpec {
+    let request_resource_version = ryuki_protocol::RequestResourceVersion::try_from(
+        current.resource_version,
+    )
+    .map_err(|_| {
+        sqlx::Error::Protocol("request resource_version is outside the protocol range".into())
+    })?;
+    Ok(ryuki_protocol::JobSpec {
         request_id,
+        request_resource_version,
         offering_id: Uuid::new_v4(),
         iac_ref: step_iac_ref.to_string(),
         iac_digest,
         vars,
         state_key: Some(step_state_key(step_id)),
         mode: effective_mode,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -23377,6 +23619,7 @@ mod step_materialization_unit_tests {
     fn sample_request() -> ryuki_engine::models::Request {
         ryuki_engine::models::Request {
             id: Uuid::new_v4().to_string(),
+            resource_version: 1,
             offering_id: "server-deployment".to_string(),
             request_type: ryuki_engine::models::RequestType::ServerDeployment,
             status: ryuki_engine::models::RequestStatus::Executing,
@@ -23398,6 +23641,7 @@ mod step_materialization_unit_tests {
     fn sample_current_row(request: &ryuki_engine::models::Request) -> DbRequestRow {
         DbRequestRow {
             id: Uuid::parse_str(&request.id).unwrap_or_else(|_| Uuid::new_v4()),
+            resource_version: request.resource_version,
             request_type: "server-deployment".to_string(),
             status: "executing".to_string(),
             stage: "execute".to_string(),
@@ -23422,6 +23666,16 @@ mod step_materialization_unit_tests {
             owner: Some("owner-unit".to_string()),
             evidence_manifest_id: None,
         }
+    }
+
+    #[test]
+    fn request_hydration_preserves_database_resource_version() {
+        let request = sample_request();
+        let mut row = sample_current_row(&request);
+        row.resource_version = 73;
+
+        let hydrated = db_row_to_request(&row, &request.id);
+        assert_eq!(hydrated.resource_version, 73);
     }
 
     #[test]
@@ -23461,7 +23715,8 @@ mod step_materialization_unit_tests {
             &request,
             &current,
             ryuki_protocol::JobMode::LivePlan,
-        );
+        )
+        .expect("positive request resource version");
 
         for (key, expected) in [
             ("datacenter", "DC-PROD"),
@@ -23506,7 +23761,8 @@ mod step_materialization_unit_tests {
                     &request,
                     &current,
                     mode.clone(),
-                );
+                )
+                .expect("positive request resource version");
                 assert_eq!(
                     spec.mode, mode,
                     "step spec for iac_ref={iac_ref} must pass through mode={mode:?}"
@@ -23540,7 +23796,8 @@ mod step_materialization_unit_tests {
                 &request,
                 &current,
                 ryuki_protocol::JobMode::LiveApply,
-            );
+            )
+            .expect("positive request resource version");
             assert_ne!(
                 spec.mode,
                 ryuki_protocol::JobMode::LiveApply,
@@ -23585,7 +23842,8 @@ mod step_materialization_unit_tests {
             &request,
             &current,
             ryuki_protocol::JobMode::LivePlan,
-        );
+        )
+        .expect("positive request resource version");
 
         assert_eq!(
             spec.state_key.as_deref(),
@@ -23774,6 +24032,7 @@ mod step_materialization_db_tests {
                 attempt_id,
                 lease_generation: 1,
                 request_id,
+                request_resource_version: plan_spec.request_resource_version,
                 result_id,
                 mode: ryuki_protocol::JobMode::LivePlan,
                 status: ryuki_protocol::JobResultStatus::Planned,
@@ -24216,7 +24475,9 @@ mod step_authoring_db_tests {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
         let pool = crate::database::get_db()?;
-        crate::database::run_migrations(pool).await.ok()?;
+        crate::database::run_migrations(pool)
+            .await
+            .expect("configured database migrations must apply");
         Some(pool)
     }
 
@@ -24485,6 +24746,8 @@ mod step_authoring_db_tests {
         // plan+grant; the guard fires before any of that machinery matters).
         let spec = ryuki_protocol::JobSpec {
             request_id: id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -24569,6 +24832,8 @@ mod step_authoring_db_tests {
 
         let spec = ryuki_protocol::JobSpec {
             request_id: id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -24880,7 +25145,7 @@ async fn requests_verify(
     let from_stage = current_stage_name(&store[idx]);
     let to_status = completed.status.as_str().to_string();
     replace_request_in_memory(&mut store, idx, completed)
-        .map_err(local_request_capacity_response)?;
+        .map_err(local_request_store_error_response)?;
     drop(store);
 
     record_local_transition(
@@ -25002,7 +25267,7 @@ async fn requests_protect(
     let from_stage = current_stage_name(&store[idx]);
     let to_status = protecting.status.as_str().to_string();
     replace_request_in_memory(&mut store, idx, protecting)
-        .map_err(local_request_capacity_response)?;
+        .map_err(local_request_store_error_response)?;
     drop(store);
 
     record_local_transition(
@@ -25125,7 +25390,7 @@ async fn requests_publish(
     let from_stage = current_stage_name(&store[idx]);
     let to_status = operational.status.as_str().to_string();
     replace_request_in_memory(&mut store, idx, operational)
-        .map_err(local_request_capacity_response)?;
+        .map_err(local_request_store_error_response)?;
     drop(store);
 
     record_local_transition(
@@ -25248,7 +25513,8 @@ async fn requests_retire(
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
     let to_status = retired.status.as_str().to_string();
-    replace_request_in_memory(&mut store, idx, retired).map_err(local_request_capacity_response)?;
+    replace_request_in_memory(&mut store, idx, retired)
+        .map_err(local_request_store_error_response)?;
     drop(store);
 
     record_local_transition(
@@ -25265,14 +25531,53 @@ async fn requests_retire(
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
 
-/// Body for reject/cancel: the human reason text only. There is deliberately no
-/// actor field — actor identity is taken exclusively from the verified session,
-/// so a forged actor is impossible.
+/// Body for cancel/rework/fail: the human reason text only. There is deliberately
+/// no actor field — actor identity is taken exclusively from the verified
+/// session, so a forged actor is impossible.
 #[derive(Debug, Deserialize)]
 struct ReasonBody {
     /// Mandatory human reason recorded in lifecycle evidence and the audit
     /// trail. Per-operation validation and length limits apply.
     reason: String,
+}
+
+/// Closed human rejection decision over one exact request snapshot. Actor and
+/// approval role remain server-derived from the verified session.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectRequestBody {
+    reason: String,
+    request_resource_version: i64,
+}
+
+impl RejectRequestBody {
+    fn validate_resource_version(&self) -> Result<i64, (StatusCode, Json<Value>)> {
+        if self.request_resource_version <= 0 {
+            return Err(status_400("request_resource_version must be positive"));
+        }
+        Ok(self.request_resource_version)
+    }
+}
+
+#[cfg(test)]
+async fn reviewed_request_reject_body(
+    request_id: &str,
+    reason: impl Into<String>,
+) -> Json<RejectRequestBody> {
+    let Json(reviewed) = reviewed_request_approval_body(request_id).await;
+    Json(RejectRequestBody {
+        reason: reason.into(),
+        request_resource_version: reviewed.request_resource_version,
+    })
+}
+
+#[cfg(test)]
+async fn reviewed_batch_reject_item(request_id: &str) -> BatchRejectItem {
+    let Json(reviewed) = reviewed_request_approval_body(request_id).await;
+    BatchRejectItem {
+        id: request_id.to_string(),
+        request_resource_version: reviewed.request_resource_version,
+    }
 }
 
 /// POST /api/requests/{id}/reject — the approver "say no" act. Valid only from
@@ -25282,7 +25587,7 @@ struct ReasonBody {
 async fn requests_reject(
     Path(request_id): Path<String>,
     AuthExtractor(session): AuthExtractor,
-    Json(body): Json<ReasonBody>,
+    Json(body): Json<RejectRequestBody>,
 ) -> ApiResult {
     if !check_permission(&session, "approve") {
         record_transition_denied(&session, &request_id, "request.reject").await;
@@ -25292,6 +25597,7 @@ async fn requests_reject(
         record_transition_denied(&session, &request_id, "request.reject").await;
         return Err(ordinary_approval_role_required());
     };
+    let expected_resource_version = body.validate_resource_version()?;
     // The single handler keeps its EXACT historic reason validation —
     // reject_control_chars + non-empty, with NO length cap. The >2000 cap is a
     // batch-only policy (see requests_batch_reject), so single reject stays
@@ -25302,9 +25608,15 @@ async fn requests_reject(
         return Err(status_400("Rejection reason is required"));
     }
 
-    reject_one(&session, &request_id, reason, &role)
-        .await
-        .map(Json)
+    reject_one(
+        &session,
+        &request_id,
+        reason,
+        &role,
+        expected_resource_version,
+    )
+    .await
+    .map(Json)
 }
 
 /// Reject a SINGLE request: scope-guarded, SoD-gated (creator != approver),
@@ -25320,6 +25632,7 @@ async fn reject_one(
     request_id: &str,
     reason: &str,
     role: &str,
+    expected_resource_version: i64,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     if approval_role_for(session).as_deref() != Some(role) {
         return Err(ordinary_approval_role_required());
@@ -25336,6 +25649,11 @@ async fn reject_one(
         .ok_or_else(|| status_404(request_id))?;
         // #2: by-id scope guard immediately after load (before SoD/engine logic).
         scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
+        if current.resource_version != expected_resource_version {
+            return Err(status_409(
+                "the request changed after it was reviewed; refresh before rejecting",
+            ));
+        }
 
         // Separation of duties: the rejecting approver must not be the creator
         // (the creator withdraws via cancel, not a self-rejection).
@@ -25348,7 +25666,7 @@ async fn reject_one(
         .await?;
 
         let request = db_row_to_request(&current, request_id);
-        let rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
+        let mut rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
         // #4 lock-ordering: apply_transition_audited's CAS `UPDATE requests`
@@ -25363,7 +25681,7 @@ async fn reject_one(
         // durable rejection decision row (with reason) in the SAME tx.
         let stages_json = serde_json::to_value(&rejected.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Rejected);
-        apply_transition_audited(
+        let updated = apply_transition_audited(
             pool,
             session,
             uid,
@@ -25375,6 +25693,7 @@ async fn reject_one(
             json!({
                 "reason": reason,
                 "approval_epoch": current.approval_epoch,
+                "approval_basis_resource_version": expected_resource_version,
             }),
             TransitionArtifacts {
                 stages_json,
@@ -25388,6 +25707,8 @@ async fn reject_one(
             },
         )
         .await?;
+
+        apply_persisted_request_metadata(&mut rejected, &updated);
 
         return Ok(serde_json::to_value(&rejected).unwrap_or_default());
     }
@@ -25426,14 +25747,19 @@ async fn reject_one(
         .iter()
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(request_id))?;
+    if store[idx].resource_version != expected_resource_version {
+        return Err(status_409(
+            "the request changed after it was reviewed; refresh before rejecting",
+        ));
+    }
 
-    let rejected = request_lifecycle::reject_request(&store[idx], &session.user_id, reason)
+    let mut rejected = request_lifecycle::reject_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
-    replace_request_in_memory(&mut store, idx, rejected.clone())
-        .map_err(local_request_capacity_response)?;
+    rejected.resource_version = replace_request_in_memory(&mut store, idx, rejected.clone())
+        .map_err(local_request_store_error_response)?;
     audit::record_audit_local(
         session,
         &AuditRecord {
@@ -25443,7 +25769,10 @@ async fn reject_one(
             to_status: "rejected",
             from_stage: Some(&from_stage),
             to_stage: "approve",
-            detail: json!({ "reason": reason }),
+            detail: json!({
+                "reason": reason,
+                "approval_basis_resource_version": expected_resource_version,
+            }),
             outcome: "applied",
         },
     )
@@ -25505,11 +25834,11 @@ async fn rework_one(
         scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
         let request = db_row_to_request(&current, request_id);
-        let reworked = request_lifecycle::rework_request(&request, &session.user_id, reason)
+        let mut reworked = request_lifecycle::rework_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&reworked.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Intake);
-        apply_transition_audited(
+        let updated = apply_transition_audited(
             pool,
             session,
             uid,
@@ -25535,6 +25864,7 @@ async fn rework_one(
             },
         )
         .await?;
+        apply_persisted_request_metadata(&mut reworked, &updated);
         return Ok(serde_json::to_value(&reworked).unwrap_or_default());
     }
 
@@ -25551,12 +25881,12 @@ async fn rework_one(
     {
         return Err(status_404(request_id));
     }
-    let reworked = request_lifecycle::rework_request(&store[idx], &session.user_id, reason)
+    let mut reworked = request_lifecycle::rework_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
-    replace_request_in_memory(&mut store, idx, reworked.clone())
-        .map_err(local_request_capacity_response)?;
+    reworked.resource_version = replace_request_in_memory(&mut store, idx, reworked.clone())
+        .map_err(local_request_store_error_response)?;
     audit::record_audit_local(
         session,
         &AuditRecord {
@@ -25625,13 +25955,14 @@ async fn fail_one(
         scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
         let request = db_row_to_request(&current, request_id);
-        let failed = request_lifecycle::fail_request(&request, reason).map_err(map_engine_error)?;
+        let mut failed =
+            request_lifecycle::fail_request(&request, reason).map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&failed.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Failed);
         // The request failed AT its current stage — record that, not a hardcoded
         // "execute" (a request can fail at validate/plan/approve too).
         let failed_stage = current_stage_name(&request);
-        apply_transition_audited(
+        let updated = apply_transition_audited(
             pool,
             session,
             uid,
@@ -25653,6 +25984,7 @@ async fn fail_one(
             },
         )
         .await?;
+        apply_persisted_request_metadata(&mut failed, &updated);
         return Ok(serde_json::to_value(&failed).unwrap_or_default());
     }
 
@@ -25669,11 +26001,12 @@ async fn fail_one(
     {
         return Err(status_404(request_id));
     }
-    let failed = request_lifecycle::fail_request(&store[idx], reason).map_err(map_engine_error)?;
+    let mut failed =
+        request_lifecycle::fail_request(&store[idx], reason).map_err(map_engine_error)?;
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
-    replace_request_in_memory(&mut store, idx, failed.clone())
-        .map_err(local_request_capacity_response)?;
+    failed.resource_version = replace_request_in_memory(&mut store, idx, failed.clone())
+        .map_err(local_request_store_error_response)?;
     audit::record_audit_local(
         session,
         &AuditRecord {
@@ -25744,12 +26077,12 @@ async fn cancel_one(
         }
 
         let request = db_row_to_request(&current, request_id);
-        let cancelled = request_lifecycle::cancel_request(&request, &session.user_id, reason)
+        let mut cancelled = request_lifecycle::cancel_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
         let stages_json = serde_json::to_value(&cancelled.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Cancelled);
-        apply_transition_audited(
+        let updated = apply_transition_audited(
             pool,
             session,
             uid,
@@ -25762,6 +26095,8 @@ async fn cancel_one(
             TransitionArtifacts::stages_only(stages_json),
         )
         .await?;
+
+        apply_persisted_request_metadata(&mut cancelled, &updated);
 
         return Ok(serde_json::to_value(&cancelled).unwrap_or_default());
     }
@@ -25788,13 +26123,13 @@ async fn cancel_one(
         return Err(status_403());
     }
 
-    let cancelled = request_lifecycle::cancel_request(&store[idx], &session.user_id, reason)
+    let mut cancelled = request_lifecycle::cancel_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
-    replace_request_in_memory(&mut store, idx, cancelled.clone())
-        .map_err(local_request_capacity_response)?;
+    cancelled.resource_version = replace_request_in_memory(&mut store, idx, cancelled.clone())
+        .map_err(local_request_store_error_response)?;
     audit::record_audit_local(
         session,
         &AuditRecord {
@@ -25879,10 +26214,19 @@ async fn requests_batch_cancel(
     })))
 }
 
-/// Body for a batch reject: the request ids and a shared reason.
+/// One exact request snapshot in a batch rejection.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchRejectItem {
+    id: String,
+    request_resource_version: i64,
+}
+
+/// Body for a batch reject: exact reviewed request snapshots and a shared reason.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchRejectRequest {
-    ids: Vec<String>,
+    items: Vec<BatchRejectItem>,
     reason: String,
 }
 
@@ -25926,23 +26270,43 @@ async fn requests_batch_reject(
             "Rejection reason is too long (max 2000 characters)",
         ));
     }
-    if b.ids.is_empty() {
-        return Err(status_400("ids cannot be empty"));
+    if b.items.is_empty() {
+        return Err(status_400("items cannot be empty"));
     }
-    if b.ids.len() > 100 {
+    if b.items.len() > 100 {
         return Err(status_400("a batch may contain at most 100 ids"));
     }
-    // Dedupe (preserving order) so the same request is never processed twice in
-    // one batch — otherwise the second attempt fails the state transition and
-    // the counts become "attempts", not unique requests.
+    // Dedupe on the canonical UUID (preserving order) so alternate UUID
+    // spellings cannot submit two decisions for one request. Non-UUID ids retain
+    // their raw spelling and fail independently as 404s in reject_one.
     let mut seen = std::collections::HashSet::new();
-    let unique_ids: Vec<&String> = b.ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+    let unique_items: Vec<&BatchRejectItem> = b
+        .items
+        .iter()
+        .filter(|item| {
+            let key = Uuid::parse_str(&item.id)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| item.id.clone());
+            seen.insert(key)
+        })
+        .collect();
 
-    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut results: Vec<Value> = Vec::with_capacity(unique_items.len());
     let mut succeeded = 0u64;
     let mut failed = 0u64;
-    for id in unique_ids {
-        match reject_one(&session, id, reason, &role).await {
+    for item in unique_items {
+        let id = &item.id;
+        if item.request_resource_version <= 0 {
+            failed += 1;
+            results.push(json!({
+                "id": id,
+                "ok": false,
+                "status": StatusCode::BAD_REQUEST.as_u16(),
+                "error": {"error": "request_resource_version must be positive"},
+            }));
+            continue;
+        }
+        match reject_one(&session, id, reason, &role, item.request_resource_version).await {
             Ok(_) => {
                 succeeded += 1;
                 results.push(json!({ "id": id, "ok": true }));
@@ -26111,10 +26475,20 @@ async fn requests_batch_fail(
     })))
 }
 
-/// Body for a batch approve: just the request ids (approve takes NO reason).
+/// One exact request snapshot in a batch approval.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchApprovalItem {
+    id: String,
+    request_resource_version: i64,
+}
+
+/// Body for a batch approve. Every item carries the exact version rendered to
+/// the approver; a stale item fails independently without weakening the rest.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchApproveRequest {
-    ids: Vec<String>,
+    items: Vec<BatchApprovalItem>,
 }
 
 /// POST /api/requests/batch/approve — record THIS approver's sign-off on up to 100
@@ -26142,10 +26516,10 @@ async fn requests_batch_approve(
         record_transition_denied(&session, "batch", "request.approve").await;
         return Err(ordinary_approval_role_required());
     };
-    if b.ids.is_empty() {
-        return Err(status_400("ids cannot be empty"));
+    if b.items.is_empty() {
+        return Err(status_400("items cannot be empty"));
     }
-    if b.ids.len() > 100 {
+    if b.items.len() > 100 {
         return Err(status_400("a batch may contain at most 100 ids"));
     }
     // Dedupe (preserving order) so the same request is never processed twice. Dedup
@@ -26154,23 +26528,34 @@ async fn requests_batch_approve(
     // re-record would idempotent-short-circuit anyway, but it must not double-count
     // the result). Non-UUID ids keep their raw text (approve_one 404s them).
     let mut seen = std::collections::HashSet::new();
-    let unique_ids: Vec<&String> = b
-        .ids
+    let unique_items: Vec<&BatchApprovalItem> = b
+        .items
         .iter()
-        .filter(|id| {
-            let key = Uuid::parse_str(id)
+        .filter(|item| {
+            let key = Uuid::parse_str(&item.id)
                 .map(|u| u.to_string())
-                .unwrap_or_else(|_| id.to_string());
+                .unwrap_or_else(|_| item.id.clone());
             seen.insert(key)
         })
         .collect();
 
-    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut results: Vec<Value> = Vec::with_capacity(unique_items.len());
     let mut succeeded = 0u64;
     let mut failed = 0u64;
     let mut approved = 0u64;
-    for id in unique_ids {
-        match approve_one(&session, id, &role).await {
+    for item in unique_items {
+        let id = &item.id;
+        if item.request_resource_version <= 0 {
+            failed += 1;
+            results.push(json!({
+                "id": id,
+                "ok": false,
+                "status": StatusCode::BAD_REQUEST.as_u16(),
+                "error": {"error": "request_resource_version must be positive"},
+            }));
+            continue;
+        }
+        match approve_one(&session, id, &role, item.request_resource_version).await {
             Ok(json) => {
                 succeeded += 1;
                 // approve_one returns the flattened request JSON (top-level fields +
@@ -49842,6 +50227,7 @@ mod unit_tests {
         let Json(approved) = requests_approve(
             Path(id.clone()),
             AuthExtractor(static_admin_operator_session()),
+            reviewed_request_approval_body(&id).await,
         )
         .await
         .expect("approval should pass after planning");
@@ -51764,9 +52150,13 @@ mod unit_tests {
         let id = format!("req-test-{}", Uuid::new_v4());
         seed_planned_request(&id, "alice").await;
         let alice = single_role_session("alice", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let Json(approved) = requests_approve(Path(id.clone()), AuthExtractor(alice))
-            .await
-            .expect("self-approval is permitted in dry-run (warn-only)");
+        let Json(approved) = requests_approve(
+            Path(id.clone()),
+            AuthExtractor(alice),
+            reviewed_request_approval_body(&id).await,
+        )
+        .await
+        .expect("self-approval is permitted in dry-run (warn-only)");
         assert_eq!(approved["status"], "Approved");
     }
 
@@ -51779,15 +52169,11 @@ mod unit_tests {
             "approver-1",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
-        let Json(body) = requests_reject(
-            Path(id.clone()),
-            AuthExtractor(approver),
-            Json(ReasonBody {
-                reason: "insufficient capacity".into(),
-            }),
-        )
-        .await
-        .expect("approver may reject a planned request");
+        let reviewed = reviewed_request_reject_body(&id, "insufficient capacity").await;
+        let expected_resource_version = reviewed.0.request_resource_version;
+        let Json(body) = requests_reject(Path(id.clone()), AuthExtractor(approver), reviewed)
+            .await
+            .expect("approver may reject a planned request");
         assert_eq!(body["status"], "Rejected");
 
         // The request is terminal in the store.
@@ -51813,7 +52199,100 @@ mod unit_tests {
         assert_eq!(reject["actor_principal"], "approver-1");
         assert_eq!(reject["to_status"], "rejected");
         assert_eq!(reject["detail"]["reason"], "insufficient capacity");
+        assert_eq!(
+            reject["detail"]["approval_basis_resource_version"],
+            expected_resource_version
+        );
         assert_eq!(reject["outcome"], "applied");
+    }
+
+    #[test]
+    fn reject_body_requires_exact_positive_version_on_the_wire() {
+        assert!(
+            serde_json::from_value::<RejectRequestBody>(json!({"reason": "no"})).is_err(),
+            "an omitted request_resource_version must fail closed"
+        );
+        assert!(
+            serde_json::from_value::<BatchRejectRequest>(json!({
+                "items": [{"id": Uuid::new_v4().to_string()}],
+                "reason": "no",
+            }))
+            .is_err(),
+            "every batch item must carry request_resource_version"
+        );
+        assert!(
+            serde_json::from_value::<RejectRequestBody>(json!({
+                "reason": "no",
+                "request_resource_version": 1,
+                "unexpected": true,
+            }))
+            .is_err(),
+            "the rejection body must remain closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_reject_rejects_zero_resource_version() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Err((status, _)) = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(approver),
+            Json(RejectRequestBody {
+                reason: "no".into(),
+                request_resource_version: 0,
+            }),
+        )
+        .await
+        else {
+            panic!("zero request_resource_version must be a 400");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            request_store()
+                .lock()
+                .await
+                .iter()
+                .find(|request| request.id == id)
+                .expect("seeded request")
+                .status,
+            ryuki_engine::models::RequestStatus::Planned
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_reject_rejects_stale_reviewed_resource_version() {
+        if get_db().is_some() {
+            eprintln!("SKIP: stale in-memory rejection test requires no-DB mode");
+            return;
+        }
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Json(mut stale) = reviewed_request_reject_body(&id, "no").await;
+        let current_resource_version = stale.request_resource_version;
+        stale.request_resource_version -= 1;
+        assert!(stale.request_resource_version > 0);
+        let Err((status, _)) =
+            requests_reject(Path(id.clone()), AuthExtractor(approver), Json(stale)).await
+        else {
+            panic!("a stale reviewed request must be rejected");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        let store = request_store().lock().await;
+        let current = store
+            .iter()
+            .find(|request| request.id == id)
+            .expect("seeded request");
+        assert_eq!(current.status, ryuki_engine::models::RequestStatus::Planned);
+        assert_eq!(current.resource_version, current_resource_version);
     }
 
     #[tokio::test]
@@ -51827,9 +52306,7 @@ mod unit_tests {
         let Err((status, _)) = requests_reject(
             Path(id.clone()),
             AuthExtractor(approver),
-            Json(ReasonBody {
-                reason: "   ".into(),
-            }),
+            reviewed_request_reject_body(&id, "   ").await,
         )
         .await
         else {
@@ -51851,9 +52328,7 @@ mod unit_tests {
         let Err((status, _)) = requests_reject(
             Path(id.clone()),
             AuthExtractor(approver),
-            Json(ReasonBody {
-                reason: "log\nforge".into(),
-            }),
+            reviewed_request_reject_body(&id, "log\nforge").await,
         )
         .await
         else {
@@ -51882,9 +52357,7 @@ mod unit_tests {
         let Err((status, _)) = requests_reject(
             Path(id.clone()),
             AuthExtractor(auditor),
-            Json(ReasonBody {
-                reason: "no".into(),
-            }),
+            reviewed_request_reject_body(&id, "no").await,
         )
         .await
         else {
@@ -51922,9 +52395,7 @@ mod unit_tests {
         let Json(body) = requests_reject(
             Path(id.clone()),
             AuthExtractor(approver),
-            Json(ReasonBody {
-                reason: long.clone(),
-            }),
+            reviewed_request_reject_body(&id, long.clone()).await,
         )
         .await
         .expect("single reject must accept a >2000-char reason (no cap)");
@@ -51943,11 +52414,15 @@ mod unit_tests {
                 ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
             ))
         };
-        let bad = |ids: Vec<String>, reason: &str| {
+        let item = |id: &str| BatchRejectItem {
+            id: id.to_string(),
+            request_resource_version: 1,
+        };
+        let bad = |items: Vec<BatchRejectItem>, reason: &str| {
             requests_batch_reject(
                 sess(),
                 Json(BatchRejectRequest {
-                    ids,
+                    items,
                     reason: reason.to_string(),
                 }),
             )
@@ -51957,25 +52432,25 @@ mod unit_tests {
                 bad(vec![], "cleanup").await,
                 Err((StatusCode::BAD_REQUEST, _))
             ),
-            "empty ids is a 400"
+            "empty items is a 400"
         );
         assert!(
             matches!(
-                bad(vec!["x".into()], "   ").await,
+                bad(vec![item("x")], "   ").await,
                 Err((StatusCode::BAD_REQUEST, _))
             ),
             "empty reason is a 400"
         );
         assert!(
             matches!(
-                bad(vec!["x".into()], "log\nforge").await,
+                bad(vec![item("x")], "log\nforge").await,
                 Err((StatusCode::BAD_REQUEST, _))
             ),
             "a control char in the reason is a 400"
         );
         assert!(
             matches!(
-                bad(vec!["x".into()], &"y".repeat(2001)).await,
+                bad(vec![item("x")], &"y".repeat(2001)).await,
                 Err((StatusCode::BAD_REQUEST, _))
             ),
             "an over-2000-char reason is a 400 (batch-only cap)"
@@ -51986,7 +52461,7 @@ mod unit_tests {
         let at_cap = requests_batch_reject(
             sess(),
             Json(BatchRejectRequest {
-                ids: vec![format!("req-test-{}", Uuid::new_v4())],
+                items: vec![item(&format!("req-test-{}", Uuid::new_v4()))],
                 reason: "y".repeat(2000),
             }),
         )
@@ -51995,7 +52470,7 @@ mod unit_tests {
             at_cap.is_ok(),
             "a 2000-char reason is accepted (cap is > 2000, not >= 2000)"
         );
-        let many: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        let many: Vec<BatchRejectItem> = (0..101).map(|i| item(&format!("id-{i}"))).collect();
         assert!(
             matches!(
                 bad(many, "cleanup").await,
@@ -52015,7 +52490,7 @@ mod unit_tests {
         let Err((status, _)) = requests_batch_reject(
             AuthExtractor(auditor),
             Json(BatchRejectRequest {
-                ids: vec![id.clone()],
+                items: vec![reviewed_batch_reject_item(&id).await],
                 reason: "no".into(),
             }),
         )
@@ -52045,10 +52520,12 @@ mod unit_tests {
             "approver-1",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
+        let item_a = reviewed_batch_reject_item(&id_a).await;
+        let item_b = reviewed_batch_reject_item(&id_b).await;
         let Json(out) = requests_batch_reject(
             AuthExtractor(approver),
             Json(BatchRejectRequest {
-                ids: vec![id_a.clone(), id_b.clone(), id_a.clone()],
+                items: vec![item_a.clone(), item_b, item_a],
                 reason: "cleanup".into(),
             }),
         )
@@ -52073,10 +52550,14 @@ mod unit_tests {
             "approver-1",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
+        let mut items = Vec::with_capacity(ids.len());
+        for id in &ids {
+            items.push(reviewed_batch_reject_item(id).await);
+        }
         let Json(out) = requests_batch_reject(
             AuthExtractor(approver),
             Json(BatchRejectRequest {
-                ids: ids.clone(),
+                items,
                 reason: "insufficient capacity".into(),
             }),
         )
@@ -52116,9 +52597,7 @@ mod unit_tests {
         let single = requests_reject(
             Path(id.clone()),
             AuthExtractor(gblon.clone()),
-            Json(ReasonBody {
-                reason: "out of scope".into(),
-            }),
+            reviewed_request_reject_body(&id, "out of scope").await,
         )
         .await;
         assert!(
@@ -52130,7 +52609,7 @@ mod unit_tests {
         let Json(out) = requests_batch_reject(
             AuthExtractor(gblon),
             Json(BatchRejectRequest {
-                ids: vec![id.clone()],
+                items: vec![reviewed_batch_reject_item(&id).await],
                 reason: "out of scope".into(),
             }),
         )
@@ -52530,7 +53009,7 @@ mod unit_tests {
                 usize::MAX,
                 usize::MAX,
             ),
-            Err(InMemoryRequestCapacityError::RecordLimit)
+            Err(InMemoryRequestStoreError::RecordLimit)
         );
         assert_eq!(count_limited.len(), 2);
         assert_eq!(count_limited[0].id, "local-capacity-first");
@@ -52552,7 +53031,7 @@ mod unit_tests {
                 record_bytes * 2 - 1,
                 usize::MAX,
             ),
-            Err(InMemoryRequestCapacityError::ByteLimit)
+            Err(InMemoryRequestStoreError::ByteLimit)
         );
         assert_eq!(byte_limited.len(), 1);
         assert_eq!(
@@ -52563,7 +53042,7 @@ mod unit_tests {
                 usize::MAX,
                 record_bytes - 1,
             ),
-            Err(InMemoryRequestCapacityError::RecordTooLarge)
+            Err(InMemoryRequestStoreError::RecordTooLarge)
         );
 
         let now = chrono::Utc::now();
@@ -52600,7 +53079,7 @@ mod unit_tests {
                 usize::MAX,
                 replacement_bytes - 1,
             ),
-            Err(InMemoryRequestCapacityError::RecordTooLarge)
+            Err(InMemoryRequestStoreError::RecordTooLarge)
         );
         assert_eq!(
             record_limited, original,
@@ -52616,7 +53095,7 @@ mod unit_tests {
                 other_bytes + replacement_bytes - 1,
                 usize::MAX,
             ),
-            Err(InMemoryRequestCapacityError::ByteLimit)
+            Err(InMemoryRequestStoreError::ByteLimit)
         );
         assert_eq!(aggregate_limited, original);
 
@@ -52628,9 +53107,106 @@ mod unit_tests {
             replacement_bytes,
         )
         .expect("a lifecycle replacement at both exact byte boundaries fits");
+        let mut stored_replacement = replacement;
+        stored_replacement.resource_version += 1;
         assert_eq!(aggregate_limited.len(), 2);
-        assert_eq!(aggregate_limited[0], replacement);
+        assert_eq!(aggregate_limited[0], stored_replacement);
         assert_eq!(aggregate_limited[1], second);
+    }
+
+    #[test]
+    fn in_memory_replacement_owns_exact_monotonic_resource_version() {
+        let mut current = test_request("local-versioned-replacement");
+        current.resource_version = 41;
+        let mut store = vec![current.clone()];
+
+        let mut first_candidate = current.clone();
+        first_candidate.status = ryuki_engine::models::RequestStatus::Validated;
+        let first_stored_version = replace_request_in_memory_with_limits(
+            &mut store,
+            0,
+            first_candidate,
+            usize::MAX,
+            usize::MAX,
+        )
+        .expect("the current candidate version is accepted");
+        assert_eq!(first_stored_version, 42);
+        assert_eq!(store[0].resource_version, 42);
+
+        let after_first = store[0].clone();
+        let mut stale_candidate = current;
+        stale_candidate.status = ryuki_engine::models::RequestStatus::Planned;
+        assert_eq!(
+            replace_request_in_memory_with_limits(
+                &mut store,
+                0,
+                stale_candidate,
+                usize::MAX,
+                usize::MAX,
+            ),
+            Err(InMemoryRequestStoreError::StaleResourceVersion)
+        );
+        assert_eq!(store, vec![after_first.clone()]);
+
+        let mut next_candidate = after_first;
+        next_candidate.status = ryuki_engine::models::RequestStatus::Planned;
+        let next_stored_version = replace_request_in_memory_with_limits(
+            &mut store,
+            0,
+            next_candidate,
+            usize::MAX,
+            usize::MAX,
+        )
+        .expect("the next current candidate version is accepted");
+        assert_eq!(next_stored_version, 43);
+        assert_eq!(store[0].resource_version, 43);
+
+        store[0].resource_version = i64::MAX;
+        let before_overflow = store[0].clone();
+        let mut overflow_candidate = before_overflow.clone();
+        overflow_candidate.status = ryuki_engine::models::RequestStatus::Approved;
+        assert_eq!(
+            replace_request_in_memory_with_limits(
+                &mut store,
+                0,
+                overflow_candidate,
+                usize::MAX,
+                usize::MAX,
+            ),
+            Err(InMemoryRequestStoreError::ResourceVersionOverflow)
+        );
+        assert_eq!(store, vec![before_overflow]);
+    }
+
+    #[test]
+    fn in_memory_store_rejects_non_positive_resource_versions() {
+        let mut invalid_new = test_request("local-invalid-version-new");
+        invalid_new.resource_version = 0;
+        assert_eq!(
+            retain_request_in_memory_with_limits(
+                &mut Vec::new(),
+                invalid_new,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            ),
+            Err(InMemoryRequestStoreError::InvalidResourceVersion)
+        );
+
+        let mut invalid_current = test_request("local-invalid-version-current");
+        invalid_current.resource_version = -1;
+        let mut store = vec![invalid_current.clone()];
+        assert_eq!(
+            replace_request_in_memory_with_limits(
+                &mut store,
+                0,
+                invalid_current.clone(),
+                usize::MAX,
+                usize::MAX,
+            ),
+            Err(InMemoryRequestStoreError::InvalidResourceVersion)
+        );
+        assert_eq!(store, vec![invalid_current]);
     }
 
     #[test]
@@ -52661,7 +53237,7 @@ mod unit_tests {
                 usize::MAX,
                 original_bytes,
             ),
-            Err(InMemoryRequestCapacityError::RecordTooLarge)
+            Err(InMemoryRequestStoreError::RecordTooLarge)
         );
         assert_eq!(store, vec![original]);
     }
@@ -53033,7 +53609,10 @@ mod unit_tests {
         let Json(out) = requests_batch_approve(
             AuthExtractor(approver),
             Json(BatchApproveRequest {
-                ids: vec![in_scope.clone(), out_scope.clone()],
+                items: vec![
+                    reviewed_batch_approval_item(&in_scope).await,
+                    reviewed_batch_approval_item(&out_scope).await,
+                ],
             }),
         )
         .await
@@ -53585,6 +54164,9 @@ mod unit_tests {
         let approve = requests_approve(
             Path(Uuid::new_v4().to_string()),
             AuthExtractor(break_glass.clone()),
+            Json(RequestApprovalBody {
+                request_resource_version: 1,
+            }),
         )
         .await;
         assert!(matches!(approve, Err((StatusCode::FORBIDDEN, _))));
@@ -53592,8 +54174,9 @@ mod unit_tests {
         let reject = requests_reject(
             Path(Uuid::new_v4().to_string()),
             AuthExtractor(break_glass.clone()),
-            Json(ReasonBody {
+            Json(RejectRequestBody {
                 reason: "emergency authority is not ordinary approval".into(),
+                request_resource_version: 1,
             }),
         )
         .await;
@@ -53605,7 +54188,7 @@ mod unit_tests {
         let batch = requests_batch_approve(
             AuthExtractor(break_glass),
             Json(BatchApproveRequest {
-                ids: vec![Uuid::new_v4().to_string()],
+                items: vec![reviewed_batch_approval_item(&Uuid::new_v4().to_string()).await],
             }),
         )
         .await;
@@ -55389,6 +55972,8 @@ mod db_lifecycle_tests {
         let id = seed_request(pool, "executing", "execute").await;
         let spec = ryuki_protocol::JobSpec {
             request_id: id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -60718,19 +61303,89 @@ mod db_lifecycle_tests {
     fn reviewed_plan_selection(
         approved_plan: &crate::agents::ApprovedPlanReference,
         digest: &str,
+        request_resource_version: i64,
     ) -> ReviewedLivePlanSelection {
         ReviewedLivePlanSelection {
             approved_plan_job_id: approved_plan.job_id,
             approved_plan_attempt_id: approved_plan.attempt_id,
             approved_plan_digest: digest.to_string(),
+            request_resource_version,
         }
     }
 
-    fn placeholder_reviewed_plan_selection() -> ReviewedLivePlanSelection {
+    /// Mirror the production LivePlan result backlink: persist the exact plan
+    /// receipt on the execute stage and let the DB-owned request trigger advance
+    /// the request from the plan's version N to N + 1.
+    async fn record_test_whole_request_live_plan_backlink(
+        pool: &PgPool,
+        request_id: Uuid,
+        approved_plan: &crate::agents::ApprovedPlanReference,
+    ) -> i64 {
+        let (plan_version, result_status, evidence_digest, raw_plan_digest): (
+            i64,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT request_resource_version, result_status, evidence_digest, raw_plan_digest \
+             FROM agent_jobs WHERE id = $1 AND request_id = $2",
+        )
+        .bind(approved_plan.job_id)
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("load successful plan receipt");
+        assert_eq!(result_status, "planned");
+
+        let stages: sqlx::types::Json<serde_json::Value> =
+            sqlx::query_scalar("SELECT stages FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_one(pool)
+                .await
+                .expect("load request stages");
+        let mut stages: Vec<ryuki_engine::models::Stage> =
+            serde_json::from_value(stages.0).expect("valid request stages");
+        let execute = stages
+            .iter_mut()
+            .find(|stage| stage.name == "execute")
+            .expect("request has execute stage");
+        execute.status = ryuki_engine::models::StageStatus::InProgress;
+        execute.completed_at = None;
+        execute
+            .metadata
+            .insert("live_plan_job_id".into(), approved_plan.job_id.to_string());
+        execute
+            .metadata
+            .insert("live_plan_result_status".into(), result_status);
+        execute
+            .metadata
+            .insert("live_plan_evidence_digest".into(), evidence_digest);
+        execute
+            .metadata
+            .insert("live_plan_raw_plan_digest".into(), raw_plan_digest);
+        let stages = serde_json::to_value(stages).expect("serialize request stages");
+
+        sqlx::query_scalar(
+            "UPDATE requests SET status = 'executing', stage = 'execute', stages = $3::jsonb, \
+                    updated_at = NOW() \
+             WHERE id = $1 AND resource_version = $2 RETURNING resource_version",
+        )
+        .bind(request_id)
+        .bind(plan_version)
+        .bind(stages)
+        .fetch_one(pool)
+        .await
+        .expect("record exact whole-request LivePlan backlink")
+    }
+
+    fn placeholder_reviewed_plan_selection(
+        request_resource_version: i64,
+    ) -> ReviewedLivePlanSelection {
         ReviewedLivePlanSelection {
             approved_plan_job_id: Uuid::new_v4(),
             approved_plan_attempt_id: Uuid::new_v4(),
             approved_plan_digest: "0".repeat(64),
+            request_resource_version,
         }
     }
 
@@ -60742,6 +61397,7 @@ mod db_lifecycle_tests {
             "approved_plan_job_id": job_id,
             "approved_plan_attempt_id": attempt_id,
             "approved_plan_digest": "a".repeat(64),
+            "request_resource_version": 1,
         }))
         .expect("closed exact body");
         assert!(exact.validate().is_ok());
@@ -60750,6 +61406,7 @@ mod db_lifecycle_tests {
             "approved_plan_job_id": job_id,
             "approved_plan_attempt_id": attempt_id,
             "approved_plan_digest": "a".repeat(64),
+            "request_resource_version": 1,
             "platform": "attacker-selected-site",
         }))
         .is_err());
@@ -60757,6 +61414,7 @@ mod db_lifecycle_tests {
             "approved_plan_job_id": job_id,
             "approved_plan_attempt_id": attempt_id,
             "approved_plan_digest": "A".repeat(64),
+            "request_resource_version": 1,
         }))
         .expect("shape remains valid");
         assert!(uppercase.validate().is_err());
@@ -65976,11 +66634,12 @@ mod db_lifecycle_tests {
             .ok();
     }
 
-    /// C086/W05C-C01: request-linked agent-job events use spec.request_id as
-    /// their authority in both the generic and alert feeds. The independent
-    /// scalar request_id, NULL/spoofed event axes, and payload request_id are not
-    /// trusted; feed projection and the atomic ack predicate agree, including
-    /// under a simultaneous authorized/foreign acknowledgement attempt.
+    /// C086/W05C-C01: request-linked agent-job events use the database-validated
+    /// spec.request_id binding as their authority in both the generic and alert
+    /// feeds. Row/spec divergence and malformed authority are rejected at
+    /// insertion; NULL/spoofed event axes and payload request_id are not trusted.
+    /// Feed projection and the atomic ack predicate agree, including under a
+    /// simultaneous authorized/foreign acknowledgement attempt.
     #[tokio::test]
     async fn request_linked_agent_job_alert_scope_is_authoritative_and_atomic() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -66014,18 +66673,38 @@ mod db_lifecycle_tests {
         let job_id = Uuid::new_v4();
         let spec = json!({
             "request_id": spec_request_id,
+            "request_resource_version": 1,
             "offering_id": Uuid::new_v4(),
             "iac_ref": "request-preflight@v1",
             "iac_digest": "0000000000000000000000000000000000000000000000000000000000000000",
             "vars": {},
             "mode": "offline_dry_run"
         });
+        let mismatched_job_error = sqlx::query(
+            "INSERT INTO agent_jobs \
+             (id, request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, 1, 'scope-test', $3, 'OfflineDryRun')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(scalar_request_id)
+        .bind(&spec)
+        .execute(pool)
+        .await
+        .expect_err("row/spec request-id divergence must be rejected");
+        assert_eq!(
+            mismatched_job_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
         sqlx::query(
-            "INSERT INTO agent_jobs (id, request_id, platform, spec, mode) \
-             VALUES ($1, $2, 'scope-test', $3, 'OfflineDryRun')",
+            "INSERT INTO agent_jobs \
+             (id, request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, 1, 'scope-test', $3, 'OfflineDryRun')",
         )
         .bind(job_id)
-        .bind(scalar_request_id)
+        .bind(spec_request_id)
         .bind(spec)
         .execute(pool)
         .await
@@ -66039,9 +66718,8 @@ mod db_lifecycle_tests {
                 event_type: "job.dead_lettered",
                 aggregate_type: "agent_job",
                 aggregate_id: &job_id_string,
-                // Deliberately contradictory: neither the scalar request id,
-                // event axes, nor payload may override the authoritative
-                // DEFRA/production spec request.
+                // Deliberately contradictory: neither event axes nor payload
+                // may override the authoritative DEFRA/production binding.
                 site: Some("GBLON"),
                 environment: Some("test"),
                 actor: "system",
@@ -66158,53 +66836,27 @@ mod db_lifecycle_tests {
         assert_eq!(ack_count_after, 1);
         assert_eq!(acknowledged_by, "agent-alert-defra");
 
-        // A request-linked shape whose spec parent is malformed is hidden and
-        // unacknowledgeable even to an unrestricted administrator. The guarded
-        // UUID cast must fail closed rather than abort the feed query.
+        // Malformed spec authority cannot be persisted for a handler to trust.
         let malformed_job_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_jobs (id, request_id, platform, spec, mode) \
-             VALUES ($1, $2, 'scope-test', '{\"request_id\":\"not-a-uuid\"}'::jsonb, \
+        let malformed_spec_error = sqlx::query(
+            "INSERT INTO agent_jobs \
+             (id, request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, 1, 'scope-test', \
+                     '{\"request_id\":\"not-a-uuid\",\"request_resource_version\":1,\"mode\":\"offline_dry_run\"}'::jsonb, \
                      'OfflineDryRun')",
         )
         .bind(malformed_job_id)
         .bind(scalar_request_id)
         .execute(pool)
         .await
-        .expect("seed malformed-spec agent job");
-        let malformed_job_id_string = malformed_job_id.to_string();
-        let malformed_event = crate::repos::domain_events::insert(
-            pool,
-            crate::repos::domain_events::NewEvent {
-                event_type: "job.dead_lettered",
-                aggregate_type: "agent_job",
-                aggregate_id: &malformed_job_id_string,
-                site: None,
-                environment: None,
-                actor: "system",
-                payload: json!({"to_status": "dead-lettered"}),
-            },
-        )
-        .await
-        .expect("seed malformed-spec alert");
-        let Json(malformed_events) = events_list(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Query(EventsQuery {
-                event_type: Some("job.dead_lettered".to_string()),
-                aggregate_id: Some(malformed_job_id_string),
-                limit: Some(50),
-            }),
-        )
-        .await
-        .expect("query malformed-spec generic events");
-        assert!(
-            malformed_events["events"].as_array().unwrap().is_empty(),
-            "malformed-spec agent-job events must fail closed even for unrestricted readers"
+        .expect_err("malformed spec request authority must be rejected");
+        assert_eq!(
+            malformed_spec_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
         );
-        assert!(matches!(
-            ack_alert_one(&AuthSession::static_dry_run(), pool, malformed_event, None,).await,
-            Err((StatusCode::NOT_FOUND, _))
-        ));
 
         // A missing job link is likewise hidden and unacknowledgeable even to
         // an unrestricted administrator.
@@ -66249,11 +66901,6 @@ mod db_lifecycle_tests {
             .ok();
         sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
             .bind(job_id)
-            .execute(pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(malformed_job_id)
             .execute(pool)
             .await
             .ok();
@@ -66453,9 +67100,13 @@ mod db_lifecycle_tests {
         let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("plan");
-        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
-            .await
-            .expect("approve");
+        let _ = requests_approve(
+            p(&id_str),
+            AuthExtractor(session.clone()),
+            reviewed_request_approval_body(&id_str).await,
+        )
+        .await
+        .expect("approve");
         let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("lock");
@@ -66604,9 +67255,13 @@ mod db_lifecycle_tests {
         let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("plan");
-        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
-            .await
-            .expect("approve");
+        let _ = requests_approve(
+            p(&id_str),
+            AuthExtractor(session.clone()),
+            reviewed_request_approval_body(&id_str).await,
+        )
+        .await
+        .expect("approve");
         let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("lock");
@@ -66797,9 +67452,13 @@ mod db_lifecycle_tests {
         let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("plan");
-        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
-            .await
-            .expect("approve");
+        let _ = requests_approve(
+            p(&id_str),
+            AuthExtractor(session.clone()),
+            reviewed_request_approval_body(&id_str).await,
+        )
+        .await
+        .expect("approve");
         let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("lock");
@@ -66853,11 +67512,15 @@ mod db_lifecycle_tests {
         };
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
+        let Json(reviewed_request) = reviewed_request_approval_body(&id_str).await;
+        let request_resource_version = reviewed_request.request_resource_version;
 
         let own = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(requester),
-            Json(placeholder_reviewed_plan_selection()),
+            Json(placeholder_reviewed_plan_selection(
+                request_resource_version,
+            )),
         )
         .await;
         assert!(
@@ -66872,7 +67535,9 @@ mod db_lifecycle_tests {
         let scoped = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(gblon_admin),
-            Json(placeholder_reviewed_plan_selection()),
+            Json(placeholder_reviewed_plan_selection(
+                request_resource_version,
+            )),
         )
         .await;
         assert!(
@@ -66885,7 +67550,9 @@ mod db_lifecycle_tests {
         let reachable = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(admin.clone()),
-            Json(placeholder_reviewed_plan_selection()),
+            Json(placeholder_reviewed_plan_selection(
+                request_resource_version,
+            )),
         )
         .await;
         assert!(
@@ -66924,12 +67591,16 @@ mod db_lifecycle_tests {
         };
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
+        let Json(reviewed_request) = reviewed_request_approval_body(&id_str).await;
+        let request_resource_version = reviewed_request.request_resource_version;
 
         // No completed live plan yet -> 409.
         let Err((st, _)) = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(admin.clone()),
-            Json(placeholder_reviewed_plan_selection()),
+            Json(placeholder_reviewed_plan_selection(
+                request_resource_version,
+            )),
         )
         .await
         else {
@@ -66943,8 +67614,12 @@ mod db_lifecycle_tests {
         let plan_bytes = reviewable_server_plan_bytes();
         let evidence_digest = ryuki_protocol::sha256_hex(&plan_bytes);
         let raw_plan_digest = "a".repeat(64);
-        let spec = ryuki_protocol::JobSpec {
+        let mut spec = ryuki_protocol::JobSpec {
             request_id: id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::try_from(
+                request_resource_version,
+            )
+            .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: ryuki_runner::iac::offering_iac_digest("linux-server-deployment")
@@ -66987,7 +67662,11 @@ mod db_lifecycle_tests {
         let cross_site = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(admin.clone()),
-            Json(reviewed_plan_selection(&cross_site_plan, &evidence_digest)),
+            Json(reviewed_plan_selection(
+                &cross_site_plan,
+                &evidence_digest,
+                request_resource_version,
+            )),
         )
         .await;
         assert!(matches!(cross_site, Err((StatusCode::CONFLICT, _))));
@@ -67029,7 +67708,11 @@ mod db_lifecycle_tests {
         let stale = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(admin.clone()),
-            Json(reviewed_plan_selection(&plan_a, &evidence_digest)),
+            Json(reviewed_plan_selection(
+                &plan_a,
+                &evidence_digest,
+                request_resource_version,
+            )),
         )
         .await;
         assert!(matches!(stale, Err((StatusCode::CONFLICT, _))));
@@ -67045,7 +67728,68 @@ mod db_lifecycle_tests {
             "stale or cross-site review mints nothing"
         );
 
-        let reviewed_selection = reviewed_plan_selection(&plan_b, &evidence_digest);
+        // The plan result backlink is the ONE allowed successor mutation: it
+        // records the exact plan identity/commitments and advances N -> N + 1.
+        let plan_b_backlink_version =
+            record_test_whole_request_live_plan_backlink(pool, id, &plan_b).await;
+        assert_eq!(plan_b_backlink_version, request_resource_version + 1);
+
+        // Any unrelated post-plan request edit advances the DB-owned version
+        // again. Refreshing the body to that newer version must not launder the
+        // older signed plan into fresh mutation authority.
+        sqlx::query("UPDATE requests SET justification = $2 WHERE id = $1")
+            .bind(id)
+            .bind("unrelated edit after the canonical live-plan backlink")
+            .execute(pool)
+            .await
+            .expect("advance request version after the live-plan backlink");
+        let stale_after_edit_version = read_global_row(pool, id).await.resource_version;
+        assert_eq!(stale_after_edit_version, plan_b_backlink_version + 1);
+        let stale_after_edit = requests_approve_live_apply(
+            p(&id_str),
+            AuthExtractor(admin.clone()),
+            Json(reviewed_plan_selection(
+                &plan_b,
+                &evidence_digest,
+                stale_after_edit_version,
+            )),
+        )
+        .await;
+        assert!(
+            matches!(stale_after_edit, Err((StatusCode::CONFLICT, _))),
+            "a refreshed body must not rebind an old plan after an unrelated edit: {stale_after_edit:?}"
+        );
+        let after_stale_edit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count LiveApply jobs after stale post-plan edit");
+        assert_eq!(after_stale_edit, 0, "stale lineage mints nothing");
+
+        // Re-plan at the exact new request version, then record that fresh
+        // plan's canonical backlink. This is the legitimate N -> N + 1 path.
+        spec.request_resource_version =
+            ryuki_protocol::RequestResourceVersion::try_from(stale_after_edit_version)
+                .expect("fresh plan version is positive");
+        let (plan_c, plan_agent_c) =
+            super::step_materialization_db_tests::seed_exact_signed_live_plan(
+                pool,
+                id,
+                "DEFRA",
+                &spec,
+                &raw_plan_digest,
+            )
+            .await;
+        let mutation_request_resource_version =
+            record_test_whole_request_live_plan_backlink(pool, id, &plan_c).await;
+        assert_eq!(
+            mutation_request_resource_version,
+            stale_after_edit_version + 1
+        );
+        let reviewed_selection =
+            reviewed_plan_selection(&plan_c, &evidence_digest, mutation_request_resource_version);
 
         // Admin approve -> mints exactly one LiveApply job (signed grant).
         let _ = requests_approve_live_apply(
@@ -67065,6 +67809,31 @@ mod db_lifecycle_tests {
         assert_eq!(
             la_count, 1,
             "a LiveApply job was minted from the approved plan"
+        );
+        let (row_version, spec_json, context_json): (
+            i64,
+            sqlx::types::Json<serde_json::Value>,
+            sqlx::types::Json<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT request_resource_version, spec, live_context FROM agent_jobs \
+             WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("load minted LiveApply lineage");
+        let apply_spec: ryuki_protocol::JobSpec =
+            serde_json::from_value(spec_json.0).expect("stored LiveApply spec");
+        let apply_grant: ryuki_protocol::VerifiedLiveContext =
+            serde_json::from_value(context_json.0).expect("stored LiveApply grant");
+        assert_eq!(row_version, mutation_request_resource_version);
+        assert_eq!(
+            i64::try_from(apply_spec.request_resource_version.get()).expect("wire version fits"),
+            mutation_request_resource_version
+        );
+        assert_eq!(
+            apply_grant.request_resource_version,
+            apply_spec.request_resource_version
         );
 
         // Idempotency: a second approve while a LiveApply is active -> 409, and
@@ -67099,7 +67868,12 @@ mod db_lifecycle_tests {
             .await
             .ok();
         cleanup_request(pool, id).await;
-        for plan_agent_id in [cross_site_agent_id, plan_agent_a, plan_agent_b] {
+        for plan_agent_id in [
+            cross_site_agent_id,
+            plan_agent_a,
+            plan_agent_b,
+            plan_agent_c,
+        ] {
             sqlx::query("DELETE FROM agents WHERE agent_id = $1")
                 .bind(&plan_agent_id)
                 .execute(pool)
@@ -67144,6 +67918,8 @@ mod db_lifecycle_tests {
         .expect("seed step");
         let spec = ryuki_protocol::JobSpec {
             request_id: req_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment".to_string(),
             iac_digest: ryuki_runner::iac::offering_iac_digest("linux-server-deployment")
@@ -67187,7 +67963,12 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .expect("link exact successful step LivePlan");
-        let reviewed_selection = reviewed_plan_selection(&approved_plan, &plan_digest);
+        let Json(reviewed_request) = reviewed_request_approval_body(&req_id.to_string()).await;
+        let reviewed_selection = reviewed_plan_selection(
+            &approved_plan,
+            &plan_digest,
+            reviewed_request.request_resource_version,
+        );
         (req_id, step_id, plan_agent_id, reviewed_selection)
     }
 
@@ -67392,9 +68173,13 @@ mod db_lifecycle_tests {
         let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("plan");
-        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
-            .await
-            .expect("approve");
+        let _ = requests_approve(
+            p(&id_str),
+            AuthExtractor(session.clone()),
+            reviewed_request_approval_body(&id_str).await,
+        )
+        .await
+        .expect("approve");
 
         let role = ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER;
         let count: i64 = sqlx::query_scalar(
@@ -67522,15 +68307,11 @@ mod db_lifecycle_tests {
         let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("plan");
-        let _ = requests_reject(
-            p(&id_str),
-            AuthExtractor(session.clone()),
-            Json(ReasonBody {
-                reason: "policy violation".into(),
-            }),
-        )
-        .await
-        .expect("reject");
+        let reviewed = reviewed_request_reject_body(&id_str, "policy violation").await;
+        let expected_resource_version = reviewed.0.request_resource_version;
+        let _ = requests_reject(p(&id_str), AuthExtractor(session.clone()), reviewed)
+            .await
+            .expect("reject");
 
         let (decision, reason): (String, Option<String>) = sqlx::query_as(
             "SELECT decision, reason FROM request_approval_decisions WHERE request_id = $1 AND role = $2",
@@ -67543,6 +68324,58 @@ mod db_lifecycle_tests {
         assert_eq!(decision, "rejected");
         assert_eq!(reason.as_deref(), Some("policy violation"));
         assert_eq!(read_global_row(pool, id).await.status, "rejected");
+        let audited_basis: Option<i64> = sqlx::query_scalar(
+            "SELECT (detail->>'approval_basis_resource_version')::bigint \
+             FROM audit_log WHERE request_id = $1 AND action = 'request.reject' \
+             AND outcome = 'applied' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("fetch rejection audit basis");
+        assert_eq!(audited_basis, Some(expected_resource_version));
+
+        cleanup_request(pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn requests_reject_db_rejects_a_stale_reviewed_resource_version() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_request(pool, "planned", "approve").await;
+        let reviewed_resource_version = read_global_row(pool, id).await.resource_version;
+        sqlx::query("UPDATE requests SET justification = $2 WHERE id = $1")
+            .bind(id)
+            .bind("changed after rejection review")
+            .execute(pool)
+            .await
+            .expect("advance request resource version");
+        let current = read_global_row(pool, id).await;
+        assert!(current.resource_version > reviewed_resource_version);
+
+        let err = requests_reject(
+            Path(id.to_string()),
+            AuthExtractor(approver_session()),
+            Json(RejectRequestBody {
+                reason: "policy violation".into(),
+                request_resource_version: reviewed_resource_version,
+            }),
+        )
+        .await
+        .expect_err("a stale reviewed request must not be rejected");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(read_global_row(pool, id).await.status, "planned");
+        let decisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_approval_decisions WHERE request_id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count decisions");
+        assert_eq!(decisions, 0);
 
         cleanup_request(pool, id).await;
     }
@@ -67561,12 +68394,15 @@ mod db_lifecycle_tests {
         for _ in 0..3 {
             ids.push(seed_request(pool, "planned", "approve").await);
         }
-        let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let mut items = Vec::with_capacity(ids.len());
+        for id in &ids {
+            items.push(reviewed_batch_reject_item(&id.to_string()).await);
+        }
 
         let Json(out) = requests_batch_reject(
             AuthExtractor(approver_session()),
             Json(BatchRejectRequest {
-                ids: id_strs.clone(),
+                items,
                 reason: "policy violation".into(),
             }),
         )
@@ -67608,11 +68444,16 @@ mod db_lifecycle_tests {
         // An already-terminal (rejected) request: the engine refuses re-rejection.
         let terminal = seed_request(pool, "rejected", "approve").await;
         let missing = Uuid::new_v4();
+        let items = vec![
+            reviewed_batch_reject_item(&valid.to_string()).await,
+            reviewed_batch_reject_item(&missing.to_string()).await,
+            reviewed_batch_reject_item(&terminal.to_string()).await,
+        ];
 
         let Json(out) = requests_batch_reject(
             AuthExtractor(approver_session()),
             Json(BatchRejectRequest {
-                ids: vec![valid.to_string(), missing.to_string(), terminal.to_string()],
+                items,
                 reason: "policy violation".into(),
             }),
         )
@@ -67675,7 +68516,7 @@ mod db_lifecycle_tests {
         let Err((status, _)) = requests_batch_reject(
             AuthExtractor(auditor),
             Json(BatchRejectRequest {
-                ids: vec![id.to_string()],
+                items: vec![reviewed_batch_reject_item(&id.to_string()).await],
                 reason: "no".into(),
             }),
         )
@@ -67725,7 +68566,10 @@ mod db_lifecycle_tests {
         let Json(out) = requests_batch_reject(
             AuthExtractor(defra),
             Json(BatchRejectRequest {
-                ids: vec![in_scope.to_string(), out_id.to_string()],
+                items: vec![
+                    reviewed_batch_reject_item(&in_scope.to_string()).await,
+                    reviewed_batch_reject_item(&out_id.to_string()).await,
+                ],
                 reason: "policy violation".into(),
             }),
         )
@@ -67885,6 +68729,8 @@ mod db_lifecycle_tests {
     ) -> Uuid {
         let spec = ryuki_protocol::JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -68868,9 +69714,14 @@ mod quorum_enforcement_db_tests {
         assert_eq!(read_row(pool, id).await.required_approval_roles, 1);
 
         let approver = approver("dc-1", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let Json(body) = requests_approve(Path(id.to_string()), AuthExtractor(approver))
-            .await
-            .expect("single approval must succeed");
+        let id_s = id.to_string();
+        let Json(body) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(approver),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("single approval must succeed");
         assert_eq!(body["quorum"]["quorum_met"], json!(true));
         assert_eq!(read_row(pool, id).await.status, "approved");
         assert_eq!(count_decisions(pool, id).await, 1);
@@ -68890,9 +69741,14 @@ mod quorum_enforcement_db_tests {
 
         // First approval (DatacenterApprover / dc-2) -> PARTIAL, stays Planned.
         let dc = approver("dc-2", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let Json(first) = requests_approve(Path(id.to_string()), AuthExtractor(dc))
-            .await
-            .expect("first partial approve is 200");
+        let id_s = id.to_string();
+        let Json(first) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("first partial approve is 200");
         assert_eq!(first["quorum"]["quorum_met"], json!(false));
         assert_eq!(first["quorum"]["approved_roles"], json!(1));
         assert_eq!(read_row(pool, id).await.status, "planned");
@@ -68902,9 +69758,13 @@ mod quorum_enforcement_db_tests {
 
         // Second, DISTINCT approver+role (PlatformAdmin / pa-2) -> quorum met.
         let pa = approver("pa-2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
-        let Json(second) = requests_approve(Path(id.to_string()), AuthExtractor(pa))
-            .await
-            .expect("second approve completes quorum");
+        let Json(second) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(pa),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("second approve completes quorum");
         assert_eq!(second["quorum"]["quorum_met"], json!(true));
         assert_eq!(read_row(pool, id).await.status, "approved");
         assert_eq!(count_decisions(pool, id).await, 2);
@@ -68947,7 +69807,13 @@ mod quorum_enforcement_db_tests {
             ryuki_engine::auth::APP_ROLE_BREAK_GLASS_ADMIN,
         );
         assert!(check_permission(&emergency, "approve"));
-        let denied = requests_approve(Path(id.to_string()), AuthExtractor(emergency)).await;
+        let id_s = id.to_string();
+        let denied = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(emergency),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await;
         assert!(matches!(denied, Err((StatusCode::FORBIDDEN, _))));
         assert_eq!(read_row(pool, id).await.status, "planned");
         assert_eq!(count_decisions(pool, id).await, 0);
@@ -68971,9 +69837,14 @@ mod quorum_enforcement_db_tests {
             "dc-old-cycle",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
-        let Json(old_partial) = requests_approve(Path(id.to_string()), AuthExtractor(old_dc))
-            .await
-            .expect("old-cycle partial approval");
+        let id_s = id.to_string();
+        let Json(old_partial) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(old_dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("old-cycle partial approval");
         assert_eq!(old_partial["quorum"]["quorum_met"], json!(false));
         assert_eq!(old_partial["quorum"]["approval_epoch"], json!(1));
         assert_eq!(read_row(pool, id).await.approval_epoch, 1);
@@ -69011,9 +69882,13 @@ mod quorum_enforcement_db_tests {
             "pa-fresh-cycle",
             ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
         );
-        let Json(fresh_partial) = requests_approve(Path(id.to_string()), AuthExtractor(fresh_pa))
-            .await
-            .expect("fresh first approval");
+        let Json(fresh_partial) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(fresh_pa),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("fresh first approval");
         assert_eq!(fresh_partial["quorum"]["quorum_met"], json!(false));
         assert_eq!(fresh_partial["quorum"]["approval_epoch"], json!(2));
         assert_eq!(fresh_partial["quorum"]["approved_roles"], json!(1));
@@ -69024,9 +69899,13 @@ mod quorum_enforcement_db_tests {
             "dc-fresh-cycle",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
-        let Json(completed) = requests_approve(Path(id.to_string()), AuthExtractor(fresh_dc))
-            .await
-            .expect("fresh second approval completes quorum");
+        let Json(completed) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(fresh_dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("fresh second approval completes quorum");
         assert_eq!(completed["quorum"]["quorum_met"], json!(true));
         assert_eq!(completed["quorum"]["approval_epoch"], json!(2));
         assert_eq!(read_row(pool, id).await.status, "approved");
@@ -69074,9 +69953,14 @@ mod quorum_enforcement_db_tests {
             "dc-before-race",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(old_dc))
-            .await
-            .expect("seed partial decision");
+        let id_s = id.to_string();
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(old_dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("seed partial decision");
 
         let a = approver("pa-rework-a", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
         let b = approver(
@@ -69152,9 +70036,14 @@ mod quorum_enforcement_db_tests {
             "dc-migration-174",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc))
-            .await
-            .expect("seed a legitimate current-epoch partial decision");
+        let id_s = id.to_string();
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("seed a legitimate current-epoch partial decision");
         assert_eq!(read_row(pool, id).await.approval_epoch, 1);
         assert_eq!(count_current_decisions(pool, id).await, 1);
 
@@ -69250,6 +70139,168 @@ mod quorum_enforcement_db_tests {
         tx.rollback()
             .await
             .expect("roll back constraint-collision fixture");
+    }
+
+    #[tokio::test]
+    async fn request_resource_version_is_database_owned_monotonic_and_fail_closed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let mut tx = pool.begin().await.expect("begin resource-version test");
+        sqlx::query("SET LOCAL ryuki.force_request_runtime_contract = 'runtime-v1'")
+            .execute(&mut *tx)
+            .await
+            .expect("force the production request-resource branch");
+        let id = Uuid::new_v4();
+
+        let inserted_version: i64 = sqlx::query_scalar(
+            "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, cpu, \
+                  memory_gb, created_by, requester, owner, resource_version) \
+             VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', \
+                     'production', 'resource-version-fixture', 2, 4, \
+                     'version-maker', 'version-maker', 'version-maker', 99) \
+             RETURNING resource_version",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("database normalizes a caller-selected insert version");
+        assert_eq!(inserted_version, 1);
+
+        let advanced_version: i64 = sqlx::query_scalar(
+            "UPDATE requests SET name = 'resource-version-advanced', updated_at = NOW() \
+             WHERE id = $1 RETURNING resource_version",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("meaningful request update advances the version");
+        assert_eq!(advanced_version, 2);
+
+        let timestamp_only_version: i64 = sqlx::query_scalar(
+            "UPDATE requests SET updated_at = updated_at + INTERVAL '1 second' \
+             WHERE id = $1 RETURNING resource_version",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("bookkeeping-only update remains admissible");
+        assert_eq!(timestamp_only_version, 2);
+
+        sqlx::query("SAVEPOINT caller_version_reuse")
+            .execute(&mut *tx)
+            .await
+            .expect("savepoint caller version reuse");
+        let reuse =
+            sqlx::query("UPDATE requests SET resource_version = resource_version WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .expect_err("even a same-value caller assignment must be rejected");
+        assert!(reuse
+            .to_string()
+            .contains("request resource_version is database-managed"));
+        sqlx::query("ROLLBACK TO SAVEPOINT caller_version_reuse")
+            .execute(&mut *tx)
+            .await
+            .expect("recover caller version reuse");
+
+        sqlx::query("SAVEPOINT caller_version_rollback")
+            .execute(&mut *tx)
+            .await
+            .expect("savepoint caller version rollback");
+        let rollback = sqlx::query("UPDATE requests SET resource_version = 1 WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("a caller cannot roll the version back");
+        assert!(rollback
+            .to_string()
+            .contains("request resource_version is database-managed"));
+        sqlx::query("ROLLBACK TO SAVEPOINT caller_version_rollback")
+            .execute(&mut *tx)
+            .await
+            .expect("recover caller version rollback");
+        let guarded_version: i64 =
+            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read caller-guarded version");
+        assert_eq!(guarded_version, 2);
+
+        sqlx::query("SAVEPOINT request_resource_delete")
+            .execute(&mut *tx)
+            .await
+            .expect("savepoint request resource delete");
+        let deletion = sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("the runtime cannot delete and recreate a canonical request id");
+        assert!(deletion
+            .to_string()
+            .contains("cannot be deleted or truncated by the runtime"));
+        sqlx::query("ROLLBACK TO SAVEPOINT request_resource_delete")
+            .execute(&mut *tx)
+            .await
+            .expect("recover request resource delete");
+
+        // Exercise the installed trigger function against an isolated terminal
+        // BIGINT fixture. The live requests row remains protected by its
+        // database-owned trigger throughout the test.
+        sqlx::raw_sql(
+            "CREATE TEMPORARY TABLE request_resource_version_overflow_fixture (
+                 name TEXT NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 resource_version BIGINT NOT NULL CHECK (resource_version > 0)
+             ) ON COMMIT DROP;
+             INSERT INTO request_resource_version_overflow_fixture (name, resource_version)
+             VALUES ('resource-version-advanced', 9223372036854775807);
+             CREATE TRIGGER request_resource_version_overflow_fixture_advance
+             BEFORE UPDATE ON request_resource_version_overflow_fixture
+             FOR EACH ROW EXECUTE FUNCTION advance_request_resource_version();",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("install isolated overflow fixture");
+
+        sqlx::query("SAVEPOINT resource_version_overflow")
+            .execute(&mut *tx)
+            .await
+            .expect("savepoint resource version overflow");
+        let overflow = sqlx::query(
+            "UPDATE request_resource_version_overflow_fixture
+             SET name = 'resource-version-must-not-wrap'",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect_err("an exhausted version must fail the meaningful update");
+        assert!(overflow
+            .to_string()
+            .contains("request resource_version exhausted"));
+        sqlx::query("ROLLBACK TO SAVEPOINT resource_version_overflow")
+            .execute(&mut *tx)
+            .await
+            .expect("recover resource version overflow");
+        let preserved: (String, i64) = sqlx::query_as(
+            "SELECT name, resource_version FROM request_resource_version_overflow_fixture",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read preserved overflow fixture");
+        assert_eq!(
+            preserved,
+            ("resource-version-advanced".into(), i64::MAX),
+            "overflow must preserve both state and the terminal version"
+        );
+
+        tx.rollback()
+            .await
+            .expect("roll back resource-version fixtures");
     }
 
     #[tokio::test]
@@ -69854,9 +70905,14 @@ mod quorum_enforcement_db_tests {
             "immutable-basis-checker",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
         );
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(first_checker))
-            .await
-            .expect("record first partial approval");
+        let id_s = id.to_string();
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(first_checker),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("record first partial approval");
         assert_eq!(count_current_decisions(pool, id).await, 1);
 
         let in_place_rewrite = sqlx::query(
@@ -69925,7 +70981,10 @@ mod quorum_enforcement_db_tests {
         let Json(out) = requests_batch_approve(
             AuthExtractor(approver),
             Json(BatchApproveRequest {
-                ids: vec![a.to_string(), b.to_string()],
+                items: vec![
+                    reviewed_batch_approval_item(&a.to_string()).await,
+                    reviewed_batch_approval_item(&b.to_string()).await,
+                ],
             }),
         )
         .await
@@ -69966,7 +71025,7 @@ mod quorum_enforcement_db_tests {
         let Json(first) = requests_batch_approve(
             AuthExtractor(dc),
             Json(BatchApproveRequest {
-                ids: vec![id.to_string()],
+                items: vec![reviewed_batch_approval_item(&id.to_string()).await],
             }),
         )
         .await
@@ -69991,7 +71050,7 @@ mod quorum_enforcement_db_tests {
         let Json(second) = requests_batch_approve(
             AuthExtractor(pa),
             Json(BatchApproveRequest {
-                ids: vec![id.to_string()],
+                items: vec![reviewed_batch_approval_item(&id.to_string()).await],
             }),
         )
         .await
@@ -70019,15 +71078,23 @@ mod quorum_enforcement_db_tests {
         assert!(matches!(
             requests_batch_approve(
                 AuthExtractor(dc()),
-                Json(BatchApproveRequest { ids: vec![] })
+                Json(BatchApproveRequest { items: vec![] })
             )
             .await,
             Err((StatusCode::BAD_REQUEST, _))
         ));
-        let many: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        let many: Vec<BatchApprovalItem> = (0..101)
+            .map(|i| BatchApprovalItem {
+                id: format!("id-{i}"),
+                request_resource_version: 1,
+            })
+            .collect();
         assert!(matches!(
-            requests_batch_approve(AuthExtractor(dc()), Json(BatchApproveRequest { ids: many }))
-                .await,
+            requests_batch_approve(
+                AuthExtractor(dc()),
+                Json(BatchApproveRequest { items: many })
+            )
+            .await,
             Err((StatusCode::BAD_REQUEST, _))
         ));
 
@@ -70051,7 +71118,7 @@ mod quorum_enforcement_db_tests {
         let Err((status, _)) = requests_batch_approve(
             AuthExtractor(operator),
             Json(BatchApproveRequest {
-                ids: vec![id.to_string()],
+                items: vec![reviewed_batch_approval_item(&id.to_string()).await],
             }),
         )
         .await
@@ -70081,16 +71148,21 @@ mod quorum_enforcement_db_tests {
         let valid = seed_planned(pool, "ba-dedup").await;
         let missing = Uuid::new_v4();
         let approver = approver("dc-dedup", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let valid_item = reviewed_batch_approval_item(&valid.to_string()).await;
+        let missing_item = reviewed_batch_approval_item(&missing.to_string()).await;
         let Json(out) = requests_batch_approve(
             AuthExtractor(approver),
             Json(BatchApproveRequest {
                 // valid duplicated + a missing id.
                 // valid twice (incl. an UPPERCASE alias — codex: UUIDs are
                 // case-insensitive, so both spellings must dedup to ONE) + a missing id.
-                ids: vec![
-                    valid.to_string(),
-                    valid.to_string().to_uppercase(),
-                    missing.to_string(),
+                items: vec![
+                    valid_item.clone(),
+                    BatchApprovalItem {
+                        id: valid.to_string().to_uppercase(),
+                        request_resource_version: valid_item.request_resource_version,
+                    },
+                    missing_item,
                 ],
             }),
         )
@@ -70134,12 +71206,25 @@ mod quorum_enforcement_db_tests {
 
         let a = approver("dc-cc", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
         let b = approver("pa-cc", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let id_s = id.to_string();
+        let Json(reviewed) = reviewed_request_approval_body(&id_s).await;
         let (ra, rb) = tokio::join!(
-            requests_approve(Path(id.to_string()), AuthExtractor(a)),
-            requests_approve(Path(id.to_string()), AuthExtractor(b)),
+            requests_approve(Path(id_s.clone()), AuthExtractor(a.clone()), Json(reviewed),),
+            requests_approve(Path(id_s.clone()), AuthExtractor(b.clone()), Json(reviewed),),
         );
-        assert!(ra.is_ok(), "approver A call failed: {ra:?}");
-        assert!(rb.is_ok(), "approver B call failed: {rb:?}");
+        assert_eq!(
+            usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+            1,
+            "one exact reviewed snapshot wins and the other must go stale: A={ra:?}, B={rb:?}"
+        );
+        let retry_actor = if ra.is_err() { a } else { b };
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(retry_actor),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("the stale approver can refresh and complete the quorum");
 
         // Final invariant: quorum met (approved) with BOTH approvers on the route.
         let final_row = read_row(pool, id).await;
@@ -70171,9 +71256,14 @@ mod quorum_enforcement_db_tests {
 
         // One partial approve.
         let dc = approver("dc-3", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc))
-            .await
-            .expect("partial approve");
+        let id_s = id.to_string();
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("partial approve");
         assert_eq!(read_row(pool, id).await.status, "planned");
 
         // A distinct third principal REJECTS -> terminal.
@@ -70181,9 +71271,7 @@ mod quorum_enforcement_db_tests {
         let _ = requests_reject(
             Path(id.to_string()),
             AuthExtractor(rej),
-            Json(ReasonBody {
-                reason: "blocked by security".into(),
-            }),
+            reviewed_request_reject_body(&id.to_string(), "blocked by security").await,
         )
         .await
         .expect("reject from planned");
@@ -70194,9 +71282,13 @@ mod quorum_enforcement_db_tests {
 
         // A subsequent approve is refused by the engine from-status guard (400).
         let late = approver("dc-3b", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let err = requests_approve(Path(id.to_string()), AuthExtractor(late))
-            .await
-            .expect_err("approve after reject must fail");
+        let err = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(late),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect_err("approve after reject must fail");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         cleanup(pool, id).await;
     }
@@ -70223,7 +71315,14 @@ mod quorum_enforcement_db_tests {
 
         let sess = approver("racer", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
         let role = approval_role_for(&sess).expect("ordinary approval role");
-        let res = apply_approval_decision_audited(pool, &sess, id, &role).await;
+        let res = apply_approval_decision_audited(
+            pool,
+            &sess,
+            id,
+            &role,
+            read_row(pool, id).await.resource_version,
+        )
+        .await;
         assert!(
             matches!(res, Err((StatusCode::BAD_REQUEST, _))),
             "a non-planned status at lock time must be the engine 400: {res:?}"
@@ -70269,13 +71368,22 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-self", 2).await;
 
         let same = approver("solo-q", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(same.clone()))
-            .await
-            .expect("first approve");
+        let id_s = id.to_string();
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(same.clone()),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("first approve");
         // Same principal + role approves again -> idempotent, still Planned.
-        let Json(again) = requests_approve(Path(id.to_string()), AuthExtractor(same))
-            .await
-            .expect("re-approve is 200");
+        let Json(again) = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(same),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("re-approve is 200");
         assert_eq!(again["quorum"]["quorum_met"], json!(false));
         assert_eq!(again["quorum"]["distinct_approvers"], json!(1));
         assert_eq!(read_row(pool, id).await.status, "planned");
@@ -70295,16 +71403,25 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-idem", 2).await;
 
         let dc = approver("dc-idem", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc.clone()))
-            .await
-            .expect("first approve");
+        let id_s = id.to_string();
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(dc.clone()),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("first approve");
         let audit_after_first = count_audit(pool, id, "request.approval_recorded").await;
         let events_after_first = count_events(pool, id, "request.approval_recorded").await;
 
         // Re-approve by the SAME role -> short-circuit: no new decision/audit/event.
-        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc))
-            .await
-            .expect("re-approve is 200");
+        let _ = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await
+        .expect("re-approve is 200");
         assert_eq!(
             count_decisions(pool, id).await,
             1,
@@ -70336,7 +71453,13 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-no409", 2).await;
 
         let dc = approver("dc-no409", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let res = requests_approve(Path(id.to_string()), AuthExtractor(dc)).await;
+        let id_s = id.to_string();
+        let res = requests_approve(
+            Path(id_s.clone()),
+            AuthExtractor(dc),
+            reviewed_request_approval_body(&id_s).await,
+        )
+        .await;
         assert!(
             res.is_ok(),
             "a partial Planned->Planned approve must be 200, not a 409: {res:?}"

@@ -340,6 +340,7 @@ struct AgentApprovalRow {
 struct AgentJobRow {
     id: Uuid,
     request_id: Uuid,
+    request_resource_version: i64,
     platform: String,
     spec: sqlx::types::Json<Value>,
     mode: String,
@@ -356,7 +357,8 @@ struct AgentJobRow {
     updated_at: chrono::DateTime<Utc>,
 }
 
-const AGENT_JOB_COLUMNS: &str = "id, request_id, platform, spec, mode, status, \
+const AGENT_JOB_COLUMNS: &str =
+    "id, request_id, request_resource_version, platform, spec, mode, status, \
     agent_id, attempt_id, lease_generation, fencing_token, cp_nonce, \
     lease_deadline, live_context, created_at, updated_at";
 
@@ -1975,6 +1977,11 @@ pub(crate) async fn lease_pending_job(
     // return to that agent. The oldest pending live job is the sole unbound
     // affinity anchor, preventing concurrent first leases of sibling jobs from
     // establishing different agents for one key.
+    //
+    // The correlated request lookup takes FOR SHARE while the candidate is
+    // qualified, before the candidate's FOR UPDATE lock. This both serializes
+    // against a concurrent request-version advance and preserves the global
+    // requests -> agent_jobs lock order.
     let row = sqlx::query_as::<_, AgentJobRow>(&format!(
         "UPDATE agent_jobs \
          SET status = 'Leased', \
@@ -1989,6 +1996,11 @@ pub(crate) async fn lease_pending_job(
              SELECT pending.id FROM agent_jobs AS pending \
              WHERE pending.platform = $6 AND pending.status = 'Pending' \
                AND (pending.agent_id IS NULL OR pending.agent_id = $1) \
+               AND pending.request_resource_version = ( \
+                 SELECT request.resource_version FROM requests AS request \
+                 WHERE request.id = pending.request_id \
+                 FOR SHARE \
+               ) \
                AND ( \
                  pending.live_context IS NULL \
                  OR ( \
@@ -2247,8 +2259,9 @@ pub async fn ack_job(
     let job_id = parse_agent_job_id(&job_id_str)?;
 
     // Atomic conditional UPDATE: transitions Leased → Running in a single
-    // statement. All four conditions (status, attempt_id, fencing_token,
-    // lease_deadline) are evaluated by the DB in one round-trip, eliminating
+    // statement. The lease fence and current parent-request resource version
+    // are evaluated by the DB in one round-trip. FOR SHARE keeps that parent
+    // version stable through the job UPDATE, eliminating
     // the TOCTOU window that existed in the previous read-then-write approach.
     // A concurrent expire/re-lease between a SELECT and this UPDATE can no
     // longer clobber a stale ack into Running.
@@ -2267,6 +2280,11 @@ pub async fn ack_job(
            AND job.attempt_id = $2 \
            AND job.fencing_token = $3 \
            AND job.lease_deadline >= NOW() \
+           AND job.request_resource_version = ( \
+             SELECT request.resource_version FROM requests AS request \
+             WHERE request.id = job.request_id \
+             FOR SHARE \
+           ) \
          RETURNING job.id",
     )
     .bind(job_id)
@@ -2290,11 +2308,21 @@ pub async fn ack_job(
         status: String,
         attempt_id: Option<Uuid>,
         lease_deadline: Option<chrono::DateTime<Utc>>,
+        fencing_token_matches: bool,
+        request_resource_version: i64,
+        current_request_resource_version: Option<i64>,
     }
     let existing = sqlx::query_as::<_, StatusRow>(
-        "SELECT agent_id, status, attempt_id, lease_deadline FROM agent_jobs WHERE id = $1",
+        "SELECT job.agent_id, job.status, job.attempt_id, job.lease_deadline, \
+                COALESCE(job.fencing_token = $2, FALSE) AS fencing_token_matches, \
+                job.request_resource_version, \
+                request.resource_version AS current_request_resource_version \
+         FROM agent_jobs AS job \
+         LEFT JOIN requests AS request ON request.id = job.request_id \
+         WHERE job.id = $1",
     )
     .bind(job_id)
+    .bind(&body.fencing_token)
     .fetch_optional(pool)
     .await
     .map_err(db_err)?;
@@ -2327,8 +2355,12 @@ pub async fn ack_job(
         "attempt_id mismatch — lease has been superseded".to_string()
     } else if row.lease_deadline.map(|d| d < Utc::now()).unwrap_or(true) {
         "lease has expired".to_string()
-    } else {
+    } else if !row.fencing_token_matches {
         "fencing_token mismatch".to_string()
+    } else if row.current_request_resource_version != Some(row.request_resource_version) {
+        "request changed after this job was dispatched".to_string()
+    } else {
+        "job lease changed while the acknowledgement was processed".to_string()
     };
 
     Err(conflict(reason))
@@ -3184,7 +3216,7 @@ fn protocol_version_is_supported(v: u32) -> bool {
 /// - absent                     → `PROTOCOL_VERSION_LEGACY` (1)
 ///
 /// The resolved value is then ALWAYS checked against
-/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v6-only allowlist therefore
+/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v7-only allowlist therefore
 /// rejects an absent header as legacy v1; omission is never a compatibility
 /// bypass. Used by the [`ProtocolVersion`] extractor.
 fn resolve_protocol_version(headers: &HeaderMap) -> Result<u32, (StatusCode, Json<Value>)> {
@@ -3333,12 +3365,16 @@ async fn advance_request_out_of_executing(
     // harmlessly — the job result is already durably recorded).
     let advanced = sqlx::query(
         "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, updated_at = NOW() \
-         WHERE id = $4 AND status = 'executing'",
+         WHERE id = $4 AND status = 'executing' \
+           AND resource_version = ( \
+             SELECT request_resource_version FROM agent_jobs WHERE id = $5 \
+           )",
     )
     .bind(new_status)
     .bind(new_stage)
     .bind(&stages_json)
     .bind(request_id)
+    .bind(job_id)
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -3444,10 +3480,14 @@ async fn record_live_plan_awaiting_apply(
 
     let recorded = sqlx::query(
         "UPDATE requests SET stages = $1::jsonb, updated_at = NOW() \
-         WHERE id = $2 AND status = 'executing'",
+         WHERE id = $2 AND status = 'executing' \
+           AND resource_version = ( \
+             SELECT request_resource_version FROM agent_jobs WHERE id = $3 \
+           )",
     )
     .bind(&stages_json)
     .bind(request_id)
+    .bind(job_id)
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -4029,6 +4069,7 @@ async fn post_job_result_with_pool(
         // Fix 3: platform and request_id loaded from DB to bind signed context.
         platform: String,
         request_id: uuid::Uuid,
+        request_resource_version: i64,
         // S5: the CP-signed approval grant for LiveApply jobs (NULL otherwise).
         live_context: Option<sqlx::types::Json<serde_json::Value>>,
         result_id: Option<uuid::Uuid>,
@@ -4043,7 +4084,7 @@ async fn post_job_result_with_pool(
 
     let row = sqlx::query_as::<_, JobForResult>(
         "SELECT id, status, agent_id, attempt_id, lease_generation, cp_nonce, spec, mode, \
-         platform, request_id, live_context, \
+         platform, request_id, request_resource_version, live_context, \
          result_id, result_status, evidence_digest, raw_plan_digest, completed_at, origin \
          FROM agent_jobs WHERE id = $1",
     )
@@ -4269,6 +4310,16 @@ async fn post_job_result_with_pool(
             "envelope.request_id does not match the dispatched job spec's request_id",
         ));
     }
+    if row.request_id != stored_spec.request_id
+        || row.request_resource_version <= 0
+        || ryuki_protocol::RequestResourceVersion::try_from(row.request_resource_version).ok()
+            != Some(stored_spec.request_resource_version)
+        || env.request_resource_version != stored_spec.request_resource_version
+    {
+        return Err(bad_request(
+            "request id/version binding differs across the job row, spec, or signed envelope",
+        ));
+    }
 
     // ── Step 7b: canonical live execution profile ──────────────────────────
     // Every non-refusal live result signs the complete non-secret profile.
@@ -4399,9 +4450,11 @@ async fn post_job_result_with_pool(
                 // The grant authorizes the exact stored JobSpec, including its
                 // mode, IaC digest/variables, and Terraform state key. This is
                 // the CP-side mirror of the agent's pre-mutation check.
-                if grant.job_spec_digest != recomputed_spec_digest {
+                if grant.job_spec_digest != recomputed_spec_digest
+                    || grant.request_resource_version != stored_spec.request_resource_version
+                {
                     return Err(bad_request(
-                        "approval grant job_spec_digest does not match the dispatched job spec",
+                        "approval grant does not match the dispatched job spec/version",
                     ));
                 }
 
@@ -4573,6 +4626,27 @@ async fn post_job_result_with_pool(
     // transaction: a job that records its result also advances its request, and
     // vice versa — never one without the other.
     let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // Current-version freshness gates only the first terminal acceptance. An
+    // exact idempotent replay arrives after the original backlink may have
+    // advanced the request version and must remain replayable after full
+    // signature/stored-copy verification above. Locking the request before the
+    // job CAS also prevents a lifecycle writer from changing it between this
+    // check and the backlink.
+    if matches!(row.status.as_str(), "Leased" | "Running") {
+        let current_request_version: Option<i64> =
+            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1 FOR UPDATE")
+                .bind(row.request_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        if current_request_version != Some(row.request_resource_version) {
+            tx.rollback().await.ok();
+            return Err(conflict(
+                "request changed after this job was dispatched; stale result requires reconciliation",
+            ));
+        }
+    }
 
     // #60 slice 2: persist the raw evidence bytes BEFORE the terminal UPDATE,
     // in the SAME transaction, so a stored offload reference can never point
@@ -4772,11 +4846,17 @@ async fn post_job_result_with_pool(
         if is_drift_recheck_replan(&stored_mode, &env.status, row.origin.as_deref()) {
             let verdict = ryuki_engine::post_apply::classify_plan_json(&body.evidence);
             if verdict != ryuki_engine::post_apply::PostApplyOutcome::Inconclusive {
-                sqlx::query("UPDATE requests SET last_drift_check_at = NOW() WHERE id = $1")
-                    .bind(stored_spec.request_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(db_err)?;
+                sqlx::query(
+                    "UPDATE requests SET last_drift_check_at = NOW() \
+                     WHERE id = $1 AND resource_version = ( \
+                       SELECT request_resource_version FROM agent_jobs WHERE id = $2 \
+                     )",
+                )
+                .bind(stored_spec.request_id)
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
             }
         }
 
@@ -4909,6 +4989,9 @@ async fn renew_running_job_lease(
     agent_id: &str,
     fence: &RunningLeaseFence,
 ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    // Match ack/lease lock ordering: qualify and FOR SHARE-lock the parent
+    // request before updating its job, so a concurrent version advance orders
+    // wholly before (and fails) or after this renewal.
     sqlx::query_scalar::<_, DateTime<Utc>>(
         "UPDATE agent_jobs AS job \
          SET lease_deadline = NOW() + make_interval( \
@@ -4924,6 +5007,11 @@ async fn renew_running_job_lease(
            AND job.lease_generation = $4 \
            AND job.fencing_token = $5 \
            AND job.lease_deadline > NOW() \
+           AND job.request_resource_version = ( \
+             SELECT request.resource_version FROM requests AS request \
+             WHERE request.id = job.request_id \
+             FOR SHARE \
+           ) \
          RETURNING job.lease_deadline",
     )
     .bind(fence.job_id)
@@ -5279,13 +5367,18 @@ pub async fn create_agent_job(
     mode: &str,
 ) -> Result<Uuid, sqlx::Error> {
     let spec_json = serde_json::to_value(spec).expect("JobSpec serialisation is infallible");
+    let request_resource_version =
+        i64::try_from(spec.request_resource_version.get()).map_err(|_| {
+            sqlx::Error::Protocol("request resource version exceeds PostgreSQL BIGINT".into())
+        })?;
 
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
-         VALUES ($1, $2, $3, $4) \
+        "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode) \
+         VALUES ($1, $2, $3, $4, $5) \
          RETURNING id",
     )
     .bind(request_id)
+    .bind(request_resource_version)
     .bind(platform)
     .bind(&spec_json)
     .bind(mode)
@@ -5581,6 +5674,11 @@ pub enum CreateLiveApplyJobError {
     /// Maps to 409 Conflict.
     #[error("multi-step requests are executed step-by-step and do not support single live-apply")]
     HasStepPlan,
+    /// The successful plan is historical truth at version N, but the locked
+    /// request does not carry the exact durable result backlink at N + 1.
+    /// This is a stale-state conflict, not malformed caller input.
+    #[error("live-plan backlink lineage conflict: {0}")]
+    PlanLineageConflict(&'static str),
     /// A database error occurred while enqueuing the job.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -5609,10 +5707,108 @@ pub struct ApprovedPlanReference {
     pub expected_execution_authority: Option<LiveExecutionAuthority>,
 }
 
+/// Validate the durable whole-request LivePlan -> LiveApply handoff receipt.
+///
+/// A successful plan remains truthfully signed at request version N. Recording
+/// that result is the one authorized request mutation: it writes the exact plan
+/// identity and commitments into the execute-stage metadata and advances the
+/// DB-owned request version to N + 1. The pair (N + 1, exact metadata) is the
+/// receipt that allows a LiveApply grant to be minted. Any unrelated later
+/// request mutation advances the version again and invalidates the receipt.
+pub(crate) struct WholeRequestLivePlanLineage<'a> {
+    pub request_status: &'a str,
+    pub request_stage: &'a str,
+    pub request_resource_version: i64,
+    pub request_stages: &'a Value,
+    pub mutation_request_resource_version: ryuki_protocol::RequestResourceVersion,
+    pub plan_job_id: Uuid,
+    pub plan_row_request_resource_version: i64,
+    pub plan_spec_request_resource_version: ryuki_protocol::RequestResourceVersion,
+    pub plan_result_status: &'a str,
+    pub plan_evidence_digest: &'a str,
+    pub plan_raw_plan_digest: &'a str,
+}
+
+pub(crate) fn validate_whole_request_live_plan_lineage(
+    lineage: WholeRequestLivePlanLineage<'_>,
+) -> Result<(), &'static str> {
+    let WholeRequestLivePlanLineage {
+        request_status,
+        request_stage,
+        request_resource_version,
+        request_stages,
+        mutation_request_resource_version,
+        plan_job_id,
+        plan_row_request_resource_version,
+        plan_spec_request_resource_version,
+        plan_result_status,
+        plan_evidence_digest,
+        plan_raw_plan_digest,
+    } = lineage;
+    if request_status != "executing" || request_stage != "execute" {
+        return Err("request is not awaiting live-apply approval in executing/execute");
+    }
+    if plan_result_status != "planned" {
+        return Err("live-plan receipt does not record a planned result");
+    }
+
+    let plan_row_version =
+        ryuki_protocol::RequestResourceVersion::try_from(plan_row_request_resource_version)
+            .map_err(|_| "stored live-plan request version is invalid")?;
+    if plan_row_version != plan_spec_request_resource_version {
+        return Err("live-plan row and signed spec request versions differ");
+    }
+    let expected_current_i64 = plan_row_request_resource_version
+        .checked_add(1)
+        .ok_or("live-plan request version cannot advance")?;
+    let expected_current = ryuki_protocol::RequestResourceVersion::try_from(expected_current_i64)
+        .map_err(|_| "live-plan request version cannot advance")?;
+    let current = ryuki_protocol::RequestResourceVersion::try_from(request_resource_version)
+        .map_err(|_| "current request version is invalid")?;
+    if current != expected_current || mutation_request_resource_version != expected_current {
+        return Err("current request version is not the exact live-plan backlink successor");
+    }
+
+    let stages = serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(request_stages.clone())
+        .map_err(|_| "request stages do not contain a valid live-plan backlink receipt")?;
+    let mut execute_stages = stages.iter().filter(|stage| stage.name == "execute");
+    let execute = execute_stages
+        .next()
+        .ok_or("request has no execute-stage live-plan backlink receipt")?;
+    if execute_stages.next().is_some()
+        || execute.status != ryuki_engine::models::StageStatus::InProgress
+    {
+        return Err("request execute-stage live-plan backlink receipt is ambiguous or inactive");
+    }
+    let expected_job_id = plan_job_id.to_string();
+    if execute.metadata.get("live_plan_job_id").map(String::as_str)
+        != Some(expected_job_id.as_str())
+        || execute
+            .metadata
+            .get("live_plan_result_status")
+            .map(String::as_str)
+            != Some(plan_result_status)
+        || execute
+            .metadata
+            .get("live_plan_evidence_digest")
+            .map(String::as_str)
+            != Some(plan_evidence_digest)
+        || execute
+            .metadata
+            .get("live_plan_raw_plan_digest")
+            .map(String::as_str)
+            != Some(plan_raw_plan_digest)
+    {
+        return Err("request execute-stage metadata does not match the exact live plan");
+    }
+    Ok(())
+}
+
 type SuccessfulPlanAuthorityRow = (
     String,
     sqlx::types::Json<Value>,
     sqlx::types::Json<Value>,
+    i64,
     Uuid,
     String,
     String,
@@ -5623,6 +5819,14 @@ type SuccessfulPlanAuthorityRow = (
     String,
     String,
     Vec<u8>,
+);
+
+type WholeRequestPlanReceiptRow = (
+    i64,
+    sqlx::types::Json<Value>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// Resolve and re-verify the exact immutable enrollment and canonical
@@ -5644,7 +5848,7 @@ async fn successful_plan_execution_authority(
             "live mutation has no state key",
         ))?;
     let row: Option<SuccessfulPlanAuthorityRow> = sqlx::query_as(
-        "SELECT j.agent_id, j.signed_envelope, j.spec, \
+        "SELECT j.agent_id, j.signed_envelope, j.spec, j.request_resource_version, \
                 a.id, a.public_key, a.status, a.platform, \
                 j.attempt_id, j.lease_generation, j.result_id, \
                 j.evidence_digest, j.raw_plan_digest, eb.bytes \
@@ -5670,6 +5874,7 @@ async fn successful_plan_execution_authority(
         agent_id,
         envelope_json,
         plan_spec_json,
+        plan_request_resource_version,
         enrollment_id,
         public_key,
         status,
@@ -5697,6 +5902,8 @@ async fn successful_plan_execution_authority(
     })?;
     if plan_spec.mode != JobMode::LivePlan
         || plan_spec.request_id != mutation_spec.request_id
+        || ryuki_protocol::RequestResourceVersion::try_from(plan_request_resource_version).ok()
+            != Some(plan_spec.request_resource_version)
         || plan_spec.offering_id != mutation_spec.offering_id
         || plan_spec.iac_ref != mutation_spec.iac_ref
         || plan_spec.iac_digest != mutation_spec.iac_digest
@@ -5721,6 +5928,7 @@ async fn successful_plan_execution_authority(
         || envelope.lease_generation != row_lease_generation as u64
         || row_result_id != Some(envelope.result_id)
         || envelope.request_id != request_id
+        || envelope.request_resource_version != plan_spec.request_resource_version
         || envelope.agent_id != agent_id
         || envelope.agent_enrollment_id != enrollment_id
         || envelope.platform != platform
@@ -5876,29 +6084,85 @@ pub async fn create_live_apply_job(
     // statements below run on this transaction; any early `?` return drops it
     // (rollback), so a grant is persisted only on the committed success path.
     let mut tx = pool.begin().await?;
-    let request_state: Option<(String, String, String)> =
-        sqlx::query_as("SELECT status, stage, site FROM requests WHERE id = $1 FOR UPDATE")
-            .bind(request_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let (request_status, request_stage, request_site) = match request_state {
-        None => {
-            return Err(CreateLiveApplyJobError::Invalid(
-                "request not found; cannot mint a live-apply grant",
-            ));
-        }
-        Some((status, _, _))
-            if crate::contracts::db_status_to_request_status(&status).is_concluded() =>
-        {
-            return Err(CreateLiveApplyJobError::RequestConcluded);
-        }
-        Some(state) => state,
-    };
+    let request_state: Option<(String, String, String, i64, sqlx::types::Json<Value>)> =
+        sqlx::query_as(
+            "SELECT status, stage, site, resource_version, stages \
+             FROM requests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let (request_status, request_stage, request_site, request_resource_version, request_stages) =
+        match request_state {
+            None => {
+                return Err(CreateLiveApplyJobError::Invalid(
+                    "request not found; cannot mint a live-apply grant",
+                ));
+            }
+            Some((status, _, _, _, _))
+                if crate::contracts::db_status_to_request_status(&status).is_concluded() =>
+            {
+                return Err(CreateLiveApplyJobError::RequestConcluded);
+            }
+            Some(state) => state,
+        };
     if request_site != platform {
         return Err(CreateLiveApplyJobError::Invalid(
             "live-apply platform differs from the authoritative request site",
         ));
     }
+    if ryuki_protocol::RequestResourceVersion::try_from(request_resource_version).ok()
+        != Some(spec.request_resource_version)
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "request changed after the live plan was reviewed",
+        ));
+    }
+
+    // The signed plan is historical truth at N. The ONLY supported whole-
+    // request handoff is the result backlink that advances the locked request
+    // to N + 1 while persisting the exact plan identity and commitments in its
+    // execute-stage metadata. Re-read that immutable plan row under the same
+    // transaction and validate the receipt before any grant is signed.
+    let plan_receipt: Option<WholeRequestPlanReceiptRow> = sqlx::query_as(
+        "SELECT request_resource_version, spec, result_status, evidence_digest, raw_plan_digest \
+         FROM agent_jobs WHERE id = $1 AND request_id = $2 FOR SHARE",
+    )
+    .bind(approved_plan.job_id)
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((
+        plan_row_request_resource_version,
+        plan_spec_json,
+        Some(plan_result_status),
+        Some(plan_evidence_digest),
+        Some(plan_raw_plan_digest),
+    )) = plan_receipt
+    else {
+        return Err(CreateLiveApplyJobError::PlanLineageConflict(
+            "approved plan has no complete durable backlink receipt",
+        ));
+    };
+    let plan_spec: JobSpec = serde_json::from_value(plan_spec_json.0).map_err(|_| {
+        CreateLiveApplyJobError::PlanLineageConflict(
+            "stored live-plan spec is malformed or unversioned",
+        )
+    })?;
+    validate_whole_request_live_plan_lineage(WholeRequestLivePlanLineage {
+        request_status: &request_status,
+        request_stage: &request_stage,
+        request_resource_version,
+        request_stages: &request_stages.0,
+        mutation_request_resource_version: spec.request_resource_version,
+        plan_job_id: approved_plan.job_id,
+        plan_row_request_resource_version,
+        plan_spec_request_resource_version: plan_spec.request_resource_version,
+        plan_result_status: &plan_result_status,
+        plan_evidence_digest: &plan_evidence_digest,
+        plan_raw_plan_digest: &plan_raw_plan_digest,
+    })
+    .map_err(CreateLiveApplyJobError::PlanLineageConflict)?;
 
     // #42 slice 3: never mint a single-shot LiveApply grant for a request that
     // has a persisted multi-step `job_steps` plan — it must be driven step-by-
@@ -5960,6 +6224,7 @@ pub async fn create_live_apply_job(
     // function's contract is unchanged by slice A.
     let unsigned_grant = VerifiedLiveContext {
         request_id,
+        request_resource_version: spec.request_resource_version,
         platform: platform.to_string(),
         job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
@@ -5995,12 +6260,14 @@ pub async fn create_live_apply_job(
         // (so step-scoped per-step LiveApply jobs are exempt), so this single-
         // job insert — which leaves step_scoped at its FALSE default — must
         // carry the same `step_scoped = FALSE` predicate here to infer it.
-        "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context, agent_id) \
-         VALUES ($1, $2, $3, 'LiveApply', $4::jsonb, $5) \
+        "INSERT INTO agent_jobs \
+             (request_id, request_resource_version, platform, spec, mode, live_context, agent_id) \
+         VALUES ($1, $2, $3, $4, 'LiveApply', $5::jsonb, $6) \
          ON CONFLICT (request_id) WHERE mode = 'LiveApply' AND step_scoped = FALSE DO NOTHING \
          RETURNING id",
     )
     .bind(request_id)
+    .bind(request_resource_version)
     .bind(platform)
     .bind(&spec_json)
     .bind(&grant_json)
@@ -6135,23 +6402,33 @@ pub async fn create_step_live_job(
     // the request row so it cannot conclude between this check and the INSERT
     // (same TOCTOU guard as the single-job path). The caller runs this inside
     // its own transaction, so the lock is held until that transaction commits.
-    let request_state: Option<(String, String)> =
-        sqlx::query_as("SELECT status, site FROM requests WHERE id = $1 FOR UPDATE")
-            .bind(request_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let request_state: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT status, site, resource_version FROM requests WHERE id = $1 FOR UPDATE",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let request_site = match request_state {
         None => {
             return Err(CreateLiveApplyJobError::Invalid(
                 "request not found; cannot mint a live-apply grant",
             ));
         }
-        Some((status, _))
+        Some((status, _, _))
             if crate::contracts::db_status_to_request_status(&status).is_concluded() =>
         {
             return Err(CreateLiveApplyJobError::RequestConcluded);
         }
-        Some((_, site)) => site,
+        Some((_, site, resource_version)) => {
+            if ryuki_protocol::RequestResourceVersion::try_from(resource_version).ok()
+                != Some(spec.request_resource_version)
+            {
+                return Err(CreateLiveApplyJobError::Invalid(
+                    "request changed before the step live job was minted",
+                ));
+            }
+            site
+        }
     };
     if request_site != platform {
         return Err(CreateLiveApplyJobError::Invalid(
@@ -6213,6 +6490,7 @@ pub async fn create_step_live_job(
     let job_id = Uuid::new_v4();
     let unsigned_grant = VerifiedLiveContext {
         request_id,
+        request_resource_version: spec.request_resource_version,
         platform: platform.to_string(),
         job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
@@ -6244,11 +6522,15 @@ pub async fn create_step_live_job(
     // ON CONFLICT: per-step single-approval is enforced by the caller's
     // AwaitingApproval->Applying lock, and the client-generated id is unique.
     sqlx::query(
-        "INSERT INTO agent_jobs (id, request_id, platform, spec, mode, step_scoped, live_context, agent_id) \
-         VALUES ($1, $2, $3, $4, $5, TRUE, $6::jsonb, $7)",
+        "INSERT INTO agent_jobs \
+             (id, request_id, request_resource_version, platform, spec, mode, step_scoped, live_context, agent_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7::jsonb, $8)",
     )
     .bind(job_id)
     .bind(request_id)
+    .bind(i64::try_from(spec.request_resource_version.get()).map_err(|_| {
+        CreateLiveApplyJobError::Invalid("request resource version exceeds PostgreSQL BIGINT")
+    })?)
     .bind(platform)
     .bind(&spec_json)
     .bind(mode_label)
@@ -6379,6 +6661,7 @@ pub struct ApproveLiveApplyBody {
     pub approved_plan_job_id: Uuid,
     pub approved_plan_attempt_id: Uuid,
     pub request_id: Uuid,
+    pub request_resource_version: i64,
     pub platform: String,
     pub spec: JobSpec,
     pub approved_plan_digest: String,
@@ -6401,6 +6684,14 @@ pub async fn approve_live_apply_with(
     session: &AuthSession,
     body: &ApproveLiveApplyBody,
 ) -> ApiResult<Json<Value>> {
+    let request_resource_version =
+        ryuki_protocol::RequestResourceVersion::try_from(body.request_resource_version)
+            .map_err(|_| bad_request("request_resource_version must be positive"))?;
+    if body.spec.request_resource_version != request_resource_version {
+        return Err(bad_request(
+            "request_resource_version does not match the mutation job spec",
+        ));
+    }
     // Validate expiry bounds here for a clean 400 before we reach create_live_apply_job.
     if body.expiry_seconds == 0 {
         return Err(bad_request("expiry_seconds must be greater than zero"));
@@ -6439,6 +6730,7 @@ pub async fn approve_live_apply_with(
         CreateLiveApplyJobError::HasStepPlan => conflict(
             "multi-step requests are executed step-by-step and do not support single live-apply",
         ),
+        CreateLiveApplyJobError::PlanLineageConflict(msg) => conflict(msg),
         CreateLiveApplyJobError::Db(db_e) => db_err(db_e),
     })?;
 
@@ -6902,6 +7194,8 @@ pub async fn admin_dead_lettered_jobs(
 /// - the PARENT REQUEST must still be ACTIVE — a job whose request has concluded
 ///   (failed/cancelled/rejected/completed/...) or is orphaned/unknown is REFUSED
 ///   (409), so requeue can never re-dispatch stale work for a closed request.
+/// - the parent request resource version must still equal the immutable version
+///   captured by the job; requeue never silently rebinds stale work.
 pub async fn admin_requeue_dead_lettered_job(
     Path(job_id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -6915,18 +7209,19 @@ pub async fn admin_requeue_dead_lettered_job(
     let mut tx = pool.begin().await.map_err(db_err)?;
 
     // 1. Read the job UNLOCKED (keeps the lock order requests-first). We validate
-    //    against the dispatched JobSpec (the `spec` JSONB), NOT the scalar
-    //    request_id/mode columns: the AGENT executes and routes by spec.request_id /
-    //    spec.mode (run.rs routes on spec.mode; the result backlink uses
-    //    spec.request_id), and create_agent_job does NOT pin the columns to the spec.
-    //    So the spec is the source of truth for "which request" and "is this live".
-    let job: Option<(sqlx::types::Json<serde_json::Value>, String, String)> =
-        sqlx::query_as("SELECT spec, status, platform FROM agent_jobs WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-    let Some((spec_json, status, platform)) = job else {
+    //    against the dispatched JobSpec (the `spec` JSONB). Migration 196 pins
+    //    request_id and request_resource_version to that spec at INSERT; the AGENT
+    //    still executes and routes by spec.mode, so the spec remains authoritative
+    //    for deciding whether this work is safe to redispatch.
+    let job: Option<(sqlx::types::Json<serde_json::Value>, String, String, i64)> = sqlx::query_as(
+        "SELECT spec, status, platform, request_resource_version \
+             FROM agent_jobs WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some((spec_json, status, platform, job_request_resource_version)) = job else {
         return Err(not_found(format!("agent job '{job_id}' not found")));
     };
 
@@ -6966,6 +7261,13 @@ pub async fn admin_requeue_dead_lettered_job(
     //    the LIVE executor by spec.mode — the column mode is not load-bearing).
     let spec: JobSpec = serde_json::from_value(spec_json.0)
         .map_err(|_| conflict("job spec is malformed; cannot requeue"))?;
+    if ryuki_protocol::RequestResourceVersion::try_from(job_request_resource_version).ok()
+        != Some(spec.request_resource_version)
+    {
+        return Err(conflict(
+            "job request resource-version binding is malformed; cannot requeue",
+        ));
+    }
     let preserve_affinity = match spec.mode {
         JobMode::OfflineDryRun => false,
         JobMode::LivePlan => true,
@@ -6982,13 +7284,13 @@ pub async fn admin_requeue_dead_lettered_job(
     //    Lock it FOR UPDATE (requests -> agent_jobs order) and refuse to revive a job
     //    whose request has concluded; the FOR UPDATE serializes against a concurrent
     //    reject/fail/cancel (those CAS the request row).
-    let parent_status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1 FOR UPDATE")
+    let parent_state: Option<(String, i64)> =
+        sqlx::query_as("SELECT status, resource_version FROM requests WHERE id = $1 FOR UPDATE")
             .bind(exec_request_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-    let Some(parent_status) = parent_status else {
+    let Some((parent_status, parent_resource_version)) = parent_state else {
         return Err(conflict(
             "parent request not found; cannot requeue an orphaned job",
         ));
@@ -7001,6 +7303,11 @@ pub async fn admin_requeue_dead_lettered_job(
             "parent request status '{parent_status}' does not permit requeue (concluded or unknown)"
         )));
     }
+    if parent_resource_version != job_request_resource_version {
+        return Err(conflict(
+            "parent request changed after this job was dispatched; cannot requeue stale work",
+        ));
+    }
 
     // 4. Requeue. The WHERE status='DeadLettered' makes the job-status race fail
     //    closed (a concurrent requeue/expire that moved it off DeadLettered yields 0
@@ -7012,10 +7319,12 @@ pub async fn admin_requeue_dead_lettered_job(
              attempt_id = NULL, \
              fencing_token = NULL, cp_nonce = NULL, lease_deadline = NULL, \
              delivery_attempts = 0, updated_at = NOW() \
-         WHERE id = $1 AND status = 'DeadLettered'",
+         WHERE id = $1 AND status = 'DeadLettered' \
+           AND request_resource_version = $3",
     )
     .bind(uid)
     .bind(preserve_affinity)
+    .bind(parent_resource_version)
     .execute(&mut *tx)
     .await
     .map_err(db_err)?
@@ -8727,7 +9036,7 @@ mod tests {
     #[test]
     fn protocol_version_absent_header_is_rejected_as_legacy_v1() {
         // No header at all resolves to legacy v1, which is intentionally outside
-        // the v6-only allowlist because older agents lack current state,
+        // the v7-only allowlist because older agents lack current state,
         // enrollment isolation, and exact signed execution-authority controls.
         let err = resolve_protocol_version(&HeaderMap::new())
             .expect_err("an absent header must be rejected as legacy protocol v1");
@@ -8753,7 +9062,7 @@ mod tests {
 
     #[test]
     fn protocol_version_v4_peer_is_rejected_after_execution_authority_cutover() {
-        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 6);
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 7);
         let err = resolve_protocol_version(&hdrs_with_version("4"))
             .expect_err("a v4 peer cannot parse the required signed execution authority");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -9289,6 +9598,8 @@ mod tests {
     fn reviewable_live_plan_spec() -> JobSpec {
         JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "a".repeat(64),
@@ -9914,6 +10225,8 @@ mod tests {
         use std::collections::BTreeMap;
         let spec = ryuki_protocol::JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: iac_ref.to_owned(),
             iac_digest: "0".repeat(64),
@@ -9921,7 +10234,19 @@ mod tests {
             state_key: Some(format!("request-test-{}", Uuid::new_v4().simple())),
             mode: ryuki_protocol::JobMode::OfflineDryRun,
         };
-        create_agent_job(pool, Uuid::new_v4(), platform, &spec, "OfflineDryRun")
+        sqlx::query(
+            "INSERT INTO requests \
+                 (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES \
+                 ($1, 'server-deployment', $2, 'test', 'agent-job-test', \
+                  'locked', 'lock', '[]'::jsonb)",
+        )
+        .bind(spec.request_id)
+        .bind(platform)
+        .execute(pool)
+        .await
+        .expect("seed request bound to pending agent job");
+        create_agent_job(pool, spec.request_id, platform, &spec, "OfflineDryRun")
             .await
             .expect("seed job")
     }
@@ -9933,6 +10258,8 @@ mod tests {
     fn stateful_test_spec(request_id: Uuid, state_key: &str, mode: JobMode) -> JobSpec {
         JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -9982,11 +10309,29 @@ mod tests {
     }
 
     async fn cleanup_jobs_for_platform(pool: &PgPool, platform: &str) {
+        let test_request_ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT DISTINCT request_id FROM agent_jobs WHERE platform = $1",
+        )
+        .bind(platform)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
         sqlx::query("DELETE FROM agent_jobs WHERE platform = $1")
             .bind(platform)
             .execute(pool)
             .await
             .ok();
+        if !test_request_ids.is_empty() {
+            sqlx::query(
+                "DELETE FROM requests \
+                 WHERE id = ANY($1) \
+                   AND name IN ('agent-job-test', 'live-apply-test')",
+            )
+            .bind(&test_request_ids)
+            .execute(pool)
+            .await
+            .ok();
+        }
     }
 
     /// Initialises the PROCESS-GLOBAL `database::POOL` so handler calls routed
@@ -10160,6 +10505,155 @@ mod tests {
             .ok();
         cleanup_agent(pool, &assignee).await;
         cleanup_agent(pool, &attacker).await;
+    }
+
+    /// Every transition that keeps dispatched work executable is fenced by the
+    /// immutable request version captured in the job. A later request mutation
+    /// leaves the job stale: it cannot be leased, acknowledged, renewed, or
+    /// administratively requeued.
+    #[tokio::test]
+    async fn db_job_lifecycle_refuses_stale_request_resource_versions() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("ci-version-fence-{}", Uuid::new_v4());
+        let agent_id = format!("version-fence-agent-{}", Uuid::new_v4());
+        let token = seed_agent(pool, &agent_id, &platform, "approved").await;
+
+        let stale_pending = seed_pending_job(pool, &platform).await;
+        let stale_pending_request: Uuid =
+            sqlx::query_scalar("SELECT request_id FROM agent_jobs WHERE id = $1")
+                .bind(stale_pending)
+                .fetch_one(pool)
+                .await
+                .expect("read pending job request binding");
+        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
+            .bind(stale_pending_request)
+            .execute(pool)
+            .await
+            .expect("advance pending job parent version");
+        assert!(
+            lease_pending_job(pool, &agent_id)
+                .await
+                .expect("stale lease query")
+                .is_none(),
+            "a stale pending job must remain invisible to the lease path"
+        );
+
+        let ack_job_id = seed_pending_job(pool, &platform).await;
+        let ack_lease = lease_pending_job(pool, &agent_id)
+            .await
+            .expect("ack lease query")
+            .expect("fresh job must lease");
+        assert_eq!(ack_lease.row.id, ack_job_id);
+        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
+            .bind(ack_lease.row.request_id)
+            .execute(pool)
+            .await
+            .expect("advance leased job parent version");
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let Err((ack_status, ack_body)) = ack_job(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            Path((agent_id.clone(), ack_job_id.to_string())),
+            headers.clone(),
+            Json(AckBody {
+                attempt_id: ack_lease.attempt_id,
+                fencing_token: ack_lease.fencing_token.clone(),
+            }),
+        )
+        .await
+        else {
+            panic!("a stale leased job must not transition to Running");
+        };
+        assert_eq!(ack_status, StatusCode::CONFLICT);
+        assert!(
+            ack_body.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("request changed")),
+            "the assignee receives the stale-version conflict"
+        );
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(ack_job_id)
+            .execute(pool)
+            .await
+            .expect("remove stale leased fixture before the one-job renewal check");
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(ack_lease.row.request_id)
+            .execute(pool)
+            .await
+            .expect("remove stale leased fixture parent");
+
+        let renew_job_id = seed_pending_job(pool, &platform).await;
+        let renew_lease = lease_pending_job(pool, &agent_id)
+            .await
+            .expect("renew lease query")
+            .expect("fresh renewal job must lease");
+        assert_eq!(renew_lease.row.id, renew_job_id);
+        let _ = ack_job(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            Path((agent_id.clone(), renew_job_id.to_string())),
+            headers,
+            Json(AckBody {
+                attempt_id: renew_lease.attempt_id,
+                fencing_token: renew_lease.fencing_token.clone(),
+            }),
+        )
+        .await
+        .expect("fresh job acknowledgement");
+        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
+            .bind(renew_lease.row.request_id)
+            .execute(pool)
+            .await
+            .expect("advance running job parent version");
+        let mut renew_tx = pool.begin().await.expect("begin stale renewal check");
+        let renewed = renew_running_job_lease(
+            &mut renew_tx,
+            &agent_id,
+            &RunningLeaseFence {
+                job_id: renew_job_id,
+                attempt_id: renew_lease.attempt_id,
+                lease_generation: renew_lease.row.lease_generation,
+                fencing_token: renew_lease.fencing_token,
+            },
+        )
+        .await
+        .expect("stale renewal query");
+        assert!(renewed.is_none(), "a stale running lease must not renew");
+        renew_tx.rollback().await.expect("rollback renewal check");
+
+        let requeue_request = seed_request_row(pool, "executing").await;
+        let requeue_job = seed_dead_lettered_job(pool, &platform, requeue_request).await;
+        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
+            .bind(requeue_request)
+            .execute(pool)
+            .await
+            .expect("advance dead-lettered job parent version");
+        let Err((requeue_status, requeue_body)) = admin_requeue_dead_lettered_job(
+            Path(requeue_job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("a stale dead-lettered job must not be requeued");
+        };
+        assert_eq!(requeue_status, StatusCode::CONFLICT);
+        assert!(
+            requeue_body.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("stale work")),
+            "the requeue response identifies stale work"
+        );
+        assert_eq!(
+            job_status_and_attempts(pool, requeue_job).await.0,
+            "DeadLettered"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, requeue_request).await;
+        cleanup_agent(pool, &agent_id).await;
     }
 
     /// A pending agent can be revoked (deny enrollment); unknown agent → 404;
@@ -12264,13 +12758,6 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load exact enrollment");
-        let request_id = Uuid::new_v4();
-        let state_key = format!("request-{request_id}");
-        let spec = stateful_test_spec(request_id, &state_key, JobMode::LiveApply);
-        let job_id = create_agent_job(&pool, request_id, &platform, &spec, "LiveApply")
-            .await
-            .expect("seed live job");
-
         let authority_json = |id: Uuid, fingerprint: String| {
             json!({
                 "execution_authority": {
@@ -12281,41 +12768,66 @@ mod tests {
                 }
             })
         };
-        sqlx::query("UPDATE agent_jobs SET agent_id = $1, live_context = $2::jsonb WHERE id = $3")
-            .bind(&agent_id)
-            .bind(authority_json(
-                Uuid::new_v4(),
-                public_key_fingerprint(&public_key),
-            ))
-            .bind(job_id)
-            .execute(&pool)
+
+        async fn seed_authority_bound_job(
+            pool: &PgPool,
+            platform: &str,
+            agent_id: &str,
+            live_context: serde_json::Value,
+        ) -> (Uuid, Uuid) {
+            let request_id = Uuid::new_v4();
+            seed_active_request(pool, request_id, platform).await;
+            let state_key = format!("request-{request_id}");
+            let spec = stateful_test_spec(request_id, &state_key, JobMode::LiveApply);
+            let job_id = sqlx::query_scalar(
+                "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, \
+                  agent_id, live_context) \
+                 VALUES ($1, 1, $2, $3::jsonb, 'LiveApply', 'Pending', $4, $5::jsonb) \
+                 RETURNING id",
+            )
+            .bind(request_id)
+            .bind(platform)
+            .bind(serde_json::to_value(&spec).expect("spec json"))
+            .bind(agent_id)
+            .bind(live_context)
+            .fetch_one(pool)
             .await
-            .expect("seed wrong enrollment authority");
+            .expect("seed immutable live execution authority");
+            (request_id, job_id)
+        }
+
+        let (wrong_enrollment_request, _wrong_enrollment_job) = seed_authority_bound_job(
+            &pool,
+            &platform,
+            &agent_id,
+            authority_json(Uuid::new_v4(), public_key_fingerprint(&public_key)),
+        )
+        .await;
         assert!(lease_pending_job(&pool, &agent_id)
             .await
             .expect("poll")
             .is_none());
 
-        sqlx::query("UPDATE agent_jobs SET live_context = $1::jsonb WHERE id = $2")
-            .bind(authority_json(enrollment_id, "sha256:wrong".to_string()))
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .expect("seed wrong key authority");
+        let (wrong_key_request, _wrong_key_job) = seed_authority_bound_job(
+            &pool,
+            &platform,
+            &agent_id,
+            authority_json(enrollment_id, "sha256:wrong".to_string()),
+        )
+        .await;
         assert!(lease_pending_job(&pool, &agent_id)
             .await
             .expect("poll")
             .is_none());
 
-        sqlx::query("UPDATE agent_jobs SET live_context = $1::jsonb WHERE id = $2")
-            .bind(authority_json(
-                enrollment_id,
-                public_key_fingerprint(&public_key),
-            ))
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .expect("seed exact authority");
+        let (exact_request, exact_job) = seed_authority_bound_job(
+            &pool,
+            &platform,
+            &agent_id,
+            authority_json(enrollment_id, public_key_fingerprint(&public_key)),
+        )
+        .await;
         assert_eq!(
             lease_pending_job(&pool, &agent_id)
                 .await
@@ -12323,10 +12835,13 @@ mod tests {
                 .expect("exact authority is leaseable")
                 .row
                 .id,
-            job_id
+            exact_job
         );
 
         cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_request_row(&pool, wrong_enrollment_request).await;
+        cleanup_request_row(&pool, wrong_key_request).await;
+        cleanup_request_row(&pool, exact_request).await;
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
     }
@@ -12539,6 +13054,54 @@ mod tests {
 
     // ── expired OfflineDryRun lease → Pending (new attempt) ──────────────
 
+    async fn request_bound_job_spec(pool: &PgPool, request_id: Uuid, mode: JobMode) -> JobSpec {
+        let request_resource_version =
+            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_optional(pool)
+                .await
+                .expect("read current request resource version")
+                // Owner-backed orphan fixtures remain useful for the explicit
+                // requeue fail-closed regression; migration 196 permits only
+                // their inert version-1 form.
+                .unwrap_or(1_i64);
+        JobSpec {
+            request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::try_from(
+                request_resource_version,
+            )
+            .expect("request fixture has a positive resource version"),
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_owned(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
+            mode,
+        }
+    }
+
+    async fn seed_request_bound_job_spec(pool: &PgPool, platform: &str, mode: JobMode) -> JobSpec {
+        let request_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests \
+                 (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES \
+                 ($1, 'server-deployment', $2, 'test', 'agent-job-test', \
+                  'locked', 'lock', '[]'::jsonb)",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .execute(pool)
+        .await
+        .expect("seed request bound to agent-job fixture");
+        request_bound_job_spec(pool, request_id, mode).await
+    }
+
+    fn job_spec_resource_version(spec: &JobSpec) -> i64 {
+        i64::try_from(spec.request_resource_version.get())
+            .expect("request resource version fits the database BIGINT contract")
+    }
+
     #[tokio::test]
     async fn db_expired_offline_dry_run_returns_to_pending() {
         let Some(pool) = test_pool().await else {
@@ -12551,17 +13114,21 @@ mod tests {
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
         );
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::OfflineDryRun).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
 
         // Seed a Leased OfflineDryRun job with a deadline in the past.
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', 'some-agent', \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', 'some-agent', \
              gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(&platform)
+        .bind(&spec_json)
         .fetch_one(&pool)
         .await
         .expect("seed");
@@ -12582,11 +13149,7 @@ mod tests {
         assert!(row.cp_nonce.is_none(), "cp_nonce must be cleared");
         assert!(row.lease_deadline.is_none(), "deadline must be cleared");
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_jobs_for_platform(&pool, &platform).await;
         pool.close().await;
     }
 
@@ -12604,16 +13167,20 @@ mod tests {
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
         );
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
 
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
-             VALUES ($1, $2, '{}'::jsonb, 'LiveApply', 'Running', 'some-agent', \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
              gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(&platform)
+        .bind(&spec_json)
         .fetch_one(&pool)
         .await
         .expect("seed");
@@ -12630,11 +13197,7 @@ mod tests {
 
         assert_eq!(row.status, "ReconcileRequired");
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_jobs_for_platform(&pool, &platform).await;
         pool.close().await;
     }
 
@@ -12643,16 +13206,20 @@ mod tests {
     /// Seed a Leased non-mutating (OfflineDryRun) job with a past deadline and a
     /// chosen `delivery_attempts`. Returns the job id.
     async fn seed_expired_leased_job(pool: &PgPool, platform: &str, attempts: i32) -> Uuid {
+        let spec = seed_request_bound_job_spec(pool, platform, JobMode::OfflineDryRun).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
         sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              delivery_attempts) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $3) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5) \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(platform)
+        .bind(&spec_json)
         .bind(attempts)
         .fetch_one(pool)
         .await
@@ -12667,16 +13234,20 @@ mod tests {
         attempts: i32,
         request_id: Uuid,
     ) -> Uuid {
+        let spec = request_bound_job_spec(pool, request_id, JobMode::OfflineDryRun).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
         sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              delivery_attempts) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $3) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5) \
              RETURNING id",
         )
-        .bind(request_id)
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(platform)
+        .bind(&spec_json)
         .bind(attempts)
         .fetch_one(pool)
         .await
@@ -12929,16 +13500,20 @@ mod tests {
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
         );
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              delivery_attempts) \
-             VALUES ($1, $2, '{}'::jsonb, 'LiveApply', 'Running', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $3) \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5) \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(&platform)
+        .bind(&spec_json)
         .bind(MAX_REDISPATCHES + 1)
         .fetch_one(&pool)
         .await
@@ -13112,15 +13687,21 @@ mod tests {
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
         );
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::OfflineDryRun).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
+        let request_resource_version = job_spec_resource_version(&spec);
 
         // The widened CHECK accepts the new terminal value, and the column is
         // present and defaults to 0.
         let dl: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'DeadLettered') RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'DeadLettered') RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(request_resource_version)
         .bind(&platform)
+        .bind(&spec_json)
         .fetch_one(&pool)
         .await
         .expect("'DeadLettered' passes the widened CHECK");
@@ -13134,22 +13715,28 @@ mod tests {
 
         // A pre-existing status value still inserts cleanly (widening preserves it).
         sqlx::query(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Pending')",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Pending')",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(request_resource_version)
         .bind(&platform)
+        .bind(&spec_json)
         .execute(&pool)
         .await
         .expect("pre-existing value 'Pending' still passes the widened CHECK");
 
         // An out-of-set status is still rejected — the CHECK is still enforced.
         let bad = sqlx::query(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Bogus')",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Bogus')",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(request_resource_version)
         .bind(&platform)
+        .bind(&spec_json)
         .execute(&pool)
         .await;
         assert!(
@@ -13184,15 +13771,21 @@ mod tests {
         // (b) fresh non-mutating → redispatch.
         let redispatch = seed_expired_leased_job(&pool, &platform, 0).await;
         // (c) expired LiveApply → reconcile.
+        let reconcile_spec =
+            seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        let reconcile_spec_json = serde_json::to_value(&reconcile_spec)
+            .expect("serialize live-apply agent-job fixture spec");
         let reconcile: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
-             VALUES ($1, $2, '{}'::jsonb, 'LiveApply', 'Running', 'some-agent', \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
              gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(reconcile_spec.request_id)
+        .bind(job_spec_resource_version(&reconcile_spec))
         .bind(&platform)
+        .bind(&reconcile_spec_json)
         .fetch_one(&pool)
         .await
         .expect("seed live-apply");
@@ -13254,17 +13847,21 @@ mod tests {
 
         let attempt = Uuid::new_v4();
         let fencing = Uuid::new_v4().to_string();
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::OfflineDryRun).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
 
         // Seed a Leased job with a deadline already in the past.
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', $3, \
-             $4, 1, $5, 'nonce', NOW() - INTERVAL '1 minute') \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', $5, \
+             $6, 1, $7, 'nonce', NOW() - INTERVAL '1 minute') \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(&platform)
+        .bind(&spec_json)
         .bind(&agent_id)
         .bind(attempt)
         .bind(&fencing)
@@ -13310,11 +13907,7 @@ mod tests {
             "expired job must stay Leased, never Running"
         );
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
     }
@@ -13338,17 +13931,21 @@ mod tests {
         let new_attempt = Uuid::new_v4();
         let old_fencing = Uuid::new_v4().to_string();
         let new_fencing = Uuid::new_v4().to_string();
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::OfflineDryRun).await;
+        let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
 
         // Seed a Leased job that has already been re-leased (new attempt/fencing).
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+            "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', $3, \
-             $4, 2, $5, 'nonce2', NOW() + INTERVAL '5 minutes') \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', $5, \
+             $6, 2, $7, 'nonce2', NOW() + INTERVAL '5 minutes') \
              RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(spec.request_id)
+        .bind(job_spec_resource_version(&spec))
         .bind(&platform)
+        .bind(&spec_json)
         .bind(&agent_id)
         .bind(new_attempt)
         .bind(&new_fencing)
@@ -13395,11 +13992,7 @@ mod tests {
             "new attempt must be preserved"
         );
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
     }
@@ -13531,6 +14124,7 @@ mod tests {
             attempt_id,
             lease_generation: 1,
             request_id,
+            request_resource_version: plan_spec.request_resource_version,
             result_id,
             mode: JobMode::LivePlan,
             status: JobResultStatus::Planned,
@@ -13583,6 +14177,79 @@ mod tests {
             attempt_id,
             expected_execution_authority: None,
         }
+    }
+
+    /// Persist the canonical whole-request plan backlink for minting tests and
+    /// return the exact N + 1 mutation version.
+    async fn seed_whole_request_plan_backlink(
+        pool: &PgPool,
+        request_id: Uuid,
+        approved_plan: &ApprovedPlanReference,
+    ) -> ryuki_protocol::RequestResourceVersion {
+        let (plan_version, result_status, evidence_digest, raw_plan_digest): (
+            i64,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT request_resource_version, result_status, evidence_digest, raw_plan_digest \
+             FROM agent_jobs WHERE id = $1 AND request_id = $2",
+        )
+        .bind(approved_plan.job_id)
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("load exact successful plan receipt");
+        let stages: sqlx::types::Json<Value> =
+            sqlx::query_scalar("SELECT stages FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_one(pool)
+                .await
+                .expect("load request stages for plan backlink");
+        let mut stages = serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(stages.0)
+            .expect("valid request stages");
+        if !stages.iter().any(|stage| stage.name == "execute") {
+            stages.push(ryuki_engine::models::Stage {
+                name: "execute".into(),
+                status: ryuki_engine::models::StageStatus::Pending,
+                started_at: None,
+                completed_at: None,
+                evidence: Vec::new(),
+                metadata: std::collections::HashMap::new(),
+            });
+        }
+        let execute = stages
+            .iter_mut()
+            .find(|stage| stage.name == "execute")
+            .expect("execute stage exists");
+        execute.status = ryuki_engine::models::StageStatus::InProgress;
+        execute.completed_at = None;
+        execute
+            .metadata
+            .insert("live_plan_job_id".into(), approved_plan.job_id.to_string());
+        execute
+            .metadata
+            .insert("live_plan_result_status".into(), result_status);
+        execute
+            .metadata
+            .insert("live_plan_evidence_digest".into(), evidence_digest);
+        execute
+            .metadata
+            .insert("live_plan_raw_plan_digest".into(), raw_plan_digest);
+        let stages = serde_json::to_value(stages).expect("serialize request stages");
+        let version: i64 = sqlx::query_scalar(
+            "UPDATE requests SET status = 'executing', stage = 'execute', stages = $3::jsonb, \
+                    updated_at = NOW() \
+             WHERE id = $1 AND resource_version = $2 RETURNING resource_version",
+        )
+        .bind(request_id)
+        .bind(plan_version)
+        .bind(stages)
+        .fetch_one(pool)
+        .await
+        .expect("record canonical whole-request plan backlink");
+        ryuki_protocol::RequestResourceVersion::try_from(version)
+            .expect("backlinked request version is positive")
     }
 
     fn dummy_approved_plan_reference() -> ApprovedPlanReference {
@@ -13779,6 +14446,7 @@ mod tests {
             attempt_id,
             lease_generation: lease_gen,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: spec.mode.clone(),
             status: status.clone(),
@@ -14446,6 +15114,7 @@ mod tests {
             attempt_id,
             lease_generation: gen as u64,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: spec.mode.clone(),
             status: JobResultStatus::CheckOk,
@@ -15064,6 +15733,8 @@ mod tests {
         use std::collections::BTreeMap;
         let spec_la = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -15071,9 +15742,10 @@ mod tests {
             state_key: Some("request-test".to_string()),
             mode: JobMode::LiveApply,
         };
-        let live_job_id = create_agent_job(&pool, Uuid::new_v4(), &platform, &spec_la, "LiveApply")
-            .await
-            .expect("seed LiveApply job");
+        let live_job_id =
+            create_agent_job(&pool, spec_la.request_id, &platform, &spec_la, "LiveApply")
+                .await
+                .expect("seed LiveApply job");
 
         let (attempt_id, fencing, nonce, gen, job_row) =
             lease_job(&pool, &platform, &agent_id).await;
@@ -15097,6 +15769,7 @@ mod tests {
                 attempt_id,
                 lease_generation: gen as u64,
                 request_id: spec_la.request_id,
+                request_resource_version: spec_la.request_resource_version,
                 result_id,
                 mode: JobMode::LiveApply,
                 status: JobResultStatus::Applied,
@@ -15221,6 +15894,7 @@ mod tests {
             attempt_id,
             lease_generation: gen as u64,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -15311,6 +15985,7 @@ mod tests {
             attempt_id,
             lease_generation: gen as u64,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -15459,6 +16134,7 @@ mod tests {
             attempt_id: plan_attempt_id,
             lease_generation: 1,
             request_id: plan_spec.request_id,
+            request_resource_version: plan_spec.request_resource_version,
             result_id: plan_result_id,
             mode: JobMode::LivePlan,
             status: JobResultStatus::Planned,
@@ -15544,6 +16220,8 @@ mod tests {
         let (_token, key, enrollment_id) = seed_agent_with_key(&pool, &agent_id, &platform).await;
         let mutation_spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -15816,6 +16494,7 @@ mod tests {
             attempt_id,
             lease_generation: gen as u64,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -15903,6 +16582,7 @@ mod tests {
             attempt_id,
             lease_generation: gen as u64,
             request_id: wrong_request_id, // mismatch
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -15990,6 +16670,7 @@ mod tests {
             attempt_id,
             lease_generation: gen as u64,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::LivePlan, // mismatch — job is OfflineDryRun
             status: JobResultStatus::Planned,
@@ -16423,6 +17104,8 @@ mod tests {
         let request_id = Uuid::new_v4();
         let spec = ryuki_protocol::JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -16430,8 +17113,10 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: ryuki_protocol::JobMode::LiveApply,
         };
+        seed_active_request(pool, request_id, platform).await;
         let unsigned = VerifiedLiveContext {
             request_id: grant_request_id.unwrap_or(request_id),
+            request_resource_version: spec.request_resource_version,
             platform: platform.to_string(),
             job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
             approved_plan_digest: approved_plan_digest.to_string(),
@@ -16522,6 +17207,7 @@ mod tests {
             attempt_id,
             lease_generation: lease_gen,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: spec.mode.clone(),
             status: status.clone(),
@@ -16776,8 +17462,10 @@ mod tests {
         .await
         .expect("seed active request for live-apply minting");
 
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -16799,6 +17487,8 @@ mod tests {
             &plan_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
 
         let jobs_before: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
@@ -17004,8 +17694,10 @@ mod tests {
         let platform = format!("audit-rollback-{}", Uuid::new_v4().simple());
         seed_active_request(&pool, request_id, &platform).await;
         let actor = format!("dbtest-live-audit-failure-{}", Uuid::new_v4());
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17028,6 +17720,8 @@ mod tests {
             &plan_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
 
         install_live_approval_audit_failure_trigger(&pool).await;
         let result = create_live_apply_job(
@@ -17098,6 +17792,8 @@ mod tests {
 
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17163,8 +17859,10 @@ mod tests {
         seed_active_request(&pool, request_id, &platform).await;
         let plan_digest = proto_sha256(b"the-exact-approved-plan");
 
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17183,6 +17881,8 @@ mod tests {
             &agent_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
 
         // CP enqueues the job with a production-signed grant.
         let _job_id = create_live_apply_job(
@@ -17276,8 +17976,10 @@ mod tests {
         let approved_digest = proto_sha256(b"the-approved-plan");
         let unapproved_digest = proto_sha256(b"a-different-unapproved-plan");
 
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17296,6 +17998,8 @@ mod tests {
             &agent_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
 
         // CP signs the grant for `approved_digest`.
         let _job_id = create_live_apply_job(
@@ -17379,6 +18083,8 @@ mod tests {
 
         let wrong_mode_spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17395,6 +18101,8 @@ mod tests {
 
         let liveplan_spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17411,6 +18119,8 @@ mod tests {
         // A LiveApply spec with matching request_id must pass.
         let valid_spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17435,6 +18145,84 @@ mod tests {
         let mut unsafe_state_key = valid_spec;
         unsafe_state_key.state_key = Some("../shared".to_string());
         assert!(validate_live_apply_params(&unsafe_state_key, request_id).is_err());
+    }
+
+    #[test]
+    fn whole_request_live_plan_lineage_requires_exact_successor_and_metadata() {
+        let plan_job_id = Uuid::new_v4();
+        let plan_version = ryuki_protocol::RequestResourceVersion::new(7).unwrap();
+        let mutation_version = ryuki_protocol::RequestResourceVersion::new(8).unwrap();
+        let evidence_digest = "a".repeat(64);
+        let raw_plan_digest = "b".repeat(64);
+        let execute = ryuki_engine::models::Stage {
+            name: "execute".into(),
+            status: ryuki_engine::models::StageStatus::InProgress,
+            started_at: None,
+            completed_at: None,
+            evidence: Vec::new(),
+            metadata: std::collections::HashMap::from([
+                ("live_plan_job_id".into(), plan_job_id.to_string()),
+                ("live_plan_result_status".into(), "planned".into()),
+                ("live_plan_evidence_digest".into(), evidence_digest.clone()),
+                ("live_plan_raw_plan_digest".into(), raw_plan_digest.clone()),
+            ]),
+        };
+        let stages = serde_json::to_value([execute]).unwrap();
+
+        assert!(
+            validate_whole_request_live_plan_lineage(WholeRequestLivePlanLineage {
+                request_status: "executing",
+                request_stage: "execute",
+                request_resource_version: 8,
+                request_stages: &stages,
+                mutation_request_resource_version: mutation_version,
+                plan_job_id,
+                plan_row_request_resource_version: 7,
+                plan_spec_request_resource_version: plan_version,
+                plan_result_status: "planned",
+                plan_evidence_digest: &evidence_digest,
+                plan_raw_plan_digest: &raw_plan_digest,
+            })
+            .is_ok()
+        );
+
+        assert_eq!(
+            validate_whole_request_live_plan_lineage(WholeRequestLivePlanLineage {
+                request_status: "executing",
+                request_stage: "execute",
+                request_resource_version: 9,
+                request_stages: &stages,
+                mutation_request_resource_version: ryuki_protocol::RequestResourceVersion::new(9)
+                    .unwrap(),
+                plan_job_id,
+                plan_row_request_resource_version: 7,
+                plan_spec_request_resource_version: plan_version,
+                plan_result_status: "planned",
+                plan_evidence_digest: &evidence_digest,
+                plan_raw_plan_digest: &raw_plan_digest,
+            }),
+            Err("current request version is not the exact live-plan backlink successor"),
+            "an unrelated post-backlink mutation must invalidate the plan"
+        );
+
+        let mut wrong_stages = stages;
+        wrong_stages[0]["metadata"]["live_plan_job_id"] = Uuid::new_v4().to_string().into();
+        assert_eq!(
+            validate_whole_request_live_plan_lineage(WholeRequestLivePlanLineage {
+                request_status: "executing",
+                request_stage: "execute",
+                request_resource_version: 8,
+                request_stages: &wrong_stages,
+                mutation_request_resource_version: mutation_version,
+                plan_job_id,
+                plan_row_request_resource_version: 7,
+                plan_spec_request_resource_version: plan_version,
+                plan_result_status: "planned",
+                plan_evidence_digest: &evidence_digest,
+                plan_raw_plan_digest: &raw_plan_digest,
+            }),
+            Err("request execute-stage metadata does not match the exact live plan")
+        );
     }
 
     /// Pubkey endpoint returns the initialised CP public key.
@@ -17492,12 +18280,12 @@ mod tests {
         let _ = expected_pubkey; // used above, consumed by init
     }
 
-    /// A LiveApply result applied within the grant window, then REPLAYED after
-    /// the grant expires (e.g. the durable outbox retries the POST much later),
-    /// must return idempotent 200 — NOT a 409 "grant expired". Expiry gates the
-    /// first apply only; a replay of an already-recorded result is not re-gated.
+    /// An exact replay of an already-recorded LiveApply result must return
+    /// idempotent 200 without rewriting or re-authorizing its immutable grant.
+    /// Freshness gates the first terminal acceptance; the terminal replay path
+    /// instead verifies that the signed result exactly matches the stored copy.
     #[tokio::test]
-    async fn db_s5_live_apply_replay_after_grant_expiry_is_idempotent() {
+    async fn db_s5_live_apply_exact_terminal_replay_is_idempotent() {
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -17540,7 +18328,7 @@ mod tests {
         );
         let result_id = job_result.result_id;
         // Two bodies sharing the SAME signed result (same result_id) — one for the
-        // first apply, one for the post-expiry replay.
+        // first apply and one for the exact terminal replay.
         let make_body = || ResultBody {
             job_result: job_result.clone(),
             evidence: evidence_bytes.clone(),
@@ -17563,31 +18351,15 @@ mod tests {
         .await
         .expect("first live apply must be accepted");
 
-        // Simulate the grant having expired after the apply was recorded. Replace
-        // the stored grant with a VALIDLY-SIGNED one whose expiry is in the past
-        // (re-sign with the same CP key so verify_vlc still passes — only the
-        // expiry is now stale). This proves the replay path is gated on terminal
-        // status, not on a fresh expiry check.
-        let stored_grant_json: sqlx::types::Json<serde_json::Value> =
+        let stored_grant_before: sqlx::types::Json<serde_json::Value> =
             sqlx::query_scalar("SELECT live_context FROM agent_jobs WHERE id = $1")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
                 .expect("read original exact-authority grant");
-        let mut expired_grant: VerifiedLiveContext =
-            serde_json::from_value(stored_grant_json.0).expect("stored grant");
-        expired_grant.expiry = Utc::now() - Duration::hours(1);
-        expired_grant.signature.clear();
-        let expired_grant = sign_vlc(expired_grant, &ensure_test_cp_key());
-        sqlx::query("UPDATE agent_jobs SET live_context = $2::jsonb WHERE id = $1")
-            .bind(job_id)
-            .bind(serde_json::to_value(&expired_grant).expect("grant json"))
-            .execute(&pool)
-            .await
-            .expect("install expired-but-signed grant");
 
-        // Replay the SAME signed result — the job is terminal, so expiry is not
-        // re-checked; the idempotency branch returns 200.
+        // Replay the SAME signed result. The idempotency branch returns 200
+        // without any authority rewrite.
         let resp = post_job_result_with_pool(
             agent_id.clone(),
             job_id.to_string(),
@@ -17596,7 +18368,7 @@ mod tests {
             &pool,
         )
         .await;
-        let out = resp.expect("replay after expiry must be idempotent 200, not 409");
+        let out = resp.expect("exact terminal replay must be idempotent 200");
         assert_eq!(
             out.0.get("idempotent").and_then(|v| v.as_bool()),
             Some(true),
@@ -17605,6 +18377,16 @@ mod tests {
         let db = read_job_result_row(&pool, job_id).await;
         assert_eq!(db.status, "Succeeded", "job stays terminal");
         assert_eq!(db.result_id, Some(result_id), "recorded result unchanged");
+        let stored_grant_after: sqlx::types::Json<serde_json::Value> =
+            sqlx::query_scalar("SELECT live_context FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read unchanged exact-authority grant");
+        assert_eq!(
+            stored_grant_after.0, stored_grant_before.0,
+            "terminal replay must not rewrite the immutable grant"
+        );
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
@@ -17704,6 +18486,8 @@ mod tests {
         seed_active_request(&pool, request_id, &platform).await;
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -17818,6 +18602,7 @@ mod tests {
             attempt_id,
             lease_generation: lease_gen,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: spec.mode.clone(),
             status: status.clone(),
@@ -18111,6 +18896,8 @@ mod tests {
             .expect("step two");
         let make_spec = |step_id| JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18494,8 +19281,10 @@ mod tests {
         seed_active_request(&pool, request_id, &platform).await;
         let digest = proto_sha256(b"approved-plan-s5c");
 
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18517,11 +19306,15 @@ mod tests {
             &plan_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
 
         let body = ApproveLiveApplyBody {
             approved_plan_job_id: approved_plan.job_id,
             approved_plan_attempt_id: approved_plan.attempt_id,
             request_id,
+            request_resource_version: i64::try_from(spec.request_resource_version.get())
+                .expect("wire version fits"),
             platform: platform.clone(),
             spec,
             approved_plan_digest: digest.clone(),
@@ -18606,10 +19399,10 @@ mod tests {
         assert_eq!(audit_row.actor_roles, approver_session.roles);
         assert_eq!(audit_row.provider_mode, approver_session.provider_mode);
         assert_eq!(grant.approver, audit_row.actor_principal);
-        assert_eq!(audit_row.from_status.as_deref(), Some("locked"));
-        assert_eq!(audit_row.to_status, "locked");
-        assert_eq!(audit_row.from_stage.as_deref(), Some("lock"));
-        assert_eq!(audit_row.to_stage, "lock");
+        assert_eq!(audit_row.from_status.as_deref(), Some("executing"));
+        assert_eq!(audit_row.to_status, "executing");
+        assert_eq!(audit_row.from_stage.as_deref(), Some("execute"));
+        assert_eq!(audit_row.to_stage, "execute");
         assert_eq!(audit_row.detail["agent_job_id"], json!(job_id));
         assert_eq!(audit_row.detail["approved_plan_digest"], json!(digest));
         assert_eq!(audit_row.detail["mode"], "LiveApply");
@@ -18653,8 +19446,10 @@ mod tests {
         let platform = format!("s5c-race-{}", Uuid::new_v4().simple());
         seed_active_request(&pool, request_id, &platform).await;
         let digest = proto_sha256(b"approved-plan-live-approval-race");
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18676,6 +19471,8 @@ mod tests {
             &plan_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
         let session_a = live_approver_session("race-approver-a");
         let session_b = live_approver_session("race-approver-b");
 
@@ -18772,6 +19569,8 @@ mod tests {
         seed_active_request(&pool, request_id, "any").await;
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18783,6 +19582,7 @@ mod tests {
             approved_plan_job_id: Uuid::new_v4(),
             approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
+            request_resource_version: 1,
             platform: "any".into(),
             spec,
             approved_plan_digest: "not-hex".into(),
@@ -18813,6 +19613,8 @@ mod tests {
         let request_id = Uuid::new_v4();
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18824,6 +19626,7 @@ mod tests {
             approved_plan_job_id: Uuid::new_v4(),
             approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
+            request_resource_version: 1,
             platform: "any".into(),
             spec,
             approved_plan_digest: proto_sha256(b"plan"),
@@ -18854,6 +19657,8 @@ mod tests {
         let request_id = Uuid::new_v4();
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18865,6 +19670,7 @@ mod tests {
             approved_plan_job_id: Uuid::new_v4(),
             approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
+            request_resource_version: 1,
             platform: "any".into(),
             spec,
             approved_plan_digest: proto_sha256(b"plan"),
@@ -18895,6 +19701,8 @@ mod tests {
         let request_id = Uuid::new_v4();
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18906,6 +19714,7 @@ mod tests {
             approved_plan_job_id: Uuid::new_v4(),
             approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
+            request_resource_version: 1,
             platform: "any".into(),
             spec,
             approved_plan_digest: proto_sha256(b"plan"),
@@ -18942,8 +19751,10 @@ mod tests {
         let sentinel_approver = "session-derived-approver-not-from-body";
         let approver_session = live_approver_session(sentinel_approver);
 
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -18965,10 +19776,14 @@ mod tests {
             &plan_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(&pool, request_id, &approved_plan).await;
         let body = ApproveLiveApplyBody {
             approved_plan_job_id: approved_plan.job_id,
             approved_plan_attempt_id: approved_plan.attempt_id,
             request_id,
+            request_resource_version: i64::try_from(spec.request_resource_version.get())
+                .expect("wire version fits"),
             platform: platform.clone(),
             spec,
             approved_plan_digest: digest.clone(),
@@ -19400,15 +20215,57 @@ mod tests {
         id
     }
 
+    async fn current_request_resource_version_for_job(
+        pool: &PgPool,
+        request_id: Uuid,
+    ) -> (i64, ryuki_protocol::RequestResourceVersion) {
+        let resource_version: i64 =
+            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_one(pool)
+                .await
+                .expect("load current request resource version for job fixture");
+        let typed_resource_version =
+            ryuki_protocol::RequestResourceVersion::try_from(resource_version)
+                .expect("request fixture has a positive resource version");
+        (resource_version, typed_resource_version)
+    }
+
+    async fn synthetic_step_job_spec(
+        pool: &PgPool,
+        request_id: Uuid,
+        mode: JobMode,
+    ) -> (i64, serde_json::Value) {
+        let (resource_version, typed_resource_version) =
+            current_request_resource_version_for_job(pool, request_id).await;
+        let spec = JobSpec {
+            request_id,
+            request_resource_version: typed_resource_version,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
+            mode,
+        };
+        let spec_json = serde_json::to_value(spec).expect("serialize synthetic step job spec");
+        (resource_version, spec_json)
+    }
+
     /// Dispatch a step: insert a synthetic `agent_jobs` row and link it via
     /// `job_steps::mark_running`, exactly as `dispatch_ready_steps` would.
     /// Returns the minted `agent_jobs.id`.
     async fn dispatch_step_job(pool: &PgPool, request_id: Uuid, step_id: Uuid) -> Uuid {
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(pool, request_id, JobMode::OfflineDryRun).await;
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'OfflineDryRun') RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, 'DEFRA', $3, 'OfflineDryRun') RETURNING id",
         )
         .bind(request_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(pool)
         .await
         .expect("insert synthetic agent_job");
@@ -19424,11 +20281,16 @@ mod tests {
     /// `dispatch_ready_steps` would for a LivePlan-mode plan. Returns the
     /// minted `agent_jobs.id`.
     async fn dispatch_liveplan_step_job(pool: &PgPool, request_id: Uuid, step_id: Uuid) -> Uuid {
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(pool, request_id, JobMode::LivePlan).await;
         let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LivePlan') RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LivePlan') RETURNING id",
         )
         .bind(request_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(pool)
         .await
         .expect("insert synthetic LivePlan agent_job");
@@ -19973,11 +20835,16 @@ mod tests {
             .await
             .unwrap();
         let step_a = plan.iter().find(|s| s.step_key == "a").unwrap();
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_a: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -20021,11 +20888,16 @@ mod tests {
         assert_eq!(status_mid, "executing", "request stays executing mid-chain");
 
         // b's LivePlan -> AwaitingApproval, then approved -> Applying, then LiveApply -> Applied.
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_b: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -20098,11 +20970,16 @@ mod tests {
         let step_b = plan.iter().find(|s| s.step_key == "b").unwrap();
         let mut job_ids = Vec::new();
         for step in [step_a, step_b] {
+            let (request_resource_version, spec) =
+                synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
             let jid: Uuid = sqlx::query_scalar(
-                "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
-                 VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+                "INSERT INTO agent_jobs \
+                     (request_id, request_resource_version, platform, spec, mode, step_scoped) \
+                 VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
             )
             .bind(req_id)
+            .bind(request_resource_version)
+            .bind(&spec)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -20226,8 +21103,11 @@ mod tests {
             // empty; complete this positive signed-plan fixture with a safe,
             // reviewable shape before minting its apply authority.
             vars.extend(reviewable_live_plan_vars());
+            let (_, request_resource_version) =
+                current_request_resource_version_for_job(pool, req_id).await;
             let apply_spec = JobSpec {
                 request_id: req_id,
+                request_resource_version,
                 offering_id: Uuid::new_v4(),
                 iac_ref: step.iac_ref.clone(),
                 iac_digest,
@@ -20281,11 +21161,16 @@ mod tests {
             .expect("link applied step authority");
             tx.commit().await.expect("commit applied step authority");
         }
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(pool, req_id, JobMode::LiveApply).await;
         let job_c: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -20723,11 +21608,16 @@ mod tests {
         drop(conn);
         // Rollback in flight: 'a' is TearingDown (its LiveDestroy dispatched),
         // 'b' already Failed. Nothing is Applied.
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(&pool, req_id, JobMode::LiveDestroy).await;
         let job_a: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveDestroy', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveDestroy', TRUE) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -20806,13 +21696,18 @@ mod tests {
         .unwrap();
         drop(conn);
         // 'a' is TearingDown behind a LiveDestroy job whose lease already expired.
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(&pool, req_id, JobMode::LiveDestroy).await;
         let job_a: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, platform, spec, mode, step_scoped, status, lease_deadline) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveDestroy', TRUE, 'Leased', \
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped, \
+                  status, lease_deadline) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveDestroy', TRUE, 'Leased', \
                      NOW() - make_interval(secs => 60)) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -20969,11 +21864,16 @@ mod tests {
         .unwrap();
         drop(conn);
         // 'a' Applying behind a still-`Pending` LiveApply (the approval-race orphan shape).
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_a: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', 'Pending', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', 'Pending', TRUE) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -20987,11 +21887,16 @@ mod tests {
         .await
         .unwrap();
         // 'b' Applying behind a `Leased` job — must be LEFT for lease-expiry reconcile.
+        let (request_resource_version, spec) =
+            synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_b: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', 'Leased', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', 'Leased', TRUE) RETURNING id",
         )
         .bind(req_id)
+        .bind(request_resource_version)
+        .bind(&spec)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -21447,6 +22352,8 @@ mod tests {
     fn dead_letter_spec(request_id: Uuid, mode: JobMode) -> JobSpec {
         JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -21456,38 +22363,50 @@ mod tests {
         }
     }
 
-    /// Seed a terminal DeadLettered job (delivery_attempts at the cap) directly. The
-    /// `spec.request_id` (what the agent acts on) == `request_id`, and the scalar
-    /// column also == `request_id` (the common, consistent case).
+    /// Seed a terminal DeadLettered job (delivery_attempts at the cap) directly.
+    /// The durable row, spec, and current request all share one authority version.
     async fn seed_dead_lettered_job(pool: &PgPool, platform: &str, request_id: Uuid) -> Uuid {
-        seed_dead_lettered_job_full(
-            pool,
-            platform,
-            request_id,
-            request_id,
-            JobMode::OfflineDryRun,
-        )
-        .await
+        seed_dead_lettered_job_full(pool, platform, request_id, JobMode::OfflineDryRun).await
     }
 
-    /// Seed a DeadLettered job with EXPLICIT column vs spec request ids + spec mode —
-    /// to exercise the spec-is-source-of-truth guards (column may differ from spec).
+    /// Seed a canonically bound DeadLettered job with an explicit execution mode.
     async fn seed_dead_lettered_job_full(
         pool: &PgPool,
         platform: &str,
-        column_request_id: Uuid,
-        spec_request_id: Uuid,
+        request_id: Uuid,
         spec_mode: JobMode,
     ) -> Uuid {
-        let spec = dead_letter_spec(spec_request_id, spec_mode);
+        let mode_label = match spec_mode {
+            JobMode::OfflineDryRun => "OfflineDryRun",
+            JobMode::LivePlan => "LivePlan",
+            JobMode::LiveApply => "LiveApply",
+            JobMode::LiveDestroy => "LiveDestroy",
+        };
+        let request_resource_version =
+            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_optional(pool)
+                .await
+                .expect("read current request resource version")
+                // Owner-backed orphan fixtures remain useful for the explicit
+                // requeue fail-closed regression; migration 196 permits only
+                // their inert version-1 form.
+                .unwrap_or(1_i64);
+        let mut spec = dead_letter_spec(request_id, spec_mode);
+        spec.request_resource_version =
+            ryuki_protocol::RequestResourceVersion::try_from(request_resource_version)
+                .expect("positive test request resource version");
         let spec_json = serde_json::to_value(&spec).expect("spec serialises");
         sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, delivery_attempts) \
-             VALUES ($1, $2, $3, 'OfflineDryRun', 'DeadLettered', 5) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, delivery_attempts) \
+             VALUES ($1, $2, $3, $4, $5, 'DeadLettered', 5) RETURNING id",
         )
-        .bind(column_request_id)
+        .bind(request_id)
+        .bind(request_resource_version)
         .bind(platform)
         .bind(&spec_json)
+        .bind(mode_label)
         .fetch_one(pool)
         .await
         .expect("seed dead-lettered job")
@@ -21971,11 +22890,10 @@ mod tests {
         cleanup_request_row(pool, req).await;
     }
 
-    /// B1 regression (codex): the SPEC mode is authoritative, NOT the scalar `mode`
-    /// column. A Leased job with column `mode='OfflineDryRun'` but `spec.mode=LiveApply`
-    /// must be REFUSED (409) — the old column-based CAS would have force-failed it.
+    /// The database rejects a scalar/spec mode split before it can become
+    /// durable work that an administrative force-fail might misclassify.
     #[tokio::test]
-    async fn force_fail_decides_on_spec_mode_not_column() {
+    async fn agent_job_insert_rejects_spec_mode_mismatch() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -21983,56 +22901,33 @@ mod tests {
         };
         let platform = format!("plt-ff-spec-{}", Uuid::new_v4().simple());
         let req = seed_request_row(pool, "executing").await;
-        // column mode = OfflineDryRun (the non-load-bearing scalar) but the dispatched
-        // spec.mode = LiveApply (what the agent actually acts on).
         let spec = dead_letter_spec(req, JobMode::LiveApply);
         let spec_json = serde_json::to_value(&spec).expect("spec serialises");
-        let job: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, $3, 'OfflineDryRun', 'Leased') RETURNING id",
+        let error = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, 1, $2, $3, 'OfflineDryRun', 'Leased') RETURNING id",
         )
         .bind(req)
         .bind(&platform)
         .bind(&spec_json)
         .fetch_one(pool)
         .await
-        .expect("seed mismatched-mode job");
-
-        let err = admin_force_fail_job(
-            Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
-            Json(ForceFailJobBody {
-                reason: "should be refused".into(),
-            }),
-        )
-        .await
-        .expect_err("a job whose SPEC mode is LiveApply must not be force-failed");
-        assert_eq!(err.0, StatusCode::CONFLICT);
-
-        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
-            .bind(job)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        assert_eq!(job_status, "Leased", "the live-apply-spec job is untouched");
+        .expect_err("a scalar/spec mode mismatch must fail at INSERT");
         assert_eq!(
-            force_fail_audit_count(pool, job).await,
-            0,
-            "no audit on a refused force-fail"
-        );
-        assert!(
-            force_failed_event_to_status(pool, job).await.is_none(),
-            "no domain event on a refused force-fail"
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
         );
 
-        cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
     }
 
-    /// A Leased job with a malformed stored spec fails CLOSED → 500 (never force-failed
-    /// on undecodable mode), and the row is untouched.
+    /// A malformed spec is rejected before it can become durable work.
     #[tokio::test]
-    async fn force_fail_malformed_spec_is_500_fail_closed() {
+    async fn agent_job_insert_rejects_malformed_spec() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -22040,44 +22935,24 @@ mod tests {
         };
         let platform = format!("plt-ff-bad-{}", Uuid::new_v4().simple());
         let req = seed_request_row(pool, "executing").await;
-        // A Leased job whose `spec` is not a valid JobSpec (empty object).
-        let job: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased') RETURNING id",
+        let error = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, 1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased') RETURNING id",
         )
         .bind(req)
         .bind(&platform)
         .fetch_one(pool)
         .await
-        .expect("seed malformed-spec job");
-
-        let err = admin_force_fail_job(
-            Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
-            Json(ForceFailJobBody {
-                reason: "bad spec".into(),
-            }),
-        )
-        .await
-        .expect_err("a malformed spec fails closed");
-        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-
-        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
-            .bind(job)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        .expect_err("a malformed agent-job spec must fail at INSERT");
         assert_eq!(
-            job_status, "Leased",
-            "a malformed-spec job is never mutated"
-        );
-        assert_eq!(
-            force_fail_audit_count(pool, job).await,
-            0,
-            "no audit on a fail-closed force-fail"
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
         );
 
-        cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
     }
 
@@ -22465,13 +23340,23 @@ mod tests {
         .expect("seed teardown step");
         drop(conn);
 
-        let spec = dead_letter_spec(req, JobMode::LiveDestroy);
+        let request_resource_version: i64 =
+            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1")
+                .bind(req)
+                .fetch_one(pool)
+                .await
+                .expect("read current request resource version");
+        let mut spec = dead_letter_spec(req, JobMode::LiveDestroy);
+        spec.request_resource_version =
+            ryuki_protocol::RequestResourceVersion::try_from(request_resource_version)
+                .expect("positive test request resource version");
         let job: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-             (request_id, platform, spec, mode, status, step_scoped) \
-             VALUES ($1, $2, $3, 'LiveDestroy', 'ReconcileRequired', TRUE) RETURNING id",
+             (request_id, request_resource_version, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, $2, $3, $4, 'LiveDestroy', 'ReconcileRequired', TRUE) RETURNING id",
         )
         .bind(req)
+        .bind(request_resource_version)
         .bind(&platform)
         .bind(serde_json::to_value(spec).expect("spec serialises"))
         .fetch_one(pool)
@@ -22554,8 +23439,10 @@ mod tests {
         // The parent request is mid-apply: Executing (NOT concluded).
         let req = seed_request_for_scope(pool, &platform, "production").await;
 
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             request_id: req,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
@@ -22578,6 +23465,8 @@ mod tests {
             &plan_key,
         )
         .await;
+        spec.request_resource_version =
+            seed_whole_request_plan_backlink(pool, req, &approved_plan).await;
         // create_live_apply_job borrows everything (request_id is Copy), so the
         // same args drive all three mint attempts below.
         let grant_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -23080,6 +23969,8 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -23154,8 +24045,11 @@ mod tests {
             return;
         };
         let platform = format!("plt-plan-review-{}", Uuid::new_v4().simple());
-        let job = seed_pending_job(pool, &platform).await;
         let spec = reviewable_live_plan_spec();
+        seed_active_request(pool, spec.request_id, &platform).await;
+        let job = create_agent_job(pool, spec.request_id, &platform, &spec, "LivePlan")
+            .await
+            .expect("seed correctly bound LivePlan job");
         let safe_projection = reviewable_live_plan(&["create"]);
         let evidence = serde_json::to_vec(&safe_projection).unwrap();
         let digest = ryuki_protocol::sha256_hex(&evidence);
@@ -23168,6 +24062,7 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::LivePlan,
             status: JobResultStatus::Planned,
@@ -23193,11 +24088,10 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE agent_jobs SET spec = $1::jsonb, mode = 'LivePlan', status = 'Succeeded', \
-             result_status = 'planned', completed_at = NOW(), result_id = $2, \
-             evidence_digest = $3, raw_plan_digest = $4, signed_envelope = $5::jsonb WHERE id = $6",
+            "UPDATE agent_jobs SET status = 'Succeeded', result_status = 'planned', \
+             completed_at = NOW(), result_id = $1, evidence_digest = $2, \
+             raw_plan_digest = $3, signed_envelope = $4::jsonb WHERE id = $5",
         )
-        .bind(serde_json::to_value(&spec).unwrap())
         .bind(result_id)
         .bind(&digest)
         .bind("a".repeat(64))
@@ -23228,6 +24122,7 @@ mod tests {
         assert!(out.get("spec").is_none());
 
         cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, spec.request_id).await;
         sqlx::query("DELETE FROM evidence_blobs WHERE digest = $1")
             .bind(&digest)
             .execute(pool)
@@ -23260,6 +24155,8 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test request resource version"),
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -23441,9 +24338,7 @@ mod tests {
         let agent_id = format!("agent-requeue-{}", Uuid::new_v4());
         seed_agent(pool, &agent_id, &platform, "approved").await;
         let request_id = seed_request_row(pool, "executing").await;
-        let job =
-            seed_dead_lettered_job_full(pool, &platform, request_id, request_id, JobMode::LivePlan)
-                .await;
+        let job = seed_dead_lettered_job_full(pool, &platform, request_id, JobMode::LivePlan).await;
         sqlx::query("UPDATE agent_jobs SET agent_id = $2 WHERE id = $1")
             .bind(job)
             .bind(&agent_id)
@@ -23584,11 +24479,11 @@ mod tests {
         cleanup_request_row(pool, failed).await;
     }
 
-    /// requeue validates the dispatched SPEC, not the scalar columns (codex MAJOR):
-    /// the agent acts on spec.request_id / spec.mode, and create_agent_job does not
-    /// pin the columns to the spec. So requeue must guard the spec.
+    /// Migration 196 prevents a request-id/version split between the durable row
+    /// and its spec. Requeue still treats the spec's execution mode as authoritative
+    /// and refuses live-mutating or malformed work.
     #[tokio::test]
-    async fn db_requeue_validates_the_spec_not_the_columns() {
+    async fn db_requeue_requires_canonical_request_binding_and_safe_spec() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -23598,52 +24493,72 @@ mod tests {
         let active = seed_request_row(pool, "executing").await;
         let concluded = seed_request_row(pool, "cancelled").await;
 
-        // A) column request_id ACTIVE but spec.request_id CONCLUDED → 409 (the guard
-        //    must follow the spec, which is what the agent executes).
-        let job_a =
-            seed_dead_lettered_job_full(pool, &platform, active, concluded, JobMode::OfflineDryRun)
-                .await;
-        let Err((sa, _)) = admin_requeue_dead_lettered_job(
-            Path(job_a.to_string()),
-            Extension(AuthSession::static_dry_run()),
-        )
-        .await
-        else {
-            panic!("spec.request_id concluded must 409 even when the column is active");
-        };
-        assert_eq!(sa, StatusCode::CONFLICT);
-        assert_eq!(job_status_and_attempts(pool, job_a).await.0, "DeadLettered");
+        // A/B) Either direction of scalar/spec request-id substitution is rejected
+        // at INSERT, before a requeueable row can exist.
+        for (column_request_id, spec_request_id) in [(active, concluded), (concluded, active)] {
+            let spec_json =
+                serde_json::to_value(dead_letter_spec(spec_request_id, JobMode::OfflineDryRun))
+                    .expect("serialize mismatched job spec");
+            let error = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO agent_jobs \
+                     (request_id, platform, spec, mode, status, delivery_attempts) \
+                 VALUES \
+                     ($1, $2, $3, 'OfflineDryRun', 'DeadLettered', 5) \
+                 RETURNING id",
+            )
+            .bind(column_request_id)
+            .bind(&platform)
+            .bind(sqlx::types::Json(spec_json))
+            .fetch_one(pool)
+            .await
+            .expect_err("row/spec request-id substitution must fail at INSERT");
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|database_error| database_error.code())
+                    .as_deref(),
+                Some("23514")
+            );
+        }
 
-        // B) column request_id CONCLUDED but spec.request_id ACTIVE → 200 (the spec's
-        //    parent is active, so requeue is allowed regardless of the stale column).
-        let job_b =
-            seed_dead_lettered_job_full(pool, &platform, concluded, active, JobMode::OfflineDryRun)
-                .await;
-        let _ = admin_requeue_dead_lettered_job(
-            Path(job_b.to_string()),
-            Extension(AuthSession::static_dry_run()),
-        )
-        .await
-        .expect("spec.request_id active must requeue (200) even if the column is concluded");
-        assert_eq!(job_status_and_attempts(pool, job_b).await.0, "Pending");
-
-        // C) spec.mode = LiveApply (column says OfflineDryRun) → 409: a live job must
+        // C) A scalar/spec mode substitution is rejected at INSERT. A canonical
+        //    LiveApply row is still refused by the requeue path, so live work can
         //    never be re-dispatched as non-mutating Pending work.
-        let job_c =
-            seed_dead_lettered_job_full(pool, &platform, active, active, JobMode::LiveApply).await;
+        let live_spec = dead_letter_spec(active, JobMode::LiveApply);
+        let mode_error = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, delivery_attempts) \
+             VALUES ($1, 1, $2, $3, 'OfflineDryRun', 'DeadLettered', 5) RETURNING id",
+        )
+        .bind(active)
+        .bind(&platform)
+        .bind(serde_json::to_value(&live_spec).expect("serialize live job spec"))
+        .fetch_one(pool)
+        .await
+        .expect_err("row/spec mode substitution must fail at INSERT");
+        assert_eq!(
+            mode_error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        let job_c = seed_dead_lettered_job_full(pool, &platform, active, JobMode::LiveApply).await;
         let Err((sc, _)) = admin_requeue_dead_lettered_job(
             Path(job_c.to_string()),
             Extension(AuthSession::static_dry_run()),
         )
         .await
         else {
-            panic!("a LiveApply spec must 409 even when the column mode is OfflineDryRun");
+            panic!("a canonically bound LiveApply job must still be refused by requeue");
         };
         assert_eq!(sc, StatusCode::CONFLICT);
         assert_eq!(job_status_and_attempts(pool, job_c).await.0, "DeadLettered");
 
-        // D) malformed spec → 409 (the agent could not have run it).
-        let job_d: Uuid = sqlx::query_scalar(
+        // D) A malformed spec is likewise rejected by the binding trigger, so it
+        // can never become admin-requeueable state.
+        let malformed_error = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, delivery_attempts) \
              VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'DeadLettered', 5) RETURNING id",
         )
@@ -23651,16 +24566,14 @@ mod tests {
         .bind(&platform)
         .fetch_one(pool)
         .await
-        .expect("seed malformed-spec job");
-        let Err((sd, _)) = admin_requeue_dead_lettered_job(
-            Path(job_d.to_string()),
-            Extension(AuthSession::static_dry_run()),
-        )
-        .await
-        else {
-            panic!("a malformed spec must 409");
-        };
-        assert_eq!(sd, StatusCode::CONFLICT);
+        .expect_err("malformed agent-job spec must fail at INSERT");
+        assert_eq!(
+            malformed_error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
 
         cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, active).await;
@@ -24074,7 +24987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_scope_cancel_projects_authoritative_spec_request_id() {
+    async fn db_scope_cancel_rejects_authority_rewrite_and_uses_bound_request() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -24086,24 +24999,42 @@ mod tests {
         let spec_request = seed_request_for_scope(pool, "GBLON", "production").await;
         let job = seed_job_in_status(pool, &platform, scalar_request, "Pending").await;
         let spec = dead_letter_spec(spec_request, JobMode::OfflineDryRun);
-        sqlx::query("UPDATE agent_jobs SET spec = $1 WHERE id = $2")
+        let rewrite = sqlx::query("UPDATE agent_jobs SET spec = $1 WHERE id = $2")
             .bind(serde_json::to_value(&spec).expect("spec serialises"))
             .bind(job)
             .execute(pool)
             .await
-            .expect("make request ids divergent");
+            .expect_err("the immutable authority trigger must reject a spec rewrite");
+        let rewrite_code = rewrite
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(rewrite_code.as_deref(), Some("55000"));
 
-        let Json(out) = admin_cancel_pending_job(
+        let Err((out_of_scope_status, _)) = admin_cancel_pending_job(
             Path(job.to_string()),
             Extension(scoped_admin_session("GBLON")),
             Json(CancelJobBody {
-                reason: "scope projection regression".into(),
+                reason: "scope binding regression".into(),
             }),
         )
         .await
-        .expect("the spec parent is in scope");
-        assert_eq!(out["request_id"], json!(spec_request.to_string()));
-        assert_ne!(out["request_id"], json!(scalar_request.to_string()));
+        else {
+            panic!("the rejected foreign spec must not change the job's scope");
+        };
+        assert_eq!(out_of_scope_status, StatusCode::NOT_FOUND);
+
+        let Json(out) = admin_cancel_pending_job(
+            Path(job.to_string()),
+            Extension(scoped_admin_session("DEFRA")),
+            Json(CancelJobBody {
+                reason: "canonical scope binding regression".into(),
+            }),
+        )
+        .await
+        .expect("the canonical bound request is in scope");
+        assert_eq!(out["request_id"], json!(scalar_request.to_string()));
+        assert_ne!(out["request_id"], json!(spec_request.to_string()));
 
         let audited_request_id: String = sqlx::query_scalar(
             "SELECT detail->>'request_id' FROM audit_log \
@@ -24114,7 +25045,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("read cancellation audit");
-        assert_eq!(audited_request_id, spec_request.to_string());
+        assert_eq!(audited_request_id, scalar_request.to_string());
         let event_request_id: String = sqlx::query_scalar(
             "SELECT payload->>'request_id' FROM domain_events \
              WHERE event_type = 'job.cancelled' AND aggregate_id = $1 \
@@ -24124,7 +25055,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("read cancellation event");
-        assert_eq!(event_request_id, spec_request.to_string());
+        assert_eq!(event_request_id, scalar_request.to_string());
 
         cleanup_dead_letter_events(pool, job).await;
         cleanup_request_and_jobs(pool, scalar_request).await;
@@ -24228,7 +25159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_scope_job_get_projects_authoritative_spec_request_id() {
+    async fn db_scope_job_get_rejects_authority_rewrite_and_uses_bound_request() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -24239,21 +25170,36 @@ mod tests {
         let spec_request = seed_request_for_scope(pool, "GBLON", "production").await;
         let job = seed_job_in_status(pool, &platform, scalar_request, "Pending").await;
         let spec = dead_letter_spec(spec_request, JobMode::OfflineDryRun);
-        sqlx::query("UPDATE agent_jobs SET spec = $1 WHERE id = $2")
+        let rewrite = sqlx::query("UPDATE agent_jobs SET spec = $1 WHERE id = $2")
             .bind(serde_json::to_value(&spec).expect("spec serialises"))
             .bind(job)
             .execute(pool)
             .await
-            .expect("make request ids divergent");
+            .expect_err("the immutable authority trigger must reject a spec rewrite");
+        let rewrite_code = rewrite
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(rewrite_code.as_deref(), Some("55000"));
 
-        let Json(out) = admin_agent_job_get(
+        let Err((out_of_scope_status, _)) = admin_agent_job_get(
             Path(job.to_string()),
             Extension(scoped_admin_session("GBLON")),
         )
         .await
-        .expect("the spec parent is in scope");
-        assert_eq!(out["request_id"], json!(spec_request.to_string()));
-        assert_ne!(out["request_id"], json!(scalar_request.to_string()));
+        else {
+            panic!("the rejected foreign spec must not change the job's scope");
+        };
+        assert_eq!(out_of_scope_status, StatusCode::NOT_FOUND);
+
+        let Json(out) = admin_agent_job_get(
+            Path(job.to_string()),
+            Extension(scoped_admin_session("DEFRA")),
+        )
+        .await
+        .expect("the canonical bound request is in scope");
+        assert_eq!(out["request_id"], json!(scalar_request.to_string()));
+        assert_ne!(out["request_id"], json!(spec_request.to_string()));
 
         cleanup_request_and_jobs(pool, scalar_request).await;
         cleanup_request_and_jobs(pool, spec_request).await;
@@ -24295,7 +25241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_scope_dead_lettered_projects_authoritative_spec_request_id() {
+    async fn db_scope_dead_lettered_rejects_divergent_request_binding() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -24304,26 +25250,25 @@ mod tests {
         let platform = format!("plt-scope-dl-id-{}", Uuid::new_v4().simple());
         let scalar_request = seed_request_for_scope(pool, "DEFRA", "production").await;
         let spec_request = seed_request_for_scope(pool, "GBLON", "production").await;
-        let job = seed_dead_lettered_job_full(
-            pool,
-            &platform,
-            scalar_request,
-            spec_request,
-            JobMode::OfflineDryRun,
+        let spec = dead_letter_spec(spec_request, JobMode::OfflineDryRun);
+        let error = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, delivery_attempts) \
+             VALUES ($1, 1, $2, $3, 'OfflineDryRun', 'DeadLettered', 5) RETURNING id",
         )
-        .await;
-
-        let Json(out) = admin_dead_lettered_jobs(Extension(scoped_admin_session("GBLON")))
-            .await
-            .expect("the spec parent is in scope");
-        let listed = out["dead_lettered_jobs"]
-            .as_array()
-            .expect("dead-lettered jobs array")
-            .iter()
-            .find(|entry| entry["job_id"] == json!(job.to_string()))
-            .expect("divergent job must be listed by its in-scope spec parent");
-        assert_eq!(listed["request_id"], json!(spec_request.to_string()));
-        assert_ne!(listed["request_id"], json!(scalar_request.to_string()));
+        .bind(scalar_request)
+        .bind(&platform)
+        .bind(serde_json::to_value(&spec).expect("serialize divergent job spec"))
+        .fetch_one(pool)
+        .await
+        .expect_err("a divergent row/spec request binding must fail at INSERT");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
 
         cleanup_request_and_jobs(pool, scalar_request).await;
         cleanup_request_and_jobs(pool, spec_request).await;
@@ -24390,64 +25335,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_scope_force_fail_malformed_spec_scoped_is_404() {
-        // codex: a malformed stored spec must NOT be a 500 existence oracle for a
-        // scoped principal — it fails closed to the same 404 a missing job returns;
-        // an unrestricted principal still surfaces the integrity 500.
+    async fn db_scope_malformed_spec_is_rejected_before_it_can_be_an_oracle() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
         let platform = format!("plt-scope-ffm-{}", Uuid::new_v4().simple());
-        // A Leased job whose stored spec is valid JSON but NOT a decodable JobSpec.
-        let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, '{\"not\":\"a-spec\"}'::jsonb, 'OfflineDryRun', 'Leased') RETURNING id",
+        let request_id = seed_request_for_scope(pool, "DEFRA", "production").await;
+        let error = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, 1, $2, '{\"not\":\"a-spec\"}'::jsonb, 'OfflineDryRun', 'Leased') \
+             RETURNING id",
         )
-        .bind(Uuid::new_v4())
+        .bind(request_id)
         .bind(&platform)
         .fetch_one(pool)
         .await
-        .expect("seed malformed-spec job");
-        let scoped = scoped_admin_session("DEFRA");
-        let Err((status, _)) = admin_force_fail_job(
-            Path(job_id.to_string()),
-            Extension(scoped),
-            Json(ForceFailJobBody {
-                reason: "scope test".into(),
-            }),
-        )
-        .await
-        else {
-            panic!("scoped malformed-spec force-fail must 404");
-        };
+        .expect_err("a malformed agent-job spec must fail at INSERT");
         assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "scoped principal must not get a malformed-spec 500 oracle"
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
         );
-        let Err((status_u, _)) = admin_force_fail_job(
-            Path(job_id.to_string()),
-            Extension(AuthSession::static_dry_run()),
-            Json(ForceFailJobBody {
-                reason: "scope test".into(),
-            }),
-        )
-        .await
-        else {
-            panic!("unrestricted malformed-spec force-fail must 500");
-        };
-        assert_eq!(
-            status_u,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unrestricted keeps the integrity 500"
-        );
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(pool)
-            .await
-            .ok();
+        cleanup_request_and_jobs(pool, request_id).await;
     }
 
     #[tokio::test]

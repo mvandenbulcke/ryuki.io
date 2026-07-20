@@ -315,10 +315,10 @@ Acceptance requires:
   persists its token, exits pending approval, and enters its poll loop only
   after the admin verifies `cryptographically_admitted: true` and approves the
   matching fingerprint and platform;
-- control plane and agent negotiate protocol v6. Missing and v1-v5
+- control plane and agent negotiate protocol v7. Missing and v1-v6
   protocol headers are rejected rather than treated as compatible. Record the
   approved agent's startup log entry `CP wire protocol is compatible` with both
-  `cp_protocol_version=6` and `agent_protocol_version=6`; the protocol rejection
+  `cp_protocol_version=7` and `agent_protocol_version=7`; the protocol rejection
   tests in Gate 1 are the evidence for older-version fail-closed behavior and
   for rejection of legacy live grants without exact destination, planning-agent
   enrollment/key, reviewed execution-profile, and exact plan-row bindings.
@@ -345,7 +345,7 @@ Keep live mode disabled for this entire gate.
    statuses become `validated`, then `planned`.
 3. Review the plan, approve the request, and lock it. The statuses become
    `approved`, then `locked`.
-4. Exercise enrollment, polling, protocol-v6 negotiation, result signing, and
+4. Exercise enrollment, polling, protocol-v7 negotiation, result signing, and
    evidence handling only through pure/stub tests that do not spawn Terraform
    or Ansible. Preserve their value-free evidence.
 5. Confirm the production runner reports the missing sealed containment

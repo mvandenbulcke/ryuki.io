@@ -267,6 +267,7 @@ mod tests {
         vec![
             RequestSummary {
                 id: "abc-1234".to_string(),
+                resource_version: 0,
                 request_type: "server-build".to_string(),
                 name: "Build web server".to_string(),
                 site: "dc-west".to_string(),
@@ -277,6 +278,7 @@ mod tests {
             },
             RequestSummary {
                 id: "def-5678".to_string(),
+                resource_version: 0,
                 request_type: "patch-maintenance".to_string(),
                 name: "Patch Tuesday".to_string(),
                 site: "dc-east".to_string(),
@@ -287,6 +289,7 @@ mod tests {
             },
             RequestSummary {
                 id: "ghi-9012".to_string(),
+                resource_version: 0,
                 request_type: "controlled-restore".to_string(),
                 name: "Restore backup".to_string(),
                 site: "dc-west".to_string(),

@@ -805,6 +805,7 @@ mod tests {
     fn row(id: &str, name: &str, site: &str, status: &str) -> RequestSummary {
         RequestSummary {
             id: id.to_string(),
+            resource_version: 0,
             request_type: "server".to_string(),
             name: name.to_string(),
             site: site.to_string(),

@@ -37,6 +37,8 @@
 //! `list_pending` reads only top-level `*.json` files.  It skips:
 //! - Subdirectories (including `dead/`).
 //! - Files whose extension is not exactly `.json` (including `*.attempts`).
+//! - Incompatible or corrupt JSON is moved byte-for-byte to `dead/` instead of
+//!   being warned-and-skipped forever after a protocol cutover.
 //!
 //! ## Security note
 //!
@@ -199,8 +201,9 @@ impl Outbox {
     ///
     /// Reads only top-level `*.json` files in `dir`.  Subdirectories (including
     /// `dead/`) and non-`.json` files (including `.attempts` sidecars) are
-    /// silently skipped.  Files that fail to deserialise are skipped with a
-    /// logged warning (they could be corrupt partial writes).
+    /// silently skipped. Files that fail to deserialise are quarantined
+    /// byte-for-byte so incompatible signed results remain available for
+    /// operator recovery without blocking every future drain pass.
     ///
     /// The order of returned results is filesystem-dependent (not guaranteed).
     pub fn list_pending(&self) -> Result<Vec<ResultBody>, OutboxError> {
@@ -247,8 +250,9 @@ impl Outbox {
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "outbox: failed to deserialise pending file — skipping (possible corrupt write)"
+                        "outbox: pending file is incompatible or corrupt — quarantining raw bytes"
                     );
+                    self.quarantine_path(&path)?;
                 }
             }
         }
@@ -328,16 +332,27 @@ impl Outbox {
     /// If the source file does not exist (e.g. already quarantined), returns
     /// `Ok(())` (idempotent).
     pub fn quarantine(&self, result_id: Uuid) -> Result<(), OutboxError> {
+        self.quarantine_path(&self.file_path(result_id))?;
+        self.clear_attempts(result_id)
+    }
+
+    fn quarantine_path(&self, src: &std::path::Path) -> Result<(), OutboxError> {
         let dead_dir = self.dead_dir();
         std::fs::create_dir_all(&dead_dir).map_err(|e| OutboxError::Io {
             path: dead_dir.display().to_string(),
             source: e,
         })?;
 
-        let src = self.file_path(result_id);
-        let dst = dead_dir.join(format!("{}.json", result_id));
+        let file_name = src.file_name().ok_or_else(|| OutboxError::Io {
+            path: src.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "outbox quarantine source has no file name",
+            ),
+        })?;
+        let dst = dead_dir.join(file_name);
 
-        match std::fs::rename(&src, &dst) {
+        match std::fs::rename(src, &dst) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Source already gone — idempotent.
@@ -346,11 +361,11 @@ impl Outbox {
                 // rename(2) can fail across filesystems (EXDEV). Fall back to
                 // copy + remove so tempdir-based tests and cross-fs setups work.
                 if e.raw_os_error() == Some(libc_exdev()) {
-                    std::fs::copy(&src, &dst).map_err(|ce| OutboxError::Io {
+                    std::fs::copy(src, &dst).map_err(|ce| OutboxError::Io {
                         path: dst.display().to_string(),
                         source: ce,
                     })?;
-                    std::fs::remove_file(&src).map_err(|re| OutboxError::Io {
+                    std::fs::remove_file(src).map_err(|re| OutboxError::Io {
                         path: src.display().to_string(),
                         source: re,
                     })?;
@@ -363,8 +378,14 @@ impl Outbox {
             }
         }
 
-        // Remove the attempts sidecar from the main dir.
-        self.clear_attempts(result_id)?;
+        if let Some(result_id) = src
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+        {
+            self.clear_attempts(result_id)?;
+        }
+
         Ok(())
     }
 
@@ -448,6 +469,8 @@ mod tests {
         let identity = AgentIdentity::generate();
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -467,6 +490,7 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: spec.request_id,
+            request_resource_version: spec.request_resource_version,
             result_id,
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -788,6 +812,30 @@ mod tests {
             pending.is_empty(),
             "list_pending must be empty after quarantine (dead/ excluded)"
         );
+    }
+
+    #[test]
+    fn incompatible_legacy_entry_is_quarantined_byte_for_byte() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+        let body = make_result_body(id);
+        let mut legacy = serde_json::to_value(body).expect("serialize fixture");
+        legacy["job_result"]["signed_envelope"]
+            .as_object_mut()
+            .expect("signed envelope")
+            .remove("request_resource_version");
+        let raw = serde_json::to_vec_pretty(&legacy).expect("legacy JSON");
+        let source = dir.path().join(format!("{id}.json"));
+        std::fs::write(&source, &raw).expect("write legacy outbox entry");
+        outbox.record_attempt(id).expect("attempt sidecar");
+
+        let pending = outbox.list_pending().expect("scan outbox");
+        assert!(pending.is_empty());
+        assert!(!source.exists());
+        assert!(!dir.path().join(format!("{id}.attempts")).exists());
+        let quarantined = dir.path().join("dead").join(format!("{id}.json"));
+        assert_eq!(std::fs::read(quarantined).expect("raw quarantine"), raw);
     }
 
     // -----------------------------------------------------------------------

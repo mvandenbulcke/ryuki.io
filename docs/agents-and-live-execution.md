@@ -45,7 +45,7 @@ contract v3, while the release-wide wire protocol is v6 because signed live
 grants also bind destination platform, the exact successful plan job and
 attempt, the exact planning-agent enrollment and key, and the reviewed
 execution trust profile; signed results bind the immutable enrollment UUID.
-Deploy only matching protocol-v6
+Deploy only matching protocol-v7
 API, agent, and portal components after the v3 enrollment migration is ready.
 
 Pre-cutover Approved and Revoked rows remain operable so the cutover does not
@@ -204,7 +204,7 @@ control-plane rehearsal until containment is implemented.
 1. **Plan.** An admin dispatches `POST /api/requests/{id}/execute?mode=live-plan`. The agent plans against the real backend and posts scrubbed evidence plus a SHA-256 plan digest.
 2. **Review.** The control plane stores the digest-covered plan bytes privately and derives an admin-only projection from the actual planned VM shape and the five planned vSphere placement lookups. Those values must exactly match the JobSpec; missing or mismatched `change.after` data fails closed. Raw Terraform JSON and provider object identifiers are not exposed.
 3. **Approve.** An admin calls `POST /api/requests/{id}/approve-live-apply` with the exact reviewed plan job UUID, attempt UUID, and digest. The control plane locks and re-verifies that selected row, including its attempt, lease generation, result UUID, signed-envelope identity, immutable enrollment, key, profile, spec, and digest. It then mints an Ed25519 grant binding the request id, destination platform, exact plan job and attempt, approved plan digest, complete JobSpec digest (including mode, IaC digest, variables, and state key), exact successful-planning agent id/enrollment/key, canonical execution-trust-profile digest, approver, and expiry (whole-request approvals use a 1-hour TTL; grants are capped at 24 hours). A later same-digest plan row cannot replace the row the administrator reviewed. The database allows one request-level live apply. Human per-step approval is deliberately disabled: the step route completes its admin, scope, and separation-of-duties checks, then returns `409 Conflict` without minting a job. Exact-plan step-grant support remains internal protocol groundwork rather than an enabled operator workflow.
-4. **Verify authority.** Before provider execution, the agent requires protocol v6, re-computes the embedded IaC digest, verifies the grant and its exact JobSpec, destination, plan job/attempt, planning-agent enrollment/key, execution-profile digest, request/step ownership, and expiry, then runs a fresh plan whose digest must equal the approved one. Any failure produces a signed `LiveRefused` result and mutation is never called. The control plane independently repeats the signed grant, platform, spec, state-owner, assigned-agent, profile, plan-row, and approved-digest checks on result ingest. Protocol v1 through v5 peers, including digest-only v5 grants, are rejected rather than interpreted without those bindings.
+4. **Verify authority.** Before provider execution, the agent requires protocol v7, re-computes the embedded IaC digest, verifies the grant and its exact JobSpec, destination, plan job/attempt, planning-agent enrollment/key, execution-profile digest, request/step ownership, exact request resource version, and expiry, then runs a fresh plan whose digest must equal the approved one. Any failure produces a signed `LiveRefused` result and mutation is never called. The control plane independently repeats the signed grant, platform, spec, state-owner, assigned-agent, profile, plan-row, request-version, and approved-digest checks on result ingest. Protocol v1 through v6 peers are rejected rather than interpreted without those bindings.
 5. **Apply and converge.** The LiveApply job creates a fresh binary plan, proves its canonical `terraform show -json` digest equals the reviewed digest, and applies that matching binary plan. It does not reuse a binary `tfplan` file from the earlier job. The runner then re-plans; a vSphere request cannot complete verification unless that post-apply plan is clean. Other Terraform offerings and Ansible check-mode runs remain preview-only until they have their own typed, server-derived review projection; neither approval endpoint will mint a grant for them.
 
 Plan, apply, and destroy jobs for one state key are pinned to the same approved
@@ -295,7 +295,7 @@ execution. The normative future-live checklist is
 ## What is implemented, and what stays yours
 
 Implemented and tested: the no-provider-authority/no-spawn dry-run protocol
-path; protocol-v6-only negotiation; the
+path; protocol-v7-only negotiation; the
 fail-closed live protocol and acceptance paths (exact-spec and exact-plan-row
 grant binding, IaC and plan digest integrity, state-owner validation, exact
 planning-agent enrollment/key and execution-profile affinity, refusal

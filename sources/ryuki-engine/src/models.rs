@@ -5,6 +5,11 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
     pub id: String,
+    #[serde(
+        default = "default_request_resource_version",
+        deserialize_with = "deserialize_request_resource_version"
+    )]
+    pub resource_version: i64,
     pub offering_id: String,
     pub request_type: RequestType,
     pub status: RequestStatus,
@@ -37,6 +42,7 @@ impl Request {
         let now = Utc::now().to_rfc3339();
         Request {
             id,
+            resource_version: default_request_resource_version(),
             offering_id,
             request_type,
             status: RequestStatus::Draft,
@@ -53,6 +59,24 @@ impl Request {
             evidence_manifest_id: None,
             metadata: HashMap::new(),
         }
+    }
+}
+
+const fn default_request_resource_version() -> i64 {
+    1
+}
+
+fn deserialize_request_resource_version<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    if value > 0 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "request resource_version must be positive",
+        ))
     }
 }
 
@@ -1002,8 +1026,54 @@ mod tests {
             "critical".into(),
         );
         assert_eq!(req.status, RequestStatus::Draft);
+        assert_eq!(req.resource_version, 1);
         assert!(req.dry_run_required);
         assert_eq!(req.site, "DEFRA");
+    }
+
+    #[test]
+    fn request_resource_version_defaults_when_legacy_json_omits_it() {
+        let request = Request::new(
+            "req-legacy-json".into(),
+            "windows-server-deployment".into(),
+            RequestType::ServerDeployment,
+            "alice".into(),
+            "bob".into(),
+            "DEFRA".into(),
+            "production".into(),
+            "critical".into(),
+        );
+        let mut legacy = serde_json::to_value(request).expect("serialize request fixture");
+        legacy
+            .as_object_mut()
+            .expect("request serializes as an object")
+            .remove("resource_version");
+
+        let decoded: Request =
+            serde_json::from_value(legacy).expect("legacy request remains compatible");
+        assert_eq!(decoded.resource_version, 1);
+    }
+
+    #[test]
+    fn request_resource_version_rejects_non_positive_json_values() {
+        let request = Request::new(
+            "req-invalid-version-json".into(),
+            "windows-server-deployment".into(),
+            RequestType::ServerDeployment,
+            "alice".into(),
+            "bob".into(),
+            "DEFRA".into(),
+            "production".into(),
+            "critical".into(),
+        );
+
+        for invalid in [0, -1, i64::MIN] {
+            let mut encoded = serde_json::to_value(&request).expect("serialize request fixture");
+            encoded["resource_version"] = serde_json::json!(invalid);
+            let error = serde_json::from_value::<Request>(encoded)
+                .expect_err("an explicit non-positive resource version must fail closed");
+            assert!(error.to_string().contains("must be positive"));
+        }
     }
 
     #[test]

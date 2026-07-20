@@ -20,6 +20,8 @@
 //!    - `grant.job_spec_digest == job_spec_digest(job.spec)` (the grant binds
 //!      the exact mode, IaC, variables, and Terraform state key),
 //!    - `grant.request_id == job.spec.request_id` (the grant is for THIS job),
+//!    - `grant.request_resource_version == job.spec.request_resource_version`
+//!      (the grant is for the exact monotonic request state that was leased),
 //!    - `grant.expiry > Utc::now()` (the grant has not expired), and
 //!    - `replanned_plan_digest == Some(grant.approved_plan_digest)` (the plan
 //!      the agent just produced matches the plan an operator reviewed and the
@@ -157,14 +159,15 @@ pub fn evaluate_execution_trust_binding(
 ///   4. `grant.platform == job.platform`
 ///   5. `grant.job_spec_digest == job_spec_digest(job.spec)`
 ///   6. `grant.request_id == job.spec.request_id`
-///   7. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
+///   7. `grant.request_resource_version == job.spec.request_resource_version`
+///   8. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
 ///      `bound_id == job.id` — a step-scoped grant only authorises the ONE
 ///      dispatched step job it was minted for, preventing replay across
 ///      steps and across re-dispatches (a re-dispatch mints a fresh job id).
 ///      `None` is the whole-request grant shape, so the step-id comparison is
 ///      skipped.
-///   8. `grant.expiry > Utc::now()`
-///   9. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
+///   9. `grant.expiry > Utc::now()`
+///   10. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 ///
 /// Any failure → `Refused` with a specific reason string.
 pub fn evaluate_live_execution(
@@ -196,8 +199,8 @@ pub fn evaluate_live_execution(
 
         // LiveDestroy also mutates (it DESTROYS the step's applied resources for
         // #42's auto compensating teardown). It requires the SAME step-bound,
-        // CP-signed grant as LiveApply (checks 1-8), but has NO plan-then-apply
-        // digest match (check 9): a destroy removes the step's own isolated
+        // CP-signed grant rigor as LiveApply, but has NO plan-then-apply digest
+        // match: a destroy removes the step's own isolated
         // workspace state, not a pre-approved plan. `replanned_plan_digest` is
         // therefore irrelevant here.
         JobMode::LiveDestroy => evaluate_live_destroy(job, cp_verifying_key, allow_live),
@@ -231,10 +234,10 @@ pub fn evaluate_live_authority(
 }
 
 /// Shared grant checks for the mutating live modes (`LiveApply` /
-/// `LiveDestroy`) — checks 1-8, in strict order; the first failure returns a
+/// `LiveDestroy`) — checks 1-9, in strict order; the first failure returns a
 /// `Refused` decision. Returns the verified grant so the caller can apply its
 /// mode-specific final check (LiveApply's plan-then-apply digest match, check
-/// 9). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
+/// 10). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
 /// signature, platform/request binding, step binding, and expiry.
 fn verify_live_grant<'g>(
     job: &'g Job,
@@ -295,7 +298,18 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 7 (#42 slice A / B2): the grant's step binding.
+    // Check 7: the signed grant and leased spec must name the exact same
+    // monotonic request state. The JobSpec digest also commits to this field,
+    // but the explicit equality check keeps the freshness fence fail-closed at
+    // the live-execution boundary and prevents future digest-shape drift from
+    // silently weakening it.
+    if grant.request_resource_version != job.spec.request_resource_version {
+        return Err(LiveDecision::Refused(
+            "grant is for a different request resource version".to_owned(),
+        ));
+    }
+
+    // Check 8 (#42 slice A / B2): the grant's step binding.
     //
     // A step-scoped grant (`step_job_id: Some`) may only be used against the ONE
     // dispatched step job it was minted for — closing cross-step replay (a grant
@@ -323,7 +337,7 @@ fn verify_live_grant<'g>(
         }
     }
 
-    // Check 8: the grant must not be expired.
+    // Check 9: the grant must not be expired.
     if grant.expiry <= Utc::now() {
         return Err(LiveDecision::Refused("grant has expired".to_owned()));
     }
@@ -339,14 +353,14 @@ fn evaluate_live_apply(
     allow_live: bool,
     replanned_plan_digest: Option<&str>,
 ) -> LiveDecision {
-    // Checks 1-6: the shared grant rigor. LiveApply tolerates a legacy
-    // whole-request (`None`) grant, so require_step_bound = false.
+    // Checks 1-9: the shared grant rigor. LiveApply permits the whole-request
+    // (`None`) grant shape, so require_step_bound = false.
     let grant = match verify_live_grant(job, cp_verifying_key, allow_live, "LiveApply", false) {
         Ok(g) => g,
         Err(refused) => return refused,
     };
 
-    // Check 8: plan-then-apply — the plan the agent just produced must match
+    // Check 10: plan-then-apply — the plan the agent just produced must match
     // the plan an operator reviewed and the CP signed off on.
     match replanned_plan_digest {
         None => LiveDecision::Refused("no plan digest available".to_owned()),
@@ -363,20 +377,20 @@ fn evaluate_live_apply(
 }
 
 /// Inner decision function for `LiveDestroy` (#42 auto compensating teardown).
-/// Applies the SAME step-bound, CP-signed grant checks as `LiveApply` (checks
-/// 1-6 via [`verify_live_grant`]), but NOT the plan-then-apply digest match
-/// (check 7): a destroy removes the step's OWN isolated `terraform` workspace
+/// Applies the SAME step-bound, CP-signed grant checks as `LiveApply` via
+/// [`verify_live_grant`], but NOT the plan-then-apply digest match: a destroy
+/// removes the step's OWN isolated `terraform` workspace
 /// state — that isolation is the bound — rather than applying a pre-approved
 /// plan, so there is no approved-plan digest to compare against. The grant is
 /// still step-scoped (it authorises destroying exactly the resources THIS step
-/// applied), signature-verified, request-bound, and expiry-checked.
+/// applied), signature-verified, request/version-bound, and expiry-checked.
 fn evaluate_live_destroy(
     job: &Job,
     cp_verifying_key: &VerifyingKey,
     allow_live: bool,
 ) -> LiveDecision {
     // require_step_bound = true: a destroy's safety bound IS the step binding,
-    // so an unbound (legacy whole-request) grant must never authorise it.
+    // so an unbound whole-request grant must never authorise it.
     match verify_live_grant(job, cp_verifying_key, allow_live, "LiveDestroy", true) {
         Ok(_) => LiveDecision::Proceed,
         Err(refused) => refused,
@@ -453,6 +467,7 @@ mod tests {
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            request_resource_version: spec.request_resource_version,
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
@@ -479,6 +494,7 @@ mod tests {
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            request_resource_version: spec.request_resource_version,
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
@@ -512,6 +528,8 @@ mod tests {
     ) -> Job {
         let spec = JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1.0.0".to_owned(),
             iac_digest: sha256_hex(b"iac-content"),
@@ -777,6 +795,7 @@ mod tests {
         let mut job = make_job(JobMode::LiveApply, request_id, None);
         let unsigned = VerifiedLiveContext {
             request_id,
+            request_resource_version: job.spec.request_resource_version,
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),
@@ -822,6 +841,24 @@ mod tests {
     }
 
     #[test]
+    fn live_apply_refused_request_resource_version_mismatch() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        let mut grant = make_valid_grant(&cp_sk, request_id, &plan_digest, &job.spec);
+        grant.request_resource_version = ryuki_protocol::RequestResourceVersion::new(2)
+            .expect("positive request resource version");
+        grant.signature.clear();
+        job.live_context = Some(sign_vlc(grant, &cp_sk));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
+            LiveDecision::Refused("grant is for a different request resource version".to_owned(),),
+        );
+    }
+
+    #[test]
     fn live_apply_refused_expired_grant() {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
@@ -830,6 +867,7 @@ mod tests {
         let mut job = make_job(JobMode::LiveApply, request_id, None);
         let unsigned = VerifiedLiveContext {
             request_id,
+            request_resource_version: job.spec.request_resource_version,
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),

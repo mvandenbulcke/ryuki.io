@@ -5676,21 +5676,149 @@ fn validate_action_resource_registry(root: &Path, registry: &Value, errors: &mut
     }
 
     let closure = registry.get("inventory_closure").unwrap_or(&Value::Null);
-    for (index, source) in array(closure, "inventory_sources")
-        .iter()
-        .filter_map(Value::as_str)
-        .enumerate()
-    {
-        validate_source_path(
-            root,
-            source,
-            None,
-            &format!(
-                "action-resource-registry.implementation.json:/inventory_closure/inventory_sources/{index}"
-            ),
-            errors,
-        );
+    validate_action_inventory_sources(root, closure, errors);
+}
+
+fn validate_action_inventory_sources(root: &Path, closure: &Value, errors: &mut Vec<String>) {
+    const PATH: &str =
+        "action-resource-registry.implementation.json:/inventory_closure/inventory_sources";
+    const REFERENCE_FIELDS: [&str; 4] = [
+        "document_id",
+        "document_version",
+        "content_digest",
+        "artifact_locator",
+    ];
+
+    let Some(sources) = closure.get("inventory_sources").and_then(Value::as_array) else {
+        errors.push(format!(
+            "{PATH}: must be a non-empty array of content-reference objects"
+        ));
+        return;
+    };
+    if sources.is_empty() {
+        errors.push(format!(
+            "{PATH}: must contain at least one content-reference object"
+        ));
+        return;
     }
+
+    let mut document_ids = BTreeSet::new();
+    let mut locators = BTreeSet::new();
+    for (index, source) in sources.iter().enumerate() {
+        let context = format!("{PATH}/{index}");
+        let Some(reference) = source.as_object() else {
+            errors.push(format!("{context}: inventory source must be an object"));
+            continue;
+        };
+
+        for field in reference.keys() {
+            if !REFERENCE_FIELDS.contains(&field.as_str()) {
+                errors.push(format!(
+                    "{context}: inventory source contains unsupported field {field}"
+                ));
+            }
+        }
+
+        match reference.get("document_id").and_then(Value::as_str) {
+            Some(document_id) if is_inventory_source_document_id(document_id) => {
+                if !document_ids.insert(document_id.to_string()) {
+                    errors.push(format!(
+                        "{context}: duplicate inventory source document_id {document_id}"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "{context}: document_id must be a canonical source reference identifier"
+            )),
+        }
+
+        if reference
+            .get("document_version")
+            .and_then(Value::as_u64)
+            .is_none_or(|version| version == 0)
+        {
+            errors.push(format!(
+                "{context}: document_version must be a positive integer"
+            ));
+        }
+
+        let expected_digest = reference.get("content_digest").and_then(Value::as_str);
+        if !expected_digest.is_some_and(is_sha256_digest) {
+            errors.push(format!(
+                "{context}: content_digest must be sha256: plus 64 lowercase hexadecimal digits"
+            ));
+        }
+
+        let Some(locator) = reference
+            .get("artifact_locator")
+            .and_then(Value::as_str)
+            .filter(|locator| is_inventory_source_locator(locator))
+        else {
+            errors.push(format!(
+                "{context}: artifact_locator must be a normalized repository-relative path"
+            ));
+            continue;
+        };
+        if !locators.insert(locator.to_string()) {
+            errors.push(format!(
+                "{context}: duplicate inventory source artifact_locator {locator}"
+            ));
+        }
+
+        let Some(path) = safe_repository_path(root, locator, &context, errors) else {
+            continue;
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: cannot read inventory source {locator}: {error}"
+                ));
+                continue;
+            }
+        };
+        let actual_digest = raw_sha256_digest(&bytes);
+        if expected_digest != Some(actual_digest.as_str()) {
+            errors.push(format!(
+                "{context}: content_digest does not match exact raw bytes at {locator}; expected {actual_digest}"
+            ));
+        }
+    }
+}
+
+fn is_inventory_source_document_id(value: &str) -> bool {
+    let Some((namespace, identifier)) = value.split_once(':') else {
+        return false;
+    };
+    let mut namespace_characters = namespace.bytes();
+    let namespace_is_valid = namespace_characters
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase())
+        && namespace_characters
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let identifier_bytes = identifier.as_bytes();
+    namespace_is_valid
+        && (3..=127).contains(&identifier_bytes.len())
+        && (identifier_bytes[0].is_ascii_lowercase() || identifier_bytes[0].is_ascii_digit())
+        && identifier_bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn is_inventory_source_locator(value: &str) -> bool {
+    let mut component_count = 0;
+    for component in value.split('/') {
+        component_count += 1;
+        if component.is_empty()
+            || matches!(component, "." | "..")
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        {
+            return false;
+        }
+    }
+    component_count >= 2
 }
 
 fn validate_security_limit_profile(root: &Path, profile: &Value, errors: &mut Vec<String>) {
@@ -6710,6 +6838,107 @@ mod tests {
     fn repository_security_contracts_pass_the_real_gate() {
         let errors = validate_repository(&root()).expect("repository validation should run");
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn action_inventory_sources_bind_the_exact_raw_source_bytes() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let original_bytes = b"pub fn fixture() {}\n";
+        fs::write(temporary_root.path().join(locator), original_bytes).unwrap();
+        let registry = json!({
+            "inventory_closure": {
+                "inventory_sources": [{
+                    "document_id": "source:fixture-one",
+                    "document_version": 1,
+                    "content_digest": raw_sha256_digest(original_bytes),
+                    "artifact_locator": locator
+                }]
+            }
+        });
+
+        let mut errors = Vec::new();
+        validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        fs::write(temporary_root.path().join(locator), b"pub fn fixture() {}").unwrap();
+        errors.clear();
+        validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("content_digest does not match exact raw bytes")
+                && error.contains(locator)
+        }));
+    }
+
+    #[test]
+    fn action_inventory_sources_reject_missing_malformed_and_duplicate_references() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let bytes = b"pub fn fixture() {}\n";
+        fs::write(temporary_root.path().join(locator), bytes).unwrap();
+        let digest = raw_sha256_digest(bytes);
+
+        let mut errors = Vec::new();
+        validate_action_resource_registry(
+            temporary_root.path(),
+            &json!({"inventory_closure": {}}),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must be a non-empty array")));
+
+        let registry = json!({
+            "inventory_closure": {
+                "inventory_sources": [
+                    locator,
+                    {
+                        "document_id": "source:fixture-one",
+                        "document_version": 1,
+                        "artifact_locator": locator
+                    },
+                    {
+                        "document_id": "source:fixture-one",
+                        "document_version": 2,
+                        "content_digest": digest,
+                        "artifact_locator": locator
+                    },
+                    {
+                        "document_id": "source:fixture-missing",
+                        "document_version": 1,
+                        "content_digest": digest,
+                        "artifact_locator": "sources/missing.rs"
+                    },
+                    {
+                        "document_id": "source:fixture-malformed",
+                        "document_version": 1,
+                        "content_digest": digest,
+                        "artifact_locator": "fixture.rs",
+                        "unexpected": true
+                    }
+                ]
+            }
+        });
+        errors.clear();
+        validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+
+        for expected in [
+            "inventory source must be an object",
+            "content_digest must be sha256:",
+            "duplicate inventory source document_id source:fixture-one",
+            "duplicate inventory source artifact_locator sources/fixture.rs",
+            "repository locator does not resolve to a file sources/missing.rs",
+            "inventory source contains unsupported field unexpected",
+            "artifact_locator must be a normalized repository-relative path",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected:?}: {}",
+                errors.join("\n")
+            );
+        }
     }
 
     #[test]

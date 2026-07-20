@@ -2010,7 +2010,7 @@ The current protocol closes the first-writer enrollment gap with migration 158:
 an unrestricted administrator issues a short-lived, single-use challenge bound
 to the exact agent id, platform, and canonical Ed25519 public key; the agent
 signs the domain-separated claim with that key; registration atomically consumes
-the challenge; and approval requires the consumed linkage. Protocol v6 rejects
+the challenge; and approval requires the consumed linkage. Protocol v7 rejects
 older peers, while the database mutation fence remains enrollment contract v3.
 Pre-cutover Pending rows are removed because their provenance is unknowable.
 Approved and Revoked legacy rows remain operable for a controlled migration but

@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,63 @@ impl std::fmt::Debug for AgentRegistration {
 // Job specification
 // ---------------------------------------------------------------------------
 
+/// Positive, monotonic version of the request resource authorized by a job,
+/// approval grant, or signed result.
+///
+/// The transparent non-zero representation keeps the JSON wire value numeric
+/// while making zero unrepresentable in locally constructed protocol values.
+/// Because fields of this type have no serde default, peers that omit the
+/// version or send zero fail deserialization instead of silently falling back
+/// to an unversioned request authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RequestResourceVersion(NonZeroU64);
+
+impl RequestResourceVersion {
+    /// Construct a positive request-resource version.
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the positive numeric wire value.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u64> for RequestResourceVersion {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("request_resource_version must be positive")
+    }
+}
+
+impl TryFrom<i64> for RequestResourceVersion {
+    type Error = &'static str;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        let value =
+            u64::try_from(value).map_err(|_| "request_resource_version must be positive")?;
+        Self::try_from(value)
+    }
+}
+
+impl From<RequestResourceVersion> for u64 {
+    fn from(value: RequestResourceVersion) -> Self {
+        value.get()
+    }
+}
+
+impl std::fmt::Display for RequestResourceVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
 /// Return whether a control-plane Terraform state key is safe for substitution
 /// into the operator's quoted backend-HCL template.
 pub fn is_safe_state_key(state_key: &str) -> bool {
@@ -227,6 +285,10 @@ pub fn is_safe_state_key(state_key: &str) -> bool {
 pub struct JobSpec {
     /// The upstream change-request id this job implements.
     pub request_id: Uuid,
+    /// Exact positive, monotonic version of `request_id` authorized when the
+    /// control plane created this job. Agents and result ingestion must reject
+    /// a job, grant, or result whose independently signed versions disagree.
+    pub request_resource_version: RequestResourceVersion,
     /// The service-catalogue offering being executed.
     pub offering_id: Uuid,
     /// Stable reference to the IaC template (path or content-addressed id).
@@ -564,13 +626,17 @@ pub struct LiveExecutionAuthority {
 /// The agent verifies this against the CP's own public key before executing.
 ///
 /// Signable fields (fixed order, see `signing_bytes_vlc`):
-/// `request_id, platform, job_spec_digest, approved_plan_digest,
+/// `request_id, request_resource_version, platform, job_spec_digest, approved_plan_digest,
 /// approved_plan_job_id, approved_plan_attempt_id, approver, expiry
 /// (RFC 3339), step_job_id, execution_authority`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedLiveContext {
     /// The upstream change-request id.
     pub request_id: Uuid,
+    /// Exact positive, monotonic version of the request whose reviewed state
+    /// this grant authorizes. A different request version requires a new plan,
+    /// approval decision, and grant.
+    pub request_resource_version: RequestResourceVersion,
     /// Exact destination platform/site this grant authorizes. The issuer copies
     /// the same canonical value into the signed grant and the dispatched
     /// [`Job`]; the agent refuses a validly signed grant whose value does not
@@ -696,7 +762,15 @@ pub const TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION: &str =
 /// field. Its `None` encoding contributes zero bytes, preserving existing v6
 /// signatures, while result validation requires `Some` for every successful
 /// LivePlan so legacy redacted-digest commitments fail closed at ingestion.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// Version 7 makes the positive request resource version required in every
+/// [`JobSpec`], [`VerifiedLiveContext`], and [`SignedEnvelope`]. Both signed
+/// message types advance to `ryuki-v5/signed-envelope` and
+/// `ryuki-v7/verified-live-context`, so a v6 peer or signature cannot be
+/// reinterpreted as version-bound authority. Mixed v6/v7 operation is
+/// intentionally unsupported because accepting an omitted version would
+/// silently downgrade approval and result freshness.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The closed set of wire-protocol versions a peer will accept, gated
 /// fail-closed exactly like [`SUPPORTED_REDACTION_POLICY_VERSIONS`]. During a
@@ -704,7 +778,7 @@ pub const PROTOCOL_VERSION: u32 = 6;
 /// interoperates, then narrow to `&[N]` once every peer is upgraded. Both the CP
 /// (accepting agent requests) and the agent (accepting the CP's advertised
 /// version) reference this ONE constant, so emission and acceptance cannot drift.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[6];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[7];
 
 /// The version an absent [`PROTOCOL_VERSION_HEADER`] is resolved to. A peer that
 /// predates protocol versioning sends no header; it is, by definition, speaking
@@ -729,9 +803,9 @@ pub const PROTOCOL_VERSION_HEADER: &str = "x-ryuki-protocol-version";
 /// rejects stale attempts via `(attempt_id, lease_generation, cp_nonce)`.
 ///
 /// **Signable fields** (fixed order — everything except `signature`; domain
-/// separator `ryuki-v4/signed-envelope`):
+/// separator `ryuki-v5/signed-envelope`):
 /// `agent_id, agent_enrollment_id, platform, job_id, attempt_id, lease_generation, request_id,
-///  result_id, mode (serialised), status (serialised), job_spec_digest,
+///  request_resource_version, result_id, mode (serialised), status (serialised), job_spec_digest,
 ///  approved_plan_digest, execution_trust_profile, evidence_digest,
 ///  redaction_policy_version, timestamp (RFC 3339), key_id, cp_nonce,
 ///  raw_plan_digest (additive-optional trailing field)`
@@ -751,6 +825,10 @@ pub struct SignedEnvelope {
     pub attempt_id: Uuid,
     pub lease_generation: u64,
     pub request_id: Uuid,
+    /// Exact positive request version copied from the dispatched [`JobSpec`].
+    /// It is signature-bound and must equal the current stored request and any
+    /// applicable [`VerifiedLiveContext`] at result ingestion.
+    pub request_resource_version: RequestResourceVersion,
     /// Idempotency key generated by the agent before writing to its durable
     /// outbox.  Bound by the signature to prevent forgery.  Must equal
     /// [`JobResult::result_id`] — the CP enforces this (S3).

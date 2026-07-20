@@ -140,13 +140,14 @@ of the digest-bound IaC once external execution is admitted.
    reviewed row, and a unique constraint prevents a second request-level apply.
    Human per-step approval is disabled: its portal control is absent and the
    route returns `409 Conflict` without minting.
-4. The protocol-v6 agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true`, it has
+4. The protocol-v7 agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true`, it has
    pinned the control-plane public key, and external containment is available.
    It verifies the embedded IaC digest and refuses unless **all** hold: the
    grant signature verifies; its full JobSpec digest and exact plan row/attempt
-   match; request, platform, step, mode, state owner, planning-agent enrollment/
-   key/profile, and expiry match; and the freshly computed raw-plan digest matches
-   the approved one. Protocol v1 through v5 is rejected. Plan, apply, and
+   match; request, exact request resource version, platform, step, mode, state
+   owner, planning-agent enrollment/key/profile, and expiry match; and the
+   freshly computed raw-plan digest matches the approved one. Protocol v1
+   through v6 is rejected. Plan, apply, and
    destroy for a state key remain pinned to the same agent.
 5. Once containment is implemented, the LiveApply path will apply only the
    fresh binary plan whose canonical raw JSON digest matched the reviewed plan.

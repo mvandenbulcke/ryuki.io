@@ -20,8 +20,9 @@
 //!    `"a"+"bc"` vs `"ab"+"c"`.
 //! 3. There is **no JSON serialisation** in the signing path, so JSON field-ordering
 //!    non-determinism cannot affect canonical bytes.
-//! 4. A domain separator (`b"ryuki-v1/<type-name>"`) is prepended so signatures
-//!    from one type cannot be replayed against another.
+//! 4. A versioned, type-specific domain separator is prepended (for example,
+//!    `b"ryuki-v5/signed-envelope"`) so signatures cannot be replayed across
+//!    message types or canonical-layout revisions.
 //!
 //! The same function is always used by both the signer and the verifier.
 

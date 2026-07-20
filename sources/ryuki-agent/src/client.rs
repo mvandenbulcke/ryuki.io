@@ -752,13 +752,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_versions_are_not_supported_after_execution_authority_upgrade() {
+    fn legacy_versions_are_not_supported_after_request_version_upgrade() {
         assert_eq!(ryuki_protocol::PROTOCOL_VERSION_LEGACY, 1);
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&1));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&3));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&4));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&5));
-        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 6);
+        assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&6));
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 7);
         assert!(
             ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&ryuki_protocol::PROTOCOL_VERSION)
         );
@@ -993,6 +994,8 @@ mod tests {
     fn job_from_cp_body_deserialises() {
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_owned(),
             iac_digest: "a".repeat(64),
@@ -1023,6 +1026,23 @@ mod tests {
         assert_eq!(decoded.id, job.id);
         assert_eq!(decoded.platform, job.platform);
         assert!(decoded.lease.is_some());
+
+        let mut missing_version = serde_json::to_value(&job).expect("serialise job value");
+        missing_version["spec"]
+            .as_object_mut()
+            .expect("job spec object")
+            .remove("request_resource_version");
+        assert!(
+            serde_json::from_value::<Job>(missing_version).is_err(),
+            "agent ingress must reject a job without a request resource version"
+        );
+
+        let mut zero_version = serde_json::to_value(&job).expect("serialise job value");
+        zero_version["spec"]["request_resource_version"] = serde_json::json!(0);
+        assert!(
+            serde_json::from_value::<Job>(zero_version).is_err(),
+            "agent ingress must reject a non-positive request resource version"
+        );
     }
 
     /// Verify that a 204 response (empty body) correctly maps to `None`.

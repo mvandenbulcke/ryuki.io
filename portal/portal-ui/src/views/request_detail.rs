@@ -606,12 +606,12 @@ pub fn RequestDetail() -> impl IntoView {
         }
     });
 
-    let approve_action = Action::new(move |id: &String| {
-        let id = id.clone();
+    let approve_action = Action::new(move |args: &(String, i64)| {
+        let (id, request_resource_version) = args.clone();
         set_action_feedback.set("Approving...".to_string());
         set_action_class.set("badge neutral");
         async move {
-            match approve_request(id).await {
+            match approve_request(id, request_resource_version).await {
                 Ok(resp) => {
                     let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
@@ -826,14 +826,15 @@ pub fn RequestDetail() -> impl IntoView {
     });
 
     // Reject and cancel carry a mandatory reason; the action input is the
-    // (id, reason) pair captured from the confirm panel. On success they close
+    // request identity, reason, and (for rejection) the exact rendered request
+    // version captured from the confirm panel. On success they close
     // the panel and refetch both the detail and the persisted audit trail.
-    let reject_action = Action::new(move |args: &(String, String)| {
-        let (id, reason) = args.clone();
+    let reject_action = Action::new(move |args: &(String, String, i64)| {
+        let (id, reason, request_resource_version) = args.clone();
         set_action_feedback.set("Rejecting...".to_string());
         set_action_class.set("badge neutral");
         async move {
-            match reject_request(id, reason).await {
+            match reject_request(id, reason, request_resource_version).await {
                 Ok(resp) => {
                     let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
@@ -971,6 +972,13 @@ pub fn RequestDetail() -> impl IntoView {
                             .actions_available
                             .iter()
                             .filter(|action| session_can(&session, action_capability(action)))
+                            // Approval decisions require an exact database-owned
+                            // version. A legacy/static zero remains readable but
+                            // cannot render an authorizing control.
+                            .filter(|action| {
+                                !matches!(action.as_str(), "approve" | "reject")
+                                    || detail.resource_version > 0
+                            })
                             // A LivePlan result moves the request to Verifying,
                             // but it has not applied anything. Keep Verify hidden
                             // until the latest OfflineDryRun/LiveApply job has the
@@ -988,14 +996,23 @@ pub fn RequestDetail() -> impl IntoView {
                         // accepted LivePlan, only after its safe projection
                         // was evidence-digest verified and its distinct raw
                         // plan commitment was signature-bound by the control plane.
-                        let show_approve_apply = session_can(&session, "admin")
+                        let show_approve_apply = detail.resource_version > 0
+                            && session_can(&session, "admin")
                             && execution_job
                                 .as_ref()
                                 .is_some_and(ExecutionJob::can_approve_live_apply);
                         let reviewed_plan_selection = execution_job
                             .as_ref()
-                            .and_then(|job| job.reviewed_plan_selection.clone());
+                            .and_then(|job| job.reviewed_plan_selection.clone())
+                            .map(|mut selection| {
+                                // The job-result projection proves the reviewed
+                                // plan; this detail read supplies the separate
+                                // optimistic-concurrency basis.
+                                selection.request_resource_version = detail.resource_version;
+                                selection
+                            });
                         let request_id_for_action = detail.id.clone();
+                        let request_resource_version = detail.resource_version;
 
                         // Persisted-state fields surfaced in the detail panel.
                         // CPU/memory are only meaningful for VM-shaped types;
@@ -1441,7 +1458,12 @@ pub fn RequestDetail() -> impl IntoView {
                                                             match action.as_str() {
                                                                 "validate" => { validate_action.dispatch(id.clone()); }
                                                                 "plan" => { plan_action.dispatch(id.clone()); }
-                                                                "approve" => { approve_action.dispatch(id.clone()); }
+                                                                "approve" => {
+                                                                    approve_action.dispatch((
+                                                                        id.clone(),
+                                                                        request_resource_version,
+                                                                    ));
+                                                                }
                                                                 "lock" => { lock_action.dispatch(id.clone()); }
                                                                 "execute" => { execute_action.dispatch(id.clone()); }
                                                                 "verify" => { verify_action.dispatch(id.clone()); }
@@ -1580,10 +1602,20 @@ pub fn RequestDetail() -> impl IntoView {
                                                                     return;
                                                                 }
                                                                 set_reason_error.set(String::new());
-                                                                let args = (submit_id.clone(), reason);
                                                                 match submit_pending.as_str() {
-                                                                    "reject" => { reject_action.dispatch(args); }
-                                                                    "cancel" => { cancel_action.dispatch(args); }
+                                                                    "reject" => {
+                                                                        reject_action.dispatch((
+                                                                            submit_id.clone(),
+                                                                            reason,
+                                                                            request_resource_version,
+                                                                        ));
+                                                                    }
+                                                                    "cancel" => {
+                                                                        cancel_action.dispatch((
+                                                                            submit_id.clone(),
+                                                                            reason,
+                                                                        ));
+                                                                    }
                                                                     _ => {}
                                                                 }
                                                             }

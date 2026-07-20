@@ -326,6 +326,8 @@ mod tests {
     fn make_spec(mode: JobMode) -> JobSpec {
         JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),

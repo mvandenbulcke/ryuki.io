@@ -1,6 +1,6 @@
-# Execution trust profile (protocol v6)
+# Execution trust profile (protocol v7)
 
-Protocol v6 makes a successful live plan an execution-authority snapshot, not
+Protocol v7 makes a successful live plan an execution-authority snapshot, not
 only a plan digest. The planning agent signs the complete non-secret
 `ExecutionTrustProfile`; the control plane validates its closed schema and
 reviewed-live allowlist, then copies its canonical digest and the exact planning
@@ -74,10 +74,9 @@ returns `409 Conflict` after authorization checks without minting a job. Exact-
 plan step-grant comparison remains internal protocol groundwork, while system-
 owned step-scoped `LiveDestroy` authority is reserved for compensation.
 
-The signed domains are `ryuki-v4/signed-envelope` and
-`ryuki-v6/verified-live-context`; protocol v1 through v5 grants/results,
-including digest-only v5 grants, are rejected rather than interpreted under the
-new authority model.
+The signed domains are `ryuki-v5/signed-envelope` and
+`ryuki-v7/verified-live-context`; protocol v1 through v6 grants/results are
+rejected rather than interpreted without the exact request-version authority.
 
 Production external execution currently remains fail-closed: the runner has no
 production constructor for the required sealed per-command descendant-

@@ -308,7 +308,7 @@ its fixed `http://127.0.0.1:18081` control-plane URL. This is an explicit local
 development exception to the agent's fail-closed transport default; never carry
 it into a non-loopback or deployed configuration.
 Record the startup log entry `CP wire protocol is compatible` and require
-`cp_protocol_version=6` and `agent_protocol_version=6`. Missing and v1-v5 peers
+`cp_protocol_version=7` and `agent_protocol_version=7`. Missing and v1-v6 peers
 fail closed; v6 also binds live grants to the destination, exact planning-agent
 enrollment/key, reviewed execution trust profile, and exact plan job/attempt.
 

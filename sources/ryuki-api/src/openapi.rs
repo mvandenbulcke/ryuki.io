@@ -42,7 +42,7 @@ pub fn openapi_document() -> Value {
                 plus Ed25519 proof of possession; `cp-public-key` is unauthenticated. \
                 Every agent-protocol request MUST \
                 carry the supported `x-ryuki-protocol-version` header. This build is \
-                protocol-v6-only; an absent header resolves to legacy v1 and is rejected. \
+                protocol-v7-only; an absent header resolves to legacy v1 and is rejected. \
                 (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal \
                 bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts \
                 feed, scheduler introspection) that requires an operator session and a \
@@ -83,7 +83,7 @@ pub fn openapi_document() -> Value {
                     "in": "header",
                     "required": true,
                     "description": "Required sender CP↔agent wire-schema version. This \
-                        control plane accepts protocol v6 only. An absent header resolves \
+                        control plane accepts protocol v7 only. An absent header resolves \
                         to legacy v1 and is rejected (400), as are duplicate, malformed, \
                         or unsupported values.",
                     "schema": {
@@ -1489,7 +1489,7 @@ mod tests {
                     .expect("required fields")
                     .iter()
                     .any(|required| required == field),
-                "VerifiedLiveContext must require protocol-v6 field {field}"
+                "VerifiedLiveContext must require protocol-v7 field {field}"
             );
         }
         assert_eq!(

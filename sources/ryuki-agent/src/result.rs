@@ -15,6 +15,7 @@
 //! | `lease_generation`      | `job.lease.lease_generation`                                   | Step 4        |
 //! | `cp_nonce`              | `job.lease.cp_nonce`                                           | Step 4 (CT)   |
 //! | `request_id`            | `job.spec.request_id`                                          | Fix 3b        |
+//! | `request_resource_version` | `job.spec.request_resource_version`                         | Freshness     |
 //! | `result_id`             | `Uuid::new_v4()` — generated once, outbox-stable               | Step 5        |
 //! | `mode`                  | `job.spec.mode`                                                | Fix 3a        |
 //! | `status`                | mapped from `RunStatus` → `JobResultStatus`                    | Step 5        |
@@ -362,6 +363,7 @@ pub fn build_signed_result_with_trust_profile(
         attempt_id: lease.attempt_id,
         lease_generation: lease.lease_generation,
         request_id: job.spec.request_id,
+        request_resource_version: job.spec.request_resource_version,
         result_id,
         mode: job.spec.mode.clone(),
         status: result_status.clone(),
@@ -462,6 +464,7 @@ pub fn build_refused_result(
         attempt_id: lease.attempt_id,
         lease_generation: lease.lease_generation,
         request_id: job.spec.request_id,
+        request_resource_version: job.spec.request_resource_version,
         result_id,
         mode: job.spec.mode.clone(),
         status: JobResultStatus::LiveRefused,
@@ -524,6 +527,8 @@ mod tests {
     fn make_leased_job(mode: JobMode) -> Job {
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("positive request resource version"),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: sha256_hex(b"iac-bytes"),
@@ -718,6 +723,46 @@ mod tests {
         assert_eq!(
             body.job_result.signed_envelope.job_spec_digest, expected,
             "job_spec_digest must equal ryuki_protocol::job_spec_digest(&spec)"
+        );
+    }
+
+    #[test]
+    fn result_envelopes_copy_and_sign_the_exact_request_resource_version() {
+        let identity = make_identity();
+        let mut job = make_leased_job(JobMode::OfflineDryRun);
+        job.spec.request_resource_version = ryuki_protocol::RequestResourceVersion::new(17)
+            .expect("positive request resource version");
+        let evidence = make_evidence(RunStatus::CheckOk);
+
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("normal result must succeed");
+        assert_eq!(
+            body.job_result.signed_envelope.request_resource_version,
+            job.spec.request_resource_version,
+        );
+
+        let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
+        let mut tampered = body.job_result.signed_envelope.clone();
+        tampered.request_resource_version = ryuki_protocol::RequestResourceVersion::new(18)
+            .expect("positive request resource version");
+        assert!(
+            verify(&tampered, &vk).is_err(),
+            "request resource version must be covered by the result signature"
+        );
+
+        let mut refused_job = make_leased_job(JobMode::LiveApply);
+        refused_job.spec.request_resource_version = ryuki_protocol::RequestResourceVersion::new(23)
+            .expect("positive request resource version");
+        let refusal = build_refused_result(
+            &identity,
+            "test-agent",
+            &refused_job,
+            "stale execution authority",
+        )
+        .expect("refused result must succeed");
+        assert_eq!(
+            refusal.job_result.signed_envelope.request_resource_version,
+            refused_job.spec.request_resource_version,
         );
     }
 

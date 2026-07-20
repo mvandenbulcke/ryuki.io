@@ -170,7 +170,7 @@
           "auth_exempt": false,
           "handler": "admin_requeue_dead_lettered_job",
           "summary": "POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue Recovers a `DeadLettered` job: returns it to `Pending` with a fresh redispatch budget (`delivery_attempts = 0`) + cleared lease state, so the agent fleet can pick it up again.",
-          "description": "POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue\n\nRecovers a `DeadLettered` job: returns it to `Pending` with a fresh redispatch\nbudget (`delivery_attempts = 0`) + cleared lease state, so the agent fleet can\npick it up again. Admin-only + audited. Guards (in the project lock order\nrequests -> agent_jobs, which cannot deadlock since no path locks job -> request):\n- the job must still be `DeadLettered` (idempotent: a second requeue 409s);\n- the PARENT REQUEST must still be ACTIVE — a job whose request has concluded\n  (failed/cancelled/rejected/completed/...) or is orphaned/unknown is REFUSED\n  (409), so requeue can never re-dispatch stale work for a closed request.",
+          "description": "POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue\n\nRecovers a `DeadLettered` job: returns it to `Pending` with a fresh redispatch\nbudget (`delivery_attempts = 0`) + cleared lease state, so the agent fleet can\npick it up again. Admin-only + audited. Guards (in the project lock order\nrequests -> agent_jobs, which cannot deadlock since no path locks job -> request):\n- the job must still be `DeadLettered` (idempotent: a second requeue 409s);\n- the PARENT REQUEST must still be ACTIVE — a job whose request has concluded\n  (failed/cancelled/rejected/completed/...) or is orphaned/unknown is REFUSED\n  (409), so requeue can never re-dispatch stale work for a closed request.\n- the parent request resource version must still equal the immutable version\n  captured by the job; requeue never silently rebinds stale work.",
           "path_params": [
             {
               "name": "job_id",
@@ -58227,8 +58227,8 @@
             "struct": "BatchApproveRequest",
             "fields": [
               {
-                "name": "ids",
-                "type": "Vec<String>",
+                "name": "items",
+                "type": "Vec<BatchApprovalItem>",
                 "optional": false,
                 "doc": null
               }
@@ -58491,8 +58491,8 @@
             "struct": "BatchRejectRequest",
             "fields": [
               {
-                "name": "ids",
-                "type": "Vec<String>",
+                "name": "items",
+                "type": "Vec<BatchRejectItem>",
                 "optional": false,
                 "doc": null
               },
@@ -59853,14 +59853,30 @@
               "description": "Opaque `rys_...` session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request."
             },
             {
+              "name": "Content-Type",
+              "type": "string",
+              "required": true,
+              "description": "Required by the resolved Axum `Json<T>` request extractor; send `application/json`."
+            },
+            {
               "name": "Idempotency-Key",
               "type": "string",
               "required": false,
               "description": "Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication."
             }
           ],
-          "request_body_state": "none",
-          "request_body": null,
+          "request_body_state": "json",
+          "request_body": {
+            "struct": "RequestApprovalBody",
+            "fields": [
+              {
+                "name": "request_resource_version",
+                "type": "i64",
+                "optional": false,
+                "doc": "Exact database-owned request version rendered on the human review\nsurface. The approval transaction rejects any later version."
+              }
+            ]
+          },
           "success_responses": [
             {
               "status": 200,
@@ -59940,6 +59956,12 @@
                 "type": "String",
                 "optional": false,
                 "doc": null
+              },
+              {
+                "name": "request_resource_version",
+                "type": "i64",
+                "optional": false,
+                "doc": "Exact request version visible alongside the reviewed plan. The minting\ntransaction locks the request and rejects any later version."
               }
             ]
           },
@@ -60790,13 +60812,19 @@
           ],
           "request_body_state": "json",
           "request_body": {
-            "struct": "ReasonBody",
+            "struct": "RejectRequestBody",
             "fields": [
               {
                 "name": "reason",
                 "type": "String",
                 "optional": false,
-                "doc": "Mandatory human reason recorded in lifecycle evidence and the audit\ntrail. Per-operation validation and length limits apply."
+                "doc": null
+              },
+              {
+                "name": "request_resource_version",
+                "type": "i64",
+                "optional": false,
+                "doc": null
               }
             ]
           },
@@ -61009,6 +61037,12 @@
                 "type": "String",
                 "optional": false,
                 "doc": null
+              },
+              {
+                "name": "request_resource_version",
+                "type": "i64",
+                "optional": false,
+                "doc": "Exact request version visible alongside the reviewed plan. The minting\ntransaction locks the request and rejects any later version."
               }
             ]
           },

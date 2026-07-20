@@ -29,19 +29,19 @@
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:c917912164ea6723f2cb224c53210583de6a64be6d6b13288e5f9196e39edb3b",
+        "content_digest": "sha256:3311a63d623b6cfb6843c95e6c1166460054ea5abc44f4e40338212d9fc865dc",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
         "document_id": "source:ryuki-api-scheduler",
         "document_version": 1,
-        "content_digest": "sha256:a9ad3888261a088606ff3625fef9056fef76b8d92575cf9a584b1e2e6bf29a4d",
+        "content_digest": "sha256:3adf2a11c56e5b662f30d907be54db663a3b8db2f35da74fad26f8ea9ec33845",
         "artifact_locator": "sources/ryuki-api/src/scheduler.rs"
       },
       {
         "document_id": "source:ryuki-api-agents",
         "document_version": 1,
-        "content_digest": "sha256:375fb86a7caee72165671c676a7b8da3a6bfff3da2d7e472a8d0c06fac105cb1",
+        "content_digest": "sha256:105d2b52333f3f0942268215deea73f0939180e2b39742b1441f95eec273cd30",
         "artifact_locator": "sources/ryuki-api/src/agents.rs"
       }
     ]
@@ -237,7 +237,7 @@
       "resource_kind": "request",
       "mode": "instance",
       "canonical_id_source": "requests.id",
-      "security_version_source": "requests.updated_at",
+      "security_version_source": "requests.resource_version",
       "permit_kind": "AuthorizationPermit",
       "fail_closed": true,
       "lifecycle": "active",

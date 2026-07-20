@@ -2986,6 +2986,10 @@ pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDeta
         // minimal detail so the UI can still navigate to the new request.
         Err(_) => Ok(RequestDetail {
             id: request_id,
+            // The follow-up read is the only authoritative source for the
+            // database-owned version. Do not invent an approval basis when it
+            // failed; zero keeps every version-bound mutation fail-closed.
+            resource_version: 0,
             request_type: payload.request_type,
             name: payload.name,
             site: payload.site,
@@ -3023,10 +3027,23 @@ async fn dispatch_stage_action_live(
     action: &str,
     path: &str,
 ) -> Result<StageActionResponse, ServerFnError> {
+    dispatch_stage_action_with_body_live(request_id, action, path, None).await
+}
+
+/// Shared stage-action transport. Most lifecycle transitions remain bodyless;
+/// approval supplies an exact database-owned request version so the API can
+/// reject a decision made against stale review state.
+#[cfg(feature = "ssr")]
+async fn dispatch_stage_action_with_body_live(
+    request_id: String,
+    action: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<StageActionResponse, ServerFnError> {
     let upstream = upstream_context();
     let session_id = session_id_from_request().await;
     let response = upstream
-        .post(path, None, session_id.as_deref())
+        .post(path, body, session_id.as_deref())
         .await
         .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
     if response.is_success() {
@@ -3050,6 +3067,23 @@ async fn dispatch_stage_action_live(
     }
 }
 
+/// Build the complete ordinary-approval input. The request resource version
+/// comes from the viewed request representation and is the immutable review
+/// basis; zero/negative/synthetic values never reach the API.
+#[cfg(any(feature = "ssr", test))]
+fn request_approval_body(
+    request_resource_version: i64,
+) -> Result<serde_json::Value, ServerFnError> {
+    if request_resource_version <= 0 {
+        return Err(ServerFnError::new(
+            "Request approval requires a positive request resource version from the reviewed request",
+        ));
+    }
+    Ok(serde_json::json!({
+        "request_resource_version": request_resource_version,
+    }))
+}
+
 /// Build the closed mutation body from the exact immutable plan snapshot that
 /// accompanied the safe review. `approved_plan_digest` is the signed raw-plan
 /// commitment, never the safe evidence digest. No request spec, placement,
@@ -3058,7 +3092,7 @@ async fn dispatch_stage_action_live(
 fn reviewed_plan_approval_body(
     selection: &ReviewedLivePlanSelection,
 ) -> Result<serde_json::Value, ServerFnError> {
-    if !selection.is_canonical() {
+    if !selection.is_canonical() || selection.request_resource_version <= 0 {
         return Err(ServerFnError::new(
             "Live apply requires an exact canonical reviewed-plan selection",
         ));
@@ -3067,6 +3101,7 @@ fn reviewed_plan_approval_body(
         "approved_plan_job_id": selection.approved_plan_job_id.as_str(),
         "approved_plan_attempt_id": selection.approved_plan_attempt_id.as_str(),
         "approved_plan_digest": selection.approved_plan_digest.as_str(),
+        "request_resource_version": selection.request_resource_version,
     }))
 }
 
@@ -3138,18 +3173,22 @@ pub async fn plan_request(request_id: String) -> Result<StageActionResponse, Ser
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-approve")]
-pub async fn approve_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
+pub async fn approve_request(
+    request_id: String,
+    request_resource_version: i64,
+) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = request_approve_path(&request_id)
         .map_err(|_| ServerFnError::new("request approve API path failed same-origin guard"))?;
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request approve API path failed same-origin guard"))?;
+    let body = request_approval_body(request_resource_version)?;
     let upstream = upstream_context();
     if !upstream.live() {
         return reject_static_preview_request_action(request_id, "approval");
     }
-    dispatch_stage_action_live(request_id, "approval", &path).await
+    dispatch_stage_action_with_body_live(request_id, "approval", &path, Some(&body)).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-lock")]
@@ -3225,6 +3264,10 @@ pub async fn approve_live_apply_request(
         .map_err(|_| {
             ServerFnError::new("request approve-live-apply API path failed same-origin guard")
         })?;
+    // Validate before the static/degraded-mode gate as well: a forged or
+    // versionless review selection is never accepted by this server boundary,
+    // even when no upstream mutation is possible.
+    let _ = reviewed_plan_approval_body(&reviewed_plan)?;
     let upstream = upstream_context();
     if !upstream.live() {
         return reject_static_preview_request_action(request_id, "live apply");
@@ -3325,13 +3368,19 @@ pub async fn retire_request(request_id: String) -> Result<StageActionResponse, S
     dispatch_stage_action_live(request_id, "retirement", &path).await
 }
 
-/// Live POST of a reason-bearing lifecycle decision (reject/cancel). Unlike
-/// `dispatch_stage_action_live` (which posts no body), this sends a
-/// `{"reason": ...}` JSON body — these transitions are never bodyless. 2xx
+/// Live POST of the reason-bearing cancellation decision. Unlike
+/// `dispatch_stage_action_live` (which posts no body), this sends exactly a
+/// `{"reason": ...}` JSON body. Rejection uses the version-bound body helper
+/// below. 2xx
 /// maps to a success badge with the freshly fetched terminal stage; 4xx (the
 /// 409 lifecycle guard, the 403 role/SoD denial, the 400 empty-reason guard)
 /// maps to a failure badge carrying the API safe message; transport failures
 /// and 5xx surface as errors so mutations never silently degrade.
+#[cfg(any(feature = "ssr", test))]
+fn request_cancellation_body(reason: String) -> serde_json::Value {
+    serde_json::json!({ "reason": reason })
+}
+
 #[cfg(feature = "ssr")]
 async fn dispatch_reason_action_live(
     request_id: String,
@@ -3341,7 +3390,7 @@ async fn dispatch_reason_action_live(
 ) -> Result<StageActionResponse, ServerFnError> {
     let upstream = upstream_context();
     let session_id = session_id_from_request().await;
-    let body = serde_json::json!({ "reason": reason });
+    let body = request_cancellation_body(reason);
     let response = upstream
         .post(path, Some(&body), session_id.as_deref())
         .await
@@ -3380,10 +3429,32 @@ fn require_reason(action: &str, reason: &str) -> Result<String, ServerFnError> {
     Ok(trimmed.to_string())
 }
 
+/// Build the complete rejection decision input from the rendered request.
+/// Rejection is an approval decision, so it is bound to the exact same
+/// database-owned version as approval. Legacy/static version zero cannot cross
+/// the mutation boundary.
+#[cfg(any(feature = "ssr", test))]
+fn request_rejection_body(
+    reason: &str,
+    request_resource_version: i64,
+) -> Result<serde_json::Value, ServerFnError> {
+    let reason = require_reason("reject", reason)?;
+    if request_resource_version <= 0 {
+        return Err(ServerFnError::new(
+            "Request rejection requires a positive request resource version from the reviewed request",
+        ));
+    }
+    Ok(serde_json::json!({
+        "reason": reason,
+        "request_resource_version": request_resource_version,
+    }))
+}
+
 #[server(prefix = "/portal/api", endpoint = "request-reject")]
 pub async fn reject_request(
     request_id: String,
     reason: String,
+    request_resource_version: i64,
 ) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = request_reject_path(&request_id)
@@ -3391,12 +3462,12 @@ pub async fn reject_request(
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request reject API path failed same-origin guard"))?;
-    let reason = require_reason("reject", &reason)?;
+    let body = request_rejection_body(&reason, request_resource_version)?;
     let upstream = upstream_context();
     if !upstream.live() {
         return reject_static_preview_request_action(request_id, "rejection");
     }
-    dispatch_reason_action_live(request_id, "rejection", reason, &path).await
+    dispatch_stage_action_with_body_live(request_id, "rejection", &path, Some(&body)).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-cancel")]
@@ -4752,18 +4823,73 @@ mod tests {
             approved_plan_job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
             approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
             approved_plan_digest: "d".repeat(64),
+            request_resource_version: 41,
         };
         let body = reviewed_plan_approval_body(&selection).expect("canonical selection");
         let keys = body.as_object().expect("approval object");
-        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.len(), 4);
         assert_eq!(body["approved_plan_job_id"], selection.approved_plan_job_id);
         assert_eq!(
             body["approved_plan_attempt_id"],
             selection.approved_plan_attempt_id
         );
         assert_eq!(body["approved_plan_digest"], selection.approved_plan_digest);
+        assert_eq!(
+            body["request_resource_version"],
+            selection.request_resource_version
+        );
         assert!(body.get("platform").is_none());
         assert!(body.get("spec").is_none());
+    }
+
+    #[test]
+    fn ordinary_approval_body_is_closed_and_version_bound() {
+        let body = request_approval_body(41).expect("positive resource version");
+        let keys = body.as_object().expect("approval object");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(body["request_resource_version"], 41);
+    }
+
+    #[test]
+    fn rejection_body_is_closed_reason_and_version_bound() {
+        let body = request_rejection_body("  policy mismatch  ", 41)
+            .expect("reason and positive resource version");
+        let keys = body.as_object().expect("rejection object");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(body["reason"], "policy mismatch");
+        assert_eq!(body["request_resource_version"], 41);
+    }
+
+    #[test]
+    fn rejection_body_rejects_non_positive_versions_and_empty_reasons() {
+        for invalid in [i64::MIN, -1, 0] {
+            assert!(request_rejection_body("policy mismatch", invalid).is_err());
+        }
+        assert!(request_rejection_body("  ", 41).is_err());
+    }
+
+    #[test]
+    fn cancellation_body_remains_reason_only() {
+        let body = request_cancellation_body("withdrawn".to_string());
+        let keys = body.as_object().expect("cancellation object");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(body["reason"], "withdrawn");
+        assert!(body.get("request_resource_version").is_none());
+    }
+
+    #[test]
+    fn approval_bodies_reject_non_positive_request_versions() {
+        for invalid in [i64::MIN, -1, 0] {
+            assert!(request_approval_body(invalid).is_err());
+
+            let selection = ReviewedLivePlanSelection {
+                approved_plan_job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+                approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+                approved_plan_digest: "d".repeat(64),
+                request_resource_version: invalid,
+            };
+            assert!(reviewed_plan_approval_body(&selection).is_err());
+        }
     }
 
     #[test]
@@ -4772,6 +4898,7 @@ mod tests {
             approved_plan_job_id: "not-a-job-id".to_string(),
             approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
             approved_plan_digest: "D".repeat(64),
+            request_resource_version: 41,
         };
         assert!(reviewed_plan_approval_body(&selection).is_err());
     }
@@ -4779,6 +4906,7 @@ mod tests {
     fn summary_row(name: &str, site: &str, status: &str, created: &str) -> RequestSummary {
         RequestSummary {
             id: format!("REQ-{name}"),
+            resource_version: 0,
             request_type: "server".to_string(),
             name: name.to_string(),
             site: site.to_string(),

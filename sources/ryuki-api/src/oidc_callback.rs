@@ -2331,16 +2331,16 @@ mod oidc_callback_db_tests {
         key_map.insert(TEST_KID.to_string(), dec);
         let validator = OidcIdTokenValidator::with_static_keys(TEST_ISS, TEST_AUD, key_map);
 
-        let oid_nonce = "nonce-entra-oid";
-        let oid_token = sign_id_token(&enc, valid_id_token_claims(oid_nonce));
+        let oid_nonce = Uuid::new_v4().to_string();
+        let oid_token = sign_id_token(&enc, valid_id_token_claims(&oid_nonce));
         let oid_claims = validator
-            .validate_entra_id_token(&oid_token, oid_nonce, "roles")
+            .validate_entra_id_token(&oid_token, &oid_nonce, "roles")
             .await
             .expect("Entra token with oid is valid");
         assert_eq!(oid_claims.user_id, "oid-test-1");
 
-        let fallback_nonce = "nonce-entra-sub";
-        let mut fallback = valid_id_token_claims(fallback_nonce);
+        let fallback_nonce = Uuid::new_v4().to_string();
+        let mut fallback = valid_id_token_claims(&fallback_nonce);
         fallback["oid"] = json!("   ");
         fallback
             .as_object_mut()
@@ -2352,7 +2352,7 @@ mod oidc_callback_db_tests {
             .remove("preferred_username");
         let fallback_token = sign_id_token(&enc, fallback);
         let fallback_claims = validator
-            .validate_entra_id_token(&fallback_token, fallback_nonce, "roles")
+            .validate_entra_id_token(&fallback_token, &fallback_nonce, "roles")
             .await
             .expect("Entra token falls back to sub when oid is blank");
         assert_eq!(fallback_claims.user_id, "sub-test-1");

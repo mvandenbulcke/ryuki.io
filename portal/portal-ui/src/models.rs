@@ -1874,6 +1874,10 @@ pub fn request_intake_form_fallback() -> RequestIntakeForm {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RequestSummary {
     pub id: String,
+    /// Database-owned optimistic-concurrency version. Static/legacy data
+    /// defaults to zero so it can be displayed but never authorize a mutation.
+    #[serde(default)]
+    pub resource_version: i64,
     pub request_type: String,
     pub name: String,
     pub site: String,
@@ -2086,6 +2090,9 @@ impl std::fmt::Debug for UpdateIntegrationPayload {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApiRequestSummary {
     pub request_id: String,
+    /// Absent on older API responses. Zero is deliberately non-authoritative.
+    #[serde(default)]
+    pub resource_version: i64,
     pub request_type: String,
     pub status: String,
     #[serde(default)]
@@ -2108,6 +2115,7 @@ impl From<ApiRequestSummary> for RequestSummary {
         };
         Self {
             id: summary.request_id,
+            resource_version: summary.resource_version,
             request_type: summary.request_type,
             name: summary.name,
             site: summary.site,
@@ -2131,6 +2139,9 @@ impl From<ApiRequestSummary> for RequestSummary {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApiRequestDetail {
     pub request_id: String,
+    /// Absent on older API responses. Zero is deliberately non-authoritative.
+    #[serde(default)]
+    pub resource_version: i64,
     pub request_type: String,
     pub status: String,
     #[serde(default)]
@@ -2290,6 +2301,7 @@ impl From<ApiRequestDetail> for RequestDetail {
         let plan = plan_summary_text(&detail.plan);
         Self {
             id: detail.request_id,
+            resource_version: detail.resource_version,
             request_type: detail.request_type,
             name: detail.name,
             site: detail.site,
@@ -2500,6 +2512,11 @@ pub fn actions_for_stage(stage: &str) -> Vec<String> {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RequestDetail {
     pub id: String,
+    /// Exact database-owned version of the rendered request. Zero marks a
+    /// static, legacy, or incomplete representation that cannot be approved
+    /// or rejected.
+    #[serde(default)]
+    pub resource_version: i64,
     pub request_type: String,
     pub name: String,
     pub site: String,
@@ -2652,9 +2669,10 @@ impl LivePlanReview {
     }
 }
 
-/// Exact immutable LivePlan snapshot the administrator reviewed. These three
-/// non-secret values are the complete mutation-authorizing selection sent back
-/// to the API; the portal never reconstructs a spec or accepts provider data.
+/// Exact immutable LivePlan snapshot the administrator reviewed. The three
+/// plan fields plus the request version rendered alongside them are the
+/// complete mutation-authorizing selection sent back to the API; the portal
+/// never reconstructs a spec or accepts provider data.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub struct ReviewedLivePlanSelection {
     pub approved_plan_job_id: String,
@@ -2662,6 +2680,11 @@ pub struct ReviewedLivePlanSelection {
     /// Signed SHA-256 of the complete canonical raw plan. This is distinct
     /// from the redacted review evidence digest.
     pub approved_plan_digest: String,
+    /// Exact database-owned version of the request detail on which the
+    /// approval UI was rendered. The job-result projection cannot supply this
+    /// value, so it remains zero until the detail view binds it.
+    #[serde(default)]
+    pub request_resource_version: i64,
 }
 
 impl ReviewedLivePlanSelection {
@@ -2732,6 +2755,9 @@ impl ApiAdminAgentJobResult {
             approved_plan_job_id: self.job_id.clone(),
             approved_plan_attempt_id: envelope.attempt_id,
             approved_plan_digest: raw_plan_digest.clone(),
+            // The request detail read is the authority for this value. The
+            // caller binds it only while rendering the matching detail.
+            request_resource_version: 0,
         };
         if !review.digest_verified
             || self.job_id != expected_job_id
@@ -3551,6 +3577,7 @@ pub fn request_summary_fallbacks() -> Vec<RequestSummary> {
     vec![
         RequestSummary {
             id: "REQ-001".to_string(),
+            resource_version: 0,
             request_type: "VM".to_string(),
             name: "srv-app-01".to_string(),
             site: "site-alpha".to_string(),
@@ -3561,6 +3588,7 @@ pub fn request_summary_fallbacks() -> Vec<RequestSummary> {
         },
         RequestSummary {
             id: "REQ-002".to_string(),
+            resource_version: 0,
             request_type: "Application".to_string(),
             name: "order-service".to_string(),
             site: "site-bravo".to_string(),
@@ -3571,6 +3599,7 @@ pub fn request_summary_fallbacks() -> Vec<RequestSummary> {
         },
         RequestSummary {
             id: "REQ-003".to_string(),
+            resource_version: 0,
             request_type: "SQL".to_string(),
             name: "analytics-db".to_string(),
             site: "site-alpha".to_string(),
@@ -3581,6 +3610,7 @@ pub fn request_summary_fallbacks() -> Vec<RequestSummary> {
         },
         RequestSummary {
             id: "REQ-004".to_string(),
+            resource_version: 0,
             request_type: "Network".to_string(),
             name: "vlan-backend".to_string(),
             site: "site-alpha".to_string(),
@@ -3591,6 +3621,7 @@ pub fn request_summary_fallbacks() -> Vec<RequestSummary> {
         },
         RequestSummary {
             id: "REQ-005".to_string(),
+            resource_version: 0,
             request_type: "Storage".to_string(),
             name: "nfs-shared".to_string(),
             site: "site-bravo".to_string(),
@@ -3608,6 +3639,7 @@ pub fn request_detail_fallback(request_id: &str) -> RequestDetail {
         .find(|r| r.id == request_id)
         .unwrap_or_else(|| RequestSummary {
             id: request_id.to_string(),
+            resource_version: 0,
             request_type: "VM".to_string(),
             name: "unknown".to_string(),
             site: "site-alpha".to_string(),
@@ -3659,6 +3691,8 @@ pub fn request_detail_fallback(request_id: &str) -> RequestDetail {
 
     RequestDetail {
         id: summary.id,
+        // Static preview rows have no database-owned concurrency authority.
+        resource_version: 0,
         request_type: summary.request_type,
         name: summary.name,
         site: summary.site,
@@ -4815,12 +4849,29 @@ mod tests {
 
         assert_eq!(summary.stage, "");
         assert_eq!(summary.environment, "");
+        assert_eq!(summary.resource_version, 0);
 
         let mapped = RequestSummary::from(summary);
         assert_eq!(mapped.id, "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        assert_eq!(mapped.resource_version, 0);
         // Missing stage falls back to the status signal.
         assert_eq!(mapped.stage, "intake");
         assert_eq!(mapped.created, "2026-06-12T10:00:00+00:00");
+    }
+
+    #[test]
+    fn api_request_versions_propagate_exactly_without_fabrication() {
+        let summary: ApiRequestSummary = serde_json::from_str(
+            r#"{"request_id":"r1","resource_version":17,"request_type":"VM","status":"planned","name":"n","site":"s","created_at":"t"}"#,
+        )
+        .expect("versioned summary decodes");
+        assert_eq!(RequestSummary::from(summary).resource_version, 17);
+
+        let detail: ApiRequestDetail = serde_json::from_str(
+            r#"{"request_id":"r1","resource_version":23,"request_type":"VM","status":"planned","stage":"plan","site":"s","name":"n","created_at":"t","updated_at":"t2"}"#,
+        )
+        .expect("versioned detail decodes");
+        assert_eq!(RequestDetail::from(detail).resource_version, 23);
     }
 
     #[test]
@@ -4831,6 +4882,7 @@ mod tests {
         let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
         let mapped = RequestDetail::from(detail);
 
+        assert_eq!(mapped.resource_version, 0);
         assert_eq!(mapped.memory, 16);
         assert_eq!(mapped.stage, "validated");
         assert_eq!(
@@ -5510,6 +5562,10 @@ mod tests {
         assert_eq!(selection.approved_plan_job_id, job_id);
         assert_eq!(selection.approved_plan_attempt_id, attempt_id);
         assert_eq!(selection.approved_plan_digest, raw_plan_digest);
+        assert_eq!(
+            selection.request_resource_version, 0,
+            "job results cannot fabricate a request-detail review version"
+        );
 
         let api = ApiExecutionJob {
             request_id: "REQ-PLAN".to_string(),
@@ -5615,6 +5671,7 @@ mod tests {
             approved_plan_job_id: "7C9E6679-7425-40de-944b-e07fc1f90ae7".to_string(),
             approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
             approved_plan_digest: "c".repeat(64),
+            request_resource_version: 0,
         };
         assert!(!uppercase.is_canonical());
     }

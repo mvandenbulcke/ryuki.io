@@ -2,13 +2,13 @@
   "components": {
     "parameters": {
       "ProtocolVersionHeader": {
-        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v6 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
+        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v7 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
         "in": "header",
         "name": "x-ryuki-protocol-version",
         "required": true,
         "schema": {
           "enum": [
-            6
+            7
           ],
           "format": "int64",
           "type": "integer"
@@ -1404,7 +1404,7 @@
     }
   },
   "info": {
-    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is unauthenticated. Every agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v6-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
+    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is unauthenticated. Every agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v7-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
     "title": "Ryuki Agent Protocol API",
     "version": "0.1.0"
   },

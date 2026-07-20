@@ -1151,9 +1151,11 @@ async fn run_job(
             // Reuses the SAME overdue gate as drift_recheck_overdue_scan
             // (`is_drift_recheck_due` against GREATEST(last LiveApply,
             // last_drift_check_at)) so the two scans agree on what counts as
-            // overdue. Dedups via `open_drift_recheck_job_exists` so an in-flight
-            // recheck is never stacked. The agent runs the dispatched job and the
-            // CP ingest (already shipped) classifies drift and resets
+            // overdue. Candidate freshness and in-flight dedup are rechecked while
+            // holding the request row lock, so a lifecycle/version transition or
+            // concurrent dispatcher can never create a stale/stacked recheck. The
+            // agent runs the dispatched job and the CP ingest (already shipped)
+            // classifies drift and resets
             // `requests.last_drift_check_at`. All on `tx`, so a failure rolls back
             // with this schedule's savepoint. `detail` is aggregate-only (counts,
             // never per-request ids).
@@ -1170,19 +1172,10 @@ async fn run_job(
             let mut skipped_inflight = 0u64;
             let mut deferred = 0u64;
             let mut skipped_bad_spec = 0u64;
+            let mut skipped_stale_candidate = 0u64;
             for row in &rows {
                 if !ryuki_engine::drift_scan::is_drift_recheck_due(row.last_verified, now, interval)
                 {
-                    continue;
-                }
-                // Dedup: never stack a second in-flight recheck for the same deployment.
-                if crate::repos::drift_scan::open_drift_recheck_job_exists(
-                    &mut **tx,
-                    row.request_id,
-                )
-                .await?
-                {
-                    skipped_inflight += 1;
                     continue;
                 }
                 // Per-tick burst cap: once we've dispatched the cap, DEFER the rest
@@ -1211,25 +1204,50 @@ async fn run_job(
                     skipped_bad_spec += 1;
                     continue;
                 }
+                let Ok(request_resource_version) =
+                    ryuki_protocol::RequestResourceVersion::try_from(row.resource_version)
+                else {
+                    // The DB owns a positive BIGINT, but retain a fail-closed
+                    // conversion boundary in case a partially migrated or
+                    // corrupted row reaches this scheduler.
+                    skipped_bad_spec += 1;
+                    continue;
+                };
+                // The source LiveApply spec is historical. A new recheck gets
+                // authority only for the exact request version observed by this
+                // candidate; the atomic enqueue below proves it is still current.
+                spec.request_resource_version = request_resource_version;
                 spec.mode = ryuki_protocol::JobMode::LivePlan;
                 let Ok(spec_json) = serde_json::to_value(&spec) else {
                     skipped_bad_spec += 1;
                     continue;
                 };
-                crate::repos::drift_scan::insert_drift_recheck_job(
-                    &mut **tx,
+                let enqueue = crate::repos::drift_scan::enqueue_drift_recheck_job_if_current(
+                    tx,
                     row.request_id,
+                    row.resource_version,
                     &row.platform,
                     &spec_json,
                 )
                 .await?;
-                dispatched += 1;
+                match enqueue {
+                    crate::repos::drift_scan::DriftRecheckEnqueueOutcome::Enqueued(_) => {
+                        dispatched += 1;
+                    }
+                    crate::repos::drift_scan::DriftRecheckEnqueueOutcome::CandidateChanged => {
+                        skipped_stale_candidate += 1;
+                    }
+                    crate::repos::drift_scan::DriftRecheckEnqueueOutcome::OpenJobExists => {
+                        skipped_inflight += 1;
+                    }
+                }
             }
             Ok((
                 "succeeded".to_string(),
                 Some(format!(
                     "{dispatched} drift-recheck(s) dispatched, {skipped_inflight} in-flight, \
-                     {deferred} deferred (per-tick cap {cap}), {skipped_bad_spec} bad-spec skipped"
+                     {deferred} deferred (per-tick cap {cap}), {skipped_bad_spec} bad-spec skipped, \
+                     {skipped_stale_candidate} stale-candidate skipped"
                 )),
             ))
         }
@@ -8171,18 +8189,47 @@ mod db_tests {
         .expect("seed operational request")
     }
 
+    async fn current_request_resource_version(pool: &PgPool, request_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1::uuid")
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .expect("read request resource version")
+    }
+
     /// Seed a successful (verified) agent_jobs row for `request_id`, completed
     /// `completed_at` in the past. Mirrors the agent_jobs NOT NULL columns
     /// (request_id, platform, spec, mode) used elsewhere in this file.
     async fn seed_verified_agent_job(pool: &PgPool, request_id: &str, completed_at_sql: &str) {
+        let resource_version = current_request_resource_version(pool, request_id).await;
+        // Persist a structurally complete, row-matching protocol spec so the
+        // DB-owned request/version/mode binding can validate this fixture. The
+        // absent state key intentionally keeps it ineligible for drift dispatch;
+        // these tests exercise only the overdue scan's completion-age signal.
+        let request_id = uuid::Uuid::parse_str(request_id).expect("valid fixture request id");
+        let spec = serde_json::to_value(ryuki_protocol::JobSpec {
+            request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::try_from(
+                resource_version,
+            )
+            .expect("positive fixture version"),
+            offering_id: uuid::Uuid::from_u128(2),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            state_key: None,
+            mode: ryuki_protocol::JobMode::LiveApply,
+        })
+        .expect("serialize overdue-scan fixture spec");
         let sql = format!(
             "INSERT INTO agent_jobs \
              (request_id, platform, spec, mode, status, result_status, completed_at) \
-             VALUES ($1::uuid, 'ci-test', '{{}}'::jsonb, 'LiveApply', 'Succeeded', \
+             VALUES ($1::uuid, 'ci-test', $2::jsonb, 'LiveApply', 'Succeeded', \
                      'applied', {completed_at_sql})"
         );
         sqlx::query(&sql)
             .bind(request_id)
+            .bind(&spec)
             .execute(pool)
             .await
             .expect("seed verified agent_job");
@@ -8403,15 +8450,17 @@ mod db_tests {
     /// so exactly ONE scan is due per tick (mirrors DRIFT_SCAN_SEED_ID).
     const DRIFT_DISPATCH_SCAN_SEED_ID: &str = "e8d3a2c4-0031-4d31-8c31-e8d3a2c40148";
 
-    /// Seed a `LiveApply` agent_jobs row with a spec that DOES deserialize as a
-    /// [`ryuki_protocol::JobSpec`] (unlike [`seed_verified_agent_job`]'s `'{}'::jsonb`,
-    /// which the dispatch scan would reject as a bad spec). `offering_id`,
-    /// `iac_digest`, and `mode` mirror a real LiveApply spec closely enough for
-    /// deserialization + the mode-swap round-trip; the digest is 64 zeros (a valid
-    /// hex placeholder, not a real artifact digest).
+    /// Seed a `LiveApply` agent_jobs row with a complete, dispatch-eligible
+    /// [`ryuki_protocol::JobSpec`]. Unlike [`seed_verified_agent_job`], this fixture
+    /// carries the request-owned state key required by the drift dispatch scan.
+    /// `offering_id`, `iac_digest`, and `mode` mirror a real LiveApply spec closely
+    /// enough for deserialization + the mode-swap round-trip; the digest is 64 zeros
+    /// (a valid hex placeholder, not a real artifact digest).
     async fn seed_liveapply_job_with_spec(pool: &PgPool, request_id: &str, completed_at_sql: &str) {
+        let resource_version = current_request_resource_version(pool, request_id).await;
         let spec = serde_json::json!({
             "request_id": request_id,
+            "request_resource_version": resource_version,
             "offering_id": "00000000-0000-0000-0000-000000000002",
             "iac_ref": "linux-server-deployment@v1",
             "iac_digest": "0".repeat(64),
@@ -8431,6 +8480,43 @@ mod db_tests {
             .execute(pool)
             .await
             .expect("seed liveapply job with valid spec");
+    }
+
+    fn drift_recheck_test_spec(request_id: uuid::Uuid, resource_version: i64) -> serde_json::Value {
+        serde_json::to_value(ryuki_protocol::JobSpec {
+            request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::try_from(
+                resource_version,
+            )
+            .expect("positive fixture version"),
+            offering_id: uuid::Uuid::from_u128(2),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            state_key: Some(crate::contracts::request_state_key(request_id)),
+            mode: ryuki_protocol::JobMode::LivePlan,
+        })
+        .expect("serialize drift-recheck fixture spec")
+    }
+
+    async fn attempt_atomic_drift_recheck_enqueue(
+        pool: &PgPool,
+        request_id: uuid::Uuid,
+        resource_version: i64,
+        spec: serde_json::Value,
+    ) -> crate::repos::drift_scan::DriftRecheckEnqueueOutcome {
+        let mut tx = pool.begin().await.expect("begin drift enqueue fixture tx");
+        let outcome = crate::repos::drift_scan::enqueue_drift_recheck_job_if_current(
+            &mut tx,
+            request_id,
+            resource_version,
+            "ci-test",
+            &spec,
+        )
+        .await
+        .expect("attempt atomic drift enqueue");
+        tx.commit().await.expect("commit drift enqueue fixture tx");
+        outcome
     }
 
     /// Plant a guaranteed-due `drift_recheck_dispatch_scan` schedule. Disables the
@@ -8489,6 +8575,8 @@ mod db_tests {
         let request_id = uuid::Uuid::new_v4();
         let mut spec = ryuki_protocol::JobSpec {
             request_id,
+            request_resource_version: ryuki_protocol::RequestResourceVersion::try_from(1_i64)
+                .expect("positive fixture version"),
             offering_id: uuid::Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -8523,6 +8611,7 @@ mod db_tests {
         };
 
         let request_id = seed_operational_request(pool, "TESTSITE", "production").await;
+        let dispatched_version = current_request_resource_version(pool, &request_id).await;
         // 30 days ago > DRIFT_RECHECK_INTERVAL_DAYS (14) — overdue. No
         // last_drift_check_at, so the LiveApply completion is the only signal.
         seed_liveapply_job_with_spec(pool, &request_id, "NOW() - INTERVAL '30 days'").await;
@@ -8555,6 +8644,21 @@ mod db_tests {
             spec_mode, "live_plan",
             "the dispatched job's spec JSONB mode must be swapped to live_plan"
         );
+        let (job_version, spec_version): (i64, i64) = sqlx::query_as(
+            "SELECT request_resource_version, \
+                    (spec->>'request_resource_version')::bigint \
+             FROM agent_jobs \
+             WHERE request_id = $1::uuid AND origin = 'drift_recheck' AND mode = 'LivePlan'",
+        )
+        .bind(&request_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(job_version, dispatched_version);
+        assert_eq!(
+            spec_version, dispatched_version,
+            "the drift JobSpec and durable job row must bind the exact candidate version"
+        );
 
         // Second tick (re-seed the due schedule): the in-flight Pending job blocks
         // a second dispatch — dedup holds.
@@ -8584,6 +8688,108 @@ mod db_tests {
             .await
             .ok();
         restore_migration_drift_dispatch_scan(pool).await;
+    }
+
+    /// Discovery is advisory: a request mutation after discovery must make the
+    /// enqueue compare-and-lock fail closed, leaving no stale-authority job.
+    #[tokio::test]
+    async fn drift_recheck_enqueue_rejects_stale_candidate_version() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let request_id_text = seed_operational_request(pool, "TESTSITE", "production").await;
+        let request_id = uuid::Uuid::parse_str(&request_id_text).unwrap();
+        let stale_version = current_request_resource_version(pool, &request_id_text).await;
+        let spec = drift_recheck_test_spec(request_id, stale_version);
+
+        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .expect("advance request after drift discovery");
+        let current_version = current_request_resource_version(pool, &request_id_text).await;
+        assert!(
+            current_version > stale_version,
+            "the security-relevant fixture mutation must advance resource_version"
+        );
+
+        let outcome =
+            attempt_atomic_drift_recheck_enqueue(pool, request_id, stale_version, spec).await;
+        assert_eq!(
+            outcome,
+            crate::repos::drift_scan::DriftRecheckEnqueueOutcome::CandidateChanged
+        );
+        assert_eq!(
+            open_drift_recheck_job_count(pool, &request_id_text).await,
+            0
+        );
+
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Two dispatchers racing from the same candidate serialize on the request
+    /// row. Exactly one inserts; the second statement observes the committed
+    /// open job and returns the dedup outcome.
+    #[tokio::test]
+    async fn drift_recheck_enqueue_serializes_concurrent_dispatchers() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let request_id_text = seed_operational_request(pool, "TESTSITE", "production").await;
+        let request_id = uuid::Uuid::parse_str(&request_id_text).unwrap();
+        let resource_version = current_request_resource_version(pool, &request_id_text).await;
+        let spec = drift_recheck_test_spec(request_id, resource_version);
+
+        let (first, second) = tokio::join!(
+            attempt_atomic_drift_recheck_enqueue(pool, request_id, resource_version, spec.clone(),),
+            attempt_atomic_drift_recheck_enqueue(pool, request_id, resource_version, spec),
+        );
+        let outcomes = [first, second];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    crate::repos::drift_scan::DriftRecheckEnqueueOutcome::Enqueued(_)
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    crate::repos::drift_scan::DriftRecheckEnqueueOutcome::OpenJobExists
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            open_drift_recheck_job_count(pool, &request_id_text).await,
+            1
+        );
+
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     // ---- #61 noise_suppression_expiry_scan ---------------------------------

@@ -255,6 +255,8 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test resource version is positive"),
             platform: "defra".to_string(),
             job_spec_digest: ryuki_protocol::sha256_hex(b"job-spec"),
             approved_plan_digest: "abc123".to_string(),

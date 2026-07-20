@@ -5,9 +5,9 @@
 //! Every `signing_bytes_*` function produces a byte sequence with these
 //! properties:
 //!
-//! 1. **Domain separator** — the first bytes are `b"ryuki-v1/<type>"` so a
-//!    signature produced for one message type cannot be replayed against another
-//!    type that happens to share fields.
+//! 1. **Domain separator** — the first bytes are a versioned
+//!    `b"ryuki-vN/<type>"` value, so a signature produced for one message type
+//!    or signed layout cannot be replayed against another.
 //!
 //! 2. **Fixed field order** — fields are appended in the exact order listed in
 //!    the source code.  There are no HashMaps in the signable set; all
@@ -22,7 +22,8 @@
 //!    JSON's non-deterministic field ordering for objects cannot affect the
 //!    canonical bytes.
 //!
-//! 5. **Scalar fields** — `u64` values are written as 8-byte little-endian;
+//! 5. **Scalar fields** — `u64` values (including positive request resource
+//!    versions) are written as 8-byte little-endian;
 //!    `DateTime<Utc>` is serialised as its RFC 3339 string (nanosecond
 //!    precision); `Uuid` as its hyphenated string; `JobMode` / `JobStatus` as
 //!    their `serde_json`-style snake_case label strings; `Option<String>` uses
@@ -305,13 +306,13 @@ pub fn verify_agent_enrollment_proof(
 /// Returns the canonical bytes that are signed / verified for a
 /// [`SignedEnvelope`].  The `signature` field is intentionally excluded.
 ///
-/// **Domain separator**: `ryuki-v4/signed-envelope`
-/// (bumped from v3 when the immutable agent-enrollment UUID was added).
+/// **Domain separator**: `ryuki-v5/signed-envelope`
+/// (bumped from v4 when the required request resource version was added).
 ///
 /// Field order (fixed; except for an explicitly asymmetric trailing optional,
 /// any change requires another version bump):
 /// domain, agent_id, agent_enrollment_id, platform, job_id, attempt_id, lease_generation,
-/// request_id, result_id, mode, status, job_spec_digest, approved_plan_digest,
+/// request_id, request_resource_version, result_id, mode, status, job_spec_digest, approved_plan_digest,
 /// execution_trust_profile, evidence_digest, redaction_policy_version,
 /// timestamp, key_id, cp_nonce, raw_plan_digest (additive-optional trailing
 /// field).
@@ -320,8 +321,9 @@ pub fn signing_bytes(env: &SignedEnvelope) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(512);
 
     // Domain separator — prevents cross-type signature replay and distinguishes
-    // v4 enrollment-bound envelopes cannot be confused with legacy v3 results.
-    write_bytes(&mut buf, b"ryuki-v4/signed-envelope");
+    // v5 request-version-bound envelopes cannot be confused with legacy v4
+    // results, even when every other field has the same value.
+    write_bytes(&mut buf, b"ryuki-v5/signed-envelope");
 
     write_str(&mut buf, &env.agent_id);
     write_str(&mut buf, &env.agent_enrollment_id.hyphenated().to_string());
@@ -330,6 +332,7 @@ pub fn signing_bytes(env: &SignedEnvelope) -> Vec<u8> {
     write_str(&mut buf, &env.attempt_id.hyphenated().to_string());
     write_u64(&mut buf, env.lease_generation);
     write_str(&mut buf, &env.request_id.hyphenated().to_string());
+    write_u64(&mut buf, env.request_resource_version.get());
     // result_id added in v2 — bound by signature to prevent idempotency key forgery.
     write_str(&mut buf, &env.result_id.hyphenated().to_string());
     write_str(&mut buf, mode_label(&env.mode));
@@ -385,17 +388,19 @@ pub fn verify(envelope: &SignedEnvelope, vk: &VerifyingKey) -> Result<(), Verify
 /// Returns the canonical bytes for a [`VerifiedLiveContext`].
 ///
 /// Field order (fixed):
-/// domain, request_id, platform, job_spec_digest, approved_plan_digest,
+/// domain, request_id, request_resource_version, platform, job_spec_digest, approved_plan_digest,
 /// approved plan job/attempt, approver, expiry, step_job_id, assigned
 /// agent/enrollment/key/profile.
 ///
-/// The v6 domain makes exact immutable plan-row identity an explicit protocol
-/// boundary: a legacy digest-only grant cannot authorize a v6 live mutation.
+/// The v7 domain makes the request resource version an explicit protocol
+/// boundary: a legacy v6 grant cannot authorize a mutation after the request's
+/// security-relevant state changes.
 pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(512);
 
-    write_bytes(&mut buf, b"ryuki-v6/verified-live-context");
+    write_bytes(&mut buf, b"ryuki-v7/verified-live-context");
     write_str(&mut buf, &ctx.request_id.hyphenated().to_string());
+    write_u64(&mut buf, ctx.request_resource_version.get());
     write_str(&mut buf, &ctx.platform);
     write_str(&mut buf, &ctx.job_spec_digest);
     write_str(&mut buf, &ctx.approved_plan_digest);
@@ -526,6 +531,42 @@ mod tests {
     // Fixtures
     // -----------------------------------------------------------------------
 
+    fn request_version(value: u64) -> RequestResourceVersion {
+        RequestResourceVersion::new(value).expect("test request version must be positive")
+    }
+
+    fn assert_request_version_is_required_and_positive<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let current = serde_json::to_value(value).expect("protocol fixture must serialize");
+        assert!(
+            current
+                .get("request_resource_version")
+                .is_some_and(|version| version.as_u64() == Some(7)),
+            "the request version must be a numeric JSON field"
+        );
+
+        let mut missing = current.clone();
+        missing
+            .as_object_mut()
+            .expect("protocol fixture must be an object")
+            .remove("request_resource_version");
+        assert!(
+            serde_json::from_value::<T>(missing).is_err(),
+            "an omitted request_resource_version must fail closed"
+        );
+
+        let mut zero = current;
+        zero.as_object_mut()
+            .expect("protocol fixture must be an object")
+            .insert("request_resource_version".to_string(), serde_json::json!(0));
+        assert!(
+            serde_json::from_value::<T>(zero).is_err(),
+            "request_resource_version zero must fail closed"
+        );
+    }
+
     fn make_envelope(key: &SigningKey) -> SignedEnvelope {
         let unsigned = SignedEnvelope {
             agent_id: "defra-vcenter-01".to_string(),
@@ -535,6 +576,7 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             result_id: Uuid::new_v4(),
             mode: JobMode::OfflineDryRun,
             status: JobResultStatus::CheckOk,
@@ -599,6 +641,7 @@ mod tests {
     fn make_vlc(key: &SigningKey) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -824,6 +867,7 @@ mod tests {
             a,
             signing_bytes_vlc(&VerifiedLiveContext {
                 request_id: challenge_id,
+                request_resource_version: request_version(7),
                 platform: "defra".to_owned(),
                 job_spec_digest: "ab".to_owned(),
                 approved_plan_digest: "c".to_owned(),
@@ -844,6 +888,7 @@ mod tests {
         use std::collections::BTreeMap;
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1.2.3".to_string(),
             iac_digest: sha256_hex(b"iac-content"),
@@ -861,19 +906,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_job_spec_without_state_key_still_decodes() {
+    fn job_spec_without_state_key_still_decodes_when_request_version_is_present() {
         let request_id = Uuid::new_v4();
         let offering_id = Uuid::new_v4();
         let json = serde_json::json!({
             "request_id": request_id,
+            "request_resource_version": 7,
             "offering_id": offering_id,
             "iac_ref": "request-preflight@v1",
             "iac_digest": sha256_hex(b"iac"),
             "mode": "live_plan"
         });
 
-        let decoded: JobSpec = serde_json::from_value(json).expect("legacy wire decode");
+        let decoded: JobSpec = serde_json::from_value(json).expect("current wire decode");
         assert_eq!(decoded.request_id, request_id);
+        assert_eq!(decoded.request_resource_version.get(), 7);
         assert_eq!(decoded.offering_id, offering_id);
         assert_eq!(decoded.state_key, None);
     }
@@ -913,6 +960,7 @@ mod tests {
         let job_id = Uuid::new_v4();
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v2.0.0".to_string(),
             iac_digest: sha256_hex(b"iac"),
@@ -977,6 +1025,35 @@ mod tests {
         assert_eq!(env, decoded);
     }
 
+    #[test]
+    fn request_resource_version_is_required_positive_and_numeric_across_the_wire() {
+        let key = generate_keypair(&mut OsRng);
+        let spec = JobSpec {
+            request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
+            offering_id: Uuid::new_v4(),
+            iac_ref: "request-preflight@v1".to_string(),
+            iac_digest: sha256_hex(b"iac"),
+            vars: std::collections::BTreeMap::new(),
+            state_key: None,
+            mode: JobMode::OfflineDryRun,
+        };
+
+        assert_request_version_is_required_and_positive(&spec);
+        assert_request_version_is_required_and_positive(&make_vlc(&key));
+        assert_request_version_is_required_and_positive(&make_envelope(&key));
+        assert!(RequestResourceVersion::try_from(0_u64).is_err());
+        assert!(RequestResourceVersion::try_from(0_i64).is_err());
+        assert!(RequestResourceVersion::try_from(-1_i64).is_err());
+    }
+
+    #[test]
+    fn protocol_v7_is_the_only_accepted_wire_contract() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, &[7]);
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&6));
+    }
+
     // -----------------------------------------------------------------------
     // Sign → verify success
     // -----------------------------------------------------------------------
@@ -990,50 +1067,64 @@ mod tests {
     }
 
     #[test]
-    fn absent_raw_plan_digest_preserves_legacy_v4_signing_bytes() {
+    fn absent_raw_plan_digest_preserves_the_v5_canonical_layout() {
         let key = generate_keypair(&mut OsRng);
         let env = make_envelope(&key);
         assert!(env.raw_plan_digest.is_none());
 
-        let mut legacy_bytes = Vec::new();
-        write_bytes(&mut legacy_bytes, b"ryuki-v4/signed-envelope");
-        write_str(&mut legacy_bytes, &env.agent_id);
+        let mut canonical_bytes = Vec::new();
+        write_bytes(&mut canonical_bytes, b"ryuki-v5/signed-envelope");
+        write_str(&mut canonical_bytes, &env.agent_id);
         write_str(
-            &mut legacy_bytes,
+            &mut canonical_bytes,
             &env.agent_enrollment_id.hyphenated().to_string(),
         );
-        write_str(&mut legacy_bytes, &env.platform);
-        write_str(&mut legacy_bytes, &env.job_id.hyphenated().to_string());
-        write_str(&mut legacy_bytes, &env.attempt_id.hyphenated().to_string());
-        write_u64(&mut legacy_bytes, env.lease_generation);
-        write_str(&mut legacy_bytes, &env.request_id.hyphenated().to_string());
-        write_str(&mut legacy_bytes, &env.result_id.hyphenated().to_string());
-        write_str(&mut legacy_bytes, mode_label(&env.mode));
-        write_str(&mut legacy_bytes, result_status_label(&env.status));
-        write_str(&mut legacy_bytes, &env.job_spec_digest);
-        write_opt_str(&mut legacy_bytes, &env.approved_plan_digest);
-        write_opt_execution_trust_profile(&mut legacy_bytes, &env.execution_trust_profile);
-        write_str(&mut legacy_bytes, &env.evidence_digest);
-        write_str(&mut legacy_bytes, &env.redaction_policy_version);
-        write_str(&mut legacy_bytes, &datetime_bytes(&env.timestamp));
-        write_str(&mut legacy_bytes, &env.key_id);
-        write_str(&mut legacy_bytes, &env.cp_nonce);
+        write_str(&mut canonical_bytes, &env.platform);
+        write_str(&mut canonical_bytes, &env.job_id.hyphenated().to_string());
+        write_str(
+            &mut canonical_bytes,
+            &env.attempt_id.hyphenated().to_string(),
+        );
+        write_u64(&mut canonical_bytes, env.lease_generation);
+        write_str(
+            &mut canonical_bytes,
+            &env.request_id.hyphenated().to_string(),
+        );
+        write_u64(&mut canonical_bytes, env.request_resource_version.get());
+        write_str(
+            &mut canonical_bytes,
+            &env.result_id.hyphenated().to_string(),
+        );
+        write_str(&mut canonical_bytes, mode_label(&env.mode));
+        write_str(&mut canonical_bytes, result_status_label(&env.status));
+        write_str(&mut canonical_bytes, &env.job_spec_digest);
+        write_opt_str(&mut canonical_bytes, &env.approved_plan_digest);
+        write_opt_execution_trust_profile(&mut canonical_bytes, &env.execution_trust_profile);
+        write_str(&mut canonical_bytes, &env.evidence_digest);
+        write_str(&mut canonical_bytes, &env.redaction_policy_version);
+        write_str(&mut canonical_bytes, &datetime_bytes(&env.timestamp));
+        write_str(&mut canonical_bytes, &env.key_id);
+        write_str(&mut canonical_bytes, &env.cp_nonce);
 
-        assert_eq!(signing_bytes(&env), legacy_bytes);
+        assert_eq!(signing_bytes(&env), canonical_bytes);
     }
 
     #[test]
-    fn legacy_v3_envelope_signature_is_rejected_by_the_v4_domain() {
+    fn legacy_v4_envelope_without_request_version_is_rejected_by_the_v5_domain() {
         let key = generate_keypair(&mut OsRng);
         let mut legacy = make_envelope(&key);
         legacy.signature.clear();
 
-        // Reconstruct the complete v3 layout: it predates the immutable
-        // enrollment UUID and uses its own domain separator. A genuine old
-        // signature must never be reinterpreted as a v4 enrollment-bound one.
+        // Reconstruct the complete v4 layout. It includes immutable enrollment
+        // identity but predates the request resource version. A genuine old
+        // signature must never be reinterpreted as v5 version-bound authority.
         let mut legacy_bytes = Vec::new();
-        write_bytes(&mut legacy_bytes, b"ryuki-v3/signed-envelope");
+        write_bytes(&mut legacy_bytes, b"ryuki-v4/signed-envelope");
         write_str(&mut legacy_bytes, &legacy.agent_id);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.agent_enrollment_id.hyphenated().to_string(),
+        );
         write_str(&mut legacy_bytes, &legacy.platform);
         write_str(&mut legacy_bytes, &legacy.job_id.hyphenated().to_string());
         write_str(
@@ -1126,6 +1217,11 @@ mod tests {
     #[test]
     fn tamper_request_id_fails() {
         tamper_envelope!(request_id, Uuid::new_v4());
+    }
+
+    #[test]
+    fn tamper_request_resource_version_fails() {
+        tamper_envelope!(request_resource_version, request_version(8));
     }
 
     #[test]
@@ -1276,6 +1372,7 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             result_id: Uuid::new_v4(),
             mode: JobMode::LiveApply,
             status: JobResultStatus::Applied,
@@ -1354,6 +1451,11 @@ mod tests {
     }
 
     #[test]
+    fn tamper_vlc_request_resource_version_fails() {
+        tamper_vlc!(request_resource_version, request_version(8));
+    }
+
+    #[test]
     fn tamper_vlc_platform_fails() {
         tamper_vlc!(platform, "another-platform".to_string());
     }
@@ -1389,13 +1491,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v6 grant layout, legacy fencing, and step binding
+    // v7 grant layout, legacy fencing, and step binding
     // -----------------------------------------------------------------------
 
-    /// Pin the v6 signing layout, including exact plan-row and execution authority.
+    /// Pin the v7 signing layout, including request version, exact plan-row,
+    /// and execution authority.
     #[test]
-    fn vlc_v6_signing_bytes_bind_exact_plan_and_execution_authority() {
+    fn vlc_v7_signing_bytes_bind_request_version_plan_and_execution_authority() {
         let request_id = Uuid::new_v4();
+        let request_resource_version = request_version(7);
         let platform = "defra".to_string();
         let job_spec_digest = sha256_hex(b"job-spec");
         let approved_plan_digest = sha256_hex(b"plan-bytes");
@@ -1406,6 +1510,7 @@ mod tests {
 
         let vlc = VerifiedLiveContext {
             request_id,
+            request_resource_version,
             platform: platform.clone(),
             job_spec_digest: job_spec_digest.clone(),
             approved_plan_digest: approved_plan_digest.clone(),
@@ -1418,10 +1523,11 @@ mod tests {
             signature: String::new(),
         };
 
-        // Hand-roll the canonical v6 field order to catch accidental drift.
+        // Hand-roll the canonical v7 field order to catch accidental drift.
         let mut baseline: Vec<u8> = Vec::new();
-        write_bytes(&mut baseline, b"ryuki-v6/verified-live-context");
+        write_bytes(&mut baseline, b"ryuki-v7/verified-live-context");
         write_str(&mut baseline, &request_id.hyphenated().to_string());
+        write_u64(&mut baseline, request_resource_version.get());
         write_str(&mut baseline, &platform);
         write_str(&mut baseline, &job_spec_digest);
         write_str(&mut baseline, &approved_plan_digest);
@@ -1456,16 +1562,16 @@ mod tests {
         assert_eq!(
             signing_bytes_vlc(&vlc),
             baseline,
-            "v6 signing bytes must include the exact plan row, destination, spec, and authority"
+            "v7 signing bytes must include the request version, exact plan row, destination, spec, and authority"
         );
     }
 
     #[test]
-    fn legacy_v5_digest_only_vlc_signature_is_rejected_by_the_v6_domain() {
+    fn legacy_v6_vlc_without_request_version_is_rejected_by_the_v7_domain() {
         let key = generate_keypair(&mut OsRng);
         let mut legacy = make_vlc(&key);
         let mut legacy_bytes = Vec::new();
-        write_bytes(&mut legacy_bytes, b"ryuki-v5/verified-live-context");
+        write_bytes(&mut legacy_bytes, b"ryuki-v6/verified-live-context");
         write_str(
             &mut legacy_bytes,
             &legacy.request_id.hyphenated().to_string(),
@@ -1473,6 +1579,14 @@ mod tests {
         write_str(&mut legacy_bytes, &legacy.platform);
         write_str(&mut legacy_bytes, &legacy.job_spec_digest);
         write_str(&mut legacy_bytes, &legacy.approved_plan_digest);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.approved_plan_job_id.hyphenated().to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.approved_plan_attempt_id.hyphenated().to_string(),
+        );
         write_str(&mut legacy_bytes, &legacy.approver);
         write_str(&mut legacy_bytes, &datetime_bytes(&legacy.expiry));
         write_opt_uuid(&mut legacy_bytes, &legacy.step_job_id);
@@ -1500,7 +1614,7 @@ mod tests {
 
         assert!(
             verify_vlc(&legacy, &key.verifying_key()).is_err(),
-            "a legacy v5 digest-only grant must not verify under the exact-plan v6 domain"
+            "a legacy v6 grant without a request version must not verify under the v7 domain"
         );
     }
 
@@ -1526,7 +1640,7 @@ mod tests {
         object.remove("approved_plan_attempt_id");
         assert!(
             serde_json::from_value::<VerifiedLiveContext>(json).is_err(),
-            "exact approved-plan job and attempt are required on the v6 wire"
+            "exact approved-plan job and attempt are required on the v7 wire"
         );
     }
 
@@ -1560,6 +1674,7 @@ mod tests {
         let step_job_id = Uuid::new_v4();
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -1599,6 +1714,7 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -1631,6 +1747,7 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -1720,6 +1837,7 @@ mod tests {
         use std::collections::BTreeMap;
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
+            request_resource_version: request_version(7),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1.2.3".to_string(),
             iac_digest: sha256_hex(b"iac-content"),
@@ -1735,5 +1853,13 @@ mod tests {
         let d1 = job_spec_digest(&spec);
         let d2 = job_spec_digest(&spec);
         assert_eq!(d1, d2, "job_spec_digest must be deterministic");
+
+        let mut newer_request = spec.clone();
+        newer_request.request_resource_version = request_version(8);
+        assert_ne!(
+            d1,
+            job_spec_digest(&newer_request),
+            "the canonical JobSpec digest must bind the request resource version"
+        );
     }
 }
