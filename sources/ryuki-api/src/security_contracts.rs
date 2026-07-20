@@ -2286,6 +2286,169 @@ pub(crate) enum ConformanceState {
     Production(Box<VerifiedProductionBoundary>),
 }
 
+/// Non-cloneable prerequisite for the one-shot production migration process.
+///
+/// Serving admission still requires all eight live runtime witnesses. Database
+/// schema creation necessarily precedes the database-backed witnesses, so the
+/// process first consumes this narrower proof derived from the sealed
+/// production boundary's exact DurablePostgresql requirement. It is not DDL
+/// authority by itself: execution stays blocked until independently
+/// authenticated target and durable-storage evidence is bound to the exact TLS
+/// session. It carries no listener, router, application-pool, or serving
+/// authority.
+pub(crate) struct VerifiedProductionMigrationAdmission {
+    boundary: Box<VerifiedProductionBoundary>,
+    role_contract: crate::database::MigrationRoleContract,
+    receipt_bound_database_target: RuntimeGuardExpectedValue,
+    expected_migration_inventory_digest: String,
+    requirement_digest: String,
+    challenge_binding_digest: String,
+}
+
+impl fmt::Debug for VerifiedProductionMigrationAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedProductionMigrationAdmission")
+            .field("requirement_digest", &self.requirement_digest)
+            .field("challenge_binding_digest", &self.challenge_binding_digest)
+            .field(
+                "expected_migration_inventory_digest",
+                &self.expected_migration_inventory_digest,
+            )
+            .field(
+                "receipt_bound_database_target_guard",
+                &self.receipt_bound_database_target.guard_id(),
+            )
+            .field("role_contract", &"[RECEIPT-BOUND]")
+            .finish()
+    }
+}
+
+/// Apply-only admission state. Both variants are issued only after the
+/// deployment security root is loaded. Non-production is executable with its
+/// configured local role contract; production retains and rechecks the sealed
+/// workload-bound prerequisite but remains non-executable until the independent
+/// target-attestation adapter is present.
+pub(crate) enum VerifiedApplyOnlyMigrationAdmission {
+    NonProduction {
+        role_contract: crate::database::MigrationRoleContract,
+        expected_migration_inventory_digest: String,
+    },
+    Production(VerifiedProductionMigrationAdmission),
+}
+
+impl fmt::Debug for VerifiedApplyOnlyMigrationAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonProduction {
+                expected_migration_inventory_digest,
+                ..
+            } => formatter
+                .debug_struct("VerifiedApplyOnlyMigrationAdmission::NonProduction")
+                .field(
+                    "expected_migration_inventory_digest",
+                    expected_migration_inventory_digest,
+                )
+                .field("role_contract", &"[CONFIGURED]")
+                .finish(),
+            Self::Production(admission) => admission.fmt(formatter),
+        }
+    }
+}
+
+impl VerifiedApplyOnlyMigrationAdmission {
+    /// Consume the one-shot state immediately before the database module would
+    /// open its isolated migration connection. Production refuses at this seam
+    /// until an authenticated target-attestation adapter can complete it.
+    pub(crate) fn into_database_execution(
+        self,
+        now: DateTime<Utc>,
+    ) -> Result<(crate::database::MigrationRoleContract, String), String> {
+        match self {
+            Self::NonProduction {
+                role_contract,
+                expected_migration_inventory_digest,
+            } => Ok((role_contract, expected_migration_inventory_digest)),
+            Self::Production(admission) => {
+                admission.boundary.ensure_fresh(trusted_time_point(now))?;
+                // The receipt carries only digests for the database identity
+                // and durable storage projection. Until a separately signed
+                // target-attestation adapter supplies and revalidates those
+                // preimages against the exact TLS session, allowing this token
+                // to reach DDL would let a substituted database with matching
+                // role names receive production migrations.
+                Err(
+                    "production migration execution requires independently authenticated database-target and durable-storage evidence before DDL"
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
+fn verify_production_migration_admission(
+    boundary: Box<VerifiedProductionBoundary>,
+    mode: crate::database::MigrationStartupMode,
+    now: DateTime<Utc>,
+) -> Result<VerifiedProductionMigrationAdmission, String> {
+    let embedded_digest = crate::database::embedded_migration_inventory_digest()
+        .map_err(|error| format!("cannot derive the embedded migration inventory: {error}"))?;
+    verify_production_migration_admission_with_inventory_digest(
+        boundary,
+        mode,
+        now,
+        &embedded_digest,
+    )
+}
+
+fn verify_production_migration_admission_with_inventory_digest(
+    boundary: Box<VerifiedProductionBoundary>,
+    mode: crate::database::MigrationStartupMode,
+    now: DateTime<Utc>,
+    embedded_digest: &str,
+) -> Result<VerifiedProductionMigrationAdmission, String> {
+    if mode != crate::database::MigrationStartupMode::ApplyOnly {
+        return Err("production migration admission requires exact apply-only mode".into());
+    }
+    boundary.ensure_fresh(trusted_time_point(now))?;
+    let challenge =
+        runtime_admission::exact_challenge(boundary.as_ref(), GuardId::DurablePostgresql).map_err(
+            |error| format!("production migration admission lost its database guard: {error}"),
+        )?;
+    let receipt_bound_database_target = challenge.expected_value().clone();
+    let RuntimeGuardExpectedValue::DurablePostgresql {
+        application_role,
+        migration_role,
+        migration_inventory_digest,
+        ..
+    } = &receipt_bound_database_target
+    else {
+        return Err(
+            "production migration admission received a non-PostgreSQL database guard value".into(),
+        );
+    };
+    let role_contract = crate::database::MigrationRoleContract::from_receipt_bound_roles(
+        migration_role,
+        application_role,
+    )?;
+    if embedded_digest != migration_inventory_digest {
+        return Err(
+            "embedded migrations differ from the receipt-bound production inventory".into(),
+        );
+    }
+    let expected_migration_inventory_digest = migration_inventory_digest.to_owned();
+    let requirement_digest = challenge.requirement_digest().to_owned();
+    let challenge_binding_digest = challenge.challenge_binding_digest().to_owned();
+    Ok(VerifiedProductionMigrationAdmission {
+        boundary,
+        role_contract,
+        receipt_bound_database_target,
+        expected_migration_inventory_digest,
+        requirement_digest,
+        challenge_binding_digest,
+    })
+}
+
 /// Value-free scope authority for typed production secret resolution. Every
 /// field comes from the sealed workload/profile identity; request handlers
 /// cannot substitute scope from a stored SecretRef or caller input.
@@ -2510,11 +2673,38 @@ impl SecurityContractContext {
         Ok(())
     }
 
-    /// Preserve the current all-guards production blocker for startup modes
-    /// that deliberately do not load the API runtime (notably apply-only
-    /// migration processes). Non-production remains unaffected.
-    pub(crate) fn reject_unverified_production_runtime_guards(&self) -> Result<(), String> {
-        reject_incomplete_runtime_guard_admission(&self.conformance_state)
+    /// Derive the narrow one-shot migration authority before any database
+    /// credential or connection is touched. Non-production continues to use
+    /// its explicitly configured local migration contract. This capability is
+    /// intentionally insufficient for serving or application-pool publication.
+    pub(crate) fn into_apply_only_migration_admission(
+        self,
+        mode: crate::database::MigrationStartupMode,
+        now: DateTime<Utc>,
+    ) -> Result<VerifiedApplyOnlyMigrationAdmission, String> {
+        if mode != crate::database::MigrationStartupMode::ApplyOnly {
+            return Err("migration capability issuance requires exact apply-only mode".into());
+        }
+        match self.conformance_state {
+            ConformanceState::NonProduction => {
+                let role_contract = crate::database::MigrationRoleContract::from_env()?;
+                let expected_migration_inventory_digest =
+                    crate::database::embedded_migration_inventory_digest().map_err(|error| {
+                        format!("cannot derive the embedded migration inventory: {error}")
+                    })?;
+                Ok(VerifiedApplyOnlyMigrationAdmission::NonProduction {
+                    role_contract,
+                    expected_migration_inventory_digest,
+                })
+            }
+            ConformanceState::Production(boundary) => {
+                let admission = verify_production_migration_admission(boundary, mode, now)?;
+                admission
+                    .role_contract
+                    .validate_optional_environment_consistency()?;
+                Ok(VerifiedApplyOnlyMigrationAdmission::Production(admission))
+            }
+        }
     }
 
     /// Perform one nonce-bound exchange with the independently pinned public
@@ -3956,6 +4146,7 @@ fn validate_runtime_guard_challenge_set(
     Ok(())
 }
 
+#[cfg(test)]
 fn reject_incomplete_runtime_guard_admission(
     conformance_state: &ConformanceState,
 ) -> Result<(), String> {
@@ -7189,6 +7380,125 @@ mod tests {
             production_composition_time(5, 6),
         )
         .expect("one exact signed production identity must seal")
+    }
+
+    #[test]
+    fn production_migration_admission_uses_receipt_bound_roles_only() {
+        let boundary = genuine_production_boundary(240);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let admission = verify_production_migration_admission_with_inventory_digest(
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(9, 9).not_before,
+            &expected_inventory_digest,
+        )
+        .expect("the sealed database requirement must authorize only its migration roles");
+        let debug = format!("{admission:?}");
+        assert!(debug.contains("[RECEIPT-BOUND]"));
+        assert!(!debug.contains("ryuki_migrator"));
+        assert!(!debug.contains("ryuki_application"));
+        assert!(admission
+            .role_contract
+            .matches_receipt_bound_roles("ryuki_migrator", "ryuki_application"));
+        assert!(!admission
+            .role_contract
+            .matches_receipt_bound_roles("ryuki_application", "ryuki_migrator"));
+    }
+
+    #[test]
+    fn production_migration_execution_stays_blocked_without_target_attestation() {
+        let boundary = genuine_production_boundary(240);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let admission = verify_production_migration_admission_with_inventory_digest(
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(9, 9).not_before,
+            &expected_inventory_digest,
+        )
+        .expect("the sealed database requirement must validate structurally");
+
+        let error = VerifiedApplyOnlyMigrationAdmission::Production(admission)
+            .into_database_execution(production_composition_time(10, 10).not_before)
+            .unwrap_err();
+        assert!(error.contains("authenticated database-target"));
+        assert!(error.contains("before DDL"));
+    }
+
+    #[test]
+    fn production_migration_admission_rejects_expired_boundary() {
+        let boundary = genuine_production_boundary(12);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let error = verify_production_migration_admission_with_inventory_digest(
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(13, 13).not_before,
+            &expected_inventory_digest,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("no longer fresh"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn production_migration_admission_rejects_wrong_mode_and_image_inventory() {
+        let boundary = genuine_production_boundary(240);
+        let expected_inventory_digest = match exact_challenge(&boundary, GuardId::DurablePostgresql)
+            .expect("database challenge")
+            .expected_value()
+        {
+            RuntimeGuardExpectedValue::DurablePostgresql {
+                migration_inventory_digest,
+                ..
+            } => migration_inventory_digest.clone(),
+            _ => panic!("database challenge changed kind"),
+        };
+        let error = verify_production_migration_admission_with_inventory_digest(
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::VerifyOnly,
+            production_composition_time(9, 9).not_before,
+            &expected_inventory_digest,
+        )
+        .unwrap_err();
+        assert!(error.contains("exact apply-only mode"));
+
+        let boundary = genuine_production_boundary(240);
+        let error = verify_production_migration_admission_with_inventory_digest(
+            Box::new(boundary),
+            crate::database::MigrationStartupMode::ApplyOnly,
+            production_composition_time(9, 9).not_before,
+            &format!("sha256:{}", "f".repeat(64)),
+        )
+        .unwrap_err();
+        assert!(error.contains("receipt-bound production inventory"));
     }
 
     fn genuine_public_ingress_attestation(

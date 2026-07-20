@@ -23,7 +23,7 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:e62ca1de5dbd1d145581e1e71db6771221ae65a606c4c71be7cab265c450bcc6",
+        "content_digest": "sha256:1441491b3d3441cd3fcb6a83c0e7bc2b0bec0bae63269230d4fd4d8183cded0c",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {

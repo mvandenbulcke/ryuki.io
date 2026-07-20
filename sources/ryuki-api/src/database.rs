@@ -1,3 +1,10 @@
+use ryuki_core::security_profile::{
+    postgresql_database_identity_digest, postgresql_migration_inventory_digest,
+    postgresql_storage_binding_digest, PostgresqlDatabaseIdentity, PostgresqlMigrationInventoryRow,
+    PostgresqlStorageBinding, ProductionDatabaseProvider, RuntimeGuardDigestError,
+    RuntimeGuardExpectedValue,
+};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,6 +272,52 @@ impl MigrationRoleContract {
             required_role_env("RYUKI_MIGRATION_EXPECTED_ROLE")?,
             required_role_env("RYUKI_APPLICATION_DATABASE_ROLE")?,
         )
+    }
+
+    /// Construct the migration-session role contract from the authenticated
+    /// DurablePostgresql runtime-guard expectation. Production callers must
+    /// use this seam instead of granting ambient role-name environment values
+    /// authority over the migration session.
+    pub(crate) fn from_receipt_bound_roles(
+        migration_role: &str,
+        application_role: &str,
+    ) -> Result<Self, String> {
+        Self::from_values(migration_role.to_owned(), application_role.to_owned())
+    }
+
+    /// Environment role names are deployment wiring only. When supplied for
+    /// compatibility with an existing manifest they must agree exactly with
+    /// the receipt-bound roles; a partial or conflicting pair fails closed.
+    pub(crate) fn validate_optional_environment_consistency(&self) -> Result<(), String> {
+        let migration = std::env::var("RYUKI_MIGRATION_EXPECTED_ROLE").ok();
+        let application = std::env::var("RYUKI_APPLICATION_DATABASE_ROLE").ok();
+        match (migration, application) {
+            (None, None) => Ok(()),
+            (Some(migration), Some(application)) => {
+                let configured = Self::from_values(migration, application)?;
+                if configured == *self {
+                    Ok(())
+                } else {
+                    Err(
+                        "migration role environment wiring differs from the receipt-bound production roles"
+                            .into(),
+                    )
+                }
+            }
+            _ => Err(
+                "production migration role environment wiring must supply both role names or neither"
+                    .into(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_receipt_bound_roles(
+        &self,
+        migration_role: &str,
+        application_role: &str,
+    ) -> bool {
+        self.expected == migration_role && self.application == application_role
     }
 }
 
@@ -565,10 +618,13 @@ pub fn migration_database_url_from_env() -> Result<String, String> {
     Ok(url)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationInventory {
     pub embedded_count: usize,
     pub latest_version: Option<i64>,
+    /// Canonical `ryuki-postgresql-migration-inventory-v1` digest of the
+    /// exact ordered version/checksum rows read back after verification.
+    pub content_digest: String,
 }
 
 /// Exact successful row retained from `public._sqlx_migrations`. Installation
@@ -821,6 +877,46 @@ pub enum PostgresqlRuntimePublicationError {
     PublishedPoolMismatch,
 }
 
+/// Independently authenticated infrastructure evidence needed by the local
+/// half of the `DurablePostgresql` guard.
+///
+/// There is deliberately no data-only implementation or constructor in this
+/// module. An implementation must retain the exact signed/provider-attested
+/// authority from which these fields were obtained and revalidate that
+/// authority in `verify_integrity`. Copying values out of the runtime-guard
+/// expectation is not an observation and must never implement this contract.
+/// The database verifier supplies every SQL-observable identity field itself;
+/// this seam supplies only facts that the least-privilege application role
+/// cannot safely observe.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait VerifiedPostgresqlInfrastructureEvidence: Send + Sync {
+    fn verify_integrity(&self) -> bool;
+    fn deployment_id(&self) -> &str;
+    fn trust_domain_id(&self) -> &str;
+    fn database_provider(&self) -> ProductionDatabaseProvider;
+    fn cluster_system_identifier(&self) -> &str;
+    fn storage_bindings(&self) -> &[PostgresqlStorageBinding];
+}
+
+#[derive(Debug, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum DurablePostgresqlRuntimeVerificationError {
+    #[error("DurablePostgresql verification requires an unpublished database runtime")]
+    RuntimeAlreadyPublished,
+    #[error("DurablePostgresql verification received the wrong runtime-guard expectation kind")]
+    ExpectedGuardKind,
+    #[error("authenticated PostgreSQL infrastructure evidence failed integrity verification")]
+    InfrastructureEvidenceInvalid,
+    #[error("the local PostgreSQL migration inventory contains an invalid version")]
+    InvalidMigrationVersion,
+    #[error("the measured DurablePostgresql value does not equal the receipt-bound expectation")]
+    ExpectedValueMismatch,
+    #[error(transparent)]
+    DigestProjection(#[from] RuntimeGuardDigestError),
+    #[error(transparent)]
+    RuntimeObservation(#[from] PostgresqlRuntimeObservationError),
+}
+
 /// Cloneable only through its retained `Arc` allocations; guard authority is
 /// supplied by the separate non-cloneable nominal runtime witness.
 #[derive(Clone)]
@@ -893,6 +989,177 @@ impl RetainedPostgresqlRuntime {
     }
 }
 
+/// The verified local half of the `DurablePostgresql` runtime guard.
+///
+/// This handle retains the exact unpublished pool, its connection-binding
+/// authority, and the independently authenticated infrastructure evidence used
+/// for the comparison. It is intentionally not `Clone`: the runtime-guard
+/// witness should own this nominal proof while callers use `runtime()` only to
+/// prove that publication consumes the same retained allocation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct VerifiedLocalDurablePostgresqlRuntime {
+    runtime: RetainedPostgresqlRuntime,
+    infrastructure_evidence: Arc<dyn VerifiedPostgresqlInfrastructureEvidence>,
+    observed_value: RuntimeGuardExpectedValue,
+}
+
+impl fmt::Debug for VerifiedLocalDurablePostgresqlRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedLocalDurablePostgresqlRuntime")
+            .field("contract", &"verified-local-durable-postgresql-v1")
+            .field("runtime", &self.runtime)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl VerifiedLocalDurablePostgresqlRuntime {
+    pub(crate) fn runtime(&self) -> &RetainedPostgresqlRuntime {
+        &self.runtime
+    }
+
+    pub(crate) fn observed_value(&self) -> &RuntimeGuardExpectedValue {
+        &self.observed_value
+    }
+
+    fn recheck_retained_projection(&self) -> Result<(), DurablePostgresqlRuntimeVerificationError> {
+        if !self.infrastructure_evidence.verify_integrity() {
+            return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
+        }
+        let current = measured_durable_postgresql_value(
+            &self.runtime,
+            self.infrastructure_evidence.as_ref(),
+        )?;
+        if current != self.observed_value {
+            return Err(DurablePostgresqlRuntimeVerificationError::ExpectedValueMismatch);
+        }
+        // An evidence implementation may re-hash retained bytes here. Check it
+        // on both sides of the projection so mutable or replaced authority
+        // cannot splice one comparison from two evidence states.
+        if !self.infrastructure_evidence.verify_integrity() {
+            return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
+        }
+        Ok(())
+    }
+
+    /// Remeasure every SQL-visible fact through the exact retained pool, then
+    /// revalidate the retained infrastructure authority and all three digest
+    /// projections against the value sealed during initial verification.
+    pub(crate) async fn remeasure_exact(
+        &self,
+    ) -> Result<(), DurablePostgresqlRuntimeVerificationError> {
+        self.runtime.remeasure_exact().await?;
+        self.recheck_retained_projection()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn measured_postgresql_migration_inventory(
+    observation: &PostgresqlRuntimeObservation,
+) -> Result<Box<[PostgresqlMigrationInventoryRow]>, DurablePostgresqlRuntimeVerificationError> {
+    observation
+        .migration_ledger()
+        .iter()
+        .map(|row| {
+            let version = u64::try_from(row.version())
+                .ok()
+                .filter(|version| *version != 0)
+                .ok_or(DurablePostgresqlRuntimeVerificationError::InvalidMigrationVersion)?;
+            Ok(PostgresqlMigrationInventoryRow {
+                version,
+                checksum_digest: format!("sha256:{:x}", Sha256::digest(row.checksum())),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn measured_durable_postgresql_value(
+    runtime: &RetainedPostgresqlRuntime,
+    infrastructure_evidence: &dyn VerifiedPostgresqlInfrastructureEvidence,
+) -> Result<RuntimeGuardExpectedValue, DurablePostgresqlRuntimeVerificationError> {
+    let observation = runtime.observation();
+    let identity = PostgresqlDatabaseIdentity {
+        deployment_id: infrastructure_evidence.deployment_id().to_owned(),
+        trust_domain_id: infrastructure_evidence.trust_domain_id().to_owned(),
+        database_provider: infrastructure_evidence.database_provider(),
+        database_name: observation.database_name().to_owned(),
+        database_oid: observation.database_oid(),
+        cluster_system_identifier: infrastructure_evidence
+            .cluster_system_identifier()
+            .to_owned(),
+        server_address: observation.server_address().to_string(),
+        server_port: observation.server_port(),
+        tls_enabled: true,
+        // PostgreSQL reports the standard protocol and cipher spellings in
+        // uppercase. The core digest contracts deliberately use canonical
+        // lowercase runtime identifiers, so normalize only that spelling.
+        tls_protocol: observation.tls().protocol().to_ascii_lowercase(),
+        tls_cipher_suite: observation.tls().cipher().to_ascii_lowercase(),
+        tls_cipher_bits: observation.tls().bits(),
+        server_major_version: observation.server_major_version(),
+        primary: observation.is_primary(),
+        writable: observation.is_transaction_writable()
+            && observation.is_default_transaction_writable(),
+    };
+    let migrations = measured_postgresql_migration_inventory(observation)?;
+    Ok(RuntimeGuardExpectedValue::DurablePostgresql {
+        database_provider: infrastructure_evidence.database_provider(),
+        server_major_version: observation.server_major_version(),
+        database_identity_digest: postgresql_database_identity_digest(&identity)?,
+        storage_binding_digest: postgresql_storage_binding_digest(
+            infrastructure_evidence.storage_bindings(),
+        )?,
+        migration_inventory_digest: postgresql_migration_inventory_digest(&migrations)?,
+        application_role: observation.application_role().to_owned(),
+        migration_role: observation.migration_role().to_owned(),
+    })
+}
+
+/// Verify the exact local PostgreSQL observation against one closed receipt
+/// expectation without deriving any observed field from that expectation.
+///
+/// The caller must supply a provider-attested evidence object and the still
+/// unpublished runtime. The returned nominal handle owns both authorities and
+/// is suitable for retention by the higher-level runtime-guard witness.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn verify_local_durable_postgresql_runtime(
+    unpublished: &UnpublishedPostgresqlRuntime,
+    infrastructure_evidence: Arc<dyn VerifiedPostgresqlInfrastructureEvidence>,
+    expected_value: &RuntimeGuardExpectedValue,
+) -> Result<VerifiedLocalDurablePostgresqlRuntime, DurablePostgresqlRuntimeVerificationError> {
+    if !unpublished.is_unpublished() {
+        return Err(DurablePostgresqlRuntimeVerificationError::RuntimeAlreadyPublished);
+    }
+    if !matches!(
+        expected_value,
+        RuntimeGuardExpectedValue::DurablePostgresql { .. }
+    ) {
+        return Err(DurablePostgresqlRuntimeVerificationError::ExpectedGuardKind);
+    }
+    if !infrastructure_evidence.verify_integrity() {
+        return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
+    }
+    let runtime = unpublished.retained_handle();
+    let observed_value =
+        measured_durable_postgresql_value(&runtime, infrastructure_evidence.as_ref())?;
+    if &observed_value != expected_value {
+        return Err(DurablePostgresqlRuntimeVerificationError::ExpectedValueMismatch);
+    }
+    if !infrastructure_evidence.verify_integrity() {
+        return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
+    }
+    let verified = VerifiedLocalDurablePostgresqlRuntime {
+        runtime,
+        infrastructure_evidence,
+        observed_value,
+    };
+    verified.recheck_retained_projection()?;
+    Ok(verified)
+}
+
 /// Owns a connected and measured pool that is not yet reachable through
 /// `get_db()`. Production startup may clone only the retained handle for guard
 /// construction; publication consumes this wrapper after all admission gates
@@ -950,10 +1217,14 @@ pub enum MigrationVerificationError {
     ChecksumMismatch(i64),
     #[error("embedded migrations are not applied: {0:?}")]
     Missing(Vec<i64>),
+    #[error("migration inventory digest projection is invalid: {0}")]
+    Digest(#[from] RuntimeGuardDigestError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationRunError {
+    #[error("migration admission was rejected: {0}")]
+    Admission(String),
     #[error("dedicated migration database connection failed: {0}")]
     Connect(#[source] sqlx::Error),
     #[error("embedded migration execution failed: {0}")]
@@ -1139,6 +1410,35 @@ fn expected_embedded_migrations() -> BTreeMap<i64, &'static [u8]> {
         .collect()
 }
 
+fn migration_inventory_content_digest(
+    rows: &[(i64, Vec<u8>)],
+) -> Result<String, MigrationVerificationError> {
+    let projection = rows
+        .iter()
+        .map(|(version, checksum)| {
+            let version = u64::try_from(*version)
+                .ok()
+                .filter(|version| *version != 0)
+                .ok_or(RuntimeGuardDigestError::InvalidProjection(
+                    "postgresql migration inventory",
+                ))?;
+            Ok(PostgresqlMigrationInventoryRow {
+                version,
+                checksum_digest: format!("sha256:{:x}", Sha256::digest(checksum)),
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeGuardDigestError>>()?;
+    postgresql_migration_inventory_digest(&projection).map_err(Into::into)
+}
+
+pub(crate) fn embedded_migration_inventory_digest() -> Result<String, MigrationVerificationError> {
+    let rows = expected_embedded_migrations()
+        .into_iter()
+        .map(|(version, checksum)| (version, checksum.to_vec()))
+        .collect::<Vec<_>>();
+    migration_inventory_content_digest(&rows)
+}
+
 fn verify_migration_inventory(
     applied: &[(i64, Vec<u8>)],
     dirty_version: Option<i64>,
@@ -1186,6 +1486,7 @@ fn verify_migration_inventory(
     Ok(MigrationInventory {
         embedded_count: expected.len(),
         latest_version: expected.keys().next_back().copied(),
+        content_digest: migration_inventory_content_digest(applied)?,
     })
 }
 
@@ -3325,12 +3626,22 @@ pub async fn apply_embedded_migrations(
     apply_embedded_migrations_inner(url, timeouts, None).await
 }
 
-pub async fn apply_embedded_migrations_with_role_contract(
+pub(crate) async fn apply_embedded_migrations_with_admission(
     url: &str,
     timeouts: MigrationTimeouts,
-    role_contract: MigrationRoleContract,
+    admission: crate::security_contracts::VerifiedApplyOnlyMigrationAdmission,
 ) -> Result<MigrationInventory, MigrationRunError> {
-    apply_embedded_migrations_inner(url, timeouts, Some(role_contract)).await
+    let (role_contract, expected_inventory_digest) = admission
+        .into_database_execution(chrono::Utc::now())
+        .map_err(MigrationRunError::Admission)?;
+    let inventory = apply_embedded_migrations_inner(url, timeouts, Some(role_contract)).await?;
+    if inventory.content_digest != expected_inventory_digest {
+        set_migration_status(MigrationStatus::Failed);
+        return Err(MigrationRunError::Admission(
+            "verified post-migration ledger differs from the admitted inventory".into(),
+        ));
+    }
+    Ok(inventory)
 }
 
 /// Whether a failed database connection is fatal instead of falling back to
@@ -3484,14 +3795,168 @@ pub static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 #[cfg(test)]
 mod tests {
     use super::{
-        build_application_pool, build_migration_pool, expected_embedded_migrations, get_db,
-        live_platform_health, migration_status, set_migration_status_for_test,
-        try_connect_with_url, verify_embedded_migrations_on_connection, verify_migration_inventory,
-        MigrationStartupMode, MigrationStatus, MigrationTimeouts, MigrationVerificationError,
-        DB_TEST_SERIAL,
+        build_application_pool, build_migration_pool, embedded_migration_inventory_digest,
+        expected_embedded_migrations, get_db, live_platform_health, migration_status,
+        set_migration_status_for_test, try_connect_with_url,
+        verify_embedded_migrations_on_connection, verify_migration_inventory, MigrationStartupMode,
+        MigrationStatus, MigrationTimeouts, MigrationVerificationError, DB_TEST_SERIAL,
     };
     use ryuki_engine::health_monitor::{HealthSource, HealthStatus};
+    use sha2::Digest as _;
     use sqlx::{Connection, PgConnection};
+
+    struct TestVerifiedPostgresqlInfrastructureEvidence {
+        valid: std::sync::atomic::AtomicBool,
+        deployment_id: String,
+        trust_domain_id: String,
+        database_provider: ryuki_core::security_profile::ProductionDatabaseProvider,
+        cluster_system_identifier: String,
+        storage_bindings: Vec<ryuki_core::security_profile::PostgresqlStorageBinding>,
+    }
+
+    impl super::VerifiedPostgresqlInfrastructureEvidence
+        for TestVerifiedPostgresqlInfrastructureEvidence
+    {
+        fn verify_integrity(&self) -> bool {
+            self.valid.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn deployment_id(&self) -> &str {
+            &self.deployment_id
+        }
+
+        fn trust_domain_id(&self) -> &str {
+            &self.trust_domain_id
+        }
+
+        fn database_provider(&self) -> ryuki_core::security_profile::ProductionDatabaseProvider {
+            self.database_provider
+        }
+
+        fn cluster_system_identifier(&self) -> &str {
+            &self.cluster_system_identifier
+        }
+
+        fn storage_bindings(&self) -> &[ryuki_core::security_profile::PostgresqlStorageBinding] {
+            &self.storage_bindings
+        }
+    }
+
+    fn durable_postgresql_verification_fixture() -> (
+        super::UnpublishedPostgresqlRuntime,
+        std::sync::Arc<TestVerifiedPostgresqlInfrastructureEvidence>,
+        ryuki_core::security_profile::RuntimeGuardExpectedValue,
+    ) {
+        use ryuki_core::security_profile::{
+            postgresql_database_identity_digest, postgresql_migration_inventory_digest,
+            postgresql_storage_binding_digest, PostgresqlDatabaseIdentity,
+            PostgresqlMigrationInventoryRow, PostgresqlStorageBinding, PostgresqlStoragePurpose,
+            ProductionDatabaseProvider, RuntimeGuardExpectedValue,
+        };
+
+        fn digest(character: char) -> String {
+            format!("sha256:{}", character.to_string().repeat(64))
+        }
+
+        let roles = super::ProductionDatabaseRoles::new(
+            "ryuki_app_runtime".into(),
+            "ryuki_schema_migrator".into(),
+        )
+        .unwrap();
+        let checksum = b"embedded-migration-checksum".to_vec();
+        let observation = std::sync::Arc::new(super::PostgresqlRuntimeObservation {
+            server_version_num: 180_002,
+            server_version: "18.2".into(),
+            server_major_version: 18,
+            database_name: "ryuki".into(),
+            database_oid: 16_384,
+            server_address: "192.0.2.10".parse().unwrap(),
+            server_port: 5432,
+            primary: true,
+            transaction_writable: true,
+            default_transaction_writable: true,
+            application_role: roles.application_role.clone(),
+            migration_role: roles.migration_role.clone(),
+            session_login_role: "ryuki_login_20260720".into(),
+            tls: super::PostgresqlTlsObservation {
+                protocol: "TLSv1.3".into(),
+                cipher: "TLS_AES_256_GCM_SHA384".into(),
+                bits: 256,
+                client_distinguished_name: None,
+                issuer_distinguished_name: None,
+            },
+            migration_ledger: vec![super::PostgresqlMigrationLedgerRow {
+                version: 196,
+                checksum: checksum.clone().into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
+        });
+        let roles = std::sync::Arc::new(roles);
+        let retained = super::RetainedPostgresqlRuntime {
+            pool: std::sync::Arc::new(
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgresql://placeholder@example.invalid/ryuki")
+                    .unwrap(),
+            ),
+            observation,
+            roles: roles.clone(),
+            connection_binding: std::sync::Arc::new(
+                super::ProductionDatabaseConnectionBinding::new(roles),
+            ),
+        };
+        let storage_bindings = vec![PostgresqlStorageBinding {
+            purpose: PostgresqlStoragePurpose::Data,
+            provider_cluster_uid_digest: digest('1'),
+            persistent_volume_claim_uid_digest: digest('2'),
+            persistent_volume_uid_digest: digest('3'),
+            csi_driver: "storage.csi.example.test".into(),
+            volume_handle_digest: digest('4'),
+            storage_class: "encrypted-rwo".into(),
+        }];
+        let evidence = std::sync::Arc::new(TestVerifiedPostgresqlInfrastructureEvidence {
+            valid: std::sync::atomic::AtomicBool::new(true),
+            deployment_id: "deployment:production".into(),
+            trust_domain_id: "trust-domain:production".into(),
+            database_provider: ProductionDatabaseProvider::CloudNativePg,
+            cluster_system_identifier: "7482247594438774091".into(),
+            storage_bindings: storage_bindings.clone(),
+        });
+        let identity = PostgresqlDatabaseIdentity {
+            deployment_id: evidence.deployment_id.clone(),
+            trust_domain_id: evidence.trust_domain_id.clone(),
+            database_provider: evidence.database_provider,
+            database_name: "ryuki".into(),
+            database_oid: 16_384,
+            cluster_system_identifier: evidence.cluster_system_identifier.clone(),
+            server_address: "192.0.2.10".into(),
+            server_port: 5432,
+            tls_enabled: true,
+            tls_protocol: "tlsv1.3".into(),
+            tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
+            tls_cipher_bits: 256,
+            server_major_version: 18,
+            primary: true,
+            writable: true,
+        };
+        let migrations = vec![PostgresqlMigrationInventoryRow {
+            version: 196,
+            checksum_digest: format!("sha256:{:x}", sha2::Sha256::digest(checksum)),
+        }];
+        let expected = RuntimeGuardExpectedValue::DurablePostgresql {
+            database_provider: ProductionDatabaseProvider::CloudNativePg,
+            server_major_version: 18,
+            database_identity_digest: postgresql_database_identity_digest(&identity).unwrap(),
+            storage_binding_digest: postgresql_storage_binding_digest(&storage_bindings).unwrap(),
+            migration_inventory_digest: postgresql_migration_inventory_digest(&migrations).unwrap(),
+            application_role: "ryuki_app_runtime".into(),
+            migration_role: "ryuki_schema_migrator".into(),
+        };
+        (
+            super::UnpublishedPostgresqlRuntime { retained },
+            evidence,
+            expected,
+        )
+    }
 
     #[test]
     fn migration_mode_is_explicit_and_rejects_unknown_values() {
@@ -3810,6 +4275,85 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn local_durable_postgresql_verifier_binds_measured_runtime_and_external_authority() {
+        let (unpublished, evidence, expected) = durable_postgresql_verification_fixture();
+        let verified = super::verify_local_durable_postgresql_runtime(
+            &unpublished,
+            evidence.clone(),
+            &expected,
+        )
+        .expect("exact local observation and authenticated infrastructure evidence must verify");
+
+        assert!(verified
+            .runtime()
+            .same_runtime(&unpublished.retained_handle()));
+        assert_eq!(verified.observed_value(), &expected);
+        let _freshness_api = super::VerifiedLocalDurablePostgresqlRuntime::remeasure_exact;
+        verified
+            .recheck_retained_projection()
+            .expect("retained evidence and digest projections must remain exact");
+
+        let debug = format!("{verified:?}");
+        for forbidden in [
+            "deployment:production",
+            "trust-domain:production",
+            "7482247594438774091",
+            "192.0.2.10",
+            "ryuki_app_runtime",
+            "ryuki_schema_migrator",
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "verified runtime debug output leaked {forbidden}: {debug}"
+            );
+        }
+
+        evidence
+            .valid
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            verified.recheck_retained_projection(),
+            Err(super::DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_durable_postgresql_verifier_rejects_expectation_and_evidence_substitution() {
+        let (unpublished, evidence, mut expected) = durable_postgresql_verification_fixture();
+        let ryuki_core::security_profile::RuntimeGuardExpectedValue::DurablePostgresql {
+            database_identity_digest,
+            ..
+        } = &mut expected
+        else {
+            unreachable!("fixture kind is fixed")
+        };
+        *database_identity_digest = format!("sha256:{}", "f".repeat(64));
+        assert!(matches!(
+            super::verify_local_durable_postgresql_runtime(&unpublished, evidence, &expected),
+            Err(super::DurablePostgresqlRuntimeVerificationError::ExpectedValueMismatch)
+        ));
+
+        let (unpublished, evidence, expected) = durable_postgresql_verification_fixture();
+        evidence
+            .valid
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            super::verify_local_durable_postgresql_runtime(&unpublished, evidence, &expected),
+            Err(super::DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid)
+        ));
+
+        let (unpublished, evidence, _) = durable_postgresql_verification_fixture();
+        let wrong_kind = ryuki_core::security_profile::RuntimeGuardExpectedValue::SecureCookies {
+            policies: Vec::new(),
+            policy_inventory_digest: format!("sha256:{}", "e".repeat(64)),
+        };
+        assert!(matches!(
+            super::verify_local_durable_postgresql_runtime(&unpublished, evidence, &wrong_kind),
+            Err(super::DurablePostgresqlRuntimeVerificationError::ExpectedGuardKind)
+        ));
+    }
+
     #[test]
     fn verify_only_inventory_rejects_missing_dirty_modified_and_unexpected_rows() {
         let expected = expected_embedded_migrations();
@@ -3825,6 +4369,10 @@ mod tests {
         let complete = verify_migration_inventory(&applied, None).unwrap();
         assert_eq!(complete.embedded_count, expected.len());
         assert_eq!(complete.latest_version, Some(latest));
+        assert_eq!(
+            complete.content_digest,
+            embedded_migration_inventory_digest().unwrap()
+        );
 
         applied.pop();
         assert!(matches!(
@@ -4405,10 +4953,10 @@ mod tests {
             "ryuki_app_runtime".into(),
         )
         .expect("valid migration role fixture");
-        super::apply_embedded_migrations_with_role_contract(
+        super::apply_embedded_migrations_inner(
             &migration_url,
             MigrationTimeouts::default(),
-            migration_contract,
+            Some(migration_contract),
         )
         .await
         .expect("strict migration postflight must reconcile and attest privileges");
