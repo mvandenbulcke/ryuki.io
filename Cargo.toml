@@ -68,6 +68,16 @@ ryuki-runner = { path = "sources/ryuki-runner" }
 ryuki-protocol = { path = "sources/ryuki-protocol" }
 ryuki-agent = { path = "sources/ryuki-agent" }
 
+# This workspace is large enough that Cargo's default full debuginfo plus
+# incremental caches can grow target/debug into the hundreds of GiB. Reduce
+# ordinary development and test cache growth while retaining source locations
+# in backtraces. A deliberate debugging session can opt back in temporarily
+# with CARGO_PROFILE_DEV_DEBUG=2, CARGO_PROFILE_TEST_DEBUG=2, and
+# CARGO_INCREMENTAL=1 as appropriate, then run `make clean` when finished.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.wasm-release]
 codegen-units = 1
 inherits = "release"
