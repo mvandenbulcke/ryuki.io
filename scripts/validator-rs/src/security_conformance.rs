@@ -5674,7 +5674,7 @@ fn validate_action_resource_registry(root: &Path, registry: &Value, errors: &mut
                 ));
             }
             if let Some(source) = string_field(entry, "source_file") {
-                validate_source_path(root, source, None, &path, errors);
+                validate_source_path(root, source, None, None, &path, errors);
             }
         }
     }
@@ -5867,6 +5867,7 @@ fn validate_security_limit_profile(root: &Path, profile: &Value, errors: &mut Ve
                     root,
                     source_file,
                     string_field(binding, "source_symbol"),
+                    string_field(binding, "source_digest"),
                     &format!("{path}/source_binding"),
                     errors,
                 );
@@ -6032,21 +6033,52 @@ fn validate_source_path(
     root: &Path,
     source: &str,
     symbol: Option<&str>,
+    expected_digest: Option<&str>,
     context: &str,
     errors: &mut Vec<String>,
 ) {
     let Some(path) = safe_repository_path(root, source, context, errors) else {
         return;
     };
+
+    if symbol.is_none() && expected_digest.is_none() {
+        return;
+    }
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot read source_file {source}: {error}"
+            ));
+            return;
+        }
+    };
+
     if let Some(symbol) = symbol {
-        match fs::read_to_string(&path) {
+        match std::str::from_utf8(&bytes) {
             Ok(contents) if contents.contains(symbol) => {}
             Ok(_) => errors.push(format!(
                 "{context}: source_symbol {symbol} is absent from {source}"
             )),
             Err(error) => errors.push(format!(
-                "{context}: cannot read source_file {source}: {error}"
+                "{context}: cannot read source_file {source} as UTF-8: {error}"
             )),
+        }
+    }
+
+    if let Some(expected_digest) = expected_digest {
+        if !is_sha256_digest(expected_digest) {
+            errors.push(format!(
+                "{context}: source_digest must be sha256: plus 64 lowercase hexadecimal digits"
+            ));
+            return;
+        }
+        let actual_digest = raw_sha256_digest(&bytes);
+        if expected_digest != actual_digest.as_str() {
+            errors.push(format!(
+                "{context}: source_digest does not match exact raw bytes at {source}; expected {actual_digest}"
+            ));
         }
     }
 }
@@ -6947,6 +6979,90 @@ mod tests {
                 errors.join("\n")
             );
         }
+    }
+
+    #[test]
+    fn security_limit_source_digest_binds_the_exact_raw_source_bytes() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture_limit.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let original_bytes = b"pub const FIXTURE_LIMIT: u64 = 300;\n";
+        fs::write(temporary_root.path().join(locator), original_bytes).unwrap();
+        let profile = json!({
+            "limits": [{
+                "limit_id": "limit:fixture.maximum-age",
+                "selected_value": 300,
+                "hard_bounds": {"minimum": 30, "maximum": 900},
+                "source_binding": {
+                    "source_file": locator,
+                    "source_symbol": "FIXTURE_LIMIT",
+                    "source_digest": raw_sha256_digest(original_bytes)
+                }
+            }]
+        });
+
+        let mut errors = Vec::new();
+        validate_security_limit_profile(temporary_root.path(), &profile, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        fs::write(
+            temporary_root.path().join(locator),
+            b"pub const FIXTURE_LIMIT: u64 = 300;",
+        )
+        .unwrap();
+        errors.clear();
+        validate_security_limit_profile(temporary_root.path(), &profile, &mut errors);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("source_digest does not match exact raw bytes")
+                    && error.contains(locator)
+            }),
+            "missing exact-byte source digest error: {}",
+            errors.join("\n")
+        );
+        assert!(
+            !errors.iter().any(|error| error.contains("source_symbol")),
+            "the byte-only mutation must retain the source symbol: {}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn security_limit_source_digest_remains_optional_and_preserves_symbol_checks() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture_limit.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        fs::write(
+            temporary_root.path().join(locator),
+            b"pub const FIXTURE_LIMIT: u64 = 300;\n",
+        )
+        .unwrap();
+        let mut profile = json!({
+            "limits": [{
+                "limit_id": "limit:fixture.maximum-age",
+                "selected_value": 300,
+                "hard_bounds": {"minimum": 30, "maximum": 900},
+                "source_binding": {
+                    "source_file": locator,
+                    "source_symbol": "FIXTURE_LIMIT"
+                }
+            }]
+        });
+
+        let mut errors = Vec::new();
+        validate_security_limit_profile(temporary_root.path(), &profile, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        profile["limits"][0]["source_binding"]["source_symbol"] = json!("MISSING_LIMIT");
+        errors.clear();
+        validate_security_limit_profile(temporary_root.path(), &profile, &mut errors);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("source_symbol MISSING_LIMIT is absent") && error.contains(locator)
+            }),
+            "missing source-symbol validation error: {}",
+            errors.join("\n")
+        );
     }
 
     #[test]

@@ -2001,6 +2001,15 @@ pub(crate) async fn lease_pending_job(
                  WHERE request.id = pending.request_id \
                  FOR SHARE \
                ) \
+               AND CASE \
+                 WHEN pending.mode IN ('LiveApply', 'LiveDestroy') THEN \
+                   COALESCE( \
+                     pending.site_status_authority_epoch = \
+                       public.ryuki_acquire_live_site_execution_epoch(pending.platform), \
+                     FALSE \
+                   ) \
+                 ELSE TRUE \
+               END \
                AND ( \
                  pending.live_context IS NULL \
                  OR ( \
@@ -2285,6 +2294,15 @@ pub async fn ack_job(
              WHERE request.id = job.request_id \
              FOR SHARE \
            ) \
+           AND CASE \
+             WHEN job.mode IN ('LiveApply', 'LiveDestroy') THEN \
+               COALESCE( \
+                 job.site_status_authority_epoch = \
+                   public.ryuki_acquire_live_site_execution_epoch(job.platform), \
+                 FALSE \
+               ) \
+             ELSE TRUE \
+           END \
          RETURNING job.id",
     )
     .bind(job_id)
@@ -2311,12 +2329,22 @@ pub async fn ack_job(
         fencing_token_matches: bool,
         request_resource_version: i64,
         current_request_resource_version: Option<i64>,
+        live_site_fence_current: bool,
     }
     let existing = sqlx::query_as::<_, StatusRow>(
         "SELECT job.agent_id, job.status, job.attempt_id, job.lease_deadline, \
                 COALESCE(job.fencing_token = $2, FALSE) AS fencing_token_matches, \
                 job.request_resource_version, \
-                request.resource_version AS current_request_resource_version \
+                request.resource_version AS current_request_resource_version, \
+                CASE \
+                  WHEN job.mode IN ('LiveApply', 'LiveDestroy') THEN \
+                    COALESCE( \
+                      job.site_status_authority_epoch = \
+                        public.ryuki_acquire_live_site_execution_epoch(job.platform), \
+                      FALSE \
+                    ) \
+                  ELSE TRUE \
+                END AS live_site_fence_current \
          FROM agent_jobs AS job \
          LEFT JOIN requests AS request ON request.id = job.request_id \
          WHERE job.id = $1",
@@ -2359,6 +2387,8 @@ pub async fn ack_job(
         "fencing_token mismatch".to_string()
     } else if row.current_request_resource_version != Some(row.request_resource_version) {
         "request changed after this job was dispatched".to_string()
+    } else if !row.live_site_fence_current {
+        "live site execution authority is no longer current".to_string()
     } else {
         "job lease changed while the acknowledgement was processed".to_string()
     };
@@ -4072,6 +4102,9 @@ async fn post_job_result_with_pool(
         request_resource_version: i64,
         // S5: the CP-signed approval grant for LiveApply jobs (NULL otherwise).
         live_context: Option<sqlx::types::Json<serde_json::Value>>,
+        // Canonical site-health authority epoch captured in the same
+        // transaction that minted this live mutation grant.
+        site_status_authority_epoch: Option<i64>,
         result_id: Option<uuid::Uuid>,
         result_status: Option<String>,
         evidence_digest: Option<String>,
@@ -4085,7 +4118,8 @@ async fn post_job_result_with_pool(
     let row = sqlx::query_as::<_, JobForResult>(
         "SELECT id, status, agent_id, attempt_id, lease_generation, cp_nonce, spec, mode, \
          platform, request_id, request_resource_version, live_context, \
-         result_id, result_status, evidence_digest, raw_plan_digest, completed_at, origin \
+         site_status_authority_epoch, result_id, result_status, evidence_digest, \
+         raw_plan_digest, completed_at, origin \
          FROM agent_jobs WHERE id = $1",
     )
     .bind(job_id)
@@ -4570,31 +4604,7 @@ async fn post_job_result_with_pool(
     // Single UPDATE conditioned on (id, attempt_id, lease_generation, status IN
     // ('Leased','Running'), lease_deadline > DB NOW). rows_affected == 0 means
     // the attempt was superseded, expired, or already terminal.
-    let new_job_status = map_result_status_to_job_status(&stored_mode, &env.status);
-    let requires_reconciliation = new_job_status == "ReconcileRequired";
     let result_status_str = result_status_label(&env.status);
-
-    // ── #43 post-apply verification verdict (LiveApply + Applied only) ────────
-    //
-    // A live apply only ASSERTS the intended state; the runner re-plans the same
-    // config immediately after apply to CONFIRM convergence (missing-feature #43).
-    // Derive that verdict from the DIGEST-VERIFIED evidence bytes (step 6 above),
-    // NOT the unsigned `body.evidence_json`, and map it to the CP-internal
-    // terminal result_status + a domain event. Fail-closed: an absent or
-    // uninterpretable verdict keeps the result "applied" and emits no event, so a
-    // job is never recorded "verified" off a re-plan the CP cannot confirm.
-    let post_apply_ingest =
-        if stored_mode == JobMode::LiveApply && env.status == JobResultStatus::Applied {
-            Some(resolve_post_apply_ingest(post_apply_verdict_from_evidence(
-                &body.evidence,
-            )))
-        } else {
-            None
-        };
-    let effective_result_status: &str = post_apply_ingest
-        .as_ref()
-        .map(|p| p.result_status)
-        .unwrap_or(result_status_str);
 
     let envelope_json = serde_json::to_value(env).map_err(db_err)?;
 
@@ -4633,20 +4643,96 @@ async fn post_job_result_with_pool(
     // signature/stored-copy verification above. Locking the request before the
     // job CAS also prevents a lifecycle writer from changing it between this
     // check and the backlink.
+    let mut request_scope: Option<(String, String)> = None;
+    let mut live_site_fence_lost = false;
     if matches!(row.status.as_str(), "Leased" | "Running") {
-        let current_request_version: Option<i64> =
-            sqlx::query_scalar("SELECT resource_version FROM requests WHERE id = $1 FOR UPDATE")
-                .bind(row.request_id)
+        let current_request: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT resource_version, site, environment FROM requests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(row.request_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // `row.status` was read before this transaction. A concurrent identical
+        // POST can terminalize the job while this request waits on the parent
+        // lock. Re-read the job under lock before applying first-acceptance
+        // gates; a now-terminal row must fall through to the exact idempotency
+        // check below instead of being rejected on newly-advanced request/site
+        // authority.
+        let current_job_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1 FOR UPDATE")
+                .bind(job_id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_err)?;
-        if current_request_version != Some(row.request_resource_version) {
-            tx.rollback().await.ok();
-            return Err(conflict(
-                "request changed after this job was dispatched; stale result requires reconciliation",
-            ));
+        if matches!(current_job_status.as_deref(), Some("Leased" | "Running")) {
+            let Some((current_request_version, site, environment)) = current_request else {
+                tx.rollback().await.ok();
+                return Err(conflict(
+                    "request changed after this job was dispatched; stale result requires reconciliation",
+                ));
+            };
+            if current_request_version != row.request_resource_version {
+                tx.rollback().await.ok();
+                return Err(conflict(
+                    "request changed after this job was dispatched; stale result requires reconciliation",
+                ));
+            }
+            request_scope = Some((site, environment));
+
+            // A refusal is signed evidence that the agent did not mutate
+            // anything, so it remains safe to record without a current site
+            // fence. Every other first terminal result for a mutating mode is
+            // compared with the exact epoch minted into the grant. If that
+            // authority was lost while the agent was executing, retain the
+            // signed evidence but require operator reconciliation instead of
+            // projecting success or retrying.
+            if matches!(stored_mode, JobMode::LiveApply | JobMode::LiveDestroy)
+                && env.status != JobResultStatus::LiveRefused
+            {
+                live_site_fence_lost =
+                    !crate::repos::degradation::live_site_execution_fence_is_current(
+                        &mut tx,
+                        &row.platform,
+                        row.site_status_authority_epoch,
+                    )
+                    .await
+                    .map_err(db_err)?;
+            }
         }
     }
+
+    let new_job_status = if live_site_fence_lost {
+        "ReconcileRequired"
+    } else {
+        map_result_status_to_job_status(&stored_mode, &env.status)
+    };
+    let requires_reconciliation = new_job_status == "ReconcileRequired";
+
+    // ── #43 post-apply verification verdict (LiveApply + Applied only) ────────
+    //
+    // A live apply only ASSERTS the intended state; the runner re-plans the same
+    // config immediately after apply to CONFIRM convergence (missing-feature #43).
+    // Derive that verdict from the DIGEST-VERIFIED evidence bytes (step 6 above),
+    // NOT the unsigned `body.evidence_json`, and map it to the CP-internal
+    // terminal result_status + a domain event. Fail-closed: an absent or
+    // uninterpretable verdict keeps the result "applied" and emits no event, so a
+    // job is never recorded "verified" off a re-plan the CP cannot confirm. A
+    // lost live-site fence suppresses this success/drift projection entirely.
+    let post_apply_ingest = if !live_site_fence_lost
+        && stored_mode == JobMode::LiveApply
+        && env.status == JobResultStatus::Applied
+    {
+        Some(resolve_post_apply_ingest(post_apply_verdict_from_evidence(
+            &body.evidence,
+        )))
+    } else {
+        None
+    };
+    let effective_result_status: &str = post_apply_ingest
+        .as_ref()
+        .map(|p| p.result_status)
+        .unwrap_or(result_status_str);
 
     // #60 slice 2: persist the raw evidence bytes BEFORE the terminal UPDATE,
     // in the SAME transaction, so a stored offload reference can never point
@@ -4722,20 +4808,35 @@ async fn post_job_result_with_pool(
             .map_err(db_err)?;
         } else {
             let job_id_string = job_id.to_string();
+            let (request_site, request_environment) = request_scope
+                .as_ref()
+                .ok_or_else(|| db_err("accepted live result has no locked request scope"))?;
+            let (reason_code, note) = if live_site_fence_lost {
+                (
+                    "live-site-authority-lost",
+                    "live site execution authority changed during mutation; provider and state reconciliation required",
+                )
+            } else {
+                (
+                    "live-mutation-failed",
+                    "live mutation reported failure; provider and state reconciliation required",
+                )
+            };
             crate::repos::domain_events::insert(
                 &mut *tx,
                 crate::repos::domain_events::NewEvent {
                     event_type: "job.reconcile_required",
                     aggregate_type: "agent_job",
                     aggregate_id: &job_id_string,
-                    site: None,
-                    environment: None,
+                    site: Some(request_site.as_str()),
+                    environment: Some(request_environment.as_str()),
                     actor: "system",
                     payload: json!({
                         "to_status": "reconcile-required",
                         "platform": &row.platform,
                         "request_id": stored_spec.request_id.to_string(),
-                        "note": "live mutation reported failure; provider and state reconciliation required",
+                        "reason_code": reason_code,
+                        "note": note,
                     }),
                 },
             )
@@ -4890,9 +4991,13 @@ async fn post_job_result_with_pool(
         attempt_id: Option<uuid::Uuid>,
         result_id: Option<uuid::Uuid>,
         result_status: Option<String>,
+        evidence_digest: Option<String>,
+        raw_plan_digest: Option<String>,
+        signed_envelope: Option<sqlx::types::Json<Value>>,
     }
     let existing = sqlx::query_as::<_, IdempotencyCheck>(
-        "SELECT status, attempt_id, result_id, result_status \
+        "SELECT status, attempt_id, result_id, result_status, evidence_digest, \
+                raw_plan_digest, signed_envelope \
          FROM agent_jobs WHERE id = $1",
     )
     .bind(job_id)
@@ -4908,7 +5013,17 @@ async fn post_job_result_with_pool(
     if let (Some(stored_result_id), Some(stored_attempt_id)) =
         (existing.result_id, existing.attempt_id)
     {
-        if stored_result_id == result.result_id && stored_attempt_id == result.attempt_id {
+        let exact_signed_replay = existing.evidence_digest.as_deref()
+            == Some(env.evidence_digest.as_str())
+            && existing.raw_plan_digest.as_deref() == accepted_raw_plan_digest.as_deref()
+            && existing
+                .signed_envelope
+                .as_ref()
+                .is_some_and(|stored| stored.0 == envelope_json);
+        if stored_result_id == result.result_id
+            && stored_attempt_id == result.attempt_id
+            && exact_signed_replay
+        {
             tracing::info!(
                 job_id = %job_id,
                 result_id = %result.result_id,
@@ -5012,6 +5127,15 @@ async fn renew_running_job_lease(
              WHERE request.id = job.request_id \
              FOR SHARE \
            ) \
+           AND CASE \
+             WHEN job.mode IN ('LiveApply', 'LiveDestroy') THEN \
+               COALESCE( \
+                 job.site_status_authority_epoch = \
+                   public.ryuki_acquire_live_site_execution_epoch(job.platform), \
+                 FALSE \
+               ) \
+             ELSE TRUE \
+           END \
          RETURNING job.lease_deadline",
     )
     .bind(fence.job_id)
@@ -5357,9 +5481,11 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
 // Inserts a Pending job. NOT wired into the request lifecycle yet (S3b).
 // ---------------------------------------------------------------------------
 
-/// Enqueues a new Pending job for the given platform and returns the job row id.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn create_agent_job(
+/// Test-only queue fixture. Production live jobs must enter through the
+/// canonical grant-minting paths above; compiling this generic helper into a
+/// release would create an unsigned alternate admission seam.
+#[cfg(test)]
+async fn create_agent_job(
     pool: &PgPool,
     request_id: Uuid,
     platform: &str,
@@ -5371,10 +5497,24 @@ pub async fn create_agent_job(
         i64::try_from(spec.request_resource_version.get()).map_err(|_| {
             sqlx::Error::Protocol("request resource version exceeds PostgreSQL BIGINT".into())
         })?;
+    let mut tx = pool.begin().await?;
+    let site_status_authority_epoch = if matches!(mode, "LiveApply" | "LiveDestroy") {
+        Some(
+            crate::repos::degradation::acquire_live_site_execution_fence(&mut tx, platform)
+                .await?
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("live site execution authority is unavailable".into())
+                })?
+                .authority_epoch(),
+        )
+    } else {
+        None
+    };
 
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, \
+                                 site_status_authority_epoch) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id",
     )
     .bind(request_id)
@@ -5382,8 +5522,10 @@ pub async fn create_agent_job(
     .bind(platform)
     .bind(&spec_json)
     .bind(mode)
-    .fetch_one(pool)
+    .bind(site_status_authority_epoch)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     tracing::info!(
         job_id = %id,
@@ -5679,6 +5821,12 @@ pub enum CreateLiveApplyJobError {
     /// This is a stale-state conflict, not malformed caller input.
     #[error("live-plan backlink lineage conflict: {0}")]
     PlanLineageConflict(&'static str),
+    /// The canonical target site is missing, inactive, not exact-healthy, has
+    /// an unavailable dependency, or its authoritative observation is stale.
+    /// Maps to a stable value-free 503; callers must never disclose the raw
+    /// site/dependency state from this mutation boundary.
+    #[error("live site execution authority is unavailable")]
+    SiteExecutionUnavailable,
     /// A database error occurred while enqueuing the job.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -5834,7 +5982,7 @@ type WholeRequestPlanReceiptRow = (
 /// agent row is share-locked through grant insertion so revocation/key changes
 /// cannot race the mint.
 async fn successful_plan_execution_authority(
-    connection: &mut sqlx::PgConnection,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     approved_plan: &ApprovedPlanReference,
     request_id: Uuid,
     platform: &str,
@@ -5868,7 +6016,7 @@ async fn successful_plan_execution_authority(
     .bind(platform)
     .bind(approved_plan_digest)
     .bind(state_key)
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut **transaction)
     .await?;
     let Some((
         agent_id,
@@ -6218,6 +6366,16 @@ pub async fn create_live_apply_job(
     )
     .await?;
 
+    // Acquire the canonical site authority in THIS grant-mint transaction,
+    // after the request and plan lineage have been locked and immediately
+    // before signing/persistence.  The old handler precheck could race a
+    // concurrent degradation transition.  The opaque fence also supplies the
+    // exact epoch persisted with the job for every later lifecycle transition.
+    let site_execution_fence =
+        crate::repos::degradation::acquire_live_site_execution_fence(&mut tx, platform)
+            .await?
+            .ok_or(CreateLiveApplyJobError::SiteExecutionUnavailable)?;
+
     // Build and sign the VerifiedLiveContext grant. This whole-request path
     // mints a legacy/single-job grant (step_job_id: None) — #42 slice B adds
     // the per-step minting path that sets step_job_id: Some(..); this
@@ -6261,8 +6419,9 @@ pub async fn create_live_apply_job(
         // job insert — which leaves step_scoped at its FALSE default — must
         // carry the same `step_scoped = FALSE` predicate here to infer it.
         "INSERT INTO agent_jobs \
-             (request_id, request_resource_version, platform, spec, mode, live_context, agent_id) \
-         VALUES ($1, $2, $3, $4, 'LiveApply', $5::jsonb, $6) \
+             (request_id, request_resource_version, platform, spec, mode, live_context, \
+              agent_id, site_status_authority_epoch) \
+         VALUES ($1, $2, $3, $4, 'LiveApply', $5::jsonb, $6, $7) \
          ON CONFLICT (request_id) WHERE mode = 'LiveApply' AND step_scoped = FALSE DO NOTHING \
          RETURNING id",
     )
@@ -6272,6 +6431,7 @@ pub async fn create_live_apply_job(
     .bind(&spec_json)
     .bind(&grant_json)
     .bind(&execution_authority.assigned_agent_id)
+    .bind(site_execution_fence.authority_epoch())
     .fetch_optional(&mut *tx)
     .await?;
     let id = id.ok_or(CreateLiveApplyJobError::Invalid(
@@ -6340,7 +6500,7 @@ pub async fn create_live_apply_job(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_step_live_job(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     approved_plan: ApprovedPlanReference,
     request_id: Uuid,
     step_id: Uuid,
@@ -6406,7 +6566,7 @@ pub async fn create_step_live_job(
         "SELECT status, site, resource_version FROM requests WHERE id = $1 FOR UPDATE",
     )
     .bind(request_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let request_site = match request_state {
         None => {
@@ -6442,7 +6602,7 @@ pub async fn create_step_live_job(
     let step_request_id: Option<Uuid> =
         sqlx::query_scalar("SELECT request_id FROM job_steps WHERE id = $1")
             .bind(step_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
     if step_request_id != Some(request_id) {
         return Err(CreateLiveApplyJobError::Invalid(
@@ -6485,6 +6645,14 @@ pub async fn create_step_live_job(
     )
     .await?;
 
+    // The step-scoped LiveApply and automatic LiveDestroy paths are equally
+    // mutating.  Acquire the same transaction-bound site fence before either
+    // grant is signed so this second minting path cannot bypass degradation.
+    let site_execution_fence =
+        crate::repos::degradation::acquire_live_site_execution_fence(tx, platform)
+            .await?
+            .ok_or(CreateLiveApplyJobError::SiteExecutionUnavailable)?;
+
     // Generate the job id client-side so it can be bound INTO the grant
     // (step_job_id) before signing — the whole point of the step-scoped grant.
     let job_id = Uuid::new_v4();
@@ -6523,20 +6691,24 @@ pub async fn create_step_live_job(
     // AwaitingApproval->Applying lock, and the client-generated id is unique.
     sqlx::query(
         "INSERT INTO agent_jobs \
-             (id, request_id, request_resource_version, platform, spec, mode, step_scoped, live_context, agent_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7::jsonb, $8)",
+             (id, request_id, request_resource_version, platform, spec, mode, step_scoped, \
+              live_context, agent_id, site_status_authority_epoch) \
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7::jsonb, $8, $9)",
     )
     .bind(job_id)
     .bind(request_id)
-    .bind(i64::try_from(spec.request_resource_version.get()).map_err(|_| {
-        CreateLiveApplyJobError::Invalid("request resource version exceeds PostgreSQL BIGINT")
-    })?)
+    .bind(
+        i64::try_from(spec.request_resource_version.get()).map_err(|_| {
+            CreateLiveApplyJobError::Invalid("request resource version exceeds PostgreSQL BIGINT")
+        })?,
+    )
     .bind(platform)
     .bind(&spec_json)
     .bind(mode_label)
     .bind(&grant_json)
     .bind(&execution_authority.assigned_agent_id)
-    .execute(&mut *tx)
+    .bind(site_execution_fence.authority_epoch())
+    .execute(&mut **tx)
     .await?;
 
     tracing::info!(
@@ -6731,6 +6903,12 @@ pub async fn approve_live_apply_with(
             "multi-step requests are executed step-by-step and do not support single live-apply",
         ),
         CreateLiveApplyJobError::PlanLineageConflict(msg) => conflict(msg),
+        CreateLiveApplyJobError::SiteExecutionUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "live site execution authority is unavailable"
+            })),
+        ),
         CreateLiveApplyJobError::Db(db_e) => db_err(db_e),
     })?;
 
@@ -10066,6 +10244,64 @@ mod tests {
         Some(pool)
     }
 
+    /// Seed a fresh exact-healthy authority for DB fixtures that exercise a
+    /// mutating live job. Random per-test platforms are registered as custom
+    /// site identifiers so tests do not share or race the migration seed rows.
+    /// Returns the real epoch after all authority-changing triggers have run.
+    async fn seed_live_site_execution_authority(pool: &PgPool, site: &str) -> i64 {
+        let mut tx = pool.begin().await.expect("begin live-site fixture");
+        sqlx::query(
+            "INSERT INTO site_registry \
+                 (unlocode, name, country, country_code, timezone, active, code_system) \
+             VALUES ($1, 'Agent test site', 'Test', 'ZZ', 'UTC', TRUE, 'custom') \
+             ON CONFLICT (unlocode) DO UPDATE SET active = TRUE",
+        )
+        .bind(site)
+        .execute(&mut *tx)
+        .await
+        .expect("seed active test site registry");
+        sqlx::query(
+            "INSERT INTO site_status (site, last_check) \
+             VALUES ($1, statement_timestamp()) \
+             ON CONFLICT (site) DO NOTHING",
+        )
+        .bind(site)
+        .execute(&mut *tx)
+        .await
+        .expect("seed test site status authority row");
+        // Refresh the dependency before the authority row. The VMware trigger
+        // serializes through site_status, so this follows the production
+        // component -> epoch lock order for an existing fixture site.
+        sqlx::query(
+            "INSERT INTO component_status (site, adapter_name, status, last_check) \
+             VALUES ($1, 'vmware', 'up', statement_timestamp()) \
+             ON CONFLICT (site, adapter_name) DO UPDATE SET \
+                 status = 'up', last_check = statement_timestamp()",
+        )
+        .bind(site)
+        .execute(&mut *tx)
+        .await
+        .expect("seed fresh VMware status");
+        sqlx::query(
+            "UPDATE site_status SET \
+                 state = 'healthy', api_status = 'up', db_status = 'up', \
+                 degradation_reason = NULL, last_check = statement_timestamp(), \
+                 updated_at = statement_timestamp() \
+             WHERE site = $1",
+        )
+        .bind(site)
+        .execute(&mut *tx)
+        .await
+        .expect("seed fresh healthy site status");
+        let epoch = crate::repos::degradation::acquire_live_site_execution_fence(&mut tx, site)
+            .await
+            .expect("read seeded live-site authority")
+            .expect("seeded live-site authority is exact-safe")
+            .authority_epoch();
+        tx.commit().await.expect("commit live-site fixture");
+        epoch
+    }
+
     /// Provision the exact challenge represented by a signed registration
     /// fixture. Tests that call the persistence boundary directly use this
     /// helper; handler tests exercise the administrator issuance endpoint.
@@ -12408,6 +12644,7 @@ mod tests {
             return;
         };
         let platform = format!("plt-cap-narrow-{}", Uuid::new_v4().simple());
+        seed_live_site_execution_authority(pool, &platform).await;
         let agent_a = format!("cap-narrow-a-{}", Uuid::new_v4());
         let agent_b = format!("cap-narrow-b-{}", Uuid::new_v4());
         seed_agent(pool, &agent_a, &platform, "approved").await;
@@ -12637,6 +12874,7 @@ mod tests {
         };
         let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
         let platform = format!("plt-affinity-{}", Uuid::new_v4().simple());
+        seed_live_site_execution_authority(&pool, &platform).await;
         let agent_a = format!("agent-a-{}", Uuid::new_v4());
         let agent_b = format!("agent-b-{}", Uuid::new_v4());
         seed_agent(&pool, &agent_a, &platform, "approved").await;
@@ -12782,8 +13020,9 @@ mod tests {
             let job_id = sqlx::query_scalar(
                 "INSERT INTO agent_jobs \
                  (request_id, request_resource_version, platform, spec, mode, status, \
-                  agent_id, live_context) \
-                 VALUES ($1, 1, $2, $3::jsonb, 'LiveApply', 'Pending', $4, $5::jsonb) \
+                  agent_id, live_context, site_status_authority_epoch) \
+                 VALUES ($1, 1, $2, $3::jsonb, 'LiveApply', 'Pending', $4, $5::jsonb, \
+                         public.ryuki_acquire_live_site_execution_epoch($2)) \
                  RETURNING id",
             )
             .bind(request_id)
@@ -13081,6 +13320,9 @@ mod tests {
     }
 
     async fn seed_request_bound_job_spec(pool: &PgPool, platform: &str, mode: JobMode) -> JobSpec {
+        if matches!(&mode, JobMode::LiveApply | JobMode::LiveDestroy) {
+            seed_live_site_execution_authority(pool, platform).await;
+        }
         let request_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO requests \
@@ -13172,9 +13414,11 @@ mod tests {
 
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
-             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
+             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
+             site_status_authority_epoch) \
              VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', \
+             public.ryuki_acquire_live_site_execution_epoch($3)) \
              RETURNING id",
         )
         .bind(spec.request_id)
@@ -13505,9 +13749,10 @@ mod tests {
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
-             delivery_attempts) \
+             delivery_attempts, site_status_authority_epoch) \
              VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5) \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5, \
+             public.ryuki_acquire_live_site_execution_epoch($3)) \
              RETURNING id",
         )
         .bind(spec.request_id)
@@ -13777,9 +14022,11 @@ mod tests {
             .expect("serialize live-apply agent-job fixture spec");
         let reconcile: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
-             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
+             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
+             site_status_authority_epoch) \
              VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', \
+             public.ryuki_acquire_live_site_execution_epoch($3)) \
              RETURNING id",
         )
         .bind(reconcile_spec.request_id)
@@ -14313,6 +14560,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_live_lease_requires_the_current_site_authority_epoch() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("live-epoch-{}", Uuid::new_v4().simple());
+        let agent_id = format!("live-epoch-agent-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_id, &platform, "approved").await;
+
+        let old_spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        let old_job = create_agent_job(
+            &pool,
+            old_spec.request_id,
+            &platform,
+            &old_spec,
+            "LiveApply",
+        )
+        .await
+        .expect("seed epoch-bound live job");
+        let old_epoch: i64 =
+            sqlx::query_scalar("SELECT site_status_authority_epoch FROM agent_jobs WHERE id = $1")
+                .bind(old_job)
+                .fetch_one(&pool)
+                .await
+                .expect("read minted authority epoch");
+        sqlx::query(
+            "UPDATE site_status SET state = 'degraded', api_status = 'degraded', \
+                 db_status = 'degraded', last_check = statement_timestamp() WHERE site = $1",
+        )
+        .bind(&platform)
+        .execute(&pool)
+        .await
+        .expect("degrade site");
+        let recovered_epoch = seed_live_site_execution_authority(&pool, &platform).await;
+        assert_ne!(old_epoch, recovered_epoch, "recovery advances the epoch");
+        assert!(
+            lease_pending_job(&pool, &agent_id)
+                .await
+                .expect("poll stale live work")
+                .is_none(),
+            "recovery must not revive a grant minted under an older epoch"
+        );
+
+        let offline_job = seed_pending_job(&pool, &platform).await;
+        let offline_lease = lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("poll non-mutating work")
+            .expect("non-mutating work remains leaseable");
+        assert_eq!(offline_lease.row.id, offline_job);
+        sqlx::query("UPDATE agent_jobs SET status = 'Succeeded' WHERE id = $1")
+            .bind(offline_job)
+            .execute(&pool)
+            .await
+            .expect("release agent slot");
+
+        let fresh_spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        let fresh_job = create_agent_job(
+            &pool,
+            fresh_spec.request_id,
+            &platform,
+            &fresh_spec,
+            "LiveApply",
+        )
+        .await
+        .expect("seed current-epoch live job");
+        let fresh_lease = lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("poll current live work")
+            .expect("a newly minted current-epoch job remains leaseable");
+        assert_eq!(fresh_lease.row.id, fresh_job);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_live_ack_rejects_a_lost_site_authority_epoch_value_free() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("live-ack-epoch-{}", Uuid::new_v4().simple());
+        let agent_id = format!("live-ack-agent-{}", Uuid::new_v4());
+        let token = seed_agent(pool, &agent_id, &platform, "approved").await;
+        let spec = seed_request_bound_job_spec(pool, &platform, JobMode::LiveApply).await;
+        let job_id = create_agent_job(pool, spec.request_id, &platform, &spec, "LiveApply")
+            .await
+            .expect("seed epoch-bound live job");
+        let lease = lease_pending_job(pool, &agent_id)
+            .await
+            .expect("lease query")
+            .expect("fresh epoch-bound live job leases");
+        assert_eq!(lease.row.id, job_id);
+
+        sqlx::query(
+            "UPDATE site_status \
+             SET state = 'degraded', api_status = 'degraded', db_status = 'degraded', \
+                 degradation_reason = 'test acknowledgement fence', \
+                 last_check = statement_timestamp(), updated_at = statement_timestamp() \
+             WHERE site = $1",
+        )
+        .bind(&platform)
+        .execute(pool)
+        .await
+        .expect("invalidate live-site authority before acknowledgement");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let Err((status, Json(body))) = ack_job(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            Path((agent_id.clone(), job_id.to_string())),
+            headers,
+            Json(AckBody {
+                attempt_id: lease.attempt_id,
+                fencing_token: lease.fencing_token,
+            }),
+        )
+        .await
+        else {
+            panic!("a live acknowledgement with a lost site epoch must fail");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({"error": "live site execution authority is no longer current"})
+        );
+        assert!(!body.to_string().contains(&platform));
+        let stored_status: String =
+            sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .expect("read denied acknowledgement state");
+        assert_eq!(stored_status, "Leased");
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    #[tokio::test]
     async fn db_running_lease_renewal_requires_exact_unexpired_fence() {
         let _expiry_guard = EXPIRE_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
@@ -14323,13 +14712,8 @@ mod tests {
         let agent_id = format!("renew-agent-{}", Uuid::new_v4());
         seed_agent(&pool, &agent_id, &platform, "approved").await;
 
-        let request_id = Uuid::new_v4();
-        let spec = stateful_test_spec(
-            request_id,
-            &format!("request-{request_id}"),
-            JobMode::LiveApply,
-        );
-        create_agent_job(&pool, request_id, &platform, &spec, "LiveApply")
+        let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        create_agent_job(&pool, spec.request_id, &platform, &spec, "LiveApply")
             .await
             .expect("seed live job");
         let (attempt_id, fencing_token, _nonce, generation, row) =
@@ -14392,8 +14776,246 @@ mod tests {
         );
         tx.rollback().await.ok();
 
+        sqlx::query(
+            "UPDATE agent_jobs SET lease_deadline = NOW() + INTERVAL '5 minutes' WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&pool)
+        .await
+        .expect("restore an unexpired lease for site-authority checks");
+        sqlx::query(
+            "UPDATE site_status SET \
+                 state = 'degraded', api_status = 'degraded', \
+                 degradation_reason = 'renewal fence test', \
+                 last_check = statement_timestamp(), updated_at = statement_timestamp() \
+             WHERE site = $1",
+        )
+        .bind(&platform)
+        .execute(&pool)
+        .await
+        .expect("revoke live-site authority before renewal");
+        let mut tx = pool.begin().await.expect("degraded-site renewal tx");
+        assert!(
+            renew_running_job_lease(&mut tx, &agent_id, &fence)
+                .await
+                .expect("degraded-site renewal query")
+                .is_none(),
+            "a running live job must not renew after site authority is revoked"
+        );
+        tx.rollback().await.ok();
+
+        seed_live_site_execution_authority(&pool, &platform).await;
+        let mut tx = pool.begin().await.expect("recovered-site renewal tx");
+        assert!(
+            renew_running_job_lease(&mut tx, &agent_id, &fence)
+                .await
+                .expect("recovered-site renewal query")
+                .is_none(),
+            "recovery must not make the job's superseded authority epoch current again"
+        );
+        tx.rollback().await.ok();
+
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_live_site_persistence_trigger_rejects_missing_wrong_stale_and_resurrected_authority(
+    ) {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("persist-epoch-{}", Uuid::new_v4().simple());
+        let apply_spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
+        let mut destroy_spec = apply_spec.clone();
+        destroy_spec.mode = JobMode::LiveDestroy;
+        let stale_epoch: i64 =
+            sqlx::query_scalar("SELECT authority_epoch FROM site_status WHERE site = $1")
+                .bind(&platform)
+                .fetch_one(&pool)
+                .await
+                .expect("read initial live-site authority epoch");
+
+        sqlx::query(
+            "UPDATE site_status SET \
+                 state = 'degraded', api_status = 'degraded', \
+                 degradation_reason = 'persistence trigger regression', \
+                 last_check = statement_timestamp(), updated_at = statement_timestamp() \
+             WHERE site = $1",
+        )
+        .bind(&platform)
+        .execute(&pool)
+        .await
+        .expect("invalidate initial live-site authority epoch");
+        let current_epoch = seed_live_site_execution_authority(&pool, &platform).await;
+        assert!(current_epoch > stale_epoch);
+
+        let request_resource_version = job_spec_resource_version(&apply_spec);
+        let apply_spec_json = serde_json::to_value(&apply_spec).expect("serialize apply spec");
+        let destroy_spec_json =
+            serde_json::to_value(&destroy_spec).expect("serialize destroy spec");
+        let mut tx = pool.begin().await.expect("persistence-trigger test tx");
+
+        sqlx::query("SAVEPOINT missing_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("create missing-epoch savepoint");
+        let error = sqlx::query(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Pending')",
+        )
+        .bind(apply_spec.request_id)
+        .bind(request_resource_version)
+        .bind(&platform)
+        .bind(&apply_spec_json)
+        .execute(&mut *tx)
+        .await
+        .expect_err("an open LiveApply without an epoch must be rejected");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        assert!(error
+            .to_string()
+            .contains("open live job requires a supplied site execution authority epoch"));
+        sqlx::query("ROLLBACK TO SAVEPOINT missing_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("recover missing-epoch savepoint");
+        sqlx::query("RELEASE SAVEPOINT missing_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("release missing-epoch savepoint");
+
+        sqlx::query("SAVEPOINT wrong_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("create wrong-epoch savepoint");
+        let error = sqlx::query(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, $3, $4, 'LiveDestroy', 'Pending', $5)",
+        )
+        .bind(destroy_spec.request_id)
+        .bind(request_resource_version)
+        .bind(&platform)
+        .bind(&destroy_spec_json)
+        .bind(current_epoch + 1)
+        .execute(&mut *tx)
+        .await
+        .expect_err("an open LiveDestroy with a guessed epoch must be rejected");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        assert!(error
+            .to_string()
+            .contains("open live job site execution authority is unavailable or stale"));
+        sqlx::query("ROLLBACK TO SAVEPOINT wrong_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("recover wrong-epoch savepoint");
+        sqlx::query("RELEASE SAVEPOINT wrong_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("release wrong-epoch savepoint");
+
+        sqlx::query("SAVEPOINT stale_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("create stale-epoch savepoint");
+        let error = sqlx::query(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Pending', $5)",
+        )
+        .bind(apply_spec.request_id)
+        .bind(request_resource_version)
+        .bind(&platform)
+        .bind(&apply_spec_json)
+        .bind(stale_epoch)
+        .execute(&mut *tx)
+        .await
+        .expect_err("an open LiveApply with a superseded epoch must be rejected");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT stale_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("recover stale-epoch savepoint");
+        sqlx::query("RELEASE SAVEPOINT stale_epoch")
+            .execute(&mut *tx)
+            .await
+            .expect("release stale-epoch savepoint");
+
+        let terminal_job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs \
+                 (request_id, request_resource_version, platform, spec, mode, status, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, $3, $4, 'LiveDestroy', 'Succeeded', $5) \
+             RETURNING id",
+        )
+        .bind(destroy_spec.request_id)
+        .bind(request_resource_version)
+        .bind(&platform)
+        .bind(&destroy_spec_json)
+        .bind(stale_epoch)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("terminal history may retain its original epoch");
+        sqlx::query("SAVEPOINT terminal_resurrection")
+            .execute(&mut *tx)
+            .await
+            .expect("create resurrection savepoint");
+        let error = sqlx::query("UPDATE agent_jobs SET status = 'Pending' WHERE id = $1")
+            .bind(terminal_job_id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("terminal live history must never be reopened");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        assert!(error
+            .to_string()
+            .contains("terminal live jobs cannot be reopened"));
+        sqlx::query("ROLLBACK TO SAVEPOINT terminal_resurrection")
+            .execute(&mut *tx)
+            .await
+            .expect("recover resurrection savepoint");
+        tx.rollback()
+            .await
+            .expect("discard persistence-trigger fixtures");
+
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(apply_spec.request_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("UPDATE site_registry SET active = FALSE WHERE unlocode = $1")
+            .bind(&platform)
+            .execute(&pool)
+            .await
+            .expect("deactivate persistence-trigger fixture site");
         pool.close().await;
     }
 
@@ -15728,6 +16350,7 @@ mod tests {
         let agent_id = format!("s3b-la-{}", Uuid::new_v4());
         let (token, key, _agent_enrollment_id) =
             seed_agent_with_key(&pool, &agent_id, &platform).await;
+        seed_live_site_execution_authority(&pool, &platform).await;
 
         // ── seed a LiveApply job ───────────────────────────────────────────
         use std::collections::BTreeMap;
@@ -16186,9 +16809,9 @@ mod tests {
             attempt_id: plan_attempt_id,
             expected_execution_authority: None,
         };
-        let mut connection = pool.acquire().await.expect("plan authority connection");
+        let mut transaction = pool.begin().await.expect("plan authority transaction");
         let authority = successful_plan_execution_authority(
-            &mut connection,
+            &mut transaction,
             &approved_plan,
             plan_spec.request_id,
             &platform,
@@ -16200,7 +16823,10 @@ mod tests {
             matches!(authority, Err(CreateLiveApplyJobError::Invalid(_))),
             "a signature from the same key must not transfer an old plan to a new enrollment"
         );
-        drop(connection);
+        transaction
+            .rollback()
+            .await
+            .expect("release plan authority transaction");
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
@@ -16285,9 +16911,9 @@ mod tests {
         );
         assert_ne!(expected_first_digest, expected_second_digest);
 
-        let mut connection = pool.acquire().await.expect("authority connection");
+        let mut transaction = pool.begin().await.expect("authority transaction");
         let first_authority = successful_plan_execution_authority(
-            &mut connection,
+            &mut transaction,
             &first,
             request_id,
             &platform,
@@ -16301,7 +16927,7 @@ mod tests {
             "a newer same-digest row must not replace the selected first authority",
         );
         let second_authority = successful_plan_execution_authority(
-            &mut connection,
+            &mut transaction,
             &second,
             request_id,
             &platform,
@@ -16321,7 +16947,7 @@ mod tests {
         };
         assert!(
             successful_plan_execution_authority(
-                &mut connection,
+                &mut transaction,
                 &wrong_attempt,
                 request_id,
                 &platform,
@@ -16332,7 +16958,10 @@ mod tests {
             .is_err(),
             "the exact row must reject a mismatched leased attempt",
         );
-        drop(connection);
+        transaction
+            .rollback()
+            .await
+            .expect("release authority transaction");
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
@@ -17071,6 +17700,7 @@ mod tests {
     /// `create_live_apply_job` loads `requests.status` — so any test that mints a
     /// grant directly must seed the request first.
     async fn seed_active_request(pool: &PgPool, request_id: Uuid, platform: &str) {
+        seed_live_site_execution_authority(pool, platform).await;
         sqlx::query(
             "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
              VALUES ($1, 'server-deployment', $2, 'prod', 'live-apply-test', 'locked', 'lock', '[]'::jsonb) \
@@ -17139,8 +17769,12 @@ mod tests {
         let spec_json = serde_json::to_value(&spec).expect("spec json");
         let grant_json = serde_json::to_value(&grant).expect("grant json");
         sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, live_context) \
-             VALUES ($1, $2, $3::jsonb, 'LiveApply', 'Pending', $4::jsonb) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, platform, spec, mode, status, live_context, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, $3::jsonb, 'LiveApply', 'Pending', $4::jsonb, \
+                     public.ryuki_acquire_live_site_execution_epoch($2)) \
+             RETURNING id",
         )
         .bind(request_id)
         .bind(platform)
@@ -17449,6 +18083,7 @@ mod tests {
         let platform = format!("s5a2-plt-{suffix}");
         let request_id = Uuid::new_v4();
         let plan_digest = proto_sha256(b"approved-plan-bytes");
+        seed_live_site_execution_authority(&pool, &platform).await;
 
         // A LiveApply grant may only be minted for a real, ACTIVE request — the
         // concluded-status gate in create_live_apply_job loads requests.status.
@@ -18388,6 +19023,191 @@ mod tests {
             "terminal replay must not rewrite the immutable grant"
         );
 
+        // Reusing the same attempt_id/result_id with newly signed, different
+        // evidence is not an idempotent replay. It must conflict even though
+        // the replacement envelope is cryptographically valid.
+        let different_evidence = b"different live apply evidence".to_vec();
+        let different_digest = proto_sha256(&different_evidence);
+        let mut different_unsigned = job_result.signed_envelope.clone();
+        different_unsigned.evidence_digest = different_digest.clone();
+        different_unsigned.signature.clear();
+        let different_envelope = sign(different_unsigned, &key);
+        let mut different_result = job_result.clone();
+        different_result.evidence_digest = different_digest;
+        different_result.signed_envelope = different_envelope;
+        let changed_replay = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs(),
+            ResultBody {
+                job_result: different_result,
+                evidence: different_evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        assert!(
+            matches!(changed_replay, Err((StatusCode::CONFLICT, _))),
+            "a different signed result reusing stored ids must not be accepted as idempotent"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_live_apply_result_after_site_epoch_loss_requires_reconciliation() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("site-fence-result-{suffix}");
+        let agent_id = format!("site-fence-agent-{suffix}");
+        let (token, key, enrollment_id) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let approved_digest = proto_sha256(b"site-fence-approved-plan");
+        let job_id = seed_live_apply_job(
+            &pool,
+            &platform,
+            &approved_digest,
+            Utc::now() + Duration::hours(1),
+            None,
+            &agent_id,
+            enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
+        )
+        .await;
+        let (attempt_id, fencing, nonce, generation, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_id, attempt_id, &fencing).await;
+
+        let evidence = serde_json::to_vec(&ryuki_engine::runners::RunOutcome {
+            runner_kind: ryuki_engine::runners::RunnerKind::Terraform,
+            mode: ryuki_engine::runners::RunMode::Live,
+            status: ryuki_engine::runners::RunStatus::Applied,
+            summary: "Apply complete".to_string(),
+            log: String::new(),
+            exit_code: Some(0),
+            post_apply: Some(ryuki_engine::post_apply::PostApplyOutcome::Verified),
+        })
+        .expect("serialize post-apply evidence");
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence) = make_live_apply_result(
+            &agent_id,
+            enrollment_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            generation as u64,
+            &key,
+            &spec,
+            &evidence,
+            Some(approved_digest),
+        );
+        let make_body = || ResultBody {
+            job_result: job_result.clone(),
+            evidence: evidence.clone(),
+            evidence_json: None,
+        };
+        let headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            headers
+        };
+        let request_before: (String, i64, Value) =
+            sqlx::query_as("SELECT status, resource_version, stages FROM requests WHERE id = $1")
+                .bind(spec.request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read request before lost-fence result");
+
+        sqlx::query(
+            "UPDATE site_status SET state = 'degraded', api_status = 'degraded', \
+                 db_status = 'degraded', degradation_reason = 'test fence transition', \
+                 last_check = statement_timestamp(), updated_at = statement_timestamp() \
+             WHERE site = $1",
+        )
+        .bind(&platform)
+        .execute(&pool)
+        .await
+        .expect("invalidate live-site authority epoch");
+
+        let accepted = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            headers(),
+            make_body(),
+            &pool,
+        )
+        .await
+        .expect("signed late evidence remains recordable");
+        assert_eq!(accepted.0["job_status"], json!("ReconcileRequired"));
+        assert_eq!(accepted.0["result_status"], json!("applied"));
+        let stored: (String, Option<String>, Option<String>, Option<Value>) = sqlx::query_as(
+            "SELECT status, result_status, evidence_digest, signed_envelope \
+             FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read reconciled live result");
+        assert_eq!(stored.0, "ReconcileRequired");
+        assert_eq!(stored.1.as_deref(), Some("applied"));
+        assert_eq!(
+            stored.2.as_deref(),
+            Some(job_result.evidence_digest.as_str())
+        );
+        assert!(stored.3.is_some(), "the signed envelope is retained");
+        let event: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT site, environment, payload->>'reason_code' FROM domain_events \
+             WHERE event_type = 'job.reconcile_required' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("read scoped reconciliation event");
+        assert_eq!(event.0.as_deref(), Some(platform.as_str()));
+        assert_eq!(event.1.as_deref(), Some("prod"));
+        assert_eq!(event.2.as_deref(), Some("live-site-authority-lost"));
+        let post_apply_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events WHERE aggregate_type = 'request' \
+               AND aggregate_id = $1 \
+               AND event_type IN ('request.post-apply-verified', 'request.post-apply-drift')",
+        )
+        .bind(spec.request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("count suppressed post-apply projections");
+        assert_eq!(post_apply_events, 0);
+        let request_after: (String, i64, Value) =
+            sqlx::query_as("SELECT status, resource_version, stages FROM requests WHERE id = $1")
+                .bind(spec.request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read request after lost-fence result");
+        assert_eq!(
+            request_after, request_before,
+            "request lifecycle is unchanged"
+        );
+
+        seed_live_site_execution_authority(&pool, &platform).await;
+        let replay = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            headers(),
+            make_body(),
+            &pool,
+        )
+        .await
+        .expect("exact replay is not re-gated on the recovered site epoch");
+        assert_eq!(replay.0["idempotent"], json!(true));
+        assert_eq!(reconcile_required_event_count(&pool, job_id).await, 1);
+
+        cleanup_dead_letter_events(&pool, job_id).await;
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
@@ -20197,6 +21017,7 @@ mod tests {
     /// `db_backlink_advances_executing_request`'s raw-SQL seeding pattern),
     /// returns its id.
     async fn seed_executing_request(pool: &PgPool) -> Uuid {
+        seed_live_site_execution_authority(pool, "DEFRA").await;
         let id = Uuid::new_v4();
         let stages = serde_json::json!([{
             "name": "execute", "status": "InProgress",
@@ -20839,8 +21660,11 @@ mod tests {
             synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_a: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE, \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -20892,8 +21716,11 @@ mod tests {
             synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_b: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE, \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -20974,8 +21801,11 @@ mod tests {
                 synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
             let jid: Uuid = sqlx::query_scalar(
                 "INSERT INTO agent_jobs \
-                     (request_id, request_resource_version, platform, spec, mode, step_scoped) \
-                 VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
+                     (request_id, request_resource_version, platform, spec, mode, step_scoped, \
+                      site_status_authority_epoch) \
+                 VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE, \
+                         public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+                 RETURNING id",
             )
             .bind(req_id)
             .bind(request_resource_version)
@@ -21165,8 +21995,11 @@ mod tests {
             synthetic_step_job_spec(pool, req_id, JobMode::LiveApply).await;
         let job_c: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE) RETURNING id",
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE, \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -21612,8 +22445,11 @@ mod tests {
             synthetic_step_job_spec(&pool, req_id, JobMode::LiveDestroy).await;
         let job_a: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, request_resource_version, platform, spec, mode, step_scoped) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveDestroy', TRUE) RETURNING id",
+                 (request_id, request_resource_version, platform, spec, mode, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveDestroy', TRUE, \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -21701,9 +22537,11 @@ mod tests {
         let job_a: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
                  (request_id, request_resource_version, platform, spec, mode, step_scoped, \
-                  status, lease_deadline) \
+                  status, lease_deadline, site_status_authority_epoch) \
              VALUES ($1, $2, 'DEFRA', $3, 'LiveDestroy', TRUE, 'Leased', \
-                     NOW() - make_interval(secs => 60)) RETURNING id",
+                     NOW() - make_interval(secs => 60), \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -21868,8 +22706,11 @@ mod tests {
             synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_a: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, request_resource_version, platform, spec, mode, status, step_scoped) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', 'Pending', TRUE) RETURNING id",
+                 (request_id, request_resource_version, platform, spec, mode, status, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', 'Pending', TRUE, \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -21891,8 +22732,11 @@ mod tests {
             synthetic_step_job_spec(&pool, req_id, JobMode::LiveApply).await;
         let job_b: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
-                 (request_id, request_resource_version, platform, spec, mode, status, step_scoped) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', 'Leased', TRUE) RETURNING id",
+                 (request_id, request_resource_version, platform, spec, mode, status, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', 'Leased', TRUE, \
+                     public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
+             RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
@@ -22652,16 +23496,20 @@ mod tests {
         };
         ensure_live_destroy_mode_allowed(pool).await;
         let platform = format!("plt-cxl-destroy-{}", Uuid::new_v4().simple());
+        let site_status_authority_epoch = seed_live_site_execution_authority(pool, &platform).await;
         let req = seed_request_row(pool, "executing").await;
         let spec = dead_letter_spec(req, JobMode::LiveDestroy);
         let spec_json = serde_json::to_value(&spec).expect("spec serialises");
         let job: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, step_scoped) \
-             VALUES ($1, $2, $3, 'LiveDestroy', 'Pending', TRUE) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, platform, spec, mode, status, step_scoped, \
+                  site_status_authority_epoch) \
+             VALUES ($1, $2, $3, 'LiveDestroy', 'Pending', TRUE, $4) RETURNING id",
         )
         .bind(req)
         .bind(&platform)
         .bind(&spec_json)
+        .bind(site_status_authority_epoch)
         .fetch_one(pool)
         .await
         .expect("seed pending LiveDestroy job");
@@ -22748,17 +23596,24 @@ mod tests {
             JobMode::LiveApply => "LiveApply",
             JobMode::LiveDestroy => "LiveDestroy",
         };
+        let site_status_authority_epoch = if matches!(mode_label, "LiveApply" | "LiveDestroy") {
+            Some(seed_live_site_execution_authority(pool, platform).await)
+        } else {
+            None
+        };
         let spec = dead_letter_spec(request_id, mode);
         let spec_json = serde_json::to_value(&spec).expect("spec serialises");
         sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, platform, spec, mode, status, site_status_authority_epoch) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(request_id)
         .bind(platform)
         .bind(&spec_json)
         .bind(mode_label)
         .bind(status)
+        .bind(site_status_authority_epoch)
         .fetch_one(pool)
         .await
         .expect("seed agent job with mode")
@@ -23436,6 +24291,7 @@ mod tests {
         };
         let cp_key = ensure_test_cp_key();
         let platform = format!("plt-slot-{}", Uuid::new_v4().simple());
+        seed_live_site_execution_authority(pool, &platform).await;
         // The parent request is mid-apply: Executing (NOT concluded).
         let req = seed_request_for_scope(pool, &platform, "production").await;
 

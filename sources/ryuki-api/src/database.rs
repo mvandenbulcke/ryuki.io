@@ -595,7 +595,7 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("shift_queue_scope_reconciliation_reviews", true, true, true),
     TablePolicy::new("site_capacity", true, true, true),
     TablePolicy::new("site_registry", true, true, false),
-    TablePolicy::new("site_status", true, true, true),
+    TablePolicy::new("site_status", true, true, false),
     TablePolicy::new("slo_definitions", true, true, true),
     TablePolicy::new("snapshots", true, true, true),
     TablePolicy::new("software_deployments", true, true, true),
@@ -3128,7 +3128,7 @@ async fn attest_application_acl(
     Ok(())
 }
 
-/// The runtime may directly invoke exactly two reviewed SECURITY DEFINER entry
+/// The runtime may directly invoke exactly three reviewed SECURITY DEFINER entry
 /// points. Every trigger, validator, and maintenance routine remains
 /// owner/trigger-only; PUBLIC, the ephemeral login, and grant options are
 /// denied across the complete public routine inventory.
@@ -3147,7 +3147,8 @@ async fn attest_application_routine_acl(
         expected(signature) AS (
             VALUES
                 ('public.reconcile_noisy_trigger_sites(integer)'::text),
-                ('public.append_audit_log(uuid,text,text,text[],text,text,text,text,text,text,jsonb,text)'::text)
+                ('public.append_audit_log(uuid,text,text,text[],text,text,text,text,text,text,jsonb,text)'::text),
+                ('public.ryuki_acquire_live_site_execution_epoch(text)'::text)
         ),
         routines AS (
             SELECT procedure.oid,
@@ -3168,8 +3169,8 @@ async fn attest_application_routine_acl(
         )
         SELECT COALESCE((
             SELECT
-                (SELECT count(*) FROM expected) = 2
-                AND (SELECT count(*) FROM allowed) = 2
+                (SELECT count(*) FROM expected) = 3
+                AND (SELECT count(*) FROM allowed) = 3
                 AND NOT EXISTS (
                     SELECT 1
                     FROM allowed
@@ -3242,7 +3243,7 @@ async fn attest_application_routine_acl(
     .await?;
     if !exact {
         return Err(role_protocol_error(
-            "application routine privileges differ from the two reviewed entry-point policy",
+            "application routine privileges differ from the three reviewed entry-point policy",
         ));
     }
     Ok(())
@@ -3388,10 +3389,10 @@ async fn attest_request_resource_version_triggers(
 }
 
 /// Prove that approval evidence and dispatched agent work remain bound to the
-/// exact request authority version selected by migration 196. These guards are
-/// part of the startup schema contract: changing a target table, trigger event
-/// or column set, execution mode, or function body must prevent the application
-/// connection from serving traffic.
+/// exact request authority version selected by migration 196 and the live-site
+/// epoch added by migration 198. These guards are part of the startup schema
+/// contract: changing a target table, trigger event or column set, execution
+/// mode, or function body must prevent the application connection from serving.
 async fn attest_request_authority_version_binding_triggers(
     connection: &mut PgConnection,
 ) -> Result<(), sqlx::Error> {
@@ -3416,7 +3417,9 @@ async fn attest_request_authority_version_binding_triggers(
             function_signature,
             trigger_type,
             column_names,
-            function_source_sha256
+            function_source_sha256,
+            security_definer,
+            function_config
         ) AS (
             VALUES
                 (
@@ -3425,7 +3428,9 @@ async fn attest_request_authority_version_binding_triggers(
                     'public.bind_request_approval_basis_resource_version()'::text,
                     7::smallint,
                     ARRAY[]::text[],
-                    'e2579634b52772f8523057618254b0c000db9ad99026c7fd6f5ff1bd670b4822'::text
+                    'e2579634b52772f8523057618254b0c000db9ad99026c7fd6f5ff1bd670b4822'::text,
+                    FALSE,
+                    NULL::text[]
                 ),
                 (
                     'request_approval_decisions'::text,
@@ -3433,7 +3438,9 @@ async fn attest_request_authority_version_binding_triggers(
                     'public.reject_request_approval_basis_version_update()'::text,
                     19::smallint,
                     ARRAY['approval_basis_resource_version']::text[],
-                    '7b412cf35870cd0ebc625e44758d279745553ae4783bc7920761a6c22522fe3f'::text
+                    '7b412cf35870cd0ebc625e44758d279745553ae4783bc7920761a6c22522fe3f'::text,
+                    FALSE,
+                    NULL::text[]
                 ),
                 (
                     'agent_jobs'::text,
@@ -3441,7 +3448,9 @@ async fn attest_request_authority_version_binding_triggers(
                     'public.bind_agent_job_request_resource_version()'::text,
                     7::smallint,
                     ARRAY[]::text[],
-                    'd26216065dfbd4f9fcdc00a5a9cfd1d0422499863109a05fc4690c5413d59d58'::text
+                    'd26216065dfbd4f9fcdc00a5a9cfd1d0422499863109a05fc4690c5413d59d58'::text,
+                    FALSE,
+                    NULL::text[]
                 ),
                 (
                     'agent_jobs'::text,
@@ -3455,11 +3464,24 @@ async fn attest_request_authority_version_binding_triggers(
                         'spec',
                         'mode',
                         'live_context',
+                        'site_status_authority_epoch',
                         'origin',
                         'step_scoped',
                         'request_resource_version'
                     ]::text[],
-                    '5b6979234abd8ad135cd5f7d4125c6e2b0444139ddf88a560951d2581376db19'::text
+                    '5b6979234abd8ad135cd5f7d4125c6e2b0444139ddf88a560951d2581376db19'::text,
+                    FALSE,
+                    NULL::text[]
+                ),
+                (
+                    'agent_jobs'::text,
+                    'trg_agent_jobs_live_site_fence_persistence'::text,
+                    'public.ryuki_enforce_agent_job_live_site_fence_persistence()'::text,
+                    23::smallint,
+                    ARRAY['status']::text[],
+                    'afee5fbdf388c235ffa652d9a5fd20b3bc83c0fa806e28763463094b35e6ae54'::text,
+                    TRUE,
+                    ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
                 )
         ),
         resolved_expected AS (
@@ -3520,11 +3542,11 @@ async fn attest_request_authority_version_binding_triggers(
               AND procedure.prokind = 'f'
               AND procedure.prorettype = 'pg_catalog.trigger'::regtype
               AND procedure.pronargs = 0
-              AND NOT procedure.prosecdef
+              AND procedure.prosecdef = expected.security_definer
               AND NOT procedure.proleakproof
               AND procedure.provolatile = 'v'
               AND procedure.proparallel = 'u'
-              AND procedure.proconfig IS NULL
+              AND procedure.proconfig IS NOT DISTINCT FROM expected.function_config
               AND language.lanname = 'plpgsql'
               AND pg_catalog.encode(
                       pg_catalog.sha256(
@@ -3534,8 +3556,8 @@ async fn attest_request_authority_version_binding_triggers(
                   ) = expected.function_source_sha256
         )
         SELECT (SELECT COUNT(*) FROM target_tables) = 2
-           AND (SELECT COUNT(*) FROM resolved_expected) = 4
-           AND (SELECT COUNT(*) FROM matching) = 4
+           AND (SELECT COUNT(*) FROM resolved_expected) = 5
+           AND (SELECT COUNT(*) FROM matching) = 5
            AND NOT EXISTS (
                SELECT 1
                FROM expected
@@ -3552,6 +3574,542 @@ async fn attest_request_authority_version_binding_triggers(
     if !exact {
         return Err(role_protocol_error(
             "request authority-version binding trigger definitions are not canonical and always enabled",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that the transaction-bound live-site authority fence still consumes
+/// the exact registered freshness limit, retains its load-bearing columns and
+/// constraints, and keeps every upstream observation, epoch-bump, and removal
+/// guard attached to its canonical table as an ALWAYS trigger. The agent-job
+/// persistence trigger is attested separately as part of the request
+/// authority-version binding contract above.
+async fn attest_live_site_execution_authority_chain(
+    connection: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    let exact: bool = sqlx::query_scalar(
+        r#"
+        WITH target_tables AS (
+            SELECT class.oid,
+                   class.relname::text AS table_name
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND class.relname IN (
+                    'site_status',
+                    'site_registry',
+                    'component_status',
+                    'agent_jobs'
+                  )
+              AND class.relkind = 'r'
+        ),
+        expected_authority_columns(
+            table_name,
+            column_name,
+            type_name,
+            not_null,
+            default_expression
+        ) AS (
+            VALUES
+                (
+                    'site_status'::text,
+                    'authority_epoch'::text,
+                    'bigint'::text,
+                    TRUE,
+                    '1'::text
+                ),
+                (
+                    'agent_jobs'::text,
+                    'site_status_authority_epoch'::text,
+                    'bigint'::text,
+                    FALSE,
+                    NULL::text
+                )
+        ),
+        matching_authority_columns AS (
+            SELECT expected.table_name,
+                   expected.column_name
+            FROM expected_authority_columns AS expected
+            JOIN target_tables
+              ON target_tables.table_name = expected.table_name
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = target_tables.oid
+             AND attribute.attname = expected.column_name
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+            WHERE pg_catalog.format_type(
+                      attribute.atttypid,
+                      attribute.atttypmod
+                  ) = expected.type_name
+              AND attribute.attnotnull = expected.not_null
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+              AND LOWER(
+                      pg_catalog.regexp_replace(
+                          pg_catalog.regexp_replace(
+                              pg_catalog.pg_get_expr(
+                                  default_value.adbin,
+                                  default_value.adrelid
+                              ),
+                              '::bigint',
+                              '',
+                              'g'
+                          ),
+                          '[[:space:]()]',
+                          '',
+                          'g'
+                      )
+                  ) IS NOT DISTINCT FROM expected.default_expression
+        ),
+        expected_checks(
+            table_name,
+            constraint_name,
+            column_names,
+            normalized_expression
+        ) AS (
+            VALUES
+                (
+                    'site_status'::text,
+                    'site_status_authority_epoch_positive'::text,
+                    ARRAY['authority_epoch']::text[],
+                    'authority_epoch>0'::text
+                ),
+                (
+                    'agent_jobs'::text,
+                    'agent_jobs_site_status_authority_epoch_positive'::text,
+                    ARRAY['site_status_authority_epoch']::text[],
+                    'site_status_authority_epochISNULLORsite_status_authority_epoch>0'::text
+                ),
+                (
+                    'agent_jobs'::text,
+                    'agent_jobs_open_live_site_fence_required'::text,
+                    ARRAY['mode', 'status', 'site_status_authority_epoch']::text[],
+                    'mode<>ALLARRAY[''LiveApply'',''LiveDestroy'']ORstatus<>ALLARRAY[''Pending'',''Leased'',''Running'']ORsite_status_authority_epochISNOTNULL'::text
+                )
+        ),
+        resolved_expected_checks AS (
+            SELECT expected.*,
+                   target_tables.oid AS table_oid,
+                   resolved_columns.resolved_count,
+                   resolved_columns.constraint_columns
+            FROM expected_checks AS expected
+            JOIN target_tables
+              ON target_tables.table_name = expected.table_name
+            CROSS JOIN LATERAL (
+                SELECT COUNT(attribute.attnum)::integer AS resolved_count,
+                       COALESCE(
+                           pg_catalog.array_agg(
+                               attribute.attnum::smallint
+                               ORDER BY column_name.ordinality
+                           ),
+                           ARRAY[]::smallint[]
+                       ) AS constraint_columns
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS column_name(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = target_tables.oid
+                 AND attribute.attname = column_name.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved_columns
+        ),
+        matching_checks AS (
+            SELECT expected.constraint_name
+            FROM resolved_expected_checks AS expected
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = expected.table_oid
+             AND constraint_catalog.conname = expected.constraint_name
+            WHERE expected.resolved_count =
+                      pg_catalog.cardinality(expected.column_names)
+              AND constraint_catalog.contype = 'c'
+              AND constraint_catalog.conkey = expected.constraint_columns
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND NOT constraint_catalog.connoinherit
+              AND pg_catalog.regexp_replace(
+                      pg_catalog.regexp_replace(
+                          pg_catalog.pg_get_expr(
+                              constraint_catalog.conbin,
+                              constraint_catalog.conrelid
+                          ),
+                          '::(text|bigint)',
+                          '',
+                          'g'
+                      ),
+                      '[[:space:]()]',
+                      '',
+                      'g'
+                  ) = expected.normalized_expression
+        ),
+        matching_site_registry_foreign_key AS (
+            SELECT constraint_catalog.oid
+            FROM target_tables AS site_status_table
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = site_status_table.oid
+             AND constraint_catalog.conname = 'site_status_canonical_site_fk'
+            JOIN target_tables AS site_registry_table
+              ON site_registry_table.table_name = 'site_registry'
+            WHERE site_status_table.table_name = 'site_status'
+              AND constraint_catalog.contype = 'f'
+              AND constraint_catalog.confrelid = site_registry_table.oid
+              AND constraint_catalog.conkey = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = site_status_table.oid
+                          AND attribute.attname = 'site'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    )
+                  ]::smallint[]
+              AND constraint_catalog.confkey = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = site_registry_table.oid
+                          AND attribute.attname = 'unlocode'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    )
+                  ]::smallint[]
+              AND constraint_catalog.confmatchtype = 's'
+              AND constraint_catalog.confupdtype = 'r'
+              AND constraint_catalog.confdeltype = 'r'
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+        ),
+        matching_component_unique AS (
+            SELECT constraint_catalog.oid
+            FROM target_tables AS component_table
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = component_table.oid
+             AND constraint_catalog.conname =
+                    'component_status_one_adapter_per_site'
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indexrelid = constraint_catalog.conindid
+             AND index_catalog.indrelid = component_table.oid
+            WHERE component_table.table_name = 'component_status'
+              AND constraint_catalog.contype = 'u'
+              AND constraint_catalog.conkey = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = component_table.oid
+                          AND attribute.attname = 'site'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    ),
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = component_table.oid
+                          AND attribute.attname = 'adapter_name'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    )
+                  ]::smallint[]
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND index_catalog.indisunique
+              AND index_catalog.indisvalid
+              AND index_catalog.indisready
+              AND index_catalog.indimmediate
+              AND index_catalog.indnkeyatts = 2
+              AND index_catalog.indnatts = 2
+              AND index_catalog.indpred IS NULL
+              AND index_catalog.indexprs IS NULL
+        ),
+        expected_routines(
+            function_signature,
+            return_type,
+            argument_names,
+            function_source_sha256,
+            security_definer,
+            volatility,
+            parallel_safety,
+            function_config,
+            language_name
+        ) AS (
+            VALUES
+                (
+                    'public.ryuki_live_site_status_max_age_seconds()'::text,
+                    'pg_catalog.int8'::regtype,
+                    NULL::text[],
+                    '7a92fb390bc256bd2ba2c1e6fcee26e424a41ab8f752e9f16e7f545054a67a5b'::text,
+                    FALSE,
+                    'i'::"char",
+                    's'::"char",
+                    ARRAY['search_path=pg_catalog, public']::text[],
+                    'sql'::text
+                ),
+                (
+                    'public.ryuki_acquire_live_site_execution_epoch(text)'::text,
+                    'pg_catalog.int8'::regtype,
+                    ARRAY['requested_site']::text[],
+                    '4eebe323182eb2f0184f7823a3efa7a8ecb5c5150b8059270e1ab707e2a327cd'::text,
+                    TRUE,
+                    'v'::"char",
+                    'u'::"char",
+                    ARRAY['search_path=pg_catalog, public, pg_temp']::text[],
+                    'plpgsql'::text
+                )
+        ),
+        matching_routines AS (
+            SELECT expected.function_signature
+            FROM expected_routines AS expected
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid =
+                    pg_catalog.to_regprocedure(expected.function_signature)
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE procedure.prokind = 'f'
+              AND procedure.prorettype = expected.return_type
+              AND NOT procedure.proretset
+              AND procedure.pronargdefaults = 0
+              AND procedure.provariadic = 0
+              AND procedure.proargnames IS NOT DISTINCT FROM expected.argument_names
+              AND procedure.proargmodes IS NULL
+              AND procedure.proallargtypes IS NULL
+              AND procedure.prosecdef = expected.security_definer
+              AND NOT procedure.proleakproof
+              AND NOT procedure.proisstrict
+              AND procedure.provolatile = expected.volatility
+              AND procedure.proparallel = expected.parallel_safety
+              AND procedure.proconfig IS NOT DISTINCT FROM expected.function_config
+              AND language.lanname = expected.language_name
+              AND pg_catalog.encode(
+                      pg_catalog.sha256(
+                          pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                      ),
+                      'hex'
+                  ) = expected.function_source_sha256
+        ),
+        expected_triggers(
+            table_name,
+            trigger_name,
+            function_signature,
+            trigger_type,
+            column_names,
+            function_source_sha256,
+            security_definer,
+            function_config
+        ) AS (
+            VALUES
+                (
+                    'site_status'::text,
+                    'trg_site_status_authority_epoch'::text,
+                    'public.ryuki_guard_site_status_authority_epoch()'::text,
+                    23::smallint,
+                    ARRAY[]::text[],
+                    '00c094ed2565000ddc77467f231f4724afc08ae3836d85701851497a9287c3d2'::text,
+                    TRUE,
+                    ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
+                ),
+                (
+                    'site_registry'::text,
+                    'trg_site_registry_live_execution_epoch'::text,
+                    'public.ryuki_bump_site_epoch_after_registry_change()'::text,
+                    17::smallint,
+                    ARRAY['active']::text[],
+                    'b24cdaccfbc411386aabcf98a0fde718444e35b1ec4f4e7293dea6d279f21544'::text,
+                    TRUE,
+                    ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
+                ),
+                (
+                    'component_status'::text,
+                    'trg_component_status_observation'::text,
+                    'public.ryuki_guard_component_status_observation()'::text,
+                    23::smallint,
+                    ARRAY[]::text[],
+                    '0a8c6fab39b74ba4808fbd33d84b77395118880a0c2bd0b972c1e6376b23a637'::text,
+                    FALSE,
+                    ARRAY['search_path=pg_catalog, public']::text[]
+                ),
+                (
+                    'component_status'::text,
+                    'trg_component_status_live_execution_epoch'::text,
+                    'public.ryuki_bump_site_epoch_after_component_change()'::text,
+                    29::smallint,
+                    ARRAY[]::text[],
+                    '05cdd0352c513af3c0c02b3f3ba234fc7e04ccf143dfaf083d32e4ca8965b096'::text,
+                    TRUE,
+                    ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
+                ),
+                (
+                    'component_status'::text,
+                    'trg_component_status_no_truncate'::text,
+                    'public.ryuki_reject_component_status_truncate()'::text,
+                    34::smallint,
+                    ARRAY[]::text[],
+                    '829c3fba4e5affb87b304862cafdd02c58ad82221c5db90b100dc3de57231f42'::text,
+                    FALSE,
+                    ARRAY['search_path=pg_catalog, public']::text[]
+                ),
+                (
+                    'site_status'::text,
+                    'trg_site_status_no_delete'::text,
+                    'public.ryuki_reject_site_status_removal()'::text,
+                    11::smallint,
+                    ARRAY[]::text[],
+                    '70e637f52019c6f9b562043b6a5b10f7b8ed118af2b680973ef8e4fd14e2fb11'::text,
+                    FALSE,
+                    ARRAY['search_path=pg_catalog, public']::text[]
+                ),
+                (
+                    'site_status'::text,
+                    'trg_site_status_no_truncate'::text,
+                    'public.ryuki_reject_site_status_removal()'::text,
+                    34::smallint,
+                    ARRAY[]::text[],
+                    '70e637f52019c6f9b562043b6a5b10f7b8ed118af2b680973ef8e4fd14e2fb11'::text,
+                    FALSE,
+                    ARRAY['search_path=pg_catalog, public']::text[]
+                )
+        ),
+        resolved_expected_triggers AS (
+            SELECT expected.*,
+                   target_tables.oid AS table_oid,
+                   resolved_columns.resolved_count,
+                   resolved_columns.trigger_columns
+            FROM expected_triggers AS expected
+            JOIN target_tables
+              ON target_tables.table_name = expected.table_name
+            CROSS JOIN LATERAL (
+                SELECT COUNT(attribute.attnum)::integer AS resolved_count,
+                       COALESCE(
+                           pg_catalog.string_agg(
+                               attribute.attnum::text,
+                               ' ' ORDER BY column_name.ordinality
+                           ),
+                           ''
+                       ) AS trigger_columns
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS column_name(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = target_tables.oid
+                 AND attribute.attname = column_name.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved_columns
+        ),
+        matching_triggers AS (
+            SELECT expected.trigger_name
+            FROM resolved_expected_triggers AS expected
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = expected.table_oid
+             AND trigger.tgname = expected.trigger_name
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid = trigger.tgfoid
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE expected.resolved_count =
+                      pg_catalog.cardinality(expected.column_names)
+              AND trigger.tgfoid =
+                      pg_catalog.to_regprocedure(expected.function_signature)
+              AND trigger.tgtype = expected.trigger_type
+              AND trigger.tgattr::text = expected.trigger_columns
+              AND trigger.tgenabled = 'A'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgparentid = 0
+              AND trigger.tgconstraint = 0
+              AND trigger.tgconstrrelid = 0
+              AND trigger.tgconstrindid = 0
+              AND NOT trigger.tgdeferrable
+              AND NOT trigger.tginitdeferred
+              AND trigger.tgnargs = 0
+              AND pg_catalog.octet_length(trigger.tgargs) = 0
+              AND trigger.tgqual IS NULL
+              AND trigger.tgoldtable IS NULL
+              AND trigger.tgnewtable IS NULL
+              AND procedure.prokind = 'f'
+              AND procedure.prorettype = 'pg_catalog.trigger'::regtype
+              AND procedure.pronargs = 0
+              AND procedure.proargnames IS NULL
+              AND procedure.proargmodes IS NULL
+              AND procedure.proallargtypes IS NULL
+              AND procedure.prosecdef = expected.security_definer
+              AND NOT procedure.proleakproof
+              AND NOT procedure.proisstrict
+              AND procedure.provolatile = 'v'
+              AND procedure.proparallel = 'u'
+              AND procedure.proconfig IS NOT DISTINCT FROM expected.function_config
+              AND language.lanname = 'plpgsql'
+              AND pg_catalog.encode(
+                      pg_catalog.sha256(
+                          pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                      ),
+                      'hex'
+                  ) = expected.function_source_sha256
+        )
+        SELECT (SELECT COUNT(*) FROM target_tables) = 4
+           AND (SELECT COUNT(*) FROM matching_authority_columns) = 2
+           AND NOT EXISTS (
+               SELECT 1
+               FROM expected_authority_columns
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM matching_authority_columns
+                   WHERE matching_authority_columns.table_name =
+                         expected_authority_columns.table_name
+                     AND matching_authority_columns.column_name =
+                         expected_authority_columns.column_name
+               )
+           )
+           AND (SELECT COUNT(*) FROM resolved_expected_checks) = 3
+           AND (SELECT COUNT(*) FROM matching_checks) = 3
+           AND NOT EXISTS (
+               SELECT 1
+               FROM expected_checks
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM matching_checks
+                   WHERE matching_checks.constraint_name =
+                         expected_checks.constraint_name
+               )
+           )
+           AND (SELECT COUNT(*) FROM matching_site_registry_foreign_key) = 1
+           AND (SELECT COUNT(*) FROM matching_component_unique) = 1
+           AND (SELECT COUNT(*) FROM matching_routines) = 2
+           AND NOT EXISTS (
+               SELECT 1
+               FROM expected_routines
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM matching_routines
+                   WHERE matching_routines.function_signature =
+                         expected_routines.function_signature
+               )
+           )
+           AND (SELECT COUNT(*) FROM resolved_expected_triggers) = 7
+           AND (SELECT COUNT(*) FROM matching_triggers) = 7
+           AND NOT EXISTS (
+               SELECT 1
+               FROM expected_triggers
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM matching_triggers
+                   WHERE matching_triggers.trigger_name =
+                         expected_triggers.trigger_name
+               )
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "live-site execution authority definitions are not canonical and always enabled",
         ));
     }
     Ok(())
@@ -3593,6 +4151,7 @@ async fn attest_application_connection(
     }
     attest_request_resource_version_triggers(connection).await?;
     attest_request_authority_version_binding_triggers(connection).await?;
+    attest_live_site_execution_authority_chain(connection).await?;
     let safe_boundary: bool = sqlx::query_scalar(
         r#"
         WITH app AS (
@@ -4397,7 +4956,7 @@ async fn reconcile_application_privileges_in_transaction(
 
     // Trigger and validation functions are invoked by PostgreSQL and do not
     // need caller EXECUTE. Deny every direct public routine call, then add back
-    // the two reviewed bounded entry points below.
+    // the three reviewed bounded entry points below.
     for (object_kind, signature) in public_routines {
         let statement =
             format!("REVOKE ALL PRIVILEGES ON {object_kind} {signature} FROM PUBLIC, {app}");
@@ -4482,6 +5041,12 @@ async fn reconcile_application_privileges_in_transaction(
         "GRANT EXECUTE ON FUNCTION \
          public.append_audit_log(uuid,text,text,text[],text,text,text,text,text,text,jsonb,text) \
          TO {app}"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.ryuki_acquire_live_site_execution_epoch(text) TO {app}"
     ))
     .execute(&mut *connection)
     .await?;
@@ -7879,6 +8444,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_site_execution_authority_chain_is_attested_against_definition_drift() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut connection = PgConnection::connect(&url)
+            .await
+            .expect("connect live-site execution authority attestation test");
+        super::EMBEDDED_MIGRATOR
+            .run(&mut connection)
+            .await
+            .expect("apply live-site execution authority migrations");
+
+        super::attest_live_site_execution_authority_chain(&mut connection)
+            .await
+            .expect("canonical live-site execution authority chain");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin component authority constraint drift fixture");
+        sqlx::query(
+            "ALTER TABLE public.component_status \
+             DROP CONSTRAINT component_status_one_adapter_per_site",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("drop component authority uniqueness inside drift fixture");
+        let drift_error = super::attest_live_site_execution_authority_chain(&mut connection)
+            .await
+            .expect_err("component authority constraint drift must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("live-site execution authority definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical component authority uniqueness");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin live-mode constraint case-drift fixture");
+        sqlx::query(
+            "ALTER TABLE public.agent_jobs \
+             DROP CONSTRAINT agent_jobs_open_live_site_fence_required",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("drop canonical open-live constraint inside drift fixture");
+        sqlx::query(
+            r#"
+            ALTER TABLE public.agent_jobs
+            ADD CONSTRAINT agent_jobs_open_live_site_fence_required
+            CHECK (
+                mode NOT IN ('liveapply', 'livedestroy')
+                OR status NOT IN ('pending', 'leased', 'running')
+                OR site_status_authority_epoch IS NOT NULL
+            )
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("install case-drifted open-live constraint inside fixture");
+        let drift_error = super::attest_live_site_execution_authority_chain(&mut connection)
+            .await
+            .expect_err("case-drifted live-mode literals must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("live-site execution authority definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical open-live constraint");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin acquisition routine drift fixture");
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION public.ryuki_acquire_live_site_execution_epoch(
+                requested_site TEXT
+            )
+            RETURNS BIGINT
+            LANGUAGE plpgsql
+            VOLATILE
+            SECURITY DEFINER
+            SET search_path = pg_catalog, public, pg_temp
+            AS $$
+            BEGIN
+                RETURN NULL;
+            END;
+            $$
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("replace acquisition routine inside drift fixture");
+        let drift_error = super::attest_live_site_execution_authority_chain(&mut connection)
+            .await
+            .expect_err("acquisition routine body drift must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("live-site execution authority definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical acquisition routine");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin freshness-limit routine drift fixture");
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION public.ryuki_live_site_status_max_age_seconds()
+            RETURNS BIGINT
+            LANGUAGE SQL
+            IMMUTABLE
+            PARALLEL SAFE
+            SET search_path = pg_catalog, public
+            AS $$
+                SELECT 301::BIGINT
+            $$
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("replace freshness-limit routine inside drift fixture");
+        let drift_error = super::attest_live_site_execution_authority_chain(&mut connection)
+            .await
+            .expect_err("freshness-limit routine body drift must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("live-site execution authority definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical freshness-limit routine");
+
+        for (table, trigger) in [
+            ("site_status", "trg_site_status_authority_epoch"),
+            ("site_registry", "trg_site_registry_live_execution_epoch"),
+            ("component_status", "trg_component_status_observation"),
+            (
+                "component_status",
+                "trg_component_status_live_execution_epoch",
+            ),
+            ("component_status", "trg_component_status_no_truncate"),
+            ("site_status", "trg_site_status_no_delete"),
+            ("site_status", "trg_site_status_no_truncate"),
+        ] {
+            sqlx::query("BEGIN")
+                .execute(&mut connection)
+                .await
+                .expect("begin live-site trigger drift fixture");
+            sqlx::query(&format!(
+                "ALTER TABLE public.{table} DISABLE TRIGGER {trigger}"
+            ))
+            .execute(&mut connection)
+            .await
+            .expect("disable one live-site authority trigger");
+            let drift_error = super::attest_live_site_execution_authority_chain(&mut connection)
+                .await
+                .expect_err("disabled live-site authority trigger must fail attestation");
+            assert!(drift_error
+                .to_string()
+                .contains("live-site execution authority definitions are not canonical"));
+            sqlx::query("ROLLBACK")
+                .execute(&mut connection)
+                .await
+                .expect("restore canonical live-site authority trigger state");
+        }
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin upstream epoch trigger body drift fixture");
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION public.ryuki_bump_site_epoch_after_registry_change()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            SECURITY DEFINER
+            SET search_path = pg_catalog, public, pg_temp
+            AS $$
+            BEGIN
+                RETURN NEW;
+            END;
+            $$
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("replace upstream epoch trigger function inside drift fixture");
+        let drift_error = super::attest_live_site_execution_authority_chain(&mut connection)
+            .await
+            .expect_err("upstream epoch trigger body drift must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("live-site execution authority definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore canonical upstream epoch trigger function");
+    }
+
+    #[tokio::test]
     async fn request_authority_version_binding_triggers_are_attested_and_must_stay_enabled() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
@@ -7897,27 +8672,32 @@ mod tests {
             .await
             .expect("canonical request authority-version binding triggers");
 
-        sqlx::query("BEGIN")
+        for trigger in [
+            "trg_agent_jobs_request_resource_version_owned",
+            "trg_agent_jobs_live_site_fence_persistence",
+        ] {
+            sqlx::query("BEGIN")
+                .execute(&mut connection)
+                .await
+                .expect("begin binding trigger drift fixture");
+            sqlx::query(&format!(
+                "ALTER TABLE public.agent_jobs DISABLE TRIGGER {trigger}"
+            ))
             .execute(&mut connection)
             .await
-            .expect("begin binding trigger drift fixture");
-        sqlx::query(
-            "ALTER TABLE public.agent_jobs DISABLE TRIGGER \
-             trg_agent_jobs_request_resource_version_owned",
-        )
-        .execute(&mut connection)
-        .await
-        .expect("disable one request authority-version binding trigger");
-        let drift_error = super::attest_request_authority_version_binding_triggers(&mut connection)
-            .await
-            .expect_err("disabled binding trigger must fail attestation");
-        assert!(drift_error
-            .to_string()
-            .contains("binding trigger definitions are not canonical and always enabled"));
-        sqlx::query("ROLLBACK")
-            .execute(&mut connection)
-            .await
-            .expect("restore canonical request authority-version binding trigger state");
+            .expect("disable one authority-binding trigger");
+            let drift_error =
+                super::attest_request_authority_version_binding_triggers(&mut connection)
+                    .await
+                    .expect_err("disabled binding trigger must fail attestation");
+            assert!(drift_error
+                .to_string()
+                .contains("binding trigger definitions are not canonical and always enabled"));
+            sqlx::query("ROLLBACK")
+                .execute(&mut connection)
+                .await
+                .expect("restore canonical authority-binding trigger state");
+        }
 
         sqlx::query("BEGIN")
             .execute(&mut connection)
@@ -8010,6 +8790,11 @@ mod tests {
             (
                 "live_context",
                 "UPDATE public.agent_jobs SET live_context = '{}'::jsonb WHERE id = $1",
+            ),
+            (
+                "site_status_authority_epoch",
+                "UPDATE public.agent_jobs \
+                 SET site_status_authority_epoch = 1 WHERE id = $1",
             ),
             (
                 "origin",
@@ -8330,6 +9115,7 @@ mod tests {
             vec![
                 "append_audit_log".to_owned(),
                 "reconcile_noisy_trigger_sites".to_owned(),
+                "ryuki_acquire_live_site_execution_epoch".to_owned(),
             ]
         );
 
@@ -8369,8 +9155,15 @@ mod tests {
         let repaired: i32 = sqlx::query_scalar("SELECT public.reconcile_noisy_trigger_sites(1)")
             .fetch_one(&pool)
             .await
-            .expect("the sole reviewed SECURITY DEFINER routine must remain executable");
+            .expect("the reviewed bounded reconciler must remain executable");
         assert!((0..=1).contains(&repaired));
+        let missing_site_epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT public.ryuki_acquire_live_site_execution_epoch('__missing_site__')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the reviewed live-site execution fence must remain executable");
+        assert_eq!(missing_site_epoch, None);
         pool.close().await;
     }
 

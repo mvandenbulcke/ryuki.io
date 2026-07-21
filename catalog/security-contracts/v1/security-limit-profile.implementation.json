@@ -22,7 +22,7 @@
   "boundary_fixture_catalog_ref": {
     "document_id": "boundary-fixture-catalog:security-limit-repository-v1",
     "document_version": 1,
-    "content_digest": "sha256:1cfc05fc38039081bf0a532237a1f541a20a39db606223a3c7b231320ed1a14b",
+    "content_digest": "sha256:6b844288d9b2a233c2c56e7f6df989cdc5f84a4bbbc7ac723fcc4c199210670f",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "immutable": true,
@@ -722,6 +722,60 @@
       "source_binding": {
         "source_file": "sources/ryuki-api/src/session_lookup_admission.rs",
         "source_symbol": "ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.uninitialized_pool_max_connections"
+      },
+      "overrides": []
+    },
+    {
+      "limit_id": "limit:live-site-status.maximum-age",
+      "category": "ttl",
+      "description": "Maximum age of the canonical site and VMware component health observations accepted when live execution authority is minted or revalidated.",
+      "selected_value": 300,
+      "published_default": 300,
+      "unit": "seconds",
+      "scope": {
+        "kind": "global",
+        "dimensions": ["deployment_id"]
+      },
+      "hard_bounds": {
+        "minimum": 30,
+        "maximum": 900,
+        "minimum_inclusive": true,
+        "maximum_inclusive": true
+      },
+      "owner": "execution-security",
+      "value_change_authority": {
+        "authority_id": "authority:runtime-security-config",
+        "owning_team": "platform-security",
+        "required_controls": ["review", "step-up"]
+      },
+      "bound_change_authority": {
+        "authority_id": "authority:security-contract-bounds",
+        "owning_team": "platform-security",
+        "required_controls": ["review", "maker-checker", "contract-revision", "new-conformance-evidence"]
+      },
+      "failure_projection": {
+        "mode": "expire",
+        "stable_code": "LIVE_SITE_STATUS_STALE",
+        "retryable": true,
+        "queueing_allowed": false,
+        "value_free": true
+      },
+      "telemetry": {
+        "metric_name": "ryuki_live_site_status_limit",
+        "cardinality": "bounded-low",
+        "value_free": true
+      },
+      "procedures": {
+        "value_change": "procedure:security-limit-value-change-v1",
+        "bound_change": "procedure:security-limit-bound-change-v1",
+        "rollback": "procedure:security-limit-rollback-v1",
+        "evidence_requirements": ["evidence-requirement:boundary-and-plus-one-v1"]
+      },
+      "enforcement_status": "enforced",
+      "source_binding": {
+        "source_file": "migrations/198_live_site_execution_fence.sql",
+        "source_symbol": "ryuki_live_site_status_max_age_seconds",
+        "source_digest": "sha256:3b64e49b50f20ad38af2c8fef91989c4354ffc9f8cb204299b137a70ec7cd693"
       },
       "overrides": []
     }

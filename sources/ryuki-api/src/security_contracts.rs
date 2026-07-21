@@ -6771,6 +6771,10 @@ impl<'a> ReferenceVerifier<'a> {
                 "docs/architecture/platform-security-boundary.md"
             ) | ("source:ryuki-api-main", "sources/ryuki-api/src/main.rs")
                 | (
+                    "source:ryuki-api-build-identity",
+                    "sources/ryuki-api/src/build_identity.rs"
+                )
+                | (
                     "source:ryuki-api-contracts",
                     "sources/ryuki-api/src/contracts.rs"
                 )
@@ -6790,6 +6794,14 @@ impl<'a> ReferenceVerifier<'a> {
                 | (
                     "source:ryuki-api-job-steps-repository",
                     "sources/ryuki-api/src/repos/job_steps.rs"
+                )
+                | (
+                    "source:ryuki-api-degradation-repository",
+                    "sources/ryuki-api/src/repos/degradation.rs"
+                )
+                | (
+                    "source:ryuki-api-database-boundary",
+                    "sources/ryuki-api/src/database.rs"
                 )
                 | (
                     "source:ryuki-api-audit-repository",
@@ -10116,12 +10128,15 @@ mod tests {
             for relative in [
                 "docs/architecture/platform-security-boundary.md",
                 "sources/ryuki-api/src/main.rs",
+                "sources/ryuki-api/src/build_identity.rs",
                 "sources/ryuki-api/src/contracts.rs",
                 "sources/ryuki-api/src/scheduler.rs",
                 "sources/ryuki-api/src/agents.rs",
                 "sources/ryuki-api/src/request_authority.rs",
                 "sources/ryuki-api/src/repos/requests.rs",
                 "sources/ryuki-api/src/repos/job_steps.rs",
+                "sources/ryuki-api/src/repos/degradation.rs",
+                "sources/ryuki-api/src/database.rs",
                 "sources/ryuki-api/src/audit.rs",
                 "sources/ryuki-api/src/entra_auth.rs",
                 "sources/ryuki-api/src/identity_authority.rs",

@@ -723,6 +723,14 @@ controls are part of the boundary rather than optional operational guidance.
   calls, and failover transitions carry the authority epoch. A fenced or old
   primary cannot mint new work, consume approvals, accept results, or rejoin as
   writer without an explicit reconciliation ceremony.
+- The repository implementation now provides the local site-health portion of
+  that fence: every `LiveApply`/`LiveDestroy` grant stores the exact epoch of an
+  active, fresh `healthy/up/up` site plus fresh VMware observation, and the
+  database rechecks it at persistence, lease, acknowledgement, renewal, and
+  first result acceptance. A lost epoch retains signed result evidence but
+  forces reconciliation. This is deliberately not yet the distributed
+  control-plane epoch above; signing that authority into the agent protocol and
+  proving multi-replica failover remain SB-3/SB-8 work.
 - An uncertain provider call is never blindly retried after leader or region
   loss. It enters a provider-specific reconciliation state that proves outcome
   before any compensation or redispatch.

@@ -9879,6 +9879,83 @@ struct DegradationEnterRequest {
     reason: String,
 }
 
+/// A DB-backed degradation read is an authority read, not an availability
+/// hint. Keep every denial projection identical and free of site, state, or
+/// driver details so callers cannot distinguish a missing row from a failed
+/// dependency.
+fn status_503_degradation_status_unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "authoritative degradation status is unavailable",
+        })),
+    )
+}
+
+fn degradation_check_db_result(
+    site: &str,
+    result: Result<Option<ryuki_engine::degradation_mode::SiteStatus>, sqlx::Error>,
+) -> ApiResult {
+    match result {
+        Ok(Some(status)) => Ok(Json(serde_json::to_value(status).unwrap_or_default())),
+        Ok(None) => {
+            tracing::warn!(%site, "degradation_check authoritative status row is missing; denying read");
+            Err(status_503_degradation_status_unavailable())
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, %site, "degradation_check authoritative status read failed; denying read");
+            Err(status_503_degradation_status_unavailable())
+        }
+    }
+}
+
+fn degradation_statuses_db_result(
+    session: &AuthSession,
+    operation: &'static str,
+    result: Result<Vec<ryuki_engine::degradation_mode::SiteStatus>, sqlx::Error>,
+) -> Result<Vec<ryuki_engine::degradation_mode::SiteStatus>, (StatusCode, Json<Value>)> {
+    let statuses = match result {
+        Ok(statuses) if !statuses.is_empty() => statuses,
+        Ok(_) => {
+            tracing::warn!(%operation, "authoritative degradation status set is empty; denying read");
+            return Err(status_503_degradation_status_unavailable());
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, %operation, "authoritative degradation status read failed; denying read");
+            return Err(status_503_degradation_status_unavailable());
+        }
+    };
+
+    let expected_sites = session
+        .site_scope
+        .iter()
+        .map(|site| site.trim())
+        .filter(|site| !site.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !expected_sites.is_empty() {
+        let observed_sites = statuses
+            .iter()
+            .map(|status| status.site.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !expected_sites.is_subset(&observed_sites) {
+            tracing::warn!(
+                %operation,
+                expected_site_count = expected_sites.len(),
+                observed_site_count = observed_sites.len(),
+                "authoritative degradation status is incomplete for the effective scope; denying read"
+            );
+            return Err(status_503_degradation_status_unavailable());
+        }
+    }
+
+    let statuses = retain_site_scoped(session, statuses, |status| status.site.as_str());
+    if statuses.is_empty() {
+        tracing::warn!(%operation, "authoritative degradation status is missing for the effective scope; denying read");
+        return Err(status_503_degradation_status_unavailable());
+    }
+    Ok(statuses)
+}
+
 async fn degradation_check(
     AuthExtractor(session): AuthExtractor,
     Path(site): Path<String>,
@@ -9888,34 +9965,27 @@ async fn degradation_check(
     // both the DB and in-memory paths.
     guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
-        match crate::repos::degradation::get_site_status(pool, &site).await {
-            Ok(Some(status)) => return Ok(Json(serde_json::to_value(status).unwrap_or_default())),
-            Ok(None) => {}
-            // A DB read error falls back to the in-memory engine so the status
-            // endpoint stays available — but log it so the outage is not silent.
-            Err(e) => {
-                tracing::warn!(error = %e, %site, "degradation_check DB read failed; serving in-memory fallback")
-            }
-        }
+        return degradation_check_db_result(
+            &site,
+            crate::repos::degradation::get_site_status(pool, &site).await,
+        );
     }
+    // The in-memory engine is an explicit development-only fallback when no
+    // database has been configured. It must never mask a configured database's
+    // missing or unreadable authority state.
     let status = degradation_mode::check_site_health(&site);
     Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
 async fn degradation_global(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
-        match crate::repos::degradation::list_site_statuses(pool).await {
-            Ok(sites) if !sites.is_empty() => {
-                // #2: a scoped principal's global view aggregates only its own sites.
-                let sites = retain_site_scoped(&session, sites, |s| s.site.as_str());
-                let global = degradation_mode::global_status_from(sites);
-                return Ok(Json(serde_json::to_value(global).unwrap_or_default()));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "degradation_global DB read failed; serving in-memory fallback")
-            }
-        }
+        let sites = degradation_statuses_db_result(
+            &session,
+            "degradation_global",
+            crate::repos::degradation::list_site_statuses(pool).await,
+        )?;
+        let global = degradation_mode::global_status_from(sites);
+        return Ok(Json(serde_json::to_value(global).unwrap_or_default()));
     }
     // #2: the in-memory fallback aggregates ALL sites and cannot be filtered; a
     // scoped principal fails closed rather than see cross-site degradation state.
@@ -9928,24 +9998,19 @@ async fn degradation_global(AuthExtractor(session): AuthExtractor) -> ApiResult 
 
 async fn degradation_degraded(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
-        match crate::repos::degradation::list_site_statuses(pool).await {
-            Ok(sites) if !sites.is_empty() => {
-                // #2: a scoped principal only sees its own site's degradation.
-                let sites = retain_site_scoped(&session, sites, |s| s.site.as_str());
-                let degraded: Vec<_> = sites
-                    .into_iter()
-                    .filter(|s| {
-                        s.state == degradation_mode::SiteDegradationState::Degraded
-                            || s.state == degradation_mode::SiteDegradationState::Unreachable
-                    })
-                    .collect();
-                return Ok(Json(serde_json::to_value(degraded).unwrap_or_default()));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "degradation_degraded DB read failed; serving in-memory fallback")
-            }
-        }
+        let sites = degradation_statuses_db_result(
+            &session,
+            "degradation_degraded",
+            crate::repos::degradation::list_site_statuses(pool).await,
+        )?;
+        let degraded: Vec<_> = sites
+            .into_iter()
+            .filter(|s| {
+                s.state == degradation_mode::SiteDegradationState::Degraded
+                    || s.state == degradation_mode::SiteDegradationState::Unreachable
+            })
+            .collect();
+        return Ok(Json(serde_json::to_value(degraded).unwrap_or_default()));
     }
     // #2: the in-memory fallback lists ALL degraded sites; a scoped principal fails closed.
     if is_scoped(&session) {
@@ -21488,10 +21553,6 @@ async fn requests_approve_live_apply(
         ));
     }
 
-    // #10: do not mint a live-execution grant for a site that is degraded or
-    // unreachable (enforces the degradation rule, not just advertises it).
-    enforce_site_operational(pool, &request_site).await?;
-
     // The evidence digest identifies the safe projection the human reviewed.
     // Execution authority is bound separately to the signed raw-plan digest;
     // never substitute one commitment for the other when minting the grant.
@@ -23495,7 +23556,7 @@ fn ready_to_teardown(
 /// mint fails, the whole transaction rolls back so a teardown is never
 /// half-dispatched.
 pub(crate) async fn dispatch_teardown_steps(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     _request: &ryuki_engine::models::Request,
     current: &DbRequestRow,
     plan: &[crate::repos::job_steps::JobStepRow],
@@ -23540,7 +23601,7 @@ pub(crate) async fn dispatch_teardown_steps(
         .bind(apply_job_id)
         .bind(request_id)
         .bind(&current.site)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some((apply_context_json, apply_spec_json, apply_row_resource_version)) = apply_row
         else {
@@ -23620,7 +23681,7 @@ pub(crate) async fn dispatch_teardown_steps(
             }
         })?;
         let affected =
-            crate::repos::job_steps::mark_tearing_down(&mut *tx, step_id, job_id).await?;
+            crate::repos::job_steps::mark_tearing_down(&mut **tx, step_id, job_id).await?;
         if affected != 1 {
             return Err(sqlx::Error::Protocol(
                 "teardown step was not in Applied state at dispatch".into(),
@@ -33409,58 +33470,6 @@ type ScopeFilters = (Option<String>, Option<String>);
 /// Enforce the session's site/environment scopes (#2) against the requested
 /// filters, returning the EFFECTIVE filters the handler must query with.
 ///
-/// #10: enforce the `write-execution-blocked-when-degraded` degradation rule —
-/// refuse a live-execution grant when the target site is degraded or
-/// unreachable. The persisted site_status (swarm #8) is authoritative; a
-/// healthy/recovering site, or one with no status row, is allowed. A DB read
-/// error fails closed: an unavailable authoritative status store cannot mint
-/// live-write authority.
-pub(crate) async fn enforce_site_operational(
-    pool: &sqlx::PgPool,
-    site: &str,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    enforce_site_operational_result(
-        site,
-        crate::repos::degradation::get_site_status(pool, site).await,
-    )
-}
-
-fn enforce_site_operational_result(
-    site: &str,
-    result: Result<Option<ryuki_engine::degradation_mode::SiteStatus>, sqlx::Error>,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    use ryuki_engine::degradation_mode::SiteDegradationState;
-    match result {
-        Ok(Some(s))
-            if s.state == SiteDegradationState::Degraded
-                || s.state == SiteDegradationState::Unreachable =>
-        {
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": format!(
-                        "site '{site}' is in degradation mode (state: {}); live write execution is blocked until it recovers",
-                        s.state
-                    ),
-                    "site": site,
-                    "state": s.state.to_string(),
-                })),
-            ))
-        }
-        Ok(_) => Ok(()),
-        Err(e) => {
-            tracing::warn!(error = %e, %site, "degradation gate: authoritative site_status read failed; blocking live execution");
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "authoritative site status is unavailable; live write execution is blocked",
-                    "site": site,
-                })),
-            ))
-        }
-    }
-}
-
 /// Security contract: an UNRESTRICTED principal (empty scope) reads any scope
 /// (the filters pass through verbatim). A SCOPED principal may only read within
 /// its authorized scopes — and crucially, omitting the filter NARROWS the read
@@ -64877,70 +64886,135 @@ mod db_lifecycle_tests {
         );
     }
 
-    /// #10: enforce_site_operational blocks a degraded/unreachable site (the
-    /// live-execution gate) and allows healthy/unknown sites — read from the
-    /// persisted site_status (mig 025 seed). Non-mutating.
-    #[tokio::test]
-    async fn enforce_site_operational_blocks_degraded_sites() {
-        let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(pool) = global_pool().await else {
-            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
-            return;
-        };
-        // GBLON seeded 'degraded', NLAMS seeded 'unreachable' → blocked (503).
-        let gblon = super::enforce_site_operational(pool, "GBLON").await;
-        assert!(
-            matches!(gblon, Err((StatusCode::SERVICE_UNAVAILABLE, _))),
-            "degraded site GBLON must be blocked: {gblon:?}"
-        );
-        let nlams = super::enforce_site_operational(pool, "NLAMS").await;
-        assert!(
-            matches!(nlams, Err((StatusCode::SERVICE_UNAVAILABLE, _))),
-            "unreachable site NLAMS must be blocked: {nlams:?}"
-        );
-        // DEFRA seeded 'healthy' → allowed; an unknown site (no row) → allowed.
-        super::enforce_site_operational(pool, "DEFRA")
-            .await
-            .expect("healthy site DEFRA must be allowed");
-        super::enforce_site_operational(pool, "ZZ-NONEXISTENT")
-            .await
-            .expect("a site with no status row must be allowed");
-    }
-
-    /// The degradation-state repository is authoritative for live execution:
-    /// an unreadable repository must deny with a value-free 503, while the
-    /// established healthy/no-row controls remain allowed.
+    /// Once a database is configured, degradation reads never fall back to the
+    /// process-local engine. Missing rows, empty effective scopes, and database
+    /// failures all project the same value-free 503.
     #[test]
-    fn enforce_site_operational_fails_closed_when_status_is_unavailable() {
+    fn degradation_repository_results_fail_closed_without_authoritative_status() {
         let internal_detail = "sensitive-database-driver-detail";
-        let Err((status, Json(body))) = super::enforce_site_operational_result(
+        let expected = json!({
+            "error": "authoritative degradation status is unavailable",
+        });
+
+        let Err((status, Json(body))) = super::degradation_check_db_result(
             "DEFRA",
             Err(sqlx::Error::Protocol(internal_detail.to_string())),
         ) else {
-            panic!("an authoritative site-status read failure must deny live execution");
+            panic!("an authoritative site-status read failure must deny the status read");
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            body,
-            json!({
-                "error": "authoritative site status is unavailable; live write execution is blocked",
-                "site": "DEFRA",
-            })
-        );
+        assert_eq!(body, expected);
         assert!(
             !body.to_string().contains(internal_detail),
             "the client-visible denial must not disclose database error details"
         );
+        assert!(
+            !body.to_string().contains("DEFRA"),
+            "the denial must not disclose the requested site"
+        );
 
-        super::enforce_site_operational_result("DEFRA", Ok(None))
-            .expect("a missing optional status row retains its established allow behavior");
-        super::enforce_site_operational_result(
+        let Err((status, Json(body))) = super::degradation_check_db_result("DEFRA", Ok(None))
+        else {
+            panic!("a missing authoritative site-status row must deny the status read");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, expected);
+
+        let unscoped = AuthSession::static_dry_run();
+        let Err((status, Json(body))) = super::degradation_statuses_db_result(
+            &unscoped,
+            "test-empty-status-set",
+            Ok(Vec::new()),
+        ) else {
+            panic!("an empty authoritative status set must deny aggregate reads");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, expected);
+
+        let mut defra_scoped = AuthSession::static_dry_run();
+        defra_scoped.site_scope = vec!["DEFRA".into()];
+        let Err((status, Json(body))) = super::degradation_statuses_db_result(
+            &defra_scoped,
+            "test-missing-effective-scope",
+            Ok(vec![ryuki_engine::degradation_mode::SiteStatus::healthy(
+                "GBLON",
+            )]),
+        ) else {
+            panic!("a missing status row for the effective scope must deny aggregate reads");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, expected);
+
+        let mut multi_site_scoped = AuthSession::static_dry_run();
+        multi_site_scoped.site_scope = vec!["DEFRA".into(), "GBLON".into()];
+        let Err((status, Json(body))) = super::degradation_statuses_db_result(
+            &multi_site_scoped,
+            "test-partial-effective-scope",
+            Ok(vec![ryuki_engine::degradation_mode::SiteStatus::healthy(
+                "DEFRA",
+            )]),
+        ) else {
+            panic!("one of two scoped status rows must not be treated as complete authority");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, expected);
+
+        let complete = super::degradation_statuses_db_result(
+            &multi_site_scoped,
+            "test-complete-effective-scope",
+            Ok(vec![
+                ryuki_engine::degradation_mode::SiteStatus::healthy("DEFRA"),
+                ryuki_engine::degradation_mode::SiteStatus::healthy("GBLON"),
+            ]),
+        )
+        .expect("all explicitly scoped sites have canonical status rows");
+        assert_eq!(complete.len(), 2);
+
+        let Err((status, Json(body))) = super::degradation_statuses_db_result(
+            &unscoped,
+            "test-repository-error",
+            Err(sqlx::Error::Protocol(internal_detail.to_string())),
+        ) else {
+            panic!("an aggregate repository failure must deny the status read");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, expected);
+        assert!(!body.to_string().contains(internal_detail));
+
+        let Json(healthy) = super::degradation_check_db_result(
             "DEFRA",
             Ok(Some(ryuki_engine::degradation_mode::SiteStatus::healthy(
                 "DEFRA",
             ))),
         )
-        .expect("a healthy authoritative status remains allowed");
+        .expect("a present authoritative status remains readable");
+        assert_eq!(healthy["site"], "DEFRA");
+    }
+
+    /// Handler-level DB proof: a site with no canonical status row produces the
+    /// same value-free 503 rather than silently consulting process-local state.
+    #[tokio::test]
+    async fn degradation_check_missing_db_row_is_value_free_503() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let missing_site = format!("ZZ{}", Uuid::new_v4().simple());
+        let Err((status, Json(body))) = degradation_check(
+            AuthExtractor(admin_session("degradation-missing-reader")),
+            Path(missing_site.clone()),
+        )
+        .await
+        else {
+            panic!("a missing DB-backed degradation row must deny the read");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({"error": "authoritative degradation status is unavailable"})
+        );
+        assert!(!body.to_string().contains(&missing_site));
     }
 
     /// #15: a scope-preference change (preferred_site/environment) is a
@@ -68930,6 +69004,37 @@ mod db_lifecycle_tests {
         request_id: Uuid,
         platform: &str,
     ) -> Uuid {
+        sqlx::query("UPDATE site_registry SET active = TRUE WHERE unlocode = $1")
+            .bind(platform)
+            .execute(pool)
+            .await
+            .expect("activate live-apply fixture site");
+        sqlx::query(
+            "UPDATE site_status \
+             SET state = 'healthy', api_status = 'up', db_status = 'up', \
+                 degradation_reason = NULL, last_check = NOW(), updated_at = NOW() \
+             WHERE site = $1",
+        )
+        .bind(platform)
+        .execute(pool)
+        .await
+        .expect("refresh live-apply fixture site status");
+        sqlx::query(
+            "UPDATE component_status SET status = 'up', last_check = NOW() \
+             WHERE site = $1 AND adapter_name = 'vmware'",
+        )
+        .bind(platform)
+        .execute(pool)
+        .await
+        .expect("refresh live-apply fixture VMware status");
+        let authority_epoch: Option<i64> =
+            sqlx::query_scalar("SELECT ryuki_acquire_live_site_execution_epoch($1)")
+                .bind(platform)
+                .fetch_one(pool)
+                .await
+                .expect("acquire live-apply fixture authority epoch");
+        let authority_epoch = authority_epoch
+            .expect("the active, healthy, fresh fixture site must authorize live execution");
         let spec = ryuki_protocol::JobSpec {
             request_id,
             request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
@@ -68942,12 +69047,14 @@ mod db_lifecycle_tests {
             mode: ryuki_protocol::JobMode::LiveApply,
         };
         sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
-             VALUES ($1, $2, $3, 'LiveApply', 'Pending') RETURNING id",
+            "INSERT INTO agent_jobs \
+                 (request_id, platform, spec, mode, status, site_status_authority_epoch) \
+             VALUES ($1, $2, $3, 'LiveApply', 'Pending', $4) RETURNING id",
         )
         .bind(request_id)
         .bind(platform)
         .bind(serde_json::to_value(spec).expect("serialize live apply spec"))
+        .bind(authority_epoch)
         .fetch_one(pool)
         .await
         .expect("seed pending live apply")
@@ -68961,8 +69068,8 @@ mod db_lifecycle_tests {
             return;
         };
         let request_id = seed_request(pool, "approved", "execute").await;
-        let platform = format!("fail-fence-{}", Uuid::new_v4().simple());
-        let job_id = seed_pending_live_apply_for_request(pool, request_id, &platform).await;
+        let platform = "DEFRA";
+        let job_id = seed_pending_live_apply_for_request(pool, request_id, platform).await;
 
         fail_one(
             &operator_session(),
@@ -69009,7 +69116,7 @@ mod db_lifecycle_tests {
             return;
         };
 
-        let platform = format!("fail-race-{}", Uuid::new_v4().simple());
+        let platform = "DEFRA";
         let race_agent = format!("race-agent-{}", Uuid::new_v4().simple());
         let race_capabilities = serde_json::json!({
             "terraform": {
@@ -69022,7 +69129,7 @@ mod db_lifecycle_tests {
             pool,
             crate::agents::ChallengeAdmittedTestAgent {
                 agent_id: &race_agent,
-                platform: &platform,
+                platform,
                 public_key: "race-public-key",
                 token_hash: &race_token_hash,
                 capabilities: &race_capabilities,
@@ -69034,7 +69141,7 @@ mod db_lifecycle_tests {
 
         for _ in 0..12 {
             let request_id = seed_request(pool, "approved", "execute").await;
-            let job_id = seed_pending_live_apply_for_request(pool, request_id, &platform).await;
+            let job_id = seed_pending_live_apply_for_request(pool, request_id, platform).await;
             let request_id_string = request_id.to_string();
             let operator = operator_session();
             let (failed, leased) = tokio::join!(
