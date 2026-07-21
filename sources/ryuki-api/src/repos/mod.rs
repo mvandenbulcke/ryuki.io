@@ -2,8 +2,10 @@
 //!
 //! # Contract
 //!
-//! - Every function takes `&PgPool` and returns `Result<T, sqlx::Error>`.
-//! - No business logic lives here; engines remain I/O-free.
+//! - Plain I/O functions take `&PgPool` and return `Result<T, sqlx::Error>`.
+//! - Authorization-bearing facades (currently `requests`) retain their unit of
+//!   work and expose only opaque permit-consuming operations.
+//! - Domain policy remains in the engine; repositories bind it to I/O.
 //! - Handlers in `contracts.rs` own the error-mapping: `sqlx::Error` → `db_error`,
 //!   `None` → `status_404`, state conflicts → `status_409`.
 //! - All UUID primary keys are cast to `TEXT` in SELECT (`id::text AS id`) so
@@ -49,6 +51,7 @@ pub mod os_baseline;
 pub mod outage_comms;
 pub mod patch_waves;
 pub mod repository_capacity;
+pub mod requests;
 pub mod restore_requests;
 pub mod runbook_executions;
 pub mod shift_queue;

@@ -3365,7 +3365,9 @@ pub async fn integration_test(
         Some(pool) => audit::record_audit(pool, &session, &audit_record)
             .await
             .map_err(db_err)?,
-        None => audit::record_audit_local(&session, &audit_record).await,
+        None => {
+            audit::record_audit_local(&session, &audit_record).await;
+        }
     }
 
     // Update last_test_at and last_test_result in DB if available.

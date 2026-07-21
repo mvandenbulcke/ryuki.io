@@ -51,6 +51,15 @@ Track the convergence as one dependency-ordered P0 program:
 | SB-8 Distributed security operations and recovery | `[ ]` | Governed policy/config changes, cryptographic inventory, authority epochs/fencing, trusted time, fair distributed budgets, degraded modes, explicit RTO/RPO, authenticated recovery media, compromise response, and restore-without-resurrection are implemented and rehearsed, including separately governed strongly consistent trust-checkpoint custody and recovery reconciliation. |
 | SB-9 Security-state migration, bypass retirement, and production acceptance | `[ ]` | Expand/migrate/verify/contract and rollback fencing are proven, legacy fallbacks are removed, and local plus operator-owned identity-provider, secret-manager/PKI, and live acceptance evidence passes. |
 
+SB-2 now has a first permit-bearing instance slice for
+`GET /api/requests/{id}`. Authentication middleware retains exact session or
+federated credential evidence; the request repository revalidates it, resolves
+only the minimal resource projection, reserves audit evidence, and consumes a
+typed `AuthorizationPermit` in the same SQL transaction or local-store lease
+before loading the full record. SB-2 remains open because collection reads,
+mutations, remaining resources, machine actors, multi-tenant scope, and the
+production registry/provider rollout have not yet converged on this boundary.
+
 SB-1 now has an identity-epoch slice in migration 165 and an explicit
 interactive-human assignment slice in migration 182. Local, OIDC, and Entra
 carriers require a versioned provider/issuer/subject role and site/environment

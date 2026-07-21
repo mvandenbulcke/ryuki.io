@@ -1252,7 +1252,7 @@ mod tests {
         let startup = startup_message();
         client.write_all(&startup).await.expect("write startup");
         read_forwarded_startup(&mut server, &startup).await;
-        server.write_all(&[b'R']).await.expect("write frame type");
+        server.write_all(b"R").await.expect("write frame type");
         server
             .write_all(&u32::MAX.to_be_bytes())
             .await

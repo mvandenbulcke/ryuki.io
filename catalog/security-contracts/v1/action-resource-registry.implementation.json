@@ -23,13 +23,13 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:03e11c898a4fd2b2f7a2b1959f7365e43936d53283758ff306bd8c8609983891",
+        "content_digest": "sha256:cfd34b6174be1b317300f69794da54bef36dba55c859a599203e4693bf1d9c5c",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:3311a63d623b6cfb6843c95e6c1166460054ea5abc44f4e40338212d9fc865dc",
+        "content_digest": "sha256:ff1d5b11ad9fa99bd58136f7ca68518a3bef210f0060cadc1624d46edf25cf2d",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
@@ -43,6 +43,54 @@
         "document_version": 1,
         "content_digest": "sha256:105d2b52333f3f0942268215deea73f0939180e2b39742b1441f95eec273cd30",
         "artifact_locator": "sources/ryuki-api/src/agents.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-request-authority",
+        "document_version": 1,
+        "content_digest": "sha256:84d7ee126f32be78bb92e6840b6bc472728a98cadeb588373a609563616bef89",
+        "artifact_locator": "sources/ryuki-api/src/request_authority.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-request-read-repository",
+        "document_version": 1,
+        "content_digest": "sha256:29587e1f2ae4f88ce803a6f767cb65a4ff273c7010bd6b34f13780d8d8165ad4",
+        "artifact_locator": "sources/ryuki-api/src/repos/requests.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-job-steps-repository",
+        "document_version": 1,
+        "content_digest": "sha256:8bdb0484d571c4a4686c65966c3c0afd737fcedb4ea40874fffd1a7ddc27cb1f",
+        "artifact_locator": "sources/ryuki-api/src/repos/job_steps.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-audit-repository",
+        "document_version": 1,
+        "content_digest": "sha256:98d1c313202ff8d30d3b07eec988c98dbc6053dc160b9590626094acb2d3a5cf",
+        "artifact_locator": "sources/ryuki-api/src/audit.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-entra-auth",
+        "document_version": 1,
+        "content_digest": "sha256:e11aee1c40be5ab7b7b641b14f8971b130c4e027fee73bb6bc2dcbe606640a89",
+        "artifact_locator": "sources/ryuki-api/src/entra_auth.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-identity-authority",
+        "document_version": 1,
+        "content_digest": "sha256:ee11a268ba872b1910189a5a0c4d545449e15a24d19f170775cdd1414adfb57b",
+        "artifact_locator": "sources/ryuki-api/src/identity_authority.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-security-contract-loader",
+        "document_version": 1,
+        "content_digest": "sha256:2f3e2de79cb26635867e29490609b311859b9685d9b2c289b50a8ad16f519bb5",
+        "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
+      },
+      {
+        "document_id": "source:ryuki-engine-authorization-kernel",
+        "document_version": 1,
+        "content_digest": "sha256:58d85d97ba1178714fe28f1c31a58b6c4dd4853f25cebb3f838b4f80948a83eb",
+        "artifact_locator": "sources/ryuki-engine/src/authorization.rs"
       }
     ]
   },
@@ -53,7 +101,8 @@
     "workload",
     "agent",
     "system",
-    "webhook"
+    "webhook",
+    "development-fixture"
   ],
   "actions": [
     {
@@ -62,7 +111,8 @@
       "resource_kind": "request",
       "permitted_actor_kinds": [
         "verified-human",
-        "service"
+        "service",
+        "development-fixture"
       ],
       "authorization_semantics": "instance",
       "obligations": [
@@ -157,7 +207,7 @@
       "sensitivity": "confidential",
       "canonical_resource_ref": {
         "schema_version": 1,
-        "required_fields": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state"],
+        "required_fields": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "tenant_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "state_digest", "sensitivity", "lifecycle_state"],
         "security_version_field": "resource_version",
         "canonicalization": "resolve-before-policy"
       },
@@ -238,6 +288,7 @@
       "mode": "instance",
       "canonical_id_source": "requests.id",
       "security_version_source": "requests.resource_version",
+      "state_digest_source": "job_steps.(id,xmin)",
       "permit_kind": "AuthorizationPermit",
       "fail_closed": true,
       "lifecycle": "active",
@@ -290,7 +341,7 @@
       "resolver_id": "resolver:request-instance-v1",
       "resolver_version": 1,
       "permit_kind": "AuthorizationPermit",
-      "permitted_actor_kinds": ["verified-human", "service"],
+      "permitted_actor_kinds": ["verified-human", "service", "development-fixture"],
       "lifecycle": "active",
       "applicability_expression": "always",
       "source_file": "sources/ryuki-api/src/contracts.rs"

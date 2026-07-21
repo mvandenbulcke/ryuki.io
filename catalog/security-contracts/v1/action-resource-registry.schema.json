@@ -94,7 +94,8 @@
         "workload",
         "agent",
         "system",
-        "webhook"
+        "webhook",
+        "development-fixture"
       ]
     },
     "documentLifecycle": {
@@ -249,7 +250,7 @@
           "type": "array",
           "minItems": 8,
           "uniqueItems": true,
-          "items": { "enum": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state", "tenant_id"] },
+          "items": { "enum": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "state_digest", "sensitivity", "lifecycle_state", "tenant_id"] },
           "allOf": [
             { "contains": { "const": "resource_kind" } },
             { "contains": { "const": "canonical_id" } },
@@ -329,6 +330,7 @@
         "mode": { "enum": ["instance", "collection", "global"] },
         "canonical_id_source": { "type": "string", "minLength": 1, "maxLength": 256 },
         "security_version_source": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "state_digest_source": { "type": "string", "minLength": 1, "maxLength": 256 },
         "permit_kind": { "enum": ["AuthorizationPermit", "QueryPermit"] },
         "fail_closed": { "const": true },
         "lifecycle": { "enum": ["active", "deprecated", "retired"] },

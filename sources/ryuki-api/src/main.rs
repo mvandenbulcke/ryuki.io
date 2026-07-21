@@ -23,6 +23,7 @@ mod oidc_callback;
 mod openapi;
 mod postgresql_tls_channel;
 mod repos;
+mod request_authority;
 mod scheduler;
 mod secret_provider_runtime;
 mod security_contracts;
@@ -105,23 +106,37 @@ async fn resolve_request_session(
     auth_mode: AuthMode,
     auth_header: Option<&str>,
     validator: &EntraTokenValidator,
-) -> (AuthSession, Option<&'static str>) {
+) -> (
+    AuthSession,
+    Option<&'static str>,
+    Option<crate::request_authority::DirectFederatedCredential>,
+) {
     match auth_mode {
-        AuthMode::MockDryRun | AuthMode::StaticDryRun => (AuthSession::static_dry_run(), None),
+        AuthMode::MockDryRun | AuthMode::StaticDryRun => {
+            (AuthSession::static_dry_run(), None, None)
+        }
         // Local mode without a persisted session is unauthenticated: zero
         // roles, token_valid=false. Both unsafe methods AND non-exempt reads
         // 401 until login (B3) — the portal sends X-Ryuki-Session-Id after the
         // local login flow.
-        AuthMode::Local => (unverified_session("local-unauthenticated"), None),
+        AuthMode::Local => (unverified_session("local-unauthenticated"), None, None),
         // EntraId: a real bearer token is cryptographically validated by the
         // injected validator (RS256 + iss/aud/exp/nbf + JWKS). A missing header
         // or any failure path is unverified_entra().
         AuthMode::EntraId => match auth_header {
             Some(h) => {
                 let outcome = validator.validate_with_reason(h).await;
-                (outcome.session, outcome.failure_reason)
+                (
+                    outcome.session,
+                    outcome.failure_reason,
+                    outcome.request_read_credential,
+                )
             }
-            None => (AuthSession::unverified_entra(), Some("missing-bearer")),
+            None => (
+                AuthSession::unverified_entra(),
+                Some("missing-bearer"),
+                None,
+            ),
         },
     }
 }
@@ -142,15 +157,19 @@ async fn auth_session_for_request(
 
 #[derive(sqlx::FromRow)]
 struct DbAuthSessionRow {
+    session_record_id: Uuid,
     user_id: String,
     display_name: String,
     roles: Vec<String>,
     bearer_verifier: Vec<u8>,
     expires_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
     provider: String,
     identity_issuer: String,
     identity_subject: String,
     identity_authority_epoch: i64,
+    identity_authority_digest: Vec<u8>,
+    identity_last_asserted_at: Option<chrono::DateTime<chrono::Utc>>,
     human_authority_version: i64,
     site_authority_mode: String,
     site_scope: Vec<String>,
@@ -191,11 +210,11 @@ fn unverified_session(provider_mode: &str) -> AuthSession {
     }
 }
 
-fn session_from_db_row(row: DbAuthSessionRow) -> AuthSession {
+fn session_from_db_row(row: &DbAuthSessionRow) -> AuthSession {
     AuthSession {
-        user_id: row.user_id,
-        display_name: row.display_name,
-        roles: row.roles,
+        user_id: row.user_id.clone(),
+        display_name: row.display_name.clone(),
+        roles: row.roles.clone(),
         token_valid: true,
         actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
         // Preserve the carrier classification used by the settings-write gate.
@@ -203,9 +222,190 @@ fn session_from_db_row(row: DbAuthSessionRow) -> AuthSession {
         // authority-cache binding, but a browser/session bearer is never a
         // freshly verified interactive external credential.
         provider_mode: "persisted-session".into(),
-        site_scope: row.site_scope,
-        environment_scope: row.environment_scope,
+        site_scope: row.site_scope.clone(),
+        environment_scope: row.environment_scope.clone(),
     }
+}
+
+fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    for value in values {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.finalize().into()
+}
+
+fn persisted_request_read_authority(
+    row: &DbAuthSessionRow,
+    config: &RyukiConfig,
+    session: &AuthSession,
+    authority: &crate::human_authority::InteractiveHumanAuthorityContext,
+) -> Result<
+    crate::request_authority::RequestReadAuthority,
+    crate::request_authority::RequestAuthorityError,
+> {
+    use crate::request_authority::{
+        InteractiveRequestReadPrincipal, PersistedSessionCredential, RequestAuthorityError,
+        RequestReadCredentialDigests, RequestReadCredentialWindow,
+    };
+    use ryuki_engine::authorization::AssuranceLevel;
+
+    let bearer_verifier: [u8; 32] = row
+        .bearer_verifier
+        .as_slice()
+        .try_into()
+        .map_err(|_| RequestAuthorityError::InvalidBinding("session bearer verifier length"))?;
+    let identity_authority_digest: [u8; 32] = row
+        .identity_authority_digest
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+        RequestAuthorityError::InvalidBinding("identity authority digest length")
+    })?;
+    let identity_fresh_until = if row.provider == crate::identity_authority::LOCAL_PROVIDER {
+        None
+    } else {
+        let last_asserted_at =
+            row.identity_last_asserted_at
+                .ok_or(RequestAuthorityError::InvalidBinding(
+                    "federated assertion time is missing",
+                ))?;
+        let staleness = i64::try_from(config.session.federated_authority_max_staleness_secs)
+            .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
+        Some(
+            last_asserted_at
+                .checked_add_signed(chrono::Duration::seconds(staleness))
+                .ok_or(RequestAuthorityError::InvalidBinding(
+                    "federated freshness bound overflow",
+                ))?,
+        )
+    };
+    let principal = InteractiveRequestReadPrincipal::new(
+        session,
+        authority,
+        identity_authority_digest,
+        row.identity_last_asserted_at,
+        identity_fresh_until,
+    )?;
+    let namespace = crate::config_store::security_contract_context_if_initialized()
+        .ok_or(RequestAuthorityError::InvalidBinding(
+            "security-contract context is unavailable",
+        ))?
+        .request_read_security_namespace(&config.auth_mode, &row.provider)
+        .map_err(|reason| {
+            tracing::warn!(reason, "request-read security namespace was not admitted");
+            RequestAuthorityError::InvalidBinding("security-contract namespace")
+        })?;
+    let digests = RequestReadCredentialDigests::new(
+        bearer_verifier,
+        request_read_digest(
+            b"ryuki-request-read-session-deployment-recipient-v1",
+            &[
+                namespace.deployment_id.as_bytes(),
+                namespace.trust_domain_id.as_bytes(),
+                namespace.tenant_id.as_deref().unwrap_or("").as_bytes(),
+            ],
+        ),
+        request_read_digest(
+            b"ryuki-request-read-session-key-v1",
+            &[config.session.credential_hmac_key.as_bytes()],
+        ),
+    )?;
+    let window = RequestReadCredentialWindow::new(
+        1,
+        row.created_at,
+        row.created_at,
+        row.expires_at,
+        AssuranceLevel::SingleFactor,
+        row.expires_at,
+    )?;
+    let credential = PersistedSessionCredential::new(
+        row.session_record_id,
+        bearer_verifier,
+        row.created_at,
+        window,
+        digests,
+    )?;
+    crate::request_authority::RequestReadAuthority::from_persisted_session(
+        namespace, principal, credential,
+    )
+}
+
+fn direct_request_read_authority(
+    admitted: &crate::identity_authority::AdmittedFederatedBearer,
+    credential: crate::request_authority::DirectFederatedCredential,
+    config: &RyukiConfig,
+) -> Result<
+    crate::request_authority::RequestReadAuthority,
+    crate::request_authority::RequestAuthorityError,
+> {
+    use crate::request_authority::{InteractiveRequestReadPrincipal, RequestAuthorityError};
+
+    let staleness = i64::try_from(config.session.federated_authority_max_staleness_secs)
+        .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
+    let identity_fresh_until = admitted
+        .identity_last_asserted_at
+        .checked_add_signed(chrono::Duration::seconds(staleness))
+        .ok_or(RequestAuthorityError::InvalidBinding(
+            "federated freshness bound overflow",
+        ))?;
+    let principal = InteractiveRequestReadPrincipal::new(
+        &admitted.session,
+        &admitted.authority,
+        admitted.identity_authority_digest,
+        Some(admitted.identity_last_asserted_at),
+        Some(identity_fresh_until),
+    )?;
+    let namespace = crate::config_store::security_contract_context_if_initialized()
+        .ok_or(RequestAuthorityError::InvalidBinding(
+            "security-contract context is unavailable",
+        ))?
+        .request_read_security_namespace(&config.auth_mode, &admitted.authority.provider)
+        .map_err(|reason| {
+            tracing::warn!(
+                reason,
+                "direct bearer request-read namespace was not admitted"
+            );
+            RequestAuthorityError::InvalidBinding("security-contract namespace")
+        })?;
+    crate::request_authority::RequestReadAuthority::from_direct_federated(
+        namespace, principal, credential,
+    )
+}
+
+fn development_request_read_authority(
+    session: &AuthSession,
+    auth_mode: &AuthMode,
+) -> Result<
+    crate::request_authority::RequestReadAuthority,
+    crate::request_authority::RequestAuthorityError,
+> {
+    let namespace = crate::config_store::security_contract_context_if_initialized()
+        .ok_or(
+            crate::request_authority::RequestAuthorityError::InvalidBinding(
+                "security-contract context is unavailable",
+            ),
+        )?
+        .request_read_security_namespace(auth_mode, "development-fixture")
+        .map_err(|reason| {
+            tracing::warn!(
+                reason,
+                "development request-read namespace was not admitted"
+            );
+            crate::request_authority::RequestAuthorityError::InvalidBinding(
+                "security-contract namespace",
+            )
+        })?;
+    let authenticated_at = chrono::Utc::now();
+    crate::request_authority::RequestReadAuthority::development_fixture(
+        namespace,
+        session,
+        authenticated_at,
+        authenticated_at + chrono::Duration::seconds(60),
+    )
 }
 
 fn bearer_value(auth_header: Option<&str>) -> Option<&str> {
@@ -524,7 +724,7 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
         &session_parser,
     )
     .await
-    .map(|(session, source, _authority)| (session, source))
+    .map(|(session, source, _authority, _request_read)| (session, source))
 }
 
 #[cfg(test)]
@@ -548,6 +748,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     AuthSession,
     SessionIdSource,
     Option<crate::human_authority::InteractiveHumanAuthorityContext>,
+    Option<crate::request_authority::RequestReadAuthority>,
 )> {
     let auth_mode = &config.auth_mode;
     let session = &config.session;
@@ -559,6 +760,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
         return Some((
             unverified_session("conflicting-or-invalid-credentials"),
             source,
+            None,
             None,
         ));
     }
@@ -572,13 +774,14 @@ async fn auth_session_from_persisted_session_with_authority_admission(
             if let Some(pool) = crate::database::get_db() {
                 let candidate = resolve_api_token(token, pool).await;
                 if candidate.token_valid {
-                    return Some((candidate, SessionIdSource::Bearer, None));
+                    return Some((candidate, SessionIdSource::Bearer, None, None));
                 }
-                return Some((candidate, SessionIdSource::Bearer, None));
+                return Some((candidate, SessionIdSource::Bearer, None, None));
             }
             return Some((
                 unverified_session("api-token-verifier-unavailable"),
                 SessionIdSource::Bearer,
+                None,
                 None,
             ));
         }
@@ -588,7 +791,12 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     // credential-free static development modes.
     if matches!(auth_mode, AuthMode::MockDryRun | AuthMode::StaticDryRun) {
         if let Some((Ok(_), source)) = session_evidence {
-            return Some((unverified_session("session-auth-disabled"), source, None));
+            return Some((
+                unverified_session("session-auth-disabled"),
+                source,
+                None,
+                None,
+            ));
         }
         return None;
     }
@@ -605,6 +813,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                 unverified_session("session-verifier-unavailable"),
                 source,
                 None,
+                None,
             ));
         }
     };
@@ -616,12 +825,18 @@ async fn auth_session_from_persisted_session_with_authority_admission(
         }
         crate::session_lookup_admission::SessionLookupDecision::Unknown(guard) => Some(guard),
         crate::session_lookup_admission::SessionLookupDecision::CachedMiss => {
-            return Some((unverified_session("session-not-found-cached"), source, None));
+            return Some((
+                unverified_session("session-not-found-cached"),
+                source,
+                None,
+                None,
+            ));
         }
         crate::session_lookup_admission::SessionLookupDecision::Rejected(_) => {
             return Some((
                 unverified_session("session-lookup-admission-rejected"),
                 source,
+                None,
                 None,
             ));
         }
@@ -635,9 +850,11 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     // 'oidc' flow that shares its validator) — never a mock/dry-run/local
     // session, which would otherwise let a leftover admin cookie in.
     let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
-    let query = "SELECT s.user_id, s.display_name, s.roles, s.bearer_verifier, s.expires_at, \
+    let query = "SELECT s.session_record_id, s.user_id, s.display_name, s.roles, \
+                s.bearer_verifier, s.expires_at, s.created_at, \
                 s.provider, s.identity_issuer, s.identity_subject, \
-                s.identity_authority_epoch, \
+                s.identity_authority_epoch, a.authority_digest AS identity_authority_digest, \
+                a.last_asserted_at AS identity_last_asserted_at, \
                 s.human_authority_version, s.site_authority_mode, s.site_scope, \
                 s.environment_authority_mode, s.environment_scope \
          FROM sessions s \
@@ -705,6 +922,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                         unverified_session("session-authority-cache-stale"),
                         source,
                         None,
+                        None,
                     ));
                 }
                 let valid_for = (row.expires_at - chrono::Utc::now())
@@ -717,25 +935,45 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                         unverified_session("session-authority-shape-invalid"),
                         source,
                         None,
+                        None,
                     ));
                 };
-                Some((session_from_db_row(row), source, Some(authority)))
+                let admitted_session = session_from_db_row(&row);
+                let request_read = match persisted_request_read_authority(
+                    &row,
+                    config,
+                    &admitted_session,
+                    &authority,
+                ) {
+                    Ok(authority) => Some(authority),
+                    Err(error) => {
+                        tracing::warn!(reason = %error, "persisted session has no request-read authority");
+                        None
+                    }
+                };
+                Some((admitted_session, source, Some(authority), request_read))
             } else {
                 admission.record_miss(verifier);
                 Some((
                     unverified_session("session-verifier-mismatch"),
                     source,
                     None,
+                    None,
                 ))
             }
         }
         Ok(None) => {
             admission.record_miss(verifier);
-            Some((unverified_session("session-not-found"), source, None))
+            Some((unverified_session("session-not-found"), source, None, None))
         }
         Err(error) => {
             tracing::error!(error = %error, "auth session lookup failed");
-            Some((unverified_session("session-lookup-failed"), source, None))
+            Some((
+                unverified_session("session-lookup-failed"),
+                source,
+                None,
+                None,
+            ))
         }
     }
 }
@@ -1748,83 +1986,121 @@ async fn auth_middleware(
     // cleared. Do not duplicate that keyed database access here. Every other
     // route resolves persisted DB sessions first; only the None fallback runs
     // validator-aware resolution.
-    let (session, session_source, failure_reason, interactive_authority) = if matches!(
-        path.as_str(),
-        "/api/auth/logout" | "/api/auth/local/logout"
-    ) {
-        (
-            unverified_session("logout-self-revocation"),
-            None,
-            None,
-            None,
-        )
-    } else {
-        match auth_session_from_persisted_session_with_authority_admission(
-            &headers,
-            auth_header,
-            app_config,
-            &lookup_admission,
-            lookup_proof,
-            &session_auth_parser,
-        )
-        .await
-        {
-            Some((session, source, authority)) => (session, Some(source), None, authority),
-            None => {
-                let (validated, reason) = resolve_request_session(
-                    auth_mode.clone(),
-                    auth_header,
-                    &authenticator_runtime.entra_bearer_validator(),
-                )
-                .await;
-                if auth_mode == AuthMode::EntraId
-                    && validated.token_valid
-                    && !validated.is_verified_human()
-                {
-                    tracing::warn!(
-                        actor_class = ?validated.actor_class,
-                        "validated Entra bearer is not a delegated human token"
-                    );
-                    (
-                        unverified_session("entra-id-actor-kind-rejected"),
-                        None,
-                        Some("actor-kind-rejected"),
-                        None,
+    let (session, session_source, failure_reason, interactive_authority, request_read_authority) =
+        if matches!(path.as_str(), "/api/auth/logout" | "/api/auth/local/logout") {
+            (
+                unverified_session("logout-self-revocation"),
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            match auth_session_from_persisted_session_with_authority_admission(
+                &headers,
+                auth_header,
+                app_config,
+                &lookup_admission,
+                lookup_proof,
+                &session_auth_parser,
+            )
+            .await
+            {
+                Some((session, source, authority, request_read)) => {
+                    (session, Some(source), None, authority, request_read)
+                }
+                None => {
+                    let (validated, reason, direct_credential) = resolve_request_session(
+                        auth_mode.clone(),
+                        auth_header,
+                        &authenticator_runtime.entra_bearer_validator(),
                     )
-                } else if auth_mode == AuthMode::EntraId && validated.token_valid {
-                    let normalized = if let Some(pool) = crate::database::get_db() {
-                        crate::identity_authority::admit_federated_bearer(
-                            pool,
-                            "entra-id",
-                            &crate::identity_authority::configured_entra_issuer(app_config),
-                            &validated.user_id,
-                            &validated.display_name,
-                            &validated.roles,
-                            validated.actor_class,
-                            &app_config.session,
+                    .await;
+                    if auth_mode == AuthMode::EntraId
+                        && validated.token_valid
+                        && !validated.is_verified_human()
+                    {
+                        tracing::warn!(
+                            actor_class = ?validated.actor_class,
+                            "validated Entra bearer is not a delegated human token"
+                        );
+                        (
+                            unverified_session("entra-id-actor-kind-rejected"),
+                            None,
+                            Some("actor-kind-rejected"),
+                            None,
+                            None,
                         )
-                        .await
-                    } else {
-                        Err(crate::identity_authority::IdentityAuthorityError::AssertionRejected)
-                    };
-                    match normalized {
-                        Ok(admitted) => (admitted.session, None, None, Some(admitted.authority)),
-                        Err(error) => {
-                            tracing::warn!(reason = %error, "verified bearer has no active platform authority assignment");
-                            (
-                                unverified_session("entra-id-authority-rejected"),
-                                None,
-                                Some("authority-rejected"),
-                                None,
+                    } else if auth_mode == AuthMode::EntraId && validated.token_valid {
+                        let normalized = if let Some(pool) = crate::database::get_db() {
+                            crate::identity_authority::admit_federated_bearer(
+                                pool,
+                                "entra-id",
+                                &crate::identity_authority::configured_entra_issuer(app_config),
+                                &validated.user_id,
+                                &validated.display_name,
+                                &validated.roles,
+                                validated.actor_class,
+                                &app_config.session,
                             )
+                            .await
+                        } else {
+                            Err(crate::identity_authority::IdentityAuthorityError::AssertionRejected)
+                        };
+                        match normalized {
+                            Ok(admitted) => {
+                                let request_read = direct_credential.and_then(|credential| {
+                                match direct_request_read_authority(
+                                    &admitted,
+                                    credential,
+                                    app_config,
+                                ) {
+                                    Ok(authority) => Some(authority),
+                                    Err(error) => {
+                                        tracing::warn!(reason = %error, "direct bearer has no request-read authority");
+                                        None
+                                    }
+                                }
+                            });
+                                (
+                                    admitted.session,
+                                    None,
+                                    None,
+                                    Some(admitted.authority),
+                                    request_read,
+                                )
+                            }
+                            Err(error) => {
+                                tracing::warn!(reason = %error, "verified bearer has no active platform authority assignment");
+                                (
+                                    unverified_session("entra-id-authority-rejected"),
+                                    None,
+                                    Some("authority-rejected"),
+                                    None,
+                                    None,
+                                )
+                            }
                         }
+                    } else {
+                        let request_read = if matches!(
+                            auth_mode,
+                            AuthMode::MockDryRun | AuthMode::StaticDryRun
+                        ) {
+                            match development_request_read_authority(&validated, &auth_mode) {
+                                Ok(authority) => Some(authority),
+                                Err(error) => {
+                                    tracing::warn!(reason = %error, "development fixture has no request-read authority");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        (validated, None, reason, None, request_read)
                     }
-                } else {
-                    (validated, None, reason, None)
                 }
             }
-        }
-    };
+        };
 
     // SAFE logging: presence + mode + token_valid + an optional low-cardinality
     // failure-reason string. NEVER the token, claims, oid, or header bytes.
@@ -1959,6 +2235,9 @@ async fn auth_middleware(
     }
 
     if let Some(authority) = interactive_authority {
+        request.extensions_mut().insert(authority);
+    }
+    if let Some(authority) = request_read_authority {
         request.extensions_mut().insert(authority);
     }
     request.extensions_mut().insert(session);
@@ -5716,16 +5995,20 @@ mod tests {
 
     #[test]
     fn test_db_session_row_maps_to_verified_session() {
-        let session = session_from_db_row(DbAuthSessionRow {
+        let session = session_from_db_row(&DbAuthSessionRow {
+            session_record_id: Uuid::new_v4(),
             user_id: "platform-engineer".into(),
             display_name: "Platform Engineer".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
             bearer_verifier: random_bearer_verifier_fixture(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            created_at: chrono::Utc::now(),
             provider: "local".into(),
             identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
             identity_subject: "platform-engineer".into(),
             identity_authority_epoch: 1,
+            identity_authority_digest: rand::random::<[u8; 32]>().to_vec(),
+            identity_last_asserted_at: None,
             human_authority_version: 1,
             site_authority_mode: "scoped".into(),
             site_scope: vec!["SITE-A".into()],
@@ -5890,16 +6173,20 @@ mod tests {
     }
 
     fn verified_persisted_session() -> AuthSession {
-        session_from_db_row(DbAuthSessionRow {
+        session_from_db_row(&DbAuthSessionRow {
+            session_record_id: Uuid::new_v4(),
             user_id: "admin".into(),
             display_name: "admin".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
             bearer_verifier: random_bearer_verifier_fixture(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            created_at: chrono::Utc::now(),
             provider: "local".into(),
             identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
             identity_subject: "admin".into(),
             identity_authority_epoch: 1,
+            identity_authority_digest: rand::random::<[u8; 32]>().to_vec(),
+            identity_last_asserted_at: None,
             human_authority_version: 1,
             site_authority_mode: "global".into(),
             site_scope: vec![],

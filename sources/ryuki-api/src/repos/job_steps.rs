@@ -10,7 +10,10 @@
 use sqlx::PgExecutor;
 use uuid::Uuid;
 
+use ryuki_engine::authorization::BindingDigest;
 use ryuki_engine::job_orchestration::{Step, StepStatus};
+
+const REQUEST_PLAN_STATE_DIGEST_DOMAIN: &[u8] = b"ryuki-request-plan-row-versions-v1";
 
 /// One persisted step of a request's orchestration plan.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -37,6 +40,106 @@ pub struct JobStepRow {
     // NULL until then (and always NULL for OfflineDryRun-only plans).
     #[cfg_attr(not(test), allow(dead_code))]
     pub live_plan_digest: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PermitBoundJobStepRow {
+    id: Uuid,
+    request_id: Uuid,
+    step_key: String,
+    depends_on: Vec<String>,
+    iac_ref: String,
+    status: String,
+    agent_job_id: Option<Uuid>,
+    live_plan_digest: Option<String>,
+    row_version: i64,
+}
+
+/// Opaque child-plan snapshot loaded by the permit-bearing repository. Before the repository's
+/// same-unit-of-work currentness check succeeds, callers can inspect only its
+/// version-set digest—not any step payload or workflow state.
+pub(crate) struct PermitBoundJobStepPlan {
+    rows: Vec<PermitBoundJobStepRow>,
+    state_digest: BindingDigest,
+}
+
+impl PermitBoundJobStepPlan {
+    pub(crate) const fn state_digest(&self) -> BindingDigest {
+        self.state_digest
+    }
+
+    pub(crate) fn into_rows(
+        self,
+        _permit: &crate::repos::requests::CurrentRequestReadPermit,
+    ) -> Vec<JobStepRow> {
+        self.rows
+            .into_iter()
+            .map(|row| JobStepRow {
+                id: row.id,
+                request_id: row.request_id,
+                step_key: row.step_key,
+                depends_on: row.depends_on,
+                iac_ref: row.iac_ref,
+                status: row.status,
+                agent_job_id: row.agent_job_id,
+                live_plan_digest: row.live_plan_digest,
+            })
+            .collect()
+    }
+}
+
+fn request_plan_state_digest(mut versions: Vec<(Uuid, i64)>) -> BindingDigest {
+    versions.sort_unstable_by_key(|(id, _)| *id);
+    let mut bytes = Vec::with_capacity(8 + versions.len().saturating_mul(24));
+    bytes.extend_from_slice(&(versions.len() as u64).to_be_bytes());
+    for (id, row_version) in versions {
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&row_version.to_be_bytes());
+    }
+    BindingDigest::sha256(REQUEST_PLAN_STATE_DIGEST_DOMAIN, &bytes)
+}
+
+pub(crate) fn empty_plan_state_digest() -> BindingDigest {
+    request_plan_state_digest(Vec::new())
+}
+
+/// Resolve only the MVCC identity/version set needed to bind the child plan
+/// into a request-read decision. No step payload, IaC reference, dependency,
+/// or status crosses the pre-authorization boundary. This deliberately does
+/// not retain row locks: the final exact-row query is compared optimistically,
+/// avoiding a lock-order inversion with orchestration writers.
+pub(crate) async fn load_plan_state_digest(
+    executor: &mut sqlx::PgConnection,
+    request_id: Uuid,
+) -> Result<BindingDigest, sqlx::Error> {
+    let versions: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT id, xmin::text::bigint AS row_version \
+         FROM job_steps WHERE request_id = $1 ORDER BY id",
+    )
+    .bind(request_id)
+    .fetch_all(executor)
+    .await?;
+    Ok(request_plan_state_digest(versions))
+}
+
+/// Load the exact child-plan snapshot that may be materialized only after its
+/// digest is re-bound and the parent permit remains current. The returned rows
+/// themselves are the protected snapshot; later writes cannot change them.
+pub(crate) async fn load_plan_for_permit_read(
+    executor: &mut sqlx::PgConnection,
+    request_id: Uuid,
+) -> Result<PermitBoundJobStepPlan, sqlx::Error> {
+    let rows: Vec<PermitBoundJobStepRow> = sqlx::query_as(
+        "SELECT id, request_id, step_key, depends_on, iac_ref, status, agent_job_id, \
+         live_plan_digest, xmin::text::bigint AS row_version \
+         FROM job_steps WHERE request_id = $1 ORDER BY step_key, id",
+    )
+    .bind(request_id)
+    .fetch_all(executor)
+    .await?;
+    let state_digest =
+        request_plan_state_digest(rows.iter().map(|row| (row.id, row.row_version)).collect());
+    Ok(PermitBoundJobStepPlan { rows, state_digest })
 }
 
 impl JobStepRow {
@@ -412,4 +515,27 @@ where
     .execute(executor)
     .await?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod permit_binding_tests {
+    use super::*;
+
+    #[test]
+    fn plan_state_digest_is_order_independent_but_version_exact() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let expected = request_plan_state_digest(vec![(first, 17), (second, 23)]);
+
+        assert_eq!(
+            request_plan_state_digest(vec![(second, 23), (first, 17)]),
+            expected
+        );
+        assert_ne!(
+            request_plan_state_digest(vec![(first, 17), (second, 24)]),
+            expected
+        );
+        assert_ne!(request_plan_state_digest(vec![(first, 17)]), expected);
+        assert_ne!(empty_plan_state_digest(), expected);
+    }
 }

@@ -8,7 +8,7 @@
 # `release.image`; a render must never replace these independently. This source
 # template is not executable. The retained final-render shape is diagnostic
 # only: every final render is rejected until an independently anchored
-# in-cluster admission layer fences live object identity and consumes a unique
+# in-cluster admission layer fences live resource identity and consumes a unique
 # attempt, and the runtime revalidates receipt freshness before database access.
 contractVersion: migration-cutover-v1
 productionExecutionEnabled: false

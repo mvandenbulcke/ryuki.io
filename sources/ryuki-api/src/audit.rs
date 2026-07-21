@@ -135,6 +135,7 @@ fn chain_hash(prev_hash: &str, payload: &str) -> String {
 /// is explicitly tagged non-durable when served.
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
+    reservation_id: uuid::Uuid,
     pub occurred_at: String,
     pub request_id: Option<String>,
     pub actor_principal: String,
@@ -250,8 +251,13 @@ pub fn security_audit<'a>(
     }
 }
 
-fn entry_from(session: &AuthSession, record: &AuditRecord<'_>) -> AuditEntry {
+fn entry_from(
+    reservation_id: uuid::Uuid,
+    session: &AuthSession,
+    record: &AuditRecord<'_>,
+) -> AuditEntry {
     AuditEntry {
+        reservation_id,
         occurred_at: chrono::Utc::now().to_rfc3339(),
         request_id: record.request_id.map(str::to_string),
         actor_principal: session.user_id.clone(),
@@ -276,7 +282,7 @@ pub async fn record_audit_tx(
     tx: &mut Transaction<'_, Postgres>,
     session: &AuthSession,
     record: &AuditRecord<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<ryuki_engine::authorization::AuditReservationEvidence, sqlx::Error> {
     let request_uuid = record
         .request_id
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
@@ -284,7 +290,7 @@ pub async fn record_audit_tx(
     // The database writer serializes the chain, allocates the positive id only
     // after acquiring that lock, derives canonical content, and computes both
     // hashes. Runtime code cannot supply ids or chain fields.
-    let _: i64 = sqlx::query_scalar(
+    let audit_log_id: i64 = sqlx::query_scalar(
         "SELECT append_audit_log( \
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12 \
          )",
@@ -303,8 +309,12 @@ pub async fn record_audit_tx(
     .bind(record.outcome)
     .fetch_one(&mut **tx)
     .await?;
-
-    Ok(())
+    let audit_log_id = u64::try_from(audit_log_id)
+        .expect("append_audit_log enforces a positive BIGINT identifier");
+    Ok(
+        ryuki_engine::authorization::AuditReservationEvidence::durable(audit_log_id)
+            .expect("append_audit_log returned a positive identifier"),
+    )
 }
 
 /// Standalone audit insert (its own short transaction) for paths that are not
@@ -316,20 +326,77 @@ pub async fn record_audit(
     record: &AuditRecord<'_>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    record_audit_tx(&mut tx, session, record).await?;
+    let _reservation = record_audit_tx(&mut tx, session, record).await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// Append to the process-local audit store (no-DB / dry-run mode). Tagged
 /// non-durable when served so demo output is never mistaken for a real trail.
-pub async fn record_audit_local(session: &AuthSession, record: &AuditRecord<'_>) {
+pub async fn record_audit_local(
+    session: &AuthSession,
+    record: &AuditRecord<'_>,
+) -> ryuki_engine::authorization::AuditReservationEvidence {
+    let reservation = reserve_audit_local(session, record).await;
+    let evidence = reservation.evidence().clone();
+    reservation.commit();
+    evidence
+}
+
+/// Rollback-capable local audit reservation retained beside an in-memory
+/// request lease. Dropping it before the permit sink succeeds removes the
+/// entry, mirroring a database transaction rollback.
+pub(crate) struct LocalAuditReservation {
+    store: tokio::sync::MutexGuard<'static, Vec<AuditEntry>>,
+    reservation_id: uuid::Uuid,
+    evidence: ryuki_engine::authorization::AuditReservationEvidence,
+    committed: bool,
+}
+
+impl LocalAuditReservation {
+    pub(crate) fn evidence(&self) -> &ryuki_engine::authorization::AuditReservationEvidence {
+        &self.evidence
+    }
+
+    pub(crate) fn commit(mut self) {
+        if self.store.len() > MAX_LOCAL_AUDIT {
+            let excess = self.store.len() - MAX_LOCAL_AUDIT;
+            self.store.drain(0..excess);
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for LocalAuditReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Some(index) = self
+                .store
+                .iter()
+                .position(|entry| entry.reservation_id == self.reservation_id)
+            {
+                self.store.remove(index);
+            }
+        }
+    }
+}
+
+pub(crate) async fn reserve_audit_local(
+    session: &AuthSession,
+    record: &AuditRecord<'_>,
+) -> LocalAuditReservation {
+    let reservation_id = uuid::Uuid::new_v4();
     let mut store = audit_store().lock().await;
-    store.push(entry_from(session, record));
-    // Keep only the most recent MAX_LOCAL_AUDIT entries (bounded ring window).
-    if store.len() > MAX_LOCAL_AUDIT {
-        let excess = store.len() - MAX_LOCAL_AUDIT;
-        store.drain(0..excess);
+    store.push(entry_from(reservation_id, session, record));
+    // Capacity trimming is deferred until commit. If permit issuance or its
+    // currentness check fails, Drop removes only this reservation and cannot
+    // accidentally evict an older committed audit entry.
+    LocalAuditReservation {
+        store,
+        reservation_id,
+        evidence: ryuki_engine::authorization::AuditReservationEvidence::local(reservation_id)
+            .expect("generated local audit reservation id is non-nil"),
+        committed: false,
     }
 }
 
@@ -352,7 +419,9 @@ pub async fn record_denied(pool: Option<&PgPool>, session: &AuthSession, record:
                 );
             }
         }
-        None => record_audit_local(session, record).await,
+        None => {
+            let _reservation = record_audit_local(session, record).await;
+        }
     }
 }
 
@@ -1368,6 +1437,7 @@ mod tests {
     #[test]
     fn audit_entry_to_json_redacts_detail_reason() {
         let entry = AuditEntry {
+            reservation_id: uuid::Uuid::new_v4(),
             occurred_at: "t".into(),
             request_id: Some("r".into()),
             actor_principal: "approver".into(),

@@ -265,6 +265,12 @@ pub fn get_security_contract_context() -> &'static crate::security_contracts::Se
         .security_contract
 }
 
+#[cfg(not(test))]
+pub(crate) fn security_contract_context_if_initialized(
+) -> Option<&'static crate::security_contracts::SecurityContractContext> {
+    startup_config_if_initialized().map(|config| &config.security_contract)
+}
+
 #[cfg(test)]
 pub fn get_security_contract_context() -> &'static crate::security_contracts::SecurityContractContext
 {
@@ -273,6 +279,12 @@ pub fn get_security_contract_context() -> &'static crate::security_contracts::Se
         .security_contract
         .as_ref()
         .expect("security contract context not initialized")
+}
+
+#[cfg(test)]
+pub(crate) fn security_contract_context_if_initialized(
+) -> Option<&'static crate::security_contracts::SecurityContractContext> {
+    startup_config_if_initialized()?.security_contract.as_ref()
 }
 
 /// The configured auth mode, or the default (`MockDryRun`) when the config store

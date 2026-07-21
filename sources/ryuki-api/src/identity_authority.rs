@@ -38,6 +38,8 @@ pub struct CreatedHumanSession {
 pub(crate) struct AdmittedFederatedBearer {
     pub session: ryuki_engine::auth::AuthSession,
     pub authority: crate::human_authority::InteractiveHumanAuthorityContext,
+    pub identity_authority_digest: [u8; 32],
+    pub identity_last_asserted_at: DateTime<Utc>,
 }
 
 pub fn configured_entra_issuer(config: &RyukiConfig) -> String {
@@ -315,7 +317,6 @@ pub async fn create_local_session(
         &crate::human_authority::HumanAuthorityAssertion::role_assertion(&user.roles),
     )
     .await?;
-
     let expires_at = sqlx::query_scalar::<_, DateTime<Utc>>(
         "INSERT INTO sessions \
          (session_record_id, bearer_verifier, user_id, display_name, roles, provider, \
@@ -505,6 +506,26 @@ pub async fn admit_federated_bearer(
         &crate::human_authority::HumanAuthorityAssertion::role_assertion(asserted_roles),
     )
     .await?;
+    let (identity_authority_digest, identity_last_asserted_at) =
+        sqlx::query_as::<_, (Vec<u8>, Option<DateTime<Utc>>)>(
+            "SELECT authority_digest, last_asserted_at \
+             FROM identity_authorities \
+             WHERE provider = $1 AND issuer = $2 AND subject = $3 \
+               AND authority_epoch = $4 AND authority_status = 'active-scoped-v2' \
+             FOR SHARE",
+        )
+        .bind(provider)
+        .bind(issuer)
+        .bind(subject)
+        .bind(authority_epoch)
+        .fetch_one(&mut *tx)
+        .await?;
+    let identity_authority_digest: [u8; 32] = identity_authority_digest
+        .as_slice()
+        .try_into()
+        .map_err(|_| IdentityAuthorityError::AssertionRejected)?;
+    let identity_last_asserted_at =
+        identity_last_asserted_at.ok_or(IdentityAuthorityError::AssertionRejected)?;
     let authority_context =
         crate::human_authority::InteractiveHumanAuthorityContext::from_effective(
             provider,
@@ -526,6 +547,8 @@ pub async fn admit_federated_bearer(
             environment_scope: authority.environment_scope,
         },
         authority: authority_context,
+        identity_authority_digest,
+        identity_last_asserted_at,
     })
 }
 

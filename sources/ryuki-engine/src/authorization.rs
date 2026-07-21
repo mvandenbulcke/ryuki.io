@@ -2,11 +2,11 @@
 //!
 //! This module deliberately does not adapt `AuthSession` into a principal. A
 //! [`VerifiedPrincipal`] and [`ResolvedResource`] have no public constructors;
-//! the future credential-admission and canonical-resource resolvers must own
-//! those construction seams. Likewise, an implementation-only action registry
-//! can evaluate only to denial. This lets repositories adopt the permit types
-//! without turning transitional catalog data or caller-provided strings into
-//! production authority.
+//! the credential-admission and canonical-resource resolvers must own those
+//! construction seams. The request-read integration accepts only exact,
+//! already-admitted credential and registry bindings. This lets repositories
+//! adopt the permit types without turning caller-provided strings, role lists,
+//! or transitional catalog defaults into production authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -92,9 +92,11 @@ impl Action {
 
     const fn actor_is_registered(self, actor: ActorKind) -> bool {
         match self {
-            Self::RequestRead | Self::AuditRead => {
-                matches!(actor, ActorKind::VerifiedHuman | ActorKind::Service)
-            }
+            Self::RequestRead => matches!(
+                actor,
+                ActorKind::VerifiedHuman | ActorKind::Service | ActorKind::DevelopmentFixture
+            ),
+            Self::AuditRead => matches!(actor, ActorKind::VerifiedHuman | ActorKind::Service),
             Self::RequestApprove | Self::PlatformSettingsUpdate => {
                 matches!(actor, ActorKind::VerifiedHuman)
             }
@@ -211,6 +213,31 @@ impl BindingDigest {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value);
         Self(hasher.finalize().into())
+    }
+
+    /// Parse an exact lowercase `sha256:<hex>` content digest retained by a
+    /// validated security contract. Callers cannot silently hash a digest
+    /// label a second time and claim it represents the referenced bytes.
+    pub fn from_sha256(value: &str) -> Result<Self, AuthorizationError> {
+        let Some(hex_value) = value.strip_prefix("sha256:") else {
+            return Err(AuthorizationError::InvalidBinding(
+                "binding digest must use sha256:<hex>",
+            ));
+        };
+        if hex_value.len() != 64
+            || !hex_value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AuthorizationError::InvalidBinding(
+                "binding digest must be canonical lowercase sha256",
+            ));
+        }
+        let mut bytes = [0_u8; 32];
+        hex::decode_to_slice(hex_value, &mut bytes).map_err(|_| {
+            AuthorizationError::InvalidBinding("binding digest must contain 32 bytes")
+        })?;
+        Ok(Self(bytes))
     }
 }
 
@@ -356,6 +383,11 @@ pub struct ResolvedResource {
     environment_id: Option<String>,
     owner_principal_id: Option<String>,
     resource_version: BindingVersion,
+    /// Exact version-set digest for protected child state returned with this
+    /// resource. `resource_version` remains the monotonic parent authority;
+    /// this digest prevents a child-row snapshot from being substituted under
+    /// an otherwise-current parent permit.
+    state_digest: Option<BindingDigest>,
     sensitivity: ResourceSensitivity,
     lifecycle_state: ResourceLifecycle,
 }
@@ -432,6 +464,20 @@ impl AuthorizationDecision {
     pub fn required_obligations(&self) -> impl Iterator<Item = ObligationKind> + '_ {
         self.binding.required_obligations.iter().copied()
     }
+
+    /// Whether a denial must preserve the protected resource's 404 shape.
+    /// Registry, expiry, actor, namespace, assurance, and entitlement failures
+    /// remain distinguishable internally and are never mislabeled as absence.
+    pub const fn conceals_resource_existence(&self) -> bool {
+        matches!(
+            self.denial_reason,
+            Some(
+                DenialReason::ScopeMismatch
+                    | DenialReason::OwnerMismatch
+                    | DenialReason::ResourceUnavailable
+            )
+        )
+    }
 }
 
 impl fmt::Debug for AuthorizationDecision {
@@ -453,6 +499,48 @@ enum ObligationIssuerKind {
     ApprovalRepository,
     QuorumRepository,
     IdempotencyRepository,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+enum AuditReservationBinding {
+    Durable { audit_log_id: NonZeroU64 },
+    Local { reservation_id: Uuid },
+}
+
+/// Opaque identity returned by the audit repository after it has reserved the
+/// exact durable row (or rollback-capable local entry) used by an obligation.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct AuditReservationEvidence(AuditReservationBinding);
+
+impl AuditReservationEvidence {
+    pub fn durable(audit_log_id: u64) -> Result<Self, AuthorizationError> {
+        let audit_log_id = NonZeroU64::new(audit_log_id).ok_or(
+            AuthorizationError::InvalidBinding("audit log id must be positive"),
+        )?;
+        Ok(Self(AuditReservationBinding::Durable { audit_log_id }))
+    }
+
+    pub fn local(reservation_id: Uuid) -> Result<Self, AuthorizationError> {
+        if reservation_id.is_nil() {
+            return Err(AuthorizationError::InvalidBinding(
+                "local audit reservation id must be non-nil",
+            ));
+        }
+        Ok(Self(AuditReservationBinding::Local { reservation_id }))
+    }
+
+    fn is_valid(&self) -> bool {
+        match &self.0 {
+            AuditReservationBinding::Durable { audit_log_id } => audit_log_id.get() > 0,
+            AuditReservationBinding::Local { reservation_id } => !reservation_id.is_nil(),
+        }
+    }
+}
+
+impl fmt::Debug for AuditReservationEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditReservationEvidence(<redacted>)")
+    }
 }
 
 impl ObligationIssuerKind {
@@ -481,7 +569,7 @@ struct ObligationIssuerBinding {
 #[allow(dead_code)] // Variants remain sealed until their owning evidence services are wired.
 enum ObligationEvidence {
     AuditReservation {
-        audit_event_id: Uuid,
+        reservation: AuditReservationEvidence,
         reservation_version: BindingVersion,
     },
     StepUp {
@@ -633,6 +721,81 @@ impl fmt::Debug for SnapshotContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SnapshotContext(<redacted>)")
     }
+}
+
+/// Exact retained authority roots for the registered request-read slice.
+///
+/// The API constructs this only from the validated deployment profile and its
+/// content-addressed action/provider lifecycle references. It is evidence, not
+/// a capability: the process-local kernel remains the only permit issuer.
+pub struct RequestReadKernelEvidence {
+    pub profile: DeploymentProfile,
+    pub expected_authority: RequestReadExpectedAuthority,
+    pub policy_version: BindingVersion,
+    pub policy_digest: BindingDigest,
+    pub action_registry_version: BindingVersion,
+    pub action_registry_digest: BindingDigest,
+    pub maximum_authority_version: BindingVersion,
+    pub maximum_authority_digest: BindingDigest,
+}
+
+/// Namespace and provider ceiling admitted by the retained deployment and
+/// provider registries. Matching principal/resource values are insufficient:
+/// both binders must match this independently admitted ceiling exactly.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RequestReadExpectedAuthority {
+    pub deployment_id: String,
+    pub trust_domain_id: String,
+    pub tenant_id: Option<String>,
+    pub provider_id: String,
+    pub provider_configuration_version: BindingVersion,
+    pub provider_lifecycle_version: BindingVersion,
+}
+
+/// Credential-admission inputs accepted by the request-read adapter. This is
+/// evidence, not an authorization capability: only the corresponding
+/// [`AuthorizationKernel`] can turn it into the opaque [`VerifiedPrincipal`]
+/// that participates in a decision and permit seal.
+pub struct RequestReadPrincipalEvidence {
+    pub actor_kind: ActorKind,
+    pub principal_id: String,
+    pub deployment_id: String,
+    pub trust_domain_id: String,
+    pub tenant_id: Option<String>,
+    pub credential_id: String,
+    pub credential_version: BindingVersion,
+    pub provider_id: String,
+    pub provider_configuration_version: BindingVersion,
+    pub provider_lifecycle_version: BindingVersion,
+    pub credential_expires_at: DateTime<Utc>,
+    pub assurance: AssuranceLevel,
+    pub audience_digest: BindingDigest,
+    pub key_id_digest: BindingDigest,
+    pub authenticated_at: DateTime<Utc>,
+    pub assurance_expires_at: DateTime<Utc>,
+    pub lifecycle_version: BindingVersion,
+    pub authority_version: BindingVersion,
+    pub site_scope: ExplicitScope,
+    pub environment_scope: ExplicitScope,
+    pub policy_roles: BTreeSet<PolicyRole>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Canonical request row inputs for the request-read resolver. The API
+/// repository creates this only from a row resolved under its transaction (or
+/// the corresponding locked local store), never from a path/body projection.
+pub struct RequestReadResourceEvidence {
+    pub canonical_id: String,
+    pub deployment_id: String,
+    pub trust_domain_id: String,
+    pub tenant_id: Option<String>,
+    pub site_id: String,
+    pub environment_id: String,
+    pub owner_principal_id: String,
+    pub resource_version: BindingVersion,
+    pub state_digest: BindingDigest,
+    pub sensitivity: ResourceSensitivity,
+    pub lifecycle_state: ResourceLifecycle,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -811,6 +974,7 @@ pub struct AuthorizationKernel {
     /// Populated only by a validated route+resolver+repository registry loader.
     /// The public implementation-only constructor always leaves this empty.
     active_actions: BTreeSet<Action>,
+    request_read_authority: Option<RequestReadExpectedAuthority>,
     authority: KernelAuthorityBinding,
     permit_key: [u8; 32],
     query_maximum_limit: u32,
@@ -846,6 +1010,7 @@ impl AuthorizationKernel {
         Self::new(
             profile,
             BTreeSet::new(),
+            None,
             policy_version,
             policy_digest,
             action_registry_version,
@@ -855,10 +1020,287 @@ impl AuthorizationKernel {
         )
     }
 
+    /// Activate only the repository-integrated `request.read` action under the
+    /// exact retained policy, action-registry, and maximum-authority roots.
+    pub fn request_read_slice(
+        evidence: RequestReadKernelEvidence,
+    ) -> Result<Self, AuthorizationError> {
+        for value in [
+            evidence.expected_authority.deployment_id.as_str(),
+            evidence.expected_authority.trust_domain_id.as_str(),
+            evidence.expected_authority.provider_id.as_str(),
+        ] {
+            if !valid_identifier(value) {
+                return Err(AuthorizationError::InvalidBinding(
+                    "request-read expected authority identifier",
+                ));
+            }
+        }
+        if evidence
+            .expected_authority
+            .tenant_id
+            .as_deref()
+            .is_some_and(|value| !valid_identifier(value))
+        {
+            return Err(AuthorizationError::InvalidBinding(
+                "request-read expected tenant identifier",
+            ));
+        }
+        Ok(Self::new(
+            evidence.profile,
+            BTreeSet::from([Action::RequestRead]),
+            Some(evidence.expected_authority),
+            evidence.policy_version,
+            evidence.policy_digest,
+            evidence.action_registry_version,
+            evidence.action_registry_digest,
+            evidence.maximum_authority_version,
+            evidence.maximum_authority_digest,
+        ))
+    }
+
+    /// Bind credential-admission evidence to an opaque principal. The caller
+    /// must be the repository authorization adapter that received the evidence
+    /// from the authentication boundary; handlers never receive this output.
+    pub fn bind_request_read_principal(
+        &self,
+        evidence: RequestReadPrincipalEvidence,
+    ) -> Result<VerifiedPrincipal, AuthorizationError> {
+        let expected =
+            self.request_read_authority
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidBinding(
+                    "request-read authority is not registered",
+                ))?;
+        let now = self.now();
+        for value in [
+            evidence.principal_id.as_str(),
+            evidence.deployment_id.as_str(),
+            evidence.trust_domain_id.as_str(),
+            evidence.credential_id.as_str(),
+            evidence.provider_id.as_str(),
+        ] {
+            if !valid_identifier(value) {
+                return Err(AuthorizationError::InvalidBinding(
+                    "request-read principal identifier",
+                ));
+            }
+        }
+        if evidence
+            .tenant_id
+            .as_deref()
+            .is_some_and(|value| !valid_identifier(value))
+            || evidence.policy_roles.is_empty()
+            || evidence.deployment_id != expected.deployment_id
+            || evidence.trust_domain_id != expected.trust_domain_id
+            || evidence.tenant_id != expected.tenant_id
+            || evidence.provider_id != expected.provider_id
+            || evidence.provider_configuration_version != expected.provider_configuration_version
+            || evidence.provider_lifecycle_version != expected.provider_lifecycle_version
+            || evidence.authenticated_at > now
+            || evidence.credential_expires_at <= now
+            || evidence.assurance_expires_at <= now
+            || evidence.expires_at <= now
+        {
+            return Err(AuthorizationError::InvalidBinding(
+                "request-read principal evidence",
+            ));
+        }
+        let principal = PrincipalVersionBinding {
+            principal_id: evidence.principal_id,
+            lifecycle_version: evidence.lifecycle_version,
+            authority_version: evidence.authority_version,
+        };
+        Ok(VerifiedPrincipal {
+            actor_kind: evidence.actor_kind,
+            actor: principal.clone(),
+            effective_subject: principal,
+            deployment_id: evidence.deployment_id,
+            trust_domain_id: evidence.trust_domain_id,
+            tenant_id: evidence.tenant_id,
+            credential: CredentialBinding {
+                credential_id: evidence.credential_id,
+                credential_version: evidence.credential_version,
+                provider_id: evidence.provider_id,
+                provider_configuration_version: evidence.provider_configuration_version,
+                provider_lifecycle_version: evidence.provider_lifecycle_version,
+                expires_at: evidence.credential_expires_at,
+            },
+            assurance: AssuranceBinding {
+                level: evidence.assurance,
+                audience_digest: evidence.audience_digest,
+                key_id_digest: evidence.key_id_digest,
+                authenticated_at: evidence.authenticated_at,
+                expires_at: evidence.assurance_expires_at,
+            },
+            delegation: DelegationBinding::Disabled,
+            site_scope: evidence.site_scope,
+            environment_scope: evidence.environment_scope,
+            policy_roles: evidence.policy_roles,
+            expires_at: evidence.expires_at,
+        })
+    }
+
+    /// Convert one canonical request row into the resource used by policy and
+    /// by the repository's same-unit-of-work currentness check.
+    pub fn bind_request_read_resource(
+        &self,
+        evidence: RequestReadResourceEvidence,
+    ) -> Result<ResolvedResource, AuthorizationError> {
+        let expected =
+            self.request_read_authority
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidBinding(
+                    "request-read authority is not registered",
+                ))?;
+        let canonical_suffix = evidence
+            .canonical_id
+            .strip_prefix("request:")
+            .filter(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            });
+        if canonical_suffix.is_none()
+            || !valid_identifier(&evidence.deployment_id)
+            || !valid_identifier(&evidence.trust_domain_id)
+            || !valid_identifier(&evidence.site_id)
+            || !valid_identifier(&evidence.environment_id)
+            || !valid_identifier(&evidence.owner_principal_id)
+            || evidence.deployment_id != expected.deployment_id
+            || evidence.trust_domain_id != expected.trust_domain_id
+            || evidence.tenant_id != expected.tenant_id
+            || evidence
+                .tenant_id
+                .as_deref()
+                .is_some_and(|value| !valid_identifier(value))
+        {
+            return Err(AuthorizationError::InvalidBinding(
+                "canonical request-read resource",
+            ));
+        }
+        Ok(ResolvedResource {
+            kind: ResourceKind::Request,
+            canonical_id: evidence.canonical_id,
+            deployment_id: evidence.deployment_id,
+            trust_domain_id: evidence.trust_domain_id,
+            tenant_id: evidence.tenant_id,
+            site_id: Some(evidence.site_id),
+            environment_id: Some(evidence.environment_id),
+            owner_principal_id: Some(evidence.owner_principal_id),
+            resource_version: evidence.resource_version,
+            state_digest: Some(evidence.state_digest),
+            sensitivity: evidence.sensitivity,
+            lifecycle_state: evidence.lifecycle_state,
+        })
+    }
+
+    /// Mint the transaction nonce owned by the repository unit of work. The
+    /// context is non-cloneable and the repository retains it beside the live
+    /// SQL transaction or local-store lock until the permit is consumed.
+    pub fn begin_transaction_context(
+        &self,
+        expires_at: DateTime<Utc>,
+    ) -> Result<TransactionContext, AuthorizationError> {
+        if expires_at <= self.now() {
+            return Err(AuthorizationError::Expired);
+        }
+        Ok(TransactionContext(TransactionBinding {
+            nonce: Uuid::new_v4(),
+            expires_at,
+        }))
+    }
+
+    /// Seal proof that the audit repository reserved a durable/local read
+    /// event inside the same authorization unit of work.
+    pub fn issue_audit_obligation_receipt(
+        &self,
+        decision: &AuthorizationDecision,
+        reservation: AuditReservationEvidence,
+        reservation_version: BindingVersion,
+        expires_at: DateTime<Utc>,
+    ) -> Result<ObligationReceipt, AuthorizationError> {
+        let now = self.now();
+        if decision.binding.kernel.kernel_instance_id != self.authority.kernel_instance_id {
+            return Err(AuthorizationError::ForeignKernel);
+        }
+        if authorization_decision_digest(decision.status, decision.denial_reason, &decision.binding)
+            != decision.decision_digest
+        {
+            return Err(AuthorizationError::InvalidDecision);
+        }
+        if decision.status != DecisionStatus::AllowPending
+            || decision.binding.action != Action::RequestRead
+            || !decision
+                .binding
+                .required_obligations
+                .contains(&ObligationKind::Audit)
+            || !reservation.is_valid()
+            || expires_at <= now
+            || expires_at > decision.binding.expires_at
+        {
+            return Err(AuthorizationError::InvalidObligationReceipt);
+        }
+        let binding = ObligationReceiptBinding {
+            receipt_id: Uuid::new_v4(),
+            kind: ObligationKind::Audit,
+            issuer: ObligationIssuerBinding {
+                kind: ObligationIssuerKind::AuditRepository,
+                issuer_id: "issuer:audit:request-read-repository".into(),
+                configuration_version: reservation_version,
+            },
+            evidence: ObligationEvidence::AuditReservation {
+                reservation,
+                reservation_version,
+            },
+            decision_digest: decision.decision_digest,
+            actor_lifecycle_version: decision.binding.principal.actor.lifecycle_version,
+            actor_authority_version: decision.binding.principal.actor.authority_version,
+            effective_subject_lifecycle_version: decision
+                .binding
+                .principal
+                .effective_subject
+                .lifecycle_version,
+            effective_subject_authority_version: decision
+                .binding
+                .principal
+                .effective_subject
+                .authority_version,
+            credential_version: decision.binding.principal.credential.credential_version,
+            provider_configuration_version: decision
+                .binding
+                .principal
+                .credential
+                .provider_configuration_version,
+            provider_lifecycle_version: decision
+                .binding
+                .principal
+                .credential
+                .provider_lifecycle_version,
+            issued_at: now,
+            expires_at,
+        };
+        let receipt_digest = digest_serializable(OBLIGATION_RECEIPT_DIGEST_DOMAIN, &binding);
+        let seal = self.seal(
+            OBLIGATION_RECEIPT_DOMAIN,
+            &ObligationReceiptPayload {
+                binding: &binding,
+                receipt_digest,
+            },
+        );
+        Ok(ObligationReceipt {
+            binding,
+            receipt_digest,
+            seal,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         profile: DeploymentProfile,
         active_actions: BTreeSet<Action>,
+        request_read_authority: Option<RequestReadExpectedAuthority>,
         policy_version: BindingVersion,
         policy_digest: BindingDigest,
         action_registry_version: BindingVersion,
@@ -877,6 +1319,7 @@ impl AuthorizationKernel {
         Self {
             profile,
             active_actions,
+            request_read_authority,
             authority: KernelAuthorityBinding {
                 kernel_instance_id,
                 policy_version,
@@ -1246,6 +1689,26 @@ impl AuthorizationKernel {
         Ok(())
     }
 
+    /// Verify currentness and the sink's exact registered action. A valid
+    /// permit for a sibling instance/global action is not interchangeable with
+    /// the capability required by a protected repository method.
+    pub fn ensure_instance_current_for(
+        &self,
+        permit: &AuthorizationPermit,
+        expected_action: Action,
+        current_principal: &VerifiedPrincipal,
+        current_resource: &ResolvedResource,
+        transaction: &TransactionContext,
+    ) -> Result<(), AuthorizationError> {
+        self.ensure_instance_current(permit, current_principal, current_resource, transaction)?;
+        if permit.binding.decision.action != expected_action
+            || permit.binding.decision.resource.kind != expected_action.resource_kind()
+        {
+            return Err(AuthorizationError::UnexpectedAction);
+        }
+        Ok(())
+    }
+
     pub fn ensure_query_current(
         &self,
         permit: &QueryPermit,
@@ -1305,7 +1768,8 @@ impl AuthorizationKernel {
                 ObligationIssuerKind::AuditRepository,
                 "issuer:audit:test",
                 ObligationEvidence::AuditReservation {
-                    audit_event_id: Uuid::new_v4(),
+                    reservation: AuditReservationEvidence::local(Uuid::new_v4())
+                        .expect("non-nil test audit reservation"),
                     reservation_version: BindingVersion::new(1).expect("positive test version"),
                 },
             ),
@@ -1450,6 +1914,8 @@ pub enum AuthorizationError {
     InvalidPermit,
     #[error("authorization permit kind does not match the operation")]
     WrongPermitKind,
+    #[error("authorization permit action does not match the protected sink")]
+    UnexpectedAction,
     #[error("authorization transaction does not match")]
     TransactionMismatch,
     #[error("authorization snapshot does not match")]
@@ -1487,7 +1953,7 @@ fn obligation_evidence_is_valid(
     principal: &VerifiedPrincipal,
 ) -> bool {
     match evidence {
-        ObligationEvidence::AuditReservation { audit_event_id, .. } => !audit_event_id.is_nil(),
+        ObligationEvidence::AuditReservation { reservation, .. } => reservation.is_valid(),
         ObligationEvidence::StepUp {
             ceremony_id,
             assurance,
@@ -1537,9 +2003,16 @@ fn policy_entitles(principal: &VerifiedPrincipal, action: Action) -> bool {
                 )
             })
         }
-        (ActorKind::Service, Action::RequestRead | Action::AuditRead) => {
+        (ActorKind::Service, Action::RequestRead) => principal
+            .policy_roles
+            .iter()
+            .any(|role| matches!(role, PolicyRole::Requester | PolicyRole::ServiceReader)),
+        (ActorKind::Service, Action::AuditRead) => {
             principal.policy_roles.contains(&PolicyRole::ServiceReader)
         }
+        (ActorKind::DevelopmentFixture, Action::RequestRead) => principal
+            .policy_roles
+            .contains(&PolicyRole::PlatformAdministrator),
         // These actions stay inactive until their complete policy and receipt
         // producers are registry-verified. Encoding the intended role floor
         // here prevents a later activation from inheriting read-tier policy.
@@ -1555,13 +2028,12 @@ fn policy_entitles(principal: &VerifiedPrincipal, action: Action) -> bool {
 }
 
 fn policy_can_read_any(principal: &VerifiedPrincipal) -> bool {
-    principal.actor_kind == ActorKind::Service
-        || principal.policy_roles.iter().any(|role| {
-            matches!(
-                role,
-                PolicyRole::Auditor | PolicyRole::PlatformAdministrator
-            )
-        })
+    principal.policy_roles.iter().any(|role| {
+        matches!(
+            role,
+            PolicyRole::Auditor | PolicyRole::PlatformAdministrator | PolicyRole::ServiceReader
+        )
+    })
 }
 
 fn assurance_permits(
@@ -1611,6 +2083,7 @@ mod tests {
         let mut kernel = AuthorizationKernel::new(
             profile,
             BTreeSet::from([Action::RequestRead, Action::AuditRead]),
+            None,
             version(11),
             digest("policy"),
             version(7),
@@ -1629,6 +2102,7 @@ mod tests {
         let mut kernel = AuthorizationKernel::new(
             profile,
             actions,
+            None,
             version(11),
             digest("policy"),
             version(7),
@@ -1709,6 +2183,7 @@ mod tests {
             environment_id: Some("env:prod".into()),
             owner_principal_id: Some("principal:actor".into()),
             resource_version: version(22),
+            state_digest: None,
             sensitivity: ResourceSensitivity::Confidential,
             lifecycle_state: ResourceLifecycle::Active,
         }
@@ -2107,10 +2582,66 @@ mod tests {
             Err(AuthorizationError::StaleBinding)
         );
 
+        let mut changed_child_snapshot = resource.clone();
+        changed_child_snapshot.state_digest = Some(digest("changed-child-version-set"));
+        assert_eq!(
+            kernel.ensure_instance_current(
+                &permit,
+                &principal,
+                &changed_child_snapshot,
+                &transaction,
+            ),
+            Err(AuthorizationError::StaleBinding)
+        );
+
         let foreign_transaction = TransactionContext::for_test(now + Duration::minutes(5));
         assert_eq!(
             kernel.ensure_instance_current(&permit, &principal, &resource, &foreign_transaction,),
             Err(AuthorizationError::TransactionMismatch)
+        );
+    }
+
+    #[test]
+    fn instance_sink_rejects_wrong_action_stale_version_and_foreign_resource() {
+        let now = test_now();
+        let kernel = kernel(DeploymentProfile::Test);
+        let (principal, resource, transaction, permit) = instance_permit(&kernel, now);
+
+        assert_eq!(
+            kernel.ensure_instance_current_for(
+                &permit,
+                Action::RequestApprove,
+                &principal,
+                &resource,
+                &transaction,
+            ),
+            Err(AuthorizationError::UnexpectedAction)
+        );
+
+        let mut stale = resource.clone();
+        stale.resource_version = version(resource.resource_version.get() + 1);
+        assert_eq!(
+            kernel.ensure_instance_current_for(
+                &permit,
+                Action::RequestRead,
+                &principal,
+                &stale,
+                &transaction,
+            ),
+            Err(AuthorizationError::StaleBinding)
+        );
+
+        let mut foreign = resource;
+        foreign.canonical_id = "request:foreign".into();
+        assert_eq!(
+            kernel.ensure_instance_current_for(
+                &permit,
+                Action::RequestRead,
+                &principal,
+                &foreign,
+                &transaction,
+            ),
+            Err(AuthorizationError::StaleBinding)
         );
     }
 

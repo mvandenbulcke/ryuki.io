@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use ryuki_engine::auth::{get_entra_config_from_env, ActorClass, AuthSession, EntraConfig};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 /// Cooldown between JWKS refresh attempts. Prevents a stream of bad-`kid`
@@ -46,6 +47,11 @@ const MAX_JWKS_BYTES: usize = 1 << 20;
 /// `Validation`, so they are not modeled here.
 #[derive(Debug, Deserialize)]
 struct EntraClaims {
+    iss: String,
+    aud: EntraAudience,
+    exp: i64,
+    nbf: i64,
+    iat: i64,
     sub: String,
     #[serde(default)]
     oid: Option<String>,
@@ -71,6 +77,32 @@ struct EntraClaims {
     azp: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EntraAudience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl EntraAudience {
+    fn canonical_values(&self) -> Option<Vec<&str>> {
+        let mut values = match self {
+            Self::One(value) => vec![value.as_str()],
+            Self::Many(values) => values.iter().map(String::as_str).collect(),
+        };
+        if values.is_empty()
+            || values
+                .iter()
+                .any(|value| value.is_empty() || value.trim() != *value)
+        {
+            return None;
+        }
+        values.sort_unstable();
+        values.dedup();
+        Some(values)
+    }
+}
+
 fn classify_entra_actor(claims: &EntraClaims) -> ActorClass {
     let has_delegated_scope = claims
         .scp
@@ -94,12 +126,21 @@ fn classify_entra_actor(claims: &EntraClaims) -> ActorClass {
 /// the validator `Send + Sync` with no trait objects.
 enum KeySource {
     Network(JwksCache),
+    #[cfg(test)]
     Static(HashMap<String, DecodingKey>),
+}
+
+#[derive(Clone)]
+struct ResolvedDecodingKey {
+    key: DecodingKey,
+    /// Digest of the exact RSA public-key material accepted from the resolved
+    /// JWKS generation. A reused `kid` cannot alias a rotated key.
+    material_digest: [u8; 32],
 }
 
 /// Mutable JWKS state guarded by the cache's `RwLock`.
 struct JwksState {
-    keys: HashMap<String, DecodingKey>,
+    keys: HashMap<String, ResolvedDecodingKey>,
     /// Absolute monotonic deadline for this complete cache generation. A
     /// generation is cleared, not merely hidden, after this deadline whenever
     /// a lookup observes expiry.
@@ -159,7 +200,7 @@ impl JwksCache {
     /// cooldown. Once the absolute deadline passes, a failed refresh or active
     /// retry cooldown clears the retired generation. Unknown-kid refresh
     /// failures preserve only a still-fresh generation for legitimate callers.
-    async fn decoding_key_for_kid(&self, kid: &str) -> Option<DecodingKey> {
+    async fn decoding_key_for_kid(&self, kid: &str) -> Option<ResolvedDecodingKey> {
         // Fast path: shared read lock. Hit only when the kid is present AND the
         // keyset is still within its TTL.
         {
@@ -221,7 +262,7 @@ impl JwksCache {
             .is_some_and(|deadline| Instant::now() < deadline)
     }
 
-    fn resolved_key_or_expire(state: &mut JwksState, kid: &str) -> Option<DecodingKey> {
+    fn resolved_key_or_expire(state: &mut JwksState, kid: &str) -> Option<ResolvedDecodingKey> {
         if Self::fresh(state) {
             state.keys.get(kid).cloned()
         } else {
@@ -231,7 +272,7 @@ impl JwksCache {
         }
     }
 
-    async fn fetch_keys(&self) -> Result<HashMap<String, DecodingKey>, ()> {
+    async fn fetch_keys(&self) -> Result<HashMap<String, ResolvedDecodingKey>, ()> {
         let resp = self
             .http
             .get(self.jwks_uri.clone())
@@ -263,7 +304,17 @@ impl JwksCache {
                 }
             }
             if let Ok(key) = DecodingKey::from_rsa_components(&jwk.n, &jwk.e) {
-                keys.insert(jwk.kid, key);
+                let material_digest = request_read_digest(
+                    b"ryuki-request-read-entra-rsa-jwk-v1",
+                    &[b"RS256", jwk.n.as_bytes(), jwk.e.as_bytes()],
+                );
+                keys.insert(
+                    jwk.kid,
+                    ResolvedDecodingKey {
+                        key,
+                        material_digest,
+                    },
+                );
             }
         }
         if keys.is_empty() {
@@ -291,11 +342,23 @@ fn failure_reason(err: &jsonwebtoken::errors::Error) -> &'static str {
     }
 }
 
+fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    for value in values {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.finalize().into()
+}
+
 /// Outcome of a validation attempt. The session is what callers consume; the
 /// reason is for safe logging only and is `None` on success.
 pub struct ValidationOutcome {
     pub session: AuthSession,
     pub failure_reason: Option<&'static str>,
+    pub(crate) request_read_credential: Option<crate::request_authority::DirectFederatedCredential>,
 }
 
 impl ValidationOutcome {
@@ -303,6 +366,7 @@ impl ValidationOutcome {
         Self {
             session: AuthSession::unverified_entra(),
             failure_reason: Some(reason),
+            request_read_credential: None,
         }
     }
 }
@@ -352,7 +416,7 @@ impl EntraTokenValidator {
     /// Test/injection constructor: a pre-built `kid -> DecodingKey` keyset with
     /// no network. `config` is supplied directly so tests can pin a known
     /// tenant/client/authority.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_static_keys(config: EntraConfig, keys: HashMap<String, DecodingKey>) -> Self {
         let (issuer, audiences, _) = Self::derive_identity_endpoints(&config)
             .expect("Entra authority must be a parsed HTTPS URL (loopback HTTP is unit-test only)");
@@ -405,10 +469,19 @@ impl EntraTokenValidator {
         Ok(authority)
     }
 
-    async fn resolve_key(&self, kid: &str) -> Option<DecodingKey> {
+    async fn resolve_key(&self, kid: &str) -> Option<ResolvedDecodingKey> {
         match &self.keys {
-            KeySource::Static(map) => map.get(kid).cloned(),
             KeySource::Network(cache) => cache.decoding_key_for_kid(kid).await,
+            #[cfg(test)]
+            KeySource::Static(map) => map.get(kid).cloned().map(|key| ResolvedDecodingKey {
+                key,
+                // Static keys are a unit-test-only injection seam and cannot
+                // produce production request authority.
+                material_digest: request_read_digest(
+                    b"ryuki-request-read-entra-static-test-key-v1",
+                    &[kid.as_bytes()],
+                ),
+            }),
         }
     }
 
@@ -459,7 +532,7 @@ impl EntraTokenValidator {
 
         // Step 3: resolve the decoding key for this kid (refresh-on-unknown-kid
         // in the network path). Missing after refresh -> fail closed.
-        let decoding_key = match self.resolve_key(&kid).await {
+        let resolved_key = match self.resolve_key(&kid).await {
             Some(k) => k,
             None => return ValidationOutcome::unverified("unknown-kid"),
         };
@@ -477,16 +550,65 @@ impl EntraTokenValidator {
         // token that simply OMITS iss/aud/nbf would otherwise slip past the
         // issuer/audience pins. Entra ID always issues all four. This call
         // REPLACES the default set, so "exp" must be listed too.
-        validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud"]);
+        validation.set_required_spec_claims(&["exp", "nbf", "iat", "iss", "aud"]);
 
         // Step 5: verify signature + iss/aud/exp/nbf atomically.
-        let data = match decode::<EntraClaims>(token, &decoding_key, &validation) {
+        let data = match decode::<EntraClaims>(token, &resolved_key.key, &validation) {
             Ok(d) => d,
             Err(e) => return ValidationOutcome::unverified(failure_reason(&e)),
         };
 
         // Step 6: map claims into a verified session.
         let claims = data.claims;
+        if claims.iss != self.issuer {
+            return ValidationOutcome::unverified("wrong-issuer");
+        }
+        let Some(audiences) = claims.aud.canonical_values() else {
+            return ValidationOutcome::unverified("wrong-audience");
+        };
+        let Some(authenticated_at) = chrono::DateTime::from_timestamp(claims.iat, 0) else {
+            return ValidationOutcome::unverified("invalid-token");
+        };
+        let Some(not_before) = chrono::DateTime::from_timestamp(claims.nbf, 0) else {
+            return ValidationOutcome::unverified("invalid-token");
+        };
+        let Some(expires_at) = chrono::DateTime::from_timestamp(claims.exp, 0) else {
+            return ValidationOutcome::unverified("invalid-token");
+        };
+        let credential_subject = claims.oid.as_deref().unwrap_or(&claims.sub);
+        let request_read_credential = (|| {
+            let window = crate::request_authority::RequestReadCredentialWindow::new(
+                1,
+                authenticated_at,
+                not_before,
+                expires_at,
+                ryuki_engine::authorization::AssuranceLevel::SingleFactor,
+                expires_at,
+            )?;
+            let credential_id =
+                request_read_digest(b"ryuki-request-read-entra-token-v1", &[token.as_bytes()]);
+            let audience_parts = audiences
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>();
+            let digests = crate::request_authority::RequestReadCredentialDigests::new(
+                credential_id,
+                request_read_digest(b"ryuki-request-read-entra-audience-v1", &audience_parts),
+                resolved_key.material_digest,
+            )?;
+            crate::request_authority::DirectFederatedCredential::new(
+                window,
+                digests,
+                "entra-id".to_string(),
+                claims.iss.clone(),
+                credential_subject.to_string(),
+            )
+        })();
+        // The normal authentication semantics keep jsonwebtoken's bounded
+        // leeway. A token accepted only because of that leeway may authenticate
+        // existing routes but receives no fresh request-read authority: permit
+        // issuance requires a currently valid, internally ordered interval.
+        let request_read_credential = request_read_credential.ok();
         let actor_class = classify_entra_actor(&claims);
         let user_id = claims.oid.clone().unwrap_or_else(|| claims.sub.clone());
         let display_name = claims
@@ -507,6 +629,7 @@ impl EntraTokenValidator {
                 ..Default::default()
             },
             failure_reason: None,
+            request_read_credential,
         }
     }
 }
@@ -754,7 +877,16 @@ mod tests {
         last_refresh_attempt: Option<Instant>,
     ) {
         let mut state = cache.inner.write().await;
-        state.keys.insert(TEST_KID.to_string(), key);
+        state.keys.insert(
+            TEST_KID.to_string(),
+            ResolvedDecodingKey {
+                key,
+                material_digest: request_read_digest(
+                    b"ryuki-request-read-entra-seeded-test-key-v1",
+                    &[TEST_KID.as_bytes()],
+                ),
+            },
+        );
         state.valid_until = Some(valid_until);
         state.last_refresh_attempt = last_refresh_attempt;
     }
@@ -1039,6 +1171,7 @@ mod tests {
             "preferred_username": "ada@contoso.example",
             "exp": now() + 3600,
             "nbf": now() - 60,
+            "iat": now() - 60,
             "roles": ["PlatformAdmin"],
             "idtyp": "user",
             "scp": "user_impersonation",

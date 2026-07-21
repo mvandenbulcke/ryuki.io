@@ -3317,6 +3317,61 @@ fn request_store() -> &'static Mutex<Vec<ryuki_engine::models::Request>> {
     REQUEST_STORE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Opaque local-store lease used only by the typed request-read adapter. The
+/// store and index stay private to this module, and row access requires the
+/// unconstructable token owned by `repos::requests`; publishing this lease does
+/// not publish a crate-wide raw request-store seam.
+pub(crate) struct LocalRequestReadLease {
+    store: tokio::sync::MutexGuard<'static, Vec<ryuki_engine::models::Request>>,
+    index: usize,
+}
+
+/// Minimal authorization projection exposed before a request-read permit has
+/// passed its same-unit-of-work currentness check. Sensitive request payload,
+/// lifecycle evidence, and presentation fields are deliberately absent.
+pub(crate) struct LocalRequestReadBinding {
+    pub(crate) id: String,
+    pub(crate) resource_version: i64,
+    pub(crate) status: ryuki_engine::models::RequestStatus,
+    pub(crate) site: String,
+    pub(crate) environment: String,
+    pub(crate) requester: String,
+    pub(crate) owner: String,
+}
+
+pub(crate) async fn lock_local_request_for_typed_read(
+    request_id: &str,
+) -> Option<LocalRequestReadLease> {
+    let store = request_store().lock().await;
+    let index = store.iter().position(|request| request.id == request_id)?;
+    Some(LocalRequestReadLease { store, index })
+}
+
+impl LocalRequestReadLease {
+    pub(crate) fn binding(&self) -> Option<LocalRequestReadBinding> {
+        let request = self.store.get(self.index)?;
+        Some(LocalRequestReadBinding {
+            id: request.id.clone(),
+            resource_version: request.resource_version,
+            status: request.status.clone(),
+            site: request.site.clone(),
+            environment: request.environment.clone(),
+            requester: request.requester.clone(),
+            owner: request.owner.clone(),
+        })
+    }
+
+    /// The full local record is a protected sink. The capability accepted here
+    /// can only be returned by the request repository's successful currentness
+    /// verifier; pre-policy code can obtain only [`Self::binding`].
+    pub(crate) fn authorized_request(
+        &self,
+        _permit: &crate::repos::requests::CurrentRequestReadPermit,
+    ) -> Option<&ryuki_engine::models::Request> {
+        self.store.get(self.index)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InMemoryRequestStoreError {
     RecordLimit,
@@ -18874,6 +18929,11 @@ async fn admin_sessions_revoke(
 /// Custom extractor: pulls AuthSession from request extensions injected by auth middleware.
 struct AuthExtractor(AuthSession);
 
+/// Exact credential/provider authority injected only by authentication
+/// middleware. A valid RBAC session without this extension cannot reach the
+/// permit-bearing request repository.
+struct RequestReadAuthorityExtractor(crate::request_authority::RequestReadAuthority);
+
 /// Exact interactive authority injected only after the identity epoch and
 /// human assignment have both been admitted. Absence is preserved for
 /// simulated and machine callers so derived credentials cannot invent human
@@ -18912,6 +18972,27 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AuthExtractor {
         }
 
         Ok(AuthExtractor(session))
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestReadAuthorityExtractor {
+    type Rejection = (StatusCode, Json<serde_json::Value>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<crate::request_authority::RequestReadAuthority>()
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "request-read authority is unavailable"})),
+                )
+            })
     }
 }
 
@@ -21648,98 +21729,75 @@ async fn requests_execution_job(
 
 async fn requests_get(
     AuthExtractor(session): AuthExtractor,
+    RequestReadAuthorityExtractor(authority): RequestReadAuthorityExtractor,
     Path(request_id): Path<String>,
 ) -> ApiResult {
-    if let Some(pool) = get_db() {
-        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(&format!(
-            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
-        ))
-        .bind(uid)
-        .fetch_optional(pool)
+    let grant = crate::repos::requests::authorize_read(&session, &authority, &request_id)
         .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&request_id))?;
-        // #2: a scoped principal may only read a request within its scope — an
-        // out-of-scope request is a 404 (indistinguishable from a missing one).
-        scope_guard_or_404(&session, &row.site, &row.environment, &request_id)?;
-        // C015: a request-only principal may read only its own request. The
-        // current requester column is authoritative; created_by is consulted
-        // solely for legacy rows where requester is absent/blank. Keep this
-        // after the scope guard so both denial dimensions retain 404 semantics.
-        request_owner_guard_or_404(
-            &session,
-            row.requester.as_deref(),
-            row.created_by.as_deref(),
-            &request_id,
-        )?;
-        // The durable lifecycle state (047): payload is authoritative for all
-        // 14 types; stages/approval_route/plan/validation_results are the REAL
-        // persisted history that survives a restart (no fabrication).
-        //
-        // Sanitize stages before sending to the portal: for any evidence item
-        // with redacted:true the raw `value` is replaced by the safe
-        // `redacted_value` (or "***REDACTED***"). The plan JSONB is also a
-        // Vec<Stage> and receives the same treatment.
-        let sanitized_stages = sanitize_stages_for_portal(&row.stages);
-        let sanitized_plan = sanitize_stages_for_portal(&row.plan);
-        // #42 slice 3: surface the request's multi-step orchestration plan (if
-        // any) so an approver can see it BEFORE approving — an empty plan (every
-        // offering except the composite "managed-server-onboarding") returns
-        // `[]`, purely additive over every existing response key. Only the
-        // fields an approver needs (step_key/depends_on/iac_ref/status); the
-        // dispatched agent_job_id is an internal back-link, not exposed here.
-        let steps_json: Vec<Value> = crate::repos::job_steps::load_plan(pool, uid)
-            .await
-            .map_err(db_error)?
-            .into_iter()
-            .map(|s| {
-                json!({
-                    "step_key": s.step_key,
-                    "depends_on": s.depends_on,
-                    "iac_ref": s.iac_ref,
-                    "status": s.status,
+        .map_err(|error| map_request_read_error(error, &request_id))?;
+    match crate::repos::requests::read(grant)
+        .await
+        .map_err(|error| map_request_read_error(error, &request_id))?
+    {
+        crate::repos::requests::RequestReadRecord::Database { row, steps } => {
+            // The durable lifecycle state (047): payload is authoritative for all
+            // 14 types; stages/approval_route/plan/validation_results are the REAL
+            // persisted history that survives a restart (no fabrication).
+            //
+            // Sanitize stages before sending to the portal: for any evidence item
+            // with redacted:true the raw `value` is replaced by the safe
+            // `redacted_value` (or "***REDACTED***"). The plan JSONB is also a
+            // Vec<Stage> and receives the same treatment.
+            let sanitized_stages = sanitize_stages_for_portal(&row.stages);
+            let sanitized_plan = sanitize_stages_for_portal(&row.plan);
+            // #42 slice 3: surface the request's multi-step orchestration plan (if
+            // any) so an approver can see it BEFORE approving — an empty plan (every
+            // offering except the composite "managed-server-onboarding") returns
+            // `[]`, purely additive over every existing response key. Only the
+            // fields an approver needs (step_key/depends_on/iac_ref/status); the
+            // dispatched agent_job_id is an internal back-link, not exposed here.
+            let steps_json: Vec<Value> = steps
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "step_key": s.step_key,
+                        "depends_on": s.depends_on,
+                        "iac_ref": s.iac_ref,
+                        "status": s.status,
+                    })
                 })
-            })
-            .collect();
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "resource_version": row.resource_version,
-            "request_type": row.request_type,
-            "status": row.status,
-            "stage": row.stage,
-            "site": row.site,
-            "environment": row.environment,
-            "name": row.name,
-            "cpu": row.cpu,
-            "memory_gb": row.memory_gb,
-            "justification": row.justification,
-            "created_by": row.created_by,
-            "created_at": row.created_at.to_rfc3339(),
-            "updated_at": row.updated_at.to_rfc3339(),
-            "payload": row.payload,
-            "stages": sanitized_stages,
-            "approval_route": row.approval_route,
-            "plan": sanitized_plan,
-            "validation_results": row.validation_results,
-            "criticality": row.criticality,
-            "requester": row.requester,
-            "owner": row.owner,
-            "evidence_manifest_id": row.evidence_manifest_id,
-            "steps": steps_json
-        })));
-    }
-
-    let store = request_store().lock().await;
-    let record = store.iter().find(|r| r.id == request_id);
-    match record {
-        Some(r) => {
-            // #2: same scope guard on the in-memory (no-DB) path.
-            scope_guard_or_404(&session, &r.site, &r.environment, &request_id)?;
-            request_owner_guard_or_404(&session, Some(r.requester.as_str()), None, &request_id)?;
+                .collect();
+            Ok(Json(json!({
+                "request_id": row.id.to_string(),
+                "resource_version": row.resource_version,
+                "request_type": row.request_type,
+                "status": row.status,
+                "stage": row.stage,
+                "site": row.site,
+                "environment": row.environment,
+                "name": row.name,
+                "cpu": row.cpu,
+                "memory_gb": row.memory_gb,
+                "justification": row.justification,
+                "created_by": row.created_by,
+                "created_at": row.created_at.to_rfc3339(),
+                "updated_at": row.updated_at.to_rfc3339(),
+                "payload": row.payload,
+                "stages": sanitized_stages,
+                "approval_route": row.approval_route,
+                "plan": sanitized_plan,
+                "validation_results": row.validation_results,
+                "criticality": row.criticality,
+                "requester": row.requester,
+                "owner": row.owner,
+                "evidence_manifest_id": row.evidence_manifest_id,
+                "steps": steps_json
+            })))
+        }
+        crate::repos::requests::RequestReadRecord::Local(request) => {
             // Sanitize in-memory request stages/plan before sending to portal,
             // applying the same redaction discipline as the DB path.
-            let mut val = serde_json::to_value(r).unwrap_or_default();
+            let mut val = serde_json::to_value(request).unwrap_or_default();
             if let Some(obj) = val.as_object_mut() {
                 if let Some(stages_val) = obj.get("stages").cloned() {
                     obj.insert(
@@ -21753,7 +21811,43 @@ async fn requests_get(
             }
             Ok(Json(val))
         }
-        None => Err(status_404(&request_id)),
+    }
+}
+
+#[cfg(test)]
+async fn requests_get_for_test(session: AuthExtractor, path: Path<String>) -> ApiResult {
+    let authority = crate::request_authority::RequestReadAuthority::test_fixture(&session.0);
+    requests_get(session, RequestReadAuthorityExtractor(authority), path).await
+}
+
+fn map_request_read_error(
+    error: crate::repos::requests::RequestReadError,
+    request_id: &str,
+) -> (StatusCode, Json<Value>) {
+    use crate::repos::requests::RequestReadError;
+
+    match error {
+        RequestReadError::NotFound => status_404(request_id),
+        RequestReadError::Forbidden => (StatusCode::FORBIDDEN, Json(json!({"error": "Forbidden"}))),
+        RequestReadError::CredentialStale => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "request-read credential is stale"})),
+        ),
+        RequestReadError::Stale => transition_conflict_409(request_id),
+        RequestReadError::AuthorityUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "typed request-read authorization is not admitted for this deployment"
+            })),
+        ),
+        RequestReadError::Authorization(error) => {
+            tracing::error!(%error, "request-read authorization integration failed closed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "request authorization failed"})),
+            )
+        }
+        RequestReadError::Database(error) => db_error(error),
     }
 }
 
@@ -24660,7 +24754,7 @@ mod step_authoring_db_tests {
         // Pre-approval: the request has not been validated/planned/approved yet,
         // but its steps are already visible.
         let Ok(Json(managed_view)) =
-            requests_get(AuthExtractor(admin.clone()), p(&managed_id_str)).await
+            requests_get_for_test(AuthExtractor(admin.clone()), p(&managed_id_str)).await
         else {
             panic!("get must succeed");
         };
@@ -24701,7 +24795,7 @@ mod step_authoring_db_tests {
         let normal_id_str = normal["id"].as_str().expect("id").to_string();
         let normal_id = Uuid::parse_str(&normal_id_str).expect("uuid");
         let Ok(Json(normal_view)) =
-            requests_get(AuthExtractor(admin.clone()), p(&normal_id_str)).await
+            requests_get_for_test(AuthExtractor(admin.clone()), p(&normal_id_str)).await
         else {
             panic!("get must succeed");
         };
@@ -51563,12 +51657,13 @@ mod unit_tests {
             "a foreign created_by filter must never widen requester visibility"
         );
 
-        let Json(own_detail) = requests_get(AuthExtractor(requester.clone()), Path(own_id.clone()))
-            .await
-            .expect("a requester may read its own request");
+        let Json(own_detail) =
+            requests_get_for_test(AuthExtractor(requester.clone()), Path(own_id.clone()))
+                .await
+                .expect("a requester may read its own request");
         assert_eq!(own_detail["id"], own_id);
 
-        let foreign_err = requests_get(AuthExtractor(requester), Path(foreign_id.clone()))
+        let foreign_err = requests_get_for_test(AuthExtractor(requester), Path(foreign_id.clone()))
             .await
             .expect_err("a foreign request must be hidden from a request-only principal");
         assert_eq!(foreign_err.0, StatusCode::NOT_FOUND);
@@ -51595,9 +51690,10 @@ mod unit_tests {
             std::collections::HashSet::from([own_id.as_str(), foreign_id.as_str()])
         );
 
-        let Json(foreign_detail) = requests_get(AuthExtractor(auditor), Path(foreign_id.clone()))
-            .await
-            .expect("an auditor retains cross-owner detail visibility");
+        let Json(foreign_detail) =
+            requests_get_for_test(AuthExtractor(auditor), Path(foreign_id.clone()))
+                .await
+                .expect("an auditor retains cross-owner detail visibility");
         assert_eq!(foreign_detail["id"], foreign_id);
     }
 
@@ -54952,7 +55048,7 @@ mod unit_tests {
 
         // A GBLON-scoped principal cannot see a DEFRA request — 404, identical to
         // a missing request (no cross-scope existence oracle).
-        let err = requests_get(
+        let err = requests_get_for_test(
             AuthExtractor(scoped_session(&["GBLON"], &[])),
             Path(id.clone()),
         )
@@ -54961,7 +55057,7 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         // The owning (DEFRA) site scope sees it.
-        let Json(body) = requests_get(
+        let Json(body) = requests_get_for_test(
             AuthExtractor(scoped_session(&["DEFRA"], &[])),
             Path(id.clone()),
         )
@@ -54971,7 +55067,7 @@ mod unit_tests {
 
         // An environment-scoped principal outside the request's environment is
         // also 404 — the guard enforces BOTH axes.
-        let err = requests_get(
+        let err = requests_get_for_test(
             AuthExtractor(scoped_session(&[], &["dev"])),
             Path(id.clone()),
         )
@@ -54980,7 +55076,7 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         // An unrestricted principal still sees everything (no regression).
-        assert!(requests_get(
+        assert!(requests_get_for_test(
             AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone())
         )
@@ -55659,6 +55755,9 @@ mod db_lifecycle_tests {
         session.user_id = user_id.to_string();
         session.display_name = format!("{user_id} (DB read test)");
         session.roles = vec![role.to_string()];
+        session.token_valid = true;
+        session.provider_mode = "test-verified".to_string();
+        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session
     }
 
@@ -55922,13 +56021,13 @@ mod db_lifecycle_tests {
         );
 
         assert!(
-            requests_get(AuthExtractor(requester.clone()), Path(own_id.to_string()))
+            requests_get_for_test(AuthExtractor(requester.clone()), Path(own_id.to_string()))
                 .await
                 .is_ok(),
             "the current requester may read its own request"
         );
         assert!(
-            requests_get(
+            requests_get_for_test(
                 AuthExtractor(requester.clone()),
                 Path(legacy_id.to_string())
             )
@@ -55936,7 +56035,7 @@ mod db_lifecycle_tests {
             .is_ok(),
             "created_by remains the fallback for a legacy row"
         );
-        let foreign = requests_get(AuthExtractor(requester), Path(foreign_id.to_string()))
+        let foreign = requests_get_for_test(AuthExtractor(requester), Path(foreign_id.to_string()))
             .await
             .expect_err("a foreign request must be hidden from a request-only principal");
         assert_eq!(foreign.0, StatusCode::NOT_FOUND);
@@ -55946,7 +56045,7 @@ mod db_lifecycle_tests {
             ryuki_engine::auth::APP_ROLE_AUDITOR,
         );
         assert!(
-            requests_get(AuthExtractor(auditor), Path(foreign_id.to_string()))
+            requests_get_for_test(AuthExtractor(auditor), Path(foreign_id.to_string()))
                 .await
                 .is_ok(),
             "an auditor retains cross-owner detail visibility"

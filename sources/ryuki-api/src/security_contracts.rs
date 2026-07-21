@@ -85,6 +85,8 @@ use crate::boundary::trust_checkpoint_transport::{
 
 const PRODUCTION_RUNTIME_GUARD_CHALLENGE_DIGEST_CONTRACT: &str =
     "ryuki-production-runtime-guard-challenge-v1";
+const REQUEST_READ_REGISTRY_PROJECTION_DIGEST_CONTRACT: &str =
+    "ryuki-request-read-registry-projection-v1";
 
 pub(crate) const SECURITY_CONTRACT_ROOT_ENV: &str = "RYUKI_SECURITY_CONTRACT_ROOT";
 pub(crate) const SECURITY_PROFILE_PATH_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH";
@@ -3135,6 +3137,36 @@ pub(crate) struct SecurityContractContext {
     /// deployment/provider applicability derivation. Authority comes from the
     /// authenticated registry and later runtime proofs, never from this claim.
     pub(crate) provider_registry_applicability: ActiveProviderRegistryApplicabilityClaim,
+    /// Semantically validated exact route/action/resource/resolver projection
+    /// for the first permit-bearing repository seam.
+    request_read_registry: RequestReadRegistryBinding,
+}
+
+#[derive(Debug, Clone)]
+struct RequestReadRegistryBinding {
+    registry_version: u64,
+    maximum_authority_digest: String,
+}
+
+/// Exact, non-secret security-contract projection consumed by the
+/// request-read credential/permit adapter. Every field comes from retained,
+/// validated startup documents; it contains no runtime credential material.
+#[derive(Debug, Clone)]
+pub(crate) struct RequestReadSecurityNamespace {
+    pub(crate) deployment_id: String,
+    pub(crate) trust_domain_id: String,
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) security_profile: SecurityProfile,
+    pub(crate) profile_digest: String,
+    pub(crate) policy_version: u64,
+    pub(crate) action_registry_version: u64,
+    pub(crate) action_registry_digest: String,
+    pub(crate) maximum_authority_version: u64,
+    pub(crate) maximum_authority_digest: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_configuration_version: u64,
+    pub(crate) provider_lifecycle_version: u64,
+    pub(crate) credential_source_provider: String,
 }
 
 #[derive(Debug)]
@@ -3165,6 +3197,100 @@ fn production_migration_runtime_render_admission_is_implemented() -> bool {
 impl SecurityContractContext {
     pub(crate) fn is_production(&self) -> bool {
         self.profile.security_profile.is_production()
+    }
+
+    /// Resolve the single provider and namespace that admitted one
+    /// request-read credential. Derived API tokens deliberately have no arm:
+    /// their credential provider, audience, action grants, and lifecycle are
+    /// not represented in the v1 provider registry and therefore fail closed.
+    pub(crate) fn request_read_security_namespace(
+        &self,
+        auth_mode: &AuthMode,
+        credential_provider: &str,
+    ) -> Result<RequestReadSecurityNamespace, String> {
+        let provider_matches_mode = match auth_mode {
+            AuthMode::MockDryRun | AuthMode::StaticDryRun => {
+                credential_provider == "development-fixture"
+                    && self.profile.security_profile.admits_development_fixture()
+            }
+            AuthMode::EntraId => matches!(credential_provider, "entra-id" | "oidc"),
+            AuthMode::Local => credential_provider == "local",
+        };
+        if !provider_matches_mode {
+            return Err(format!(
+                "credential provider {credential_provider} is not admitted by auth mode {}",
+                auth_mode.as_str()
+            ));
+        }
+        if self.profile.tenancy_mode != TenancyMode::SingleTenant {
+            return Err(
+                "request-read authority requires an exact tenant binding for multi-tenant profiles"
+                    .into(),
+            );
+        }
+
+        let selected = self.select_authentication_provider(auth_mode)?;
+        if selected.config_version == 0 || selected.active_lifecycle_record_version == 0 {
+            return Err("request-read provider versions must be positive".into());
+        }
+        if self.profile.policy_version == 0
+            || self.profile.action_resource_registry_ref.document_version == 0
+            || self.request_read_registry.registry_version == 0
+        {
+            return Err("request-read authority versions must be positive".into());
+        }
+        validate_digest_pin("request-read deployment profile", &self.profile_digest)?;
+        validate_digest_pin(
+            "request-read action/resource registry",
+            &self.profile.action_resource_registry_ref.content_digest,
+        )?;
+        validate_digest_pin(
+            "request-read maximum authority",
+            &self.request_read_registry.maximum_authority_digest,
+        )?;
+        if !self
+            .profile
+            .trust_topology
+            .trust_domain_ids
+            .contains(&selected.trust_domain_id)
+        {
+            return Err(
+                "request-read provider trust domain is outside the deployment topology".into(),
+            );
+        }
+
+        if let ConformanceState::Production(boundary) = &self.conformance_state {
+            if self.profile.deployment_id != boundary.conformance.deployment_id()
+                || selected.trust_domain_id != boundary.conformance.trust_domain_id()
+            {
+                return Err(
+                    "request-read namespace differs from the sealed production boundary".into(),
+                );
+            }
+        } else if self.profile.security_profile.is_production() {
+            return Err("production request-read authority has no sealed boundary".into());
+        }
+
+        Ok(RequestReadSecurityNamespace {
+            deployment_id: self.profile.deployment_id.clone(),
+            trust_domain_id: selected.trust_domain_id.clone(),
+            tenant_id: None,
+            security_profile: self.profile.security_profile,
+            profile_digest: self.profile_digest.clone(),
+            policy_version: self.profile.policy_version,
+            action_registry_version: self.request_read_registry.registry_version,
+            action_registry_digest: self
+                .profile
+                .action_resource_registry_ref
+                .content_digest
+                .clone(),
+            maximum_authority_version: self.request_read_registry.registry_version,
+            maximum_authority_digest: self.request_read_registry.maximum_authority_digest.clone(),
+            provider_id: selected.provider_id.clone(),
+            provider_configuration_version: selected.config_version,
+            provider_lifecycle_version: selected.active_lifecycle_record_version,
+            credential_source_provider: credential_provider.to_string(),
+        })
     }
 
     fn exact_production_secret_provider(
@@ -4678,6 +4804,24 @@ fn finalize_startup_security_contract(
 
     validate_runtime_guard_challenge_set(&conformance_state)?;
 
+    // Parse the route/action/resource projection only after the referenced
+    // document set and (for production) its external checkpoint/semantic
+    // closure have authenticated. This keeps semantic errors from masking a
+    // stale or otherwise invalid production proof.
+    let request_read_registry_document = prepared
+        .documents
+        .get(
+            &prepared
+                .profile
+                .action_resource_registry_ref
+                .artifact_locator,
+        )
+        .ok_or_else(|| {
+            "request-read action/resource registry did not resolve to retained JSON".to_string()
+        })?;
+    let request_read_registry =
+        request_read_registry_binding(request_read_registry_document, &prepared.profile)?;
+
     Ok(SecurityContractContext {
         profile: prepared.profile,
         profile_digest: prepared.profile_digest,
@@ -4689,6 +4833,7 @@ fn finalize_startup_security_contract(
         verified_approved_secret_provider_guard: None,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
+        request_read_registry,
     })
 }
 
@@ -6153,6 +6298,166 @@ fn raw_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn unique_registry_entry<'a>(
+    document: &'a Value,
+    collection: &str,
+    key: &str,
+    expected: &str,
+) -> Result<&'a Value, String> {
+    let entries = document
+        .get(collection)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("action registry {collection} is not an array"))?;
+    let mut matches = entries
+        .iter()
+        .filter(|entry| entry.get(key).and_then(Value::as_str) == Some(expected));
+    let entry = matches
+        .next()
+        .ok_or_else(|| format!("action registry omits {key}={expected}"))?;
+    if matches.next().is_some() {
+        return Err(format!("action registry duplicates {key}={expected}"));
+    }
+    Ok(entry)
+}
+
+fn request_read_registry_binding(
+    document: &Value,
+    profile: &DeploymentSecurityProfile,
+) -> Result<RequestReadRegistryBinding, String> {
+    let registry_version = required_u64(document, "registry_version", "action registry")?;
+    let profile_name = profile.security_profile.as_str();
+    if !document
+        .pointer("/applicability/security_profiles")
+        .and_then(Value::as_array)
+        .is_some_and(|profiles| profiles.iter().any(|value| value == profile_name))
+    {
+        return Err(format!(
+            "request-read action registry does not apply to {profile_name}"
+        ));
+    }
+    if profile.security_profile.is_production()
+        && (document.pointer("/lifecycle/state") != Some(&Value::String("active".into()))
+            || document.pointer("/applicability/evaluation_scope")
+                != Some(&Value::String("deployment".into()))
+            || document.pointer("/inventory_closure/coverage_status")
+                != Some(&Value::String("complete".into()))
+            || document.pointer("/inventory_closure/router_inventory_equal")
+                != Some(&Value::Bool(true))
+            || document.pointer("/inventory_closure/unknown_entries_rejected")
+                != Some(&Value::Bool(true)))
+    {
+        return Err(
+            "production request-read activation requires an active deployment registry with complete router closure"
+                .into(),
+        );
+    }
+
+    let actor_kinds = serde_json::json!(["verified-human", "service", "development-fixture"]);
+    let action = unique_registry_entry(document, "actions", "action_id", "request.read")?;
+    if action.get("resource_kind") != Some(&Value::String("request".into()))
+        || action.get("permitted_actor_kinds") != Some(&actor_kinds)
+        || action.get("authorization_semantics") != Some(&Value::String("instance".into()))
+        || action.get("obligations") != Some(&serde_json::json!(["audit"]))
+        || action.get("risk_class") != Some(&Value::String("ordinary".into()))
+        || action.get("lifecycle") != Some(&Value::String("active".into()))
+        || action.get("applicability_expression") != Some(&Value::String("always".into()))
+    {
+        return Err("request.read action semantics differ from the permit adapter".into());
+    }
+
+    let resource = unique_registry_entry(document, "resources", "resource_kind", "request")?;
+    let required_fields = serde_json::json!([
+        "resource_kind",
+        "canonical_id",
+        "deployment_id",
+        "trust_domain_id",
+        "tenant_id",
+        "site_id",
+        "environment_id",
+        "owner_principal_id",
+        "resource_version",
+        "state_digest",
+        "sensitivity",
+        "lifecycle_state"
+    ]);
+    if resource.get("canonical_id_pattern") != Some(&Value::String("^request:[a-z0-9-]+$".into()))
+        || resource.get("resolver_id")
+            != Some(&Value::String("resolver:request-instance-v1".into()))
+        || resource.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || resource.get("requires_security_version") != Some(&Value::Bool(true))
+        || resource.get("aliases_allowed") != Some(&Value::Bool(false))
+        || resource.get("sensitivity") != Some(&Value::String("confidential".into()))
+        || resource.pointer("/canonical_resource_ref/required_fields") != Some(&required_fields)
+        || resource.pointer("/canonical_resource_ref/security_version_field")
+            != Some(&Value::String("resource_version".into()))
+        || resource.pointer("/canonical_resource_ref/canonicalization")
+            != Some(&Value::String("resolve-before-policy".into()))
+        || resource.get("lifecycle") != Some(&Value::String("active".into()))
+        || resource.get("applicability_expression") != Some(&Value::String("always".into()))
+    {
+        return Err("request resource semantics differ from the permit adapter".into());
+    }
+
+    let resolver = unique_registry_entry(
+        document,
+        "resolvers",
+        "resolver_id",
+        "resolver:request-instance-v1",
+    )?;
+    if resolver.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || resolver.get("resource_kind") != Some(&Value::String("request".into()))
+        || resolver.get("mode") != Some(&Value::String("instance".into()))
+        || resolver.get("canonical_id_source") != Some(&Value::String("requests.id".into()))
+        || resolver.get("security_version_source")
+            != Some(&Value::String("requests.resource_version".into()))
+        || resolver.get("state_digest_source") != Some(&Value::String("job_steps.(id,xmin)".into()))
+        || resolver.get("permit_kind") != Some(&Value::String("AuthorizationPermit".into()))
+        || resolver.get("fail_closed") != Some(&Value::Bool(true))
+        || resolver.get("lifecycle") != Some(&Value::String("active".into()))
+        || resolver.get("applicability_expression") != Some(&Value::String("always".into()))
+    {
+        return Err("request resolver semantics differ from the permit adapter".into());
+    }
+
+    let route = unique_registry_entry(
+        document,
+        "route_mappings",
+        "mapping_id",
+        "route:request-read-v1",
+    )?;
+    if route.get("method") != Some(&Value::String("GET".into()))
+        || route.get("path_template") != Some(&Value::String("/api/requests/{id}".into()))
+        || route.get("action_id") != Some(&Value::String("request.read".into()))
+        || route.get("resource_kind") != Some(&Value::String("request".into()))
+        || route.get("resolver_id") != Some(&Value::String("resolver:request-instance-v1".into()))
+        || route.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || route.get("permit_kind") != Some(&Value::String("AuthorizationPermit".into()))
+        || route.get("permitted_actor_kinds") != Some(&actor_kinds)
+        || route.get("lifecycle") != Some(&Value::String("active".into()))
+        || route.get("applicability_expression") != Some(&Value::String("always".into()))
+        || route.get("source_file")
+            != Some(&Value::String("sources/ryuki-api/src/contracts.rs".into()))
+    {
+        return Err("request-read route semantics differ from the permit adapter".into());
+    }
+
+    let projection = serde_json::json!({
+        "digest_contract": REQUEST_READ_REGISTRY_PROJECTION_DIGEST_CONTRACT,
+        "registry_version": registry_version,
+        "action": action,
+        "resource": resource,
+        "resolver": resolver,
+        "route": route,
+    });
+    let bytes = canonical_json_bytes(&projection).map_err(|error| {
+        format!("request-read registry projection is not canonicalizable: {error}")
+    })?;
+    Ok(RequestReadRegistryBinding {
+        registry_version,
+        maximum_authority_digest: raw_digest(&bytes),
+    })
+}
+
 #[derive(Debug)]
 struct OfflineRetriever;
 
@@ -6474,6 +6779,38 @@ impl<'a> ReferenceVerifier<'a> {
                     "sources/ryuki-api/src/scheduler.rs"
                 )
                 | ("source:ryuki-api-agents", "sources/ryuki-api/src/agents.rs")
+                | (
+                    "source:ryuki-api-request-authority",
+                    "sources/ryuki-api/src/request_authority.rs"
+                )
+                | (
+                    "source:ryuki-api-request-read-repository",
+                    "sources/ryuki-api/src/repos/requests.rs"
+                )
+                | (
+                    "source:ryuki-api-job-steps-repository",
+                    "sources/ryuki-api/src/repos/job_steps.rs"
+                )
+                | (
+                    "source:ryuki-api-audit-repository",
+                    "sources/ryuki-api/src/audit.rs"
+                )
+                | (
+                    "source:ryuki-api-entra-auth",
+                    "sources/ryuki-api/src/entra_auth.rs"
+                )
+                | (
+                    "source:ryuki-api-identity-authority",
+                    "sources/ryuki-api/src/identity_authority.rs"
+                )
+                | (
+                    "source:ryuki-api-security-contract-loader",
+                    "sources/ryuki-api/src/security_contracts.rs"
+                )
+                | (
+                    "source:ryuki-engine-authorization-kernel",
+                    "sources/ryuki-engine/src/authorization.rs"
+                )
         );
         if !exact_fixture_reference || reference.document_version != Some(1) {
             return Err(format!(
@@ -9782,6 +10119,14 @@ mod tests {
                 "sources/ryuki-api/src/contracts.rs",
                 "sources/ryuki-api/src/scheduler.rs",
                 "sources/ryuki-api/src/agents.rs",
+                "sources/ryuki-api/src/request_authority.rs",
+                "sources/ryuki-api/src/repos/requests.rs",
+                "sources/ryuki-api/src/repos/job_steps.rs",
+                "sources/ryuki-api/src/audit.rs",
+                "sources/ryuki-api/src/entra_auth.rs",
+                "sources/ryuki-api/src/identity_authority.rs",
+                "sources/ryuki-api/src/security_contracts.rs",
+                "sources/ryuki-engine/src/authorization.rs",
             ] {
                 copy_relative(&repository, &root, relative);
             }
