@@ -89,7 +89,7 @@
       {
         "document_id": "source:ryuki-api-entra-auth",
         "document_version": 1,
-        "content_digest": "sha256:e11aee1c40be5ab7b7b641b14f8971b130c4e027fee73bb6bc2dcbe606640a89",
+        "content_digest": "sha256:fe701a72bacdb852bfcb0863d623617548c55c117df56df55002f1a01d50c2ea",
         "artifact_locator": "sources/ryuki-api/src/entra_auth.rs"
       },
       {
@@ -101,7 +101,7 @@
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:db208af1ddc80dd8c24ba1a24e7c2d2c4b9d6b706fc3c6f632d653914aa22a0d",
+        "content_digest": "sha256:c12d8d0730afd15a6befa6822c4de3fa44240e74bded43edc0e1525dbe045d39",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {

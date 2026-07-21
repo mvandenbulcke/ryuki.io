@@ -18,6 +18,7 @@ base64 = "0.22"
 ed25519-dalek = "2"
 thiserror = "2"
 url = { workspace = true }
+uuid = "1"
 
 [dev-dependencies]
 jsonschema = { workspace = true }

@@ -28,6 +28,7 @@ use ryuki_engine::auth::{get_entra_config_from_env, ActorClass, AuthSession, Ent
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Cooldown between JWKS refresh attempts. Prevents a stream of bad-`kid`
 /// tokens from hammering Entra's discovery endpoint.
@@ -41,10 +42,11 @@ const MAX_JWKS_KEYS: usize = 32;
 /// only an early rejection hint; the cumulative bytes remain authoritative.
 const MAX_JWKS_BYTES: usize = 1 << 20;
 
-/// Claims we extract from a validated Entra token. All identity fields except
-/// `sub` are optional; `roles` defaults to empty (a valid identity with zero
-/// app permissions). `jsonwebtoken` validates iss/aud/exp/nbf separately via
-/// `Validation`, so they are not modeled here.
+/// Claims we extract from a validated Entra token. `sub` remains a required
+/// signed OIDC claim, while `oid` is the canonical Entra account key selected
+/// after signature validation. `roles` defaults to empty (a valid identity with
+/// zero app permissions). `jsonwebtoken` validates iss/aud/exp/nbf separately
+/// via `Validation`, so they are not modeled here.
 #[derive(Debug, Deserialize)]
 struct EntraClaims {
     iss: String,
@@ -115,6 +117,18 @@ fn classify_entra_actor(claims: &EntraClaims) -> ActorClass {
         (None, false) if claims.appid.is_some() || claims.azp.is_some() => ActorClass::Workload,
         (None, false) => ActorClass::Unknown,
     }
+}
+
+/// Select the exact Entra directory object identifier used as the account key.
+///
+/// Entra `oid` values are UUIDs. Accepting another UUID spelling, surrounding
+/// whitespace, or `sub` as a fallback would let the same directory object enter
+/// the authority registry under more than one key. Requiring the canonical
+/// lowercase, hyphenated spelling keeps principal-key selection singular.
+fn canonical_entra_oid(value: Option<&str>) -> Option<&str> {
+    let value = value?;
+    let parsed = Uuid::parse_str(value).ok()?;
+    (parsed.hyphenated().to_string() == value).then_some(value)
 }
 
 /// The injectable key-resolution seam.
@@ -545,12 +559,12 @@ impl EntraTokenValidator {
         validation.leeway = self.leeway_secs;
         validation.validate_exp = true;
         validation.validate_nbf = true;
-        // Demand the pinned claims are PRESENT, not merely correct-when-present.
-        // jsonwebtoken's default `required_spec_claims` is only {"exp"}, so a
-        // token that simply OMITS iss/aud/nbf would otherwise slip past the
-        // issuer/audience pins. Entra ID always issues all four. This call
-        // REPLACES the default set, so "exp" must be listed too.
-        validation.set_required_spec_claims(&["exp", "nbf", "iat", "iss", "aud"]);
+        // Demand the pinned claims and signed OIDC subject are PRESENT, not
+        // merely correct-when-present. jsonwebtoken's default
+        // `required_spec_claims` is only {"exp"}, so this call REPLACES that set
+        // and must retain "exp" explicitly. `sub` remains required signed input
+        // even though only canonical Entra `oid` is selected as the account key.
+        validation.set_required_spec_claims(&["exp", "nbf", "iat", "iss", "aud", "sub"]);
 
         // Step 5: verify signature + iss/aud/exp/nbf atomically.
         let data = match decode::<EntraClaims>(token, &resolved_key.key, &validation) {
@@ -560,6 +574,9 @@ impl EntraTokenValidator {
 
         // Step 6: map claims into a verified session.
         let claims = data.claims;
+        if claims.sub.is_empty() {
+            return ValidationOutcome::unverified("invalid-token");
+        }
         if claims.iss != self.issuer {
             return ValidationOutcome::unverified("wrong-issuer");
         }
@@ -575,7 +592,10 @@ impl EntraTokenValidator {
         let Some(expires_at) = chrono::DateTime::from_timestamp(claims.exp, 0) else {
             return ValidationOutcome::unverified("invalid-token");
         };
-        let credential_subject = claims.oid.as_deref().unwrap_or(&claims.sub);
+        let Some(entra_account_key) = canonical_entra_oid(claims.oid.as_deref()) else {
+            return ValidationOutcome::unverified("invalid-token");
+        };
+        let entra_account_key = entra_account_key.to_string();
         let request_read_credential = (|| {
             let window = crate::request_authority::RequestReadCredentialWindow::new(
                 1,
@@ -601,7 +621,7 @@ impl EntraTokenValidator {
                 digests,
                 "entra-id".to_string(),
                 claims.iss.clone(),
-                credential_subject.to_string(),
+                entra_account_key.clone(),
             )
         })();
         // The normal authentication semantics keep jsonwebtoken's bounded
@@ -610,7 +630,7 @@ impl EntraTokenValidator {
         // issuance requires a currently valid, internally ordered interval.
         let request_read_credential = request_read_credential.ok();
         let actor_class = classify_entra_actor(&claims);
-        let user_id = claims.oid.clone().unwrap_or_else(|| claims.sub.clone());
+        let user_id = entra_account_key;
         let display_name = claims
             .name
             .clone()
@@ -646,6 +666,7 @@ mod tests {
     const TEST_CLIENT: &str = "ryuki-app-client-0000";
     const TEST_AUTHORITY: &str = "https://login.microsoftonline.com";
     const TEST_KID: &str = "test-kid-1";
+    const TEST_OBJECT_ID: &str = "11111111-2222-4333-8444-555555555555";
 
     fn test_config(enabled: bool) -> EntraConfig {
         EntraConfig {
@@ -1166,7 +1187,7 @@ mod tests {
             "iss": expected_issuer(),
             "aud": TEST_CLIENT,
             "sub": "subject-1",
-            "oid": "object-id-1",
+            "oid": TEST_OBJECT_ID,
             "name": "Ada Admin",
             "preferred_username": "ada@contoso.example",
             "exp": now() + 3600,
@@ -1185,15 +1206,24 @@ mod tests {
         let validator = static_validator(dec, true);
         let token = sign(&enc, valid_claims());
 
-        let session = validator.validate(&auth(&token)).await;
-        assert!(session.token_valid);
-        assert!(session.is_verified_human());
-        assert_eq!(session.provider_mode, "entra-id");
-        assert_eq!(session.roles, vec!["PlatformAdmin"]);
-        // oid preferred over sub.
-        assert_eq!(session.user_id, "object-id-1");
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert_eq!(outcome.failure_reason, None);
+        assert!(outcome.request_read_credential.is_some());
+        assert!(outcome.session.token_valid);
+        assert!(outcome.session.is_verified_human());
+        assert_eq!(outcome.session.provider_mode, "entra-id");
+        assert_eq!(outcome.session.roles, vec!["PlatformAdmin"]);
+        assert_eq!(outcome.session.user_id, TEST_OBJECT_ID);
         // name preferred for display.
-        assert_eq!(session.display_name, "Ada Admin");
+        assert_eq!(outcome.session.display_name, "Ada Admin");
+
+        // The credential's Debug projection is safe if it reaches diagnostic
+        // logging: neither the reusable bearer nor signed identity claims are
+        // rendered.
+        let credential_debug = format!("{:?}", outcome.request_read_credential);
+        assert!(!credential_debug.contains(&token));
+        assert!(!credential_debug.contains(TEST_OBJECT_ID));
+        assert!(!credential_debug.contains("subject-1"));
     }
 
     #[tokio::test]
@@ -1461,16 +1491,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_user_id_falls_back_to_sub_when_oid_absent() {
+    async fn test_missing_oid_rejected_without_sub_fallback_or_sensitive_log_reason() {
         let (enc, dec, _) = make_keypair();
         let validator = static_validator(dec, true);
         let mut claims = valid_claims();
+        claims["sub"] = json!("signed-sub-must-not-become-the-account-key");
         claims.as_object_mut().unwrap().remove("oid");
         let token = sign(&enc, claims);
 
-        let session = validator.validate(&auth(&token)).await;
-        assert!(session.token_valid);
-        assert_eq!(session.user_id, "subject-1");
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.session.provider_mode, "entra-id-unverified");
+        assert_ne!(
+            outcome.session.user_id,
+            "signed-sub-must-not-become-the-account-key"
+        );
+        assert!(outcome.request_read_credential.is_none());
+        assert_eq!(outcome.failure_reason, Some("invalid-token"));
+        let log_reason = outcome.failure_reason.unwrap_or_default();
+        assert!(!log_reason.contains(&token));
+        assert!(!log_reason.contains("signed-sub-must-not-become-the-account-key"));
+    }
+
+    #[tokio::test]
+    async fn test_blank_or_noncanonical_oid_rejected() {
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator(dec, true);
+
+        for oid in [
+            "",
+            "   ",
+            "11111111222243338444555555555555",
+            "11111111-2222-4333-8444-555555555555 ",
+            "11111111-2222-4333-8444-55555555555A",
+        ] {
+            let mut claims = valid_claims();
+            claims["oid"] = json!(oid);
+            let token = sign(&enc, claims);
+
+            let outcome = validator.validate_with_reason(&auth(&token)).await;
+            assert!(!outcome.session.token_valid, "oid={oid:?}");
+            assert!(outcome.request_read_credential.is_none(), "oid={oid:?}");
+            assert_eq!(outcome.failure_reason, Some("invalid-token"));
+            let log_reason = outcome.failure_reason.unwrap_or_default();
+            assert!(!log_reason.contains(&token));
+            if !oid.is_empty() {
+                assert!(!log_reason.contains(oid));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1485,13 +1553,13 @@ mod tests {
         let session = validator.validate(&auth(&token)).await;
         assert_eq!(session.display_name, "ada@contoso.example");
 
-        // name + preferred_username absent -> user_id (oid here).
+        // name + preferred_username absent -> canonical oid.
         let mut claims = valid_claims();
         claims.as_object_mut().unwrap().remove("name");
         claims.as_object_mut().unwrap().remove("preferred_username");
         let token = sign(&enc, claims);
         let session = validator.validate(&auth(&token)).await;
-        assert_eq!(session.display_name, "object-id-1");
+        assert_eq!(session.display_name, TEST_OBJECT_ID);
     }
 
     #[tokio::test]

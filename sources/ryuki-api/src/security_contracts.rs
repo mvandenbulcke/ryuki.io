@@ -85,8 +85,7 @@ use crate::boundary::trust_checkpoint_transport::{
 
 const PRODUCTION_RUNTIME_GUARD_CHALLENGE_DIGEST_CONTRACT: &str =
     "ryuki-production-runtime-guard-challenge-v1";
-const REQUEST_READ_REGISTRY_PROJECTION_DIGEST_CONTRACT: &str =
-    "ryuki-request-read-registry-projection-v1";
+const MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT: &str = "ryuki-maximum-authority-binding-v1";
 
 pub(crate) const SECURITY_CONTRACT_ROOT_ENV: &str = "RYUKI_SECURITY_CONTRACT_ROOT";
 pub(crate) const SECURITY_PROFILE_PATH_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH";
@@ -6442,20 +6441,39 @@ fn request_read_registry_binding(
     }
 
     let projection = serde_json::json!({
-        "digest_contract": REQUEST_READ_REGISTRY_PROJECTION_DIGEST_CONTRACT,
+        "digest_contract": MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT,
         "registry_version": registry_version,
         "action": action,
         "resource": resource,
         "resolver": resolver,
         "route": route,
     });
-    let bytes = canonical_json_bytes(&projection).map_err(|error| {
-        format!("request-read registry projection is not canonicalizable: {error}")
-    })?;
     Ok(RequestReadRegistryBinding {
         registry_version,
-        maximum_authority_digest: raw_digest(&bytes),
+        maximum_authority_digest: maximum_authority_binding_digest(&projection)?,
     })
+}
+
+fn maximum_authority_binding_digest(projection: &Value) -> Result<String, String> {
+    maximum_authority_binding_digest_for_domain(
+        MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT,
+        projection,
+    )
+}
+
+fn maximum_authority_binding_digest_for_domain(
+    domain: &str,
+    projection: &Value,
+) -> Result<String, String> {
+    let canonical = canonical_json_bytes(projection).map_err(|error| {
+        format!("request-read maximum-authority projection is not canonicalizable: {error}")
+    })?;
+    let mut hasher = Sha256::new();
+    for frame in [domain.as_bytes(), canonical.as_slice()] {
+        hasher.update((frame.len() as u64).to_le_bytes());
+        hasher.update(frame);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 #[derive(Debug)]
@@ -8524,6 +8542,96 @@ mod tests {
         "catalog/security-contracts/v1/control-trace.runtime-test.json";
     const SECRET_PROVIDER_RUNTIME_BINDING_PATH: &str =
         "catalog/security-contracts/v1/secret-provider-runtime-binding.runtime-test.json";
+
+    fn maximum_authority_projection_fixture() -> Value {
+        json!({
+            "digest_contract": MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT,
+            "registry_version": 7,
+            "action": {
+                "action_id": "request.read",
+                "permitted_actor_kinds": ["service", "verified-human"]
+            },
+            "resource": {
+                "resource_kind": "request",
+                "required_fields": ["canonical_id", "resource_version"]
+            },
+            "resolver": {
+                "resolver_id": "resolver:request-instance-v1",
+                "resolver_version": 1
+            },
+            "route": {
+                "method": "GET",
+                "path_template": "/api/requests/{id}"
+            }
+        })
+    }
+
+    #[test]
+    fn maximum_authority_digest_is_invariant_to_json_object_key_order() {
+        let first: Value = serde_json::from_str(
+            r#"{"z":{"second":2,"first":1},"a":[{"right":true,"left":false}]}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"a":[{"left":false,"right":true}],"z":{"first":1,"second":2}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            maximum_authority_binding_digest(&first).unwrap(),
+            maximum_authority_binding_digest(&reordered).unwrap()
+        );
+    }
+
+    #[test]
+    fn maximum_authority_digest_is_length_framed_and_domain_separated() {
+        let projection = maximum_authority_projection_fixture();
+        let digest = maximum_authority_binding_digest(&projection).unwrap();
+        let alternate_domain = maximum_authority_binding_digest_for_domain(
+            "ryuki-maximum-authority-binding-v2",
+            &projection,
+        )
+        .unwrap();
+        let unframed = raw_digest(&canonical_json_bytes(&projection).unwrap());
+
+        assert_ne!(digest, alternate_domain);
+        assert_ne!(digest, unframed);
+    }
+
+    #[test]
+    fn maximum_authority_digest_binds_every_projection_component() {
+        let projection = maximum_authority_projection_fixture();
+        let expected = maximum_authority_binding_digest(&projection).unwrap();
+
+        for (pointer, replacement) in [
+            (
+                "/digest_contract",
+                json!("ryuki-maximum-authority-binding-v2"),
+            ),
+            ("/registry_version", json!(8)),
+            ("/action/action_id", json!("request.list")),
+            (
+                "/action/permitted_actor_kinds/0",
+                json!("development-fixture"),
+            ),
+            ("/resource/resource_kind", json!("audit-log")),
+            ("/resource/required_fields/0", json!("alias")),
+            ("/resolver/resolver_id", json!("resolver:request-list-v1")),
+            ("/resolver/resolver_version", json!(2)),
+            ("/route/method", json!("POST")),
+            ("/route/path_template", json!("/api/requests")),
+        ] {
+            let mut mutated = projection.clone();
+            *mutated
+                .pointer_mut(pointer)
+                .expect("fixture mutation pointer must resolve") = replacement;
+            assert_ne!(
+                expected,
+                maximum_authority_binding_digest(&mutated).unwrap(),
+                "mutation at {pointer} did not change the maximum-authority digest"
+            );
+        }
+    }
 
     #[test]
     fn production_migration_execution_remains_contained_without_live_render_admission() {

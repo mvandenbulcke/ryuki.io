@@ -5,6 +5,7 @@ pub mod conformance_trust;
 pub mod cookie_policy;
 pub mod deployed_workload;
 pub mod postgresql_infrastructure;
+pub mod principal_id;
 pub mod production_applicability;
 pub mod production_build;
 pub mod production_deployment_applicability;
@@ -13,3 +14,5 @@ pub mod secret_scan;
 pub mod security_profile;
 pub mod types;
 pub mod yaml;
+
+pub use principal_id::{PrincipalId, PrincipalIdError};
