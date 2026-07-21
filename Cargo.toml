@@ -78,6 +78,10 @@ ryuki-agent = { path = "sources/ryuki-agent" }
 debug = "line-tables-only"
 incremental = false
 
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
 [profile.wasm-release]
 codegen-units = 1
 inherits = "release"

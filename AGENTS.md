@@ -44,8 +44,9 @@ of free disk and cap the disposable target at 64 GiB; override them only with
 `RYUKI_VERIFY_MIN_FREE_GIB` and `RYUKI_VERIFY_MAX_TARGET_GIB` after an explicit
 capacity review.
 
-The workspace development profile, which the test profile inherits, disables
-incremental compilation and retains line-table-only debug information. This
+The workspace development and test profiles both explicitly disable incremental
+compilation and retain line-table-only debug information. (`cargo test` uses its
+own profile; it does not inherit these overrides from `[profile.dev]`.) This
 trades slower iterative rebuilds for substantially lower `target/debug` growth.
 For a deliberate interactive debugging session, opt in temporarily with
 `CARGO_PROFILE_DEV_DEBUG=2`, `CARGO_PROFILE_TEST_DEBUG=2`, and
