@@ -27271,10 +27271,11 @@ async fn request_evidence_pack(
     })))
 }
 
-/// GET /api/activity/audit — the global, newest-first, actor-attributed audit
-/// feed across all requests. Same audit-tier gate as the per-request trail:
-/// who-acted-when is sensitive identity data. Static/mock sessions carry
-/// PlatformAdmin (audit via the admin superuser), so the demo is unaffected.
+/// GET /api/activity/audit — the global-only, newest-first, actor-attributed
+/// audit feed across all requests. Same audit-tier gate as the per-request
+/// trail: who-acted-when is sensitive identity data. Principals carrying any
+/// site or environment scope are refused because the global feed cannot enforce
+/// that narrower authority; they must use the scoped per-request audit path.
 async fn activity_audit_feed(
     AuthExtractor(session): AuthExtractor,
     Query(params): Query<PaginationParams>,
@@ -27283,6 +27284,14 @@ async fn activity_audit_feed(
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "Audit-tier access is required to read the activity audit feed"})),
+        ));
+    }
+    if !session.site_scope.is_empty() || !session.environment_scope.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Global audit-feed access requires an explicit global scope"
+            })),
         ));
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
@@ -33404,14 +33413,24 @@ type ScopeFilters = (Option<String>, Option<String>);
 /// refuse a live-execution grant when the target site is degraded or
 /// unreachable. The persisted site_status (swarm #8) is authoritative; a
 /// healthy/recovering site, or one with no status row, is allowed. A DB read
-/// error is allowed (fail-open + logged) so a transient status-store blip cannot
-/// block ALL live execution — matching the degradation read-path posture.
+/// error fails closed: an unavailable authoritative status store cannot mint
+/// live-write authority.
 pub(crate) async fn enforce_site_operational(
     pool: &sqlx::PgPool,
     site: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    enforce_site_operational_result(
+        site,
+        crate::repos::degradation::get_site_status(pool, site).await,
+    )
+}
+
+fn enforce_site_operational_result(
+    site: &str,
+    result: Result<Option<ryuki_engine::degradation_mode::SiteStatus>, sqlx::Error>,
+) -> Result<(), (StatusCode, Json<Value>)> {
     use ryuki_engine::degradation_mode::SiteDegradationState;
-    match crate::repos::degradation::get_site_status(pool, site).await {
+    match result {
         Ok(Some(s))
             if s.state == SiteDegradationState::Degraded
                 || s.state == SiteDegradationState::Unreachable =>
@@ -33430,8 +33449,14 @@ pub(crate) async fn enforce_site_operational(
         }
         Ok(_) => Ok(()),
         Err(e) => {
-            tracing::warn!(error = %e, %site, "degradation gate: site_status read failed; allowing execution (fail-open)");
-            Ok(())
+            tracing::warn!(error = %e, %site, "degradation gate: authoritative site_status read failed; blocking live execution");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "authoritative site status is unavailable; live write execution is blocked",
+                    "site": site,
+                })),
+            ))
         }
     }
 }
@@ -53938,7 +53963,9 @@ mod unit_tests {
 
     /// The global activity feed is the same sensitive identity data as the
     /// per-request trail and carries the same audit-tier gate. A no-roles
-    /// session is refused; an Auditor (audit permission) is allowed.
+    /// session is refused; a globally scoped Auditor is allowed; a scoped
+    /// Auditor is refused because audit_log has no scope columns with which to
+    /// enforce a narrower query.
     #[tokio::test]
     async fn activity_audit_feed_requires_audit_permission() {
         let no_roles = AuthSession {
@@ -53969,7 +53996,7 @@ mod unit_tests {
         let auditor = single_role_session("aud-2", ryuki_engine::auth::APP_ROLE_AUDITOR);
         assert!(
             activity_audit_feed(
-                AuthExtractor(auditor),
+                AuthExtractor(auditor.clone()),
                 Query(PaginationParams {
                     limit: None,
                     offset: None,
@@ -53977,8 +54004,49 @@ mod unit_tests {
             )
             .await
             .is_ok(),
-            "an auditor must be allowed to read the activity audit feed"
+            "a global auditor must be allowed to read the activity audit feed"
         );
+
+        let mut site_scoped_auditor = auditor.clone();
+        site_scoped_auditor.site_scope = vec!["DEFRA".to_string()];
+        let mut environment_scoped_auditor = auditor.clone();
+        environment_scoped_auditor.environment_scope = vec!["production".to_string()];
+        let mut dual_scoped_auditor = auditor.clone();
+        dual_scoped_auditor.site_scope = vec!["DEFRA".to_string()];
+        dual_scoped_auditor.environment_scope = vec!["production".to_string()];
+        let mut blank_scoped_auditor = auditor;
+        blank_scoped_auditor.site_scope = vec![" ".to_string()];
+        let mut scoped_admin =
+            single_role_session("admin-scoped", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        scoped_admin.site_scope = vec!["DEFRA".to_string()];
+
+        for (case, scoped_session) in [
+            ("site-scoped auditor", site_scoped_auditor),
+            ("environment-scoped auditor", environment_scoped_auditor),
+            ("dual-scoped auditor", dual_scoped_auditor),
+            ("malformed blank-scoped auditor", blank_scoped_auditor),
+            ("site-scoped platform admin", scoped_admin),
+        ] {
+            let Err((status, Json(body))) = activity_audit_feed(
+                AuthExtractor(scoped_session),
+                Query(PaginationParams {
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await
+            else {
+                panic!("{case} must not read the global activity feed");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN, "{case}");
+            assert_eq!(
+                body,
+                json!({
+                    "error": "Global audit-feed access requires an explicit global scope"
+                }),
+                "{case} denial must remain value-free"
+            );
+        }
     }
 
     /// Pagination limits are clamped by the handler before reaching the store:
@@ -64837,6 +64905,42 @@ mod db_lifecycle_tests {
         super::enforce_site_operational(pool, "ZZ-NONEXISTENT")
             .await
             .expect("a site with no status row must be allowed");
+    }
+
+    /// The degradation-state repository is authoritative for live execution:
+    /// an unreadable repository must deny with a value-free 503, while the
+    /// established healthy/no-row controls remain allowed.
+    #[test]
+    fn enforce_site_operational_fails_closed_when_status_is_unavailable() {
+        let internal_detail = "sensitive-database-driver-detail";
+        let Err((status, Json(body))) = super::enforce_site_operational_result(
+            "DEFRA",
+            Err(sqlx::Error::Protocol(internal_detail.to_string())),
+        ) else {
+            panic!("an authoritative site-status read failure must deny live execution");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({
+                "error": "authoritative site status is unavailable; live write execution is blocked",
+                "site": "DEFRA",
+            })
+        );
+        assert!(
+            !body.to_string().contains(internal_detail),
+            "the client-visible denial must not disclose database error details"
+        );
+
+        super::enforce_site_operational_result("DEFRA", Ok(None))
+            .expect("a missing optional status row retains its established allow behavior");
+        super::enforce_site_operational_result(
+            "DEFRA",
+            Ok(Some(ryuki_engine::degradation_mode::SiteStatus::healthy(
+                "DEFRA",
+            ))),
+        )
+        .expect("a healthy authoritative status remains allowed");
     }
 
     /// #15: a scope-preference change (preferred_site/environment) is a
