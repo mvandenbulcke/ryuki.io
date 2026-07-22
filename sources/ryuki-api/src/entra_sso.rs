@@ -53,6 +53,9 @@
 //!   Confidential-client deployments are served by the generic `oidc.*` flow.
 //! - Session cookies are emitted only through the retained Entra issuer
 //!   capability; no weaker Entra-specific policy exists.
+//! - The Entra provider key is the canonical lowercase, hyphenated `oid`; it
+//!   never falls back to `sub`. Identity authority resolves that external key
+//!   to the opaque internal principal persisted with the session.
 //! - No token material, code, verifier, or session id is ever logged; id_token
 //!   failures log only the validator's safe reason string.
 
@@ -497,7 +500,7 @@ pub(crate) async fn entra_callback(
             pool,
             "entra-id",
             &deps.issuer,
-            &claims.user_id,
+            &claims.provider_subject,
             &claims.display_name,
             claims.email.as_deref(),
             &claims.roles,
@@ -708,6 +711,7 @@ mod entra_sso_db_tests {
     const TEST_CLIENT: &str = "entra-sso-client-test";
     const TEST_REDIRECT: &str = "http://127.0.0.1:9/api/auth/entra/callback";
     const TEST_KID: &str = "entra-sso-test-kid";
+    const TEST_ENTRA_OID: &str = "11111111-2222-4333-8444-555555555555";
     static TEST_SESSION_HMAC_KEY: LazyLock<String> = LazyLock::new(|| {
         let mut key = [0_u8; 32];
         OsRng.fill_bytes(&mut key);
@@ -775,6 +779,9 @@ mod entra_sso_db_tests {
         nonce: String,
         aud: String,
         iss: String,
+        /// Exact Entra directory object identifier to include. `None` omits
+        /// the claim so the callback's no-fallback policy can be exercised.
+        oid: Option<String>,
         /// exp = now + offset (negative → already expired).
         exp_offset: i64,
         /// When true, the token endpoint answers 500.
@@ -795,6 +802,9 @@ mod entra_sso_db_tests {
         }
         fn set_aud(&self, aud: &str) {
             self.issue.lock().unwrap().aud = aud.to_string();
+        }
+        fn set_oid(&self, oid: Option<&str>) {
+            self.issue.lock().unwrap().oid = oid.map(str::to_string);
         }
         fn set_exp_offset(&self, offset: i64) {
             self.issue.lock().unwrap().exp_offset = offset;
@@ -838,6 +848,7 @@ mod entra_sso_db_tests {
             nonce: String::new(),
             aud: TEST_CLIENT.to_string(),
             iss: format!("{base_url}/{TEST_TENANT}/v2.0"),
+            oid: Some(TEST_ENTRA_OID.to_string()),
             exp_offset: 3600,
             fail_with_500: false,
         }));
@@ -894,11 +905,10 @@ mod entra_sso_db_tests {
                                 Json(json!({"error": "server_error"})),
                             );
                         }
-                        let claims = json!({
+                        let mut claims = json!({
                             "iss": spec.iss,
                             "aud": spec.aud,
                             "sub": "entra-sub-1",
-                            "oid": "entra-oid-1",
                             "name": "Entra Test User",
                             "preferred_username": "entra.user@stub.example",
                             "email": "entra.user@stub.example",
@@ -907,6 +917,9 @@ mod entra_sso_db_tests {
                             "exp": now() + spec.exp_offset,
                             "nbf": now() - 60,
                         });
+                        if let Some(oid) = &spec.oid {
+                            claims["oid"] = json!(oid);
+                        }
                         let mut header = Header::new(Algorithm::RS256);
                         header.kid = Some(TEST_KID.to_string());
                         let id_token = jsonwebtoken::encode(&header, &claims, &encoding)
@@ -1115,11 +1128,12 @@ mod entra_sso_db_tests {
 
         let stub = start_stub_idp().await;
         let deps = stub_deps(&stub);
+        let expected_issuer = deps.issuer.clone();
         provision_global_assignment(
             pool,
             "entra-id",
             &deps.issuer,
-            "entra-oid-1",
+            TEST_ENTRA_OID,
             &["PlatformAdmin".to_string()],
         )
         .await;
@@ -1180,18 +1194,27 @@ mod entra_sso_db_tests {
             &test_session_config(),
         )
         .expect("test verifier");
-        let row: (Uuid, String, String, Vec<String>, String) = sqlx::query_as(
-            "SELECT session_record_id, user_id, display_name, roles, provider FROM sessions \
-             WHERE bearer_verifier = $1 AND expires_at > NOW()",
+        let row: (Uuid, Uuid, String, Vec<String>, String, String, String) = sqlx::query_as(
+            "SELECT s.session_record_id, s.principal_id, s.display_name, s.roles, \
+                    k.provider_id, k.issuer, k.subject \
+             FROM sessions s \
+             JOIN principal_keys k ON k.principal_key_id = s.principal_key_id \
+             WHERE s.bearer_verifier = $1 AND s.expires_at > NOW()",
         )
         .bind(verifier.as_slice())
         .fetch_one(pool)
         .await
         .expect("session row");
-        assert_eq!(row.1, "entra-oid-1");
+        assert_ne!(
+            row.1,
+            Uuid::nil(),
+            "the persisted session must use a registry-issued opaque principal id"
+        );
         assert_eq!(row.2, "Entra Test User");
         assert_eq!(row.3, vec!["PlatformAdmin".to_string()]);
         assert_eq!(row.4, "entra-id");
+        assert_eq!(row.5, expected_issuer);
+        assert_eq!(row.6, TEST_ENTRA_OID);
 
         // The token exchange must have been a PKCE PUBLIC client exchange:
         // grant/code/redirect/client + a verifier that hashes to the
@@ -1216,6 +1239,50 @@ mod entra_sso_db_tests {
             .bind(row.0)
             .execute(pool)
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_callback_missing_oid_rejects_without_sub_fallback() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            return;
+        };
+
+        let stub = start_stub_idp().await;
+        let deps = stub_deps(&stub);
+        // Make the signed `sub` fully admissible as an authority key. If the
+        // callback ever restores oid→sub fallback, this request would mint a
+        // session and the regression would fail.
+        provision_global_assignment(
+            pool,
+            "entra-id",
+            &deps.issuer,
+            "entra-sub-1",
+            &["PlatformAdmin".to_string()],
+        )
+        .await;
+        let app = test_router(deps);
+
+        let (state, nonce, _code_challenge, binding) = begin_login(&app).await;
+        stub.set_nonce(&nonce);
+        stub.set_oid(None);
+
+        let response = app
+            .oneshot(callback_req(&state, &binding))
+            .await
+            .expect("callback request");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .next()
+                .is_none(),
+            "an Entra assertion without oid must never mint a session cookie"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["error"], "ENTRA_TOKEN_INVALID");
     }
 
     #[tokio::test]
@@ -1250,7 +1317,7 @@ mod entra_sso_db_tests {
             pool,
             "entra-id",
             &deps.issuer,
-            "entra-oid-1",
+            TEST_ENTRA_OID,
             &["PlatformAdmin".to_string()],
         )
         .await;
@@ -1552,45 +1619,6 @@ mod entra_sso_db_tests {
                 } else {
                     "https://login.microsoftonline.example/test-tenant/v2.0"
                 };
-                let digest = Sha256::digest(format!("entra-mode-test\0{provider}\0{issuer}"));
-                let mut identity_tx = pool.begin().await.expect("begin Entra test identity seed");
-                crate::human_authority::prepare_writer_tx(
-                    &mut identity_tx,
-                    provider,
-                    issuer,
-                    "admin",
-                )
-                .await
-                .expect("prepare Entra test identity writer");
-                crate::human_authority::mark_governed_identity_reactivation_tx(&mut identity_tx)
-                    .await
-                    .expect("mark Entra test identity reactivation");
-                let epoch = sqlx::query_scalar::<_, i64>(
-                    "INSERT INTO identity_authorities \
-                     (provider, issuer, subject, authority_epoch, authority_digest, authority_status, \
-                      last_asserted_at) \
-                     VALUES ($1, $2, 'admin', 1, $3, 'active-scoped-v2', NOW()) \
-                     ON CONFLICT (provider, issuer, subject) DO UPDATE SET \
-                       authority_epoch = CASE \
-                         WHEN identity_authorities.authority_status <> 'active-scoped-v2' \
-                           OR identity_authorities.authority_digest <> EXCLUDED.authority_digest \
-                         THEN identity_authorities.authority_epoch + 1 \
-                         ELSE identity_authorities.authority_epoch \
-                       END, \
-                       authority_digest = EXCLUDED.authority_digest, \
-                       authority_status = 'active-scoped-v2', last_asserted_at = NOW() \
-                     RETURNING authority_epoch",
-                )
-                .bind(provider)
-                .bind(issuer)
-                .bind(digest.as_slice())
-                .fetch_one(&mut *identity_tx)
-                .await
-                .expect("seed identity authority");
-                identity_tx
-                    .commit()
-                    .await
-                    .expect("commit Entra test identity seed");
                 crate::human_authority::persist_governed_assignment(
                     pool,
                     provider,
@@ -1601,16 +1629,7 @@ mod entra_sso_db_tests {
                     ]),
                 )
                 .await
-                .expect("seed human authority assignment");
-                let authority_version: i64 = sqlx::query_scalar(
-                    "SELECT assignment_version FROM human_authority_assignments \
-                     WHERE provider = $1 AND issuer = $2 AND subject = 'admin'",
-                )
-                .bind(provider)
-                .bind(issuer)
-                .fetch_one(pool)
-                .await
-                .expect("read human authority version");
+                .expect("seed opaque principal authority");
                 let mut session_tx = pool.begin().await.expect("begin Entra test session seed");
                 crate::human_authority::prepare_writer_tx(
                     &mut session_tx,
@@ -1620,22 +1639,36 @@ mod entra_sso_db_tests {
                 )
                 .await
                 .expect("prepare Entra test session writer");
+                let binding = crate::principal_registry::resolve_active_binding_tx(
+                    &mut session_tx,
+                    provider,
+                    issuer,
+                    "admin",
+                )
+                .await
+                .expect("resolve Entra test principal binding");
                 sqlx::query(
                     "INSERT INTO sessions \
-                     (session_record_id, bearer_verifier, user_id, display_name, email, roles, provider, \
-                      identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
-                      site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
-                     VALUES ($1, $2, 'admin', 'Admin', NULL, $3, $4, $5, 'admin', $6, $7, \
+                     (session_record_id, bearer_verifier, principal_id, \
+                      principal_lifecycle_version, principal_authority_version, \
+                      principal_key_id, principal_key_version, principal_link_id, \
+                      principal_link_version, display_name, email, roles, \
+                      site_authority_mode, site_scope, environment_authority_mode, \
+                      environment_scope, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Admin', NULL, $10, \
                              'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], \
                              NOW() + INTERVAL '1 hour')",
                 )
                 .bind(record_id)
                 .bind(credential.verifier().as_slice())
+                .bind(binding.principal_id.into_uuid())
+                .bind(binding.principal_lifecycle_version)
+                .bind(binding.principal_authority_version)
+                .bind(binding.principal_key_id)
+                .bind(binding.principal_key_version)
+                .bind(binding.principal_link_id)
+                .bind(binding.principal_link_version)
                 .bind(&["PlatformAdmin".to_string()] as &[String])
-                .bind(provider)
-                .bind(issuer)
-                .bind(epoch)
-                .bind(authority_version)
                 .execute(&mut *session_tx)
                 .await
                 .expect("seed session");
@@ -1643,12 +1676,16 @@ mod entra_sso_db_tests {
                     .commit()
                     .await
                     .expect("commit Entra test session seed");
-                (record_id, credential.bearer().to_string())
+                (
+                    record_id,
+                    credential.bearer().to_string(),
+                    binding.principal_id,
+                )
             }
         };
-        let (local_id, local_bearer) = seed("local").await;
-        let (entra_id, entra_bearer) = seed("entra-id").await;
-        let (oidc_id, oidc_bearer) = seed("oidc").await;
+        let (local_id, local_bearer, _local_principal) = seed("local").await;
+        let (entra_id, entra_bearer, entra_principal) = seed("entra-id").await;
+        let (oidc_id, oidc_bearer, _oidc_principal) = seed("oidc").await;
 
         let resolve = |session_bearer: String, tenant_id: &'static str, oidc_enabled: bool| async move {
             let session_config = test_session_config();
@@ -1696,7 +1733,7 @@ mod entra_sso_db_tests {
         );
         // The entra-id session resolves with its identity + roles.
         let entra = resolve(entra_bearer.clone(), "test-tenant", false).await;
-        assert_eq!(entra.user_id, "admin");
+        assert_eq!(entra.principal_id, Some(entra_principal));
         assert_eq!(entra.roles, vec!["PlatformAdmin".to_string()]);
         let rotated_tenant = resolve(entra_bearer, "rotated-tenant", false).await;
         assert!(

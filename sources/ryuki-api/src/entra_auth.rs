@@ -372,6 +372,11 @@ fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
 pub struct ValidationOutcome {
     pub session: AuthSession,
     pub failure_reason: Option<&'static str>,
+    /// Canonical provider subject proven by this validation attempt. This is
+    /// lookup provenance for the principal registry, not an authorization ID.
+    /// It is populated only after signature, issuer, audience, lifetime, and
+    /// canonical Entra object-ID validation all succeed.
+    pub(crate) external_subject: Option<String>,
     pub(crate) request_read_credential: Option<crate::request_authority::DirectFederatedCredential>,
 }
 
@@ -380,6 +385,7 @@ impl ValidationOutcome {
         Self {
             session: AuthSession::unverified_entra(),
             failure_reason: Some(reason),
+            external_subject: None,
             request_read_credential: None,
         }
     }
@@ -630,16 +636,20 @@ impl EntraTokenValidator {
         // issuance requires a currently valid, internally ordered interval.
         let request_read_credential = request_read_credential.ok();
         let actor_class = classify_entra_actor(&claims);
-        let user_id = entra_account_key;
+        let external_subject = entra_account_key;
         let display_name = claims
             .name
             .clone()
             .or_else(|| claims.preferred_username.clone())
-            .unwrap_or_else(|| user_id.clone());
+            .unwrap_or_else(|| external_subject.clone());
 
         ValidationOutcome {
             session: AuthSession {
-                user_id,
+                display_user_id: external_subject.clone(),
+                // Raw provider validation proves a provider-qualified key, not
+                // an internal principal. Registry admission below this seam is
+                // the only code allowed to populate principal_id.
+                principal_id: None,
                 display_name,
                 roles: claims.roles,
                 token_valid: true,
@@ -649,6 +659,7 @@ impl EntraTokenValidator {
                 ..Default::default()
             },
             failure_reason: None,
+            external_subject: Some(external_subject),
             request_read_credential,
         }
     }
@@ -1201,19 +1212,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_valid_token_yields_verified_session() {
+    async fn test_valid_token_yields_validated_but_unbound_session() {
         let (enc, dec, _) = make_keypair();
         let validator = static_validator(dec, true);
         let token = sign(&enc, valid_claims());
 
         let outcome = validator.validate_with_reason(&auth(&token)).await;
         assert_eq!(outcome.failure_reason, None);
+        assert_eq!(outcome.external_subject.as_deref(), Some(TEST_OBJECT_ID));
         assert!(outcome.request_read_credential.is_some());
         assert!(outcome.session.token_valid);
-        assert!(outcome.session.is_verified_human());
+        assert_eq!(
+            outcome.session.actor_class,
+            ryuki_engine::auth::ActorClass::VerifiedHuman
+        );
+        assert_eq!(outcome.session.principal_id, None);
+        assert!(!outcome.session.is_verified_human());
         assert_eq!(outcome.session.provider_mode, "entra-id");
         assert_eq!(outcome.session.roles, vec!["PlatformAdmin"]);
-        assert_eq!(outcome.session.user_id, TEST_OBJECT_ID);
+        assert_eq!(outcome.session.display_user_id, TEST_OBJECT_ID);
         // name preferred for display.
         assert_eq!(outcome.session.display_name, "Ada Admin");
 
@@ -1503,9 +1520,10 @@ mod tests {
         assert!(!outcome.session.token_valid);
         assert_eq!(outcome.session.provider_mode, "entra-id-unverified");
         assert_ne!(
-            outcome.session.user_id,
+            outcome.session.display_user_id,
             "signed-sub-must-not-become-the-account-key"
         );
+        assert!(outcome.external_subject.is_none());
         assert!(outcome.request_read_credential.is_none());
         assert_eq!(outcome.failure_reason, Some("invalid-token"));
         let log_reason = outcome.failure_reason.unwrap_or_default();

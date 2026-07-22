@@ -8,6 +8,7 @@
 //! current projection.
 
 use chrono::{Duration, Utc};
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::AuthSession;
 use ryuki_engine::authorization::{
     Action, AuthorizationError, AuthorizationKernel, AuthorizationPermit, BindingDigest,
@@ -15,7 +16,7 @@ use ryuki_engine::authorization::{
     ResourceLifecycle, ResourceSensitivity, TransactionContext, VerifiedPrincipal,
 };
 use serde_json::json;
-use sqlx::{Postgres, Transaction};
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditRecord, LocalAuditReservation};
@@ -65,10 +66,10 @@ impl From<RequestAuthorityError> for RequestReadError {
 
 pub(crate) enum RequestReadRecord {
     Database {
-        row: DbRequestRow,
+        row: Box<DbRequestRow>,
         steps: Vec<crate::repos::job_steps::JobStepRow>,
     },
-    Local(ryuki_engine::models::Request),
+    Local(Box<ryuki_engine::models::Request>),
 }
 
 #[derive(Clone)]
@@ -86,8 +87,8 @@ struct DbRequestReadBindingRow {
     stage: String,
     site: String,
     environment: String,
-    requester: Option<String>,
-    created_by: Option<String>,
+    principal_binding_state: String,
+    owner_principal_id: Option<Uuid>,
 }
 
 enum RequestReadUnitOfWork {
@@ -237,7 +238,7 @@ async fn authorize_local_read(
             outcome: "success",
         },
     )
-    .await;
+    .await?;
     let receipt = kernel.issue_audit_obligation_receipt(
         &decision,
         audit_reservation.evidence().clone(),
@@ -280,14 +281,16 @@ pub(crate) async fn read(grant: RequestReadGrant) -> Result<RequestReadRecord, R
             // immutable snapshot to the permit before releasing either sink.
             // Optimistic MVCC binding avoids deadlocks with orchestration's
             // plan-first writers while detecting every changed tuple.
-            let row: DbRequestRow = sqlx::query_as(&format!(
-                "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+            let snapshot = sqlx::query(&format!(
+                "SELECT {REQUEST_COLUMNS}, principal_binding_state, owner_principal_id \
+                 FROM requests WHERE id = $1"
             ))
             .bind(request_id)
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(RequestReadError::Stale)?;
-            let current = binding_from_database_row(&row);
+            let row = DbRequestRow::from_row(&snapshot)?;
+            let current = DbRequestReadBindingRow::from_row(&snapshot)?;
             let locked_plan =
                 crate::repos::job_steps::load_plan_for_permit_read(&mut transaction, request_id)
                     .await?;
@@ -303,7 +306,10 @@ pub(crate) async fn read(grant: RequestReadGrant) -> Result<RequestReadRecord, R
 
             let steps = locked_plan.into_rows(&current_permit);
             transaction.commit().await?;
-            Ok(RequestReadRecord::Database { row, steps })
+            Ok(RequestReadRecord::Database {
+                row: Box::new(row),
+                steps,
+            })
         }
         RequestReadUnitOfWork::Local {
             lease,
@@ -323,7 +329,7 @@ pub(crate) async fn read(grant: RequestReadGrant) -> Result<RequestReadRecord, R
                 .ok_or(RequestReadError::Stale)?
                 .clone();
             audit_reservation.commit();
-            Ok(RequestReadRecord::Local(request))
+            Ok(RequestReadRecord::Local(Box::new(request)))
         }
     }
 }
@@ -333,25 +339,13 @@ async fn load_binding_row(
     request_id: Uuid,
 ) -> Result<Option<DbRequestReadBindingRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, resource_version, status, stage, site, environment, requester, created_by \
+        "SELECT id, resource_version, status, stage, site, environment, \
+                principal_binding_state, owner_principal_id \
          FROM requests WHERE id = $1",
     )
     .bind(request_id)
     .fetch_optional(&mut **transaction)
     .await
-}
-
-fn binding_from_database_row(row: &DbRequestRow) -> DbRequestReadBindingRow {
-    DbRequestReadBindingRow {
-        id: row.id,
-        resource_version: row.resource_version,
-        status: row.status.clone(),
-        stage: row.stage.clone(),
-        site: row.site.clone(),
-        environment: row.environment.clone(),
-        requester: row.requester.clone(),
-        created_by: row.created_by.clone(),
-    }
 }
 
 fn boundary_from(authority: &RevalidatedRequestReadAuthority<'_>) -> RequestReadBoundary {
@@ -368,7 +362,12 @@ fn bind_database_resource(
     row: &DbRequestReadBindingRow,
     state_digest: BindingDigest,
 ) -> Result<ResolvedResource, RequestReadError> {
-    let owner = authoritative_owner(row.requester.as_deref(), row.created_by.as_deref())?;
+    // `request.read` follows the current opaque owner, not the maker/requester.
+    // Creation initializes those identities together. Any future ownership
+    // transfer must be a governed transition that advances resource_version;
+    // this reader must never recover authority from either legacy label or the
+    // immutable requester when the exact owner binding is absent.
+    let owner = authoritative_database_owner(&row.principal_binding_state, row.owner_principal_id)?;
     bind_resource(
         kernel,
         boundary,
@@ -387,7 +386,7 @@ fn bind_local_resource(
     boundary: &RequestReadBoundary,
     row: &LocalRequestReadBinding,
 ) -> Result<ResolvedResource, RequestReadError> {
-    let owner = authoritative_owner(Some(&row.requester), Some(&row.owner))?;
+    let owner = authoritative_local_owner(&row.owner)?;
     bind_resource(
         kernel,
         boundary,
@@ -409,7 +408,7 @@ fn bind_resource(
     resource_version: i64,
     site: &str,
     environment: &str,
-    owner: String,
+    owner: PrincipalId,
     state_digest: BindingDigest,
     lifecycle_state: ResourceLifecycle,
 ) -> Result<ResolvedResource, RequestReadError> {
@@ -438,20 +437,22 @@ fn bind_resource(
     )
 }
 
-fn authoritative_owner(
-    preferred: Option<&str>,
-    legacy_fallback: Option<&str>,
-) -> Result<String, RequestReadError> {
-    preferred
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            legacy_fallback
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .map(str::to_string)
+fn authoritative_database_owner(
+    binding_state: &str,
+    owner_principal_id: Option<Uuid>,
+) -> Result<PrincipalId, RequestReadError> {
+    if binding_state != "exact-v1" {
+        return Err(RequestReadError::NotFound);
+    }
+    owner_principal_id
+        .and_then(|value| PrincipalId::from_uuid(value).ok())
         .ok_or(RequestReadError::NotFound)
+}
+
+fn authoritative_local_owner(owner_principal_id: &str) -> Result<PrincipalId, RequestReadError> {
+    owner_principal_id
+        .parse::<PrincipalId>()
+        .map_err(|_| RequestReadError::NotFound)
 }
 
 fn database_lifecycle(status: &str) -> ResourceLifecycle {
@@ -519,5 +520,63 @@ mod currentness {
                 }
                 other => RequestReadError::Authorization(other),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OWNER: &str = "018f3f54-8f5e-7bb7-9f06-1f3cc6f819d0";
+
+    #[test]
+    fn quarantined_database_rows_never_recover_legacy_owner_text() {
+        let owner = Uuid::parse_str(OWNER).expect("test owner UUID");
+
+        assert!(matches!(
+            authoritative_database_owner("legacy-quarantined", Some(owner)),
+            Err(RequestReadError::NotFound)
+        ));
+        assert!(matches!(
+            authoritative_database_owner("exact-v1", None),
+            Err(RequestReadError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn exact_database_owner_is_a_non_nil_internal_uuid() {
+        let owner = Uuid::parse_str(OWNER).expect("test owner UUID");
+
+        assert_eq!(
+            authoritative_database_owner("exact-v1", Some(owner))
+                .expect("exact owner")
+                .to_string(),
+            OWNER
+        );
+        assert!(matches!(
+            authoritative_database_owner("exact-v1", Some(Uuid::nil())),
+            Err(RequestReadError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn local_rows_require_canonical_uuid_owners() {
+        assert_eq!(
+            authoritative_local_owner(OWNER)
+                .expect("canonical local owner")
+                .to_string(),
+            OWNER
+        );
+        for legacy in [
+            "shared-subject",
+            "user@example.test",
+            "018F3F54-8F5E-7BB7-9F06-1F3CC6F819D0",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(matches!(
+                authoritative_local_owner(legacy),
+                Err(RequestReadError::NotFound)
+            ));
+        }
     }
 }

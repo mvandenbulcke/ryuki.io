@@ -19,6 +19,9 @@
 //! - Secrets never logged: `client_secret`, `code`, `pkce_verifier`, `id_token`,
 //!   `access_token` are NEVER passed to any `tracing::*` call.
 //! - Roles from validated claims only, via the `roles_claim` config key.
+//! - Validated provider subjects remain external lookup evidence. Identity
+//!   authority resolves the exact provider/issuer/subject tuple to a random,
+//!   opaque internal principal before persisting a session.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -485,11 +488,12 @@ enum KeySource {
 
 /// Validated identity extracted from an OIDC id_token.
 pub struct ValidatedOidcClaims {
-    /// Provider subject selected by the explicit validator policy. Generic
-    /// OIDC always uses `sub`; only the Entra-specific entry point may use its
-    /// `oid` object identifier with `sub` as a compatibility fallback.
-    pub user_id: String,
-    /// `name` → `preferred_username` → `user_id` fallback chain.
+    /// External provider-subject evidence selected by the explicit validator
+    /// policy. This value is lookup material for the opaque principal registry;
+    /// it is never an internal principal identifier. Generic OIDC uses `sub`,
+    /// while the Entra-specific entry point requires canonical `oid`.
+    pub provider_subject: String,
+    /// `name` → `preferred_username` → provider-subject fallback chain.
     pub display_name: String,
     pub email: Option<String>,
     pub roles: Vec<String>,
@@ -498,7 +502,18 @@ pub struct ValidatedOidcClaims {
 #[derive(Clone, Copy)]
 enum SubjectMapping {
     StandardSub,
-    EntraOidThenSub,
+    EntraCanonicalOid,
+}
+
+/// Return the exact canonical Entra directory object identifier.
+///
+/// Entra `oid` values are UUIDs. Accepting an alternate UUID spelling,
+/// surrounding whitespace, or `sub` as a fallback would let one directory
+/// object enter the principal registry under multiple provider keys.
+fn canonical_entra_oid(value: Option<&str>) -> Option<&str> {
+    let value = value?;
+    let parsed = Uuid::parse_str(value).ok()?;
+    (parsed.hyphenated().to_string() == value).then_some(value)
 }
 
 /// RS256 id_token validator.  Built once from OIDC config (or injected with
@@ -591,8 +606,10 @@ impl OidcIdTokenValidator {
     }
 
     /// Entra browser SSO uses the tenant object id as its durable provider
-    /// subject. Keeping this policy behind an explicit entry point prevents a
-    /// vendor claim from changing generic OIDC identity semantics.
+    /// subject. The object id must use its canonical lowercase, hyphenated UUID
+    /// spelling and never falls back to `sub`. Keeping this policy behind an
+    /// explicit entry point prevents a vendor claim from changing generic OIDC
+    /// identity semantics.
     pub(crate) async fn validate_entra_id_token(
         &self,
         token: &str,
@@ -603,7 +620,7 @@ impl OidcIdTokenValidator {
             token,
             expected_nonce,
             roles_claim,
-            SubjectMapping::EntraOidThenSub,
+            SubjectMapping::EntraCanonicalOid,
         )
         .await
     }
@@ -656,13 +673,12 @@ impl OidcIdTokenValidator {
             .and_then(|v| v.as_str())
             .filter(|subject| !subject.trim().is_empty())
             .ok_or("missing-sub")?;
-        let user_id = match subject_mapping {
+        let provider_subject = match subject_mapping {
             SubjectMapping::StandardSub => sub,
-            SubjectMapping::EntraOidThenSub => claims
-                .get("oid")
-                .and_then(|v| v.as_str())
-                .filter(|object_id| !object_id.trim().is_empty())
-                .unwrap_or(sub),
+            SubjectMapping::EntraCanonicalOid => {
+                canonical_entra_oid(claims.get("oid").and_then(|value| value.as_str()))
+                    .ok_or("invalid-token")?
+            }
         }
         .to_string();
 
@@ -670,7 +686,7 @@ impl OidcIdTokenValidator {
             .get("name")
             .and_then(|v| v.as_str())
             .or_else(|| claims.get("preferred_username").and_then(|v| v.as_str()))
-            .unwrap_or(&user_id)
+            .unwrap_or(&provider_subject)
             .to_string();
 
         let email = claims
@@ -690,7 +706,7 @@ impl OidcIdTokenValidator {
             .unwrap_or_default();
 
         Ok(ValidatedOidcClaims {
-            user_id,
+            provider_subject,
             display_name,
             email,
             roles,
@@ -879,7 +895,7 @@ pub(crate) async fn oidc_callback(
             pool,
             "oidc",
             &cfg.oidc.issuer,
-            &claims.user_id,
+            &claims.provider_subject,
             &claims.display_name,
             claims.email.as_deref(),
             &claims.roles,
@@ -991,6 +1007,7 @@ mod oidc_callback_db_tests {
     const TEST_KID: &str = "oidc-test-kid-1";
     const TEST_ISS: &str = "https://idp.example.com";
     const TEST_AUD: &str = "oidc-client-test";
+    const TEST_ENTRA_OID: &str = "11111111-2222-4333-8444-555555555555";
     const TEST_BINDING: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const OTHER_TEST_BINDING: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
@@ -1572,7 +1589,7 @@ mod oidc_callback_db_tests {
             "iss": TEST_ISS,
             "aud": TEST_AUD,
             "sub": "sub-test-1",
-            "oid": "oid-test-1",
+            "oid": TEST_ENTRA_OID,
             "name": "Test User",
             "preferred_username": "test@example.com",
             "email": "test@example.com",
@@ -1782,23 +1799,33 @@ mod oidc_callback_db_tests {
             &crate::config_store::get_app_config().session,
         )
         .expect("test verifier");
-        let (record_id, persisted_user_id, persisted_subject, remaining_secs): (
-            Uuid,
-            String,
-            String,
-            f64,
-        ) = sqlx::query_as(
-            "SELECT session_record_id, user_id, identity_subject, \
-                    EXTRACT(EPOCH FROM expires_at - NOW())::double precision \
-             FROM sessions WHERE bearer_verifier = $1",
+        let (
+            record_id,
+            principal_id,
+            persisted_provider,
+            persisted_issuer,
+            persisted_subject,
+            remaining_secs,
+        ): (Uuid, Uuid, String, String, String, f64) = sqlx::query_as(
+            "SELECT s.session_record_id, s.principal_id, k.provider_id, k.issuer, k.subject, \
+                    EXTRACT(EPOCH FROM s.expires_at - NOW())::double precision \
+             FROM sessions s \
+             JOIN principal_keys k ON k.principal_key_id = s.principal_key_id \
+             WHERE s.bearer_verifier = $1",
         )
         .bind(verifier.as_slice())
         .fetch_one(pool)
         .await
         .expect("load persisted OIDC session expiry");
+        assert_ne!(
+            principal_id,
+            Uuid::nil(),
+            "the persisted session must use a registry-issued opaque principal id"
+        );
+        assert_eq!(persisted_provider, "oidc");
         assert_eq!(
-            persisted_user_id, "sub-test-1",
-            "generic OIDC sessions must be keyed by sub even when oid is present"
+            persisted_issuer, TEST_ISS,
+            "the exact validated issuer remains provider-key provenance"
         );
         assert_eq!(persisted_subject, "sub-test-1");
         assert!(
@@ -2285,10 +2312,32 @@ mod oidc_callback_db_tests {
             .validate_id_token(&token, nonce, "roles")
             .await
             .expect("should succeed");
-        assert_eq!(claims.user_id, "sub-test-1");
+        assert_eq!(claims.provider_subject, "sub-test-1");
         assert_eq!(claims.display_name, "Test User");
         assert_eq!(claims.email.as_deref(), Some("test@example.com"));
         assert_eq!(claims.roles, vec!["PlatformAdmin"]);
+    }
+
+    #[tokio::test]
+    async fn test_generic_oidc_keeps_sub_semantics_without_entra_oid() {
+        let (enc, dec) = make_keypair();
+        let mut key_map = HashMap::new();
+        key_map.insert(TEST_KID.to_string(), dec);
+        let validator = OidcIdTokenValidator::with_static_keys(TEST_ISS, TEST_AUD, key_map);
+
+        let nonce = "nonce-standard-sub";
+        let mut claims = valid_id_token_claims(nonce);
+        claims
+            .as_object_mut()
+            .expect("claims fixture is an object")
+            .remove("oid");
+        let token = sign_id_token(&enc, claims);
+
+        let claims = validator
+            .validate_id_token(&token, nonce, "roles")
+            .await
+            .expect("generic OIDC requires sub, not the Entra-only oid claim");
+        assert_eq!(claims.provider_subject, "sub-test-1");
     }
 
     #[tokio::test]
@@ -2326,38 +2375,67 @@ mod oidc_callback_db_tests {
     }
 
     #[tokio::test]
-    async fn test_entra_subject_mapping_is_explicit_and_falls_back_safely() {
+    async fn test_entra_subject_mapping_requires_canonical_oid_without_sub_fallback() {
         let (enc, dec) = make_keypair();
         let mut key_map = HashMap::new();
         key_map.insert(TEST_KID.to_string(), dec);
         let validator = OidcIdTokenValidator::with_static_keys(TEST_ISS, TEST_AUD, key_map);
 
         let oid_nonce = Uuid::new_v4().to_string();
-        let oid_token = sign_id_token(&enc, valid_id_token_claims(&oid_nonce));
+        let mut oid_token_claims = valid_id_token_claims(&oid_nonce);
+        oid_token_claims["oid"] = json!(TEST_ENTRA_OID);
+        let oid_token = sign_id_token(&enc, oid_token_claims);
         let oid_claims = validator
             .validate_entra_id_token(&oid_token, &oid_nonce, "roles")
             .await
             .expect("Entra token with oid is valid");
-        assert_eq!(oid_claims.user_id, "oid-test-1");
+        assert_eq!(oid_claims.provider_subject, TEST_ENTRA_OID);
 
-        let fallback_nonce = Uuid::new_v4().to_string();
-        let mut fallback = valid_id_token_claims(&fallback_nonce);
-        fallback["oid"] = json!("   ");
-        fallback
-            .as_object_mut()
-            .expect("claims fixture is an object")
-            .remove("name");
-        fallback
-            .as_object_mut()
-            .expect("claims fixture is an object")
-            .remove("preferred_username");
-        let fallback_token = sign_id_token(&enc, fallback);
-        let fallback_claims = validator
-            .validate_entra_id_token(&fallback_token, &fallback_nonce, "roles")
+        let display_fallback_nonce = "nonce-entra-display-fallback";
+        let mut display_fallback_claims = valid_id_token_claims(display_fallback_nonce);
+        for claim in ["name", "preferred_username"] {
+            display_fallback_claims
+                .as_object_mut()
+                .expect("claims fixture is an object")
+                .remove(claim);
+        }
+        let display_fallback_token = sign_id_token(&enc, display_fallback_claims);
+        let display_fallback = validator
+            .validate_entra_id_token(&display_fallback_token, display_fallback_nonce, "roles")
             .await
-            .expect("Entra token falls back to sub when oid is blank");
-        assert_eq!(fallback_claims.user_id, "sub-test-1");
-        assert_eq!(fallback_claims.display_name, "sub-test-1");
+            .expect("canonical Entra oid remains a valid display-name fallback");
+        assert_eq!(display_fallback.display_name, TEST_ENTRA_OID);
+
+        for (label, oid) in [
+            ("missing", None),
+            ("empty", Some("")),
+            ("blank", Some("   ")),
+            ("uppercase", Some("11111111-2222-4333-8444-55555555555A")),
+            ("compact", Some("11111111222243338444555555555555")),
+            ("provider-subject", Some("sub-test-1")),
+        ] {
+            let nonce = format!("nonce-entra-oid-{label}");
+            let mut claims = valid_id_token_claims(&nonce);
+            match oid {
+                Some(oid) => claims["oid"] = json!(oid),
+                None => {
+                    claims
+                        .as_object_mut()
+                        .expect("claims fixture is an object")
+                        .remove("oid");
+                }
+            }
+            let token = sign_id_token(&enc, claims);
+            let reason = validator
+                .validate_entra_id_token(&token, &nonce, "roles")
+                .await
+                .err()
+                .expect("noncanonical Entra oid must be rejected");
+            assert_eq!(
+                reason, "invalid-token",
+                "{label} oid must fail closed rather than falling back to sub"
+            );
+        }
     }
 
     #[tokio::test]

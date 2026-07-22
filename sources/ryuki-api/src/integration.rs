@@ -2043,6 +2043,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::{check_permission, resolve_scope_filter, AuthSession, ScopeFilter};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -2056,6 +2057,27 @@ fn require_admin(session: &AuthSession) -> Result<(), (StatusCode, Json<Value>)>
             Json(json!({"error": "Admin permission required"})),
         ))
     }
+}
+
+/// Return the server-attested opaque principal used by integration ownership,
+/// credential-access audit, and other security-bearing persistence seams.
+///
+/// `display_user_id` intentionally is not consulted: it is a compatibility/UI
+/// projection and may contain a provider subject or caller-controlled wire
+/// value. A simulated or deserialized session therefore cannot acquire durable
+/// authority merely by presenting UUID-shaped text.
+fn require_opaque_principal(
+    session: &AuthSession,
+) -> Result<PrincipalId, (StatusCode, Json<Value>)> {
+    session.principal_id.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "OPAQUE_PRINCIPAL_REQUIRED",
+                "message": "The authenticated credential has no current opaque principal binding"
+            })),
+        )
+    })
 }
 
 /// Post-load, site-only, NULLABLE-site scope guard for a connection (#2). Maps an
@@ -2157,7 +2179,7 @@ pub async fn integration_create(
     // created_by = the authenticated caller, never a client body field. This is
     // an audit/attribution column (and feeds downstream ownership checks), so it
     // must name the real principal and cannot be spoofed by the request body.
-    let created_by = session.user_id.clone();
+    let created_by = require_opaque_principal(&session)?.to_string();
 
     if let Some(pool) = get_db() {
         // FIX-6: validate env-var key names before any DB writes.
@@ -2380,7 +2402,7 @@ pub async fn integration_create(
         }
         _ => body.credential_ref.clone(),
     };
-    let conn = ryuki_engine::integration_connections::create_connection(
+    let prepared = ryuki_engine::integration_connections::prepare_connection(
         &body.vendor_type,
         &body.name,
         &body.endpoint_url,
@@ -2390,11 +2412,9 @@ pub async fn integration_create(
         &created_by,
     )
     .map_err(|e| integration_400(&e))?;
-    // Best-effort audit (no DB → no tx). record_audit_local returns unit; it can
-    // never fail the already-applied in-memory create — codex nit 4.
-    audit::record_audit_local(
-        &session,
-        &audit::security_audit(
+    let audit_record = {
+        let conn = prepared.connection();
+        audit::security_audit(
             "integration.connection.created",
             None,
             "configured",
@@ -2404,9 +2424,17 @@ pub async fn integration_create(
                 "site_scope": conn.site_scope,
                 "cred_source": conn.credential_source.as_str(),
             }),
-        ),
-    )
-    .await;
+        )
+    };
+    // Reserve the mandatory local audit before publishing the connection. A
+    // failed insertion drops the reservation; a successful insertion is
+    // followed only by the infallible reservation commit.
+    let audit_reservation = audit::reserve_audit_local(&session, &audit_record)
+        .await
+        .map_err(db_err)?;
+    let conn = ryuki_engine::integration_connections::insert_prepared_connection(prepared)
+        .map_err(|e| integration_400(&e))?;
+    audit_reservation.commit();
     Ok(Json(json!({
         "source": "in-memory",
         "connection": IntegrationConnectionRow::to_json(&conn),
@@ -2596,6 +2624,7 @@ pub async fn integration_update(
         // must be indistinguishable from a missing one.
         let row = row.ok_or_else(|| integration_not_found(&id))?;
         connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
+        require_opaque_principal(&session)?;
         let (mut conn, mut secret_ref, mut secret_ref_generation) =
             row.try_into_connection_with_secret_ref().map_err(db_err)?;
         let prior_secret_ref_generation = secret_ref_generation;
@@ -2912,6 +2941,7 @@ pub async fn set_webhook_secret(
     if body.webhook_secret.trim().is_empty() {
         return Err(integration_400("webhook_secret must not be empty"));
     }
+    require_opaque_principal(&session)?;
 
     let (ciphertext, nonce, key_id) = encrypt_secret(&conn.id, body.webhook_secret.as_bytes())
         .map_err(|e| integration_500(&e.to_string()))?;
@@ -3117,6 +3147,7 @@ pub async fn integration_delete(
     };
 
     if let Some(pool) = get_db() {
+        require_opaque_principal(&session)?;
         let mut tx = pool.begin().await.map_err(db_err)?;
         // #2: for a scoped principal, pre-read the row's site_scope (locked, same tx)
         // and guard BEFORE the DELETE — an out-of-scope delete must 404 WITHOUT
@@ -3155,16 +3186,21 @@ pub async fn integration_delete(
         return Ok(Json(json!({"deleted": id})));
     }
 
-    // No DB: remove-and-return atomically (one lock — no TOCTOU between read + remove).
-    // #2: scope-check FIRST so an out-of-scope delete 404s WITHOUT deleting (the
-    // pre-read is a separate lock acquisition — acceptable for the no-DB fallback).
-    if let Some(conn) = ryuki_engine::integration_connections::get_connection(&id) {
-        connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
-    }
+    // The in-memory delete cannot roll back, so establish typed attribution and
+    // reserve its audit before removing anything. The principal check is
+    // unconditional: a row created between lookup and removal cannot be deleted
+    // by an unbound session.
+    require_opaque_principal(&session)?;
+    let conn = ryuki_engine::integration_connections::get_connection(&id)
+        .ok_or_else(|| integration_not_found(&id))?;
+    connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+    let audit_record = audit_for(conn.vendor_type, conn.site_scope);
+    let audit_reservation = audit::reserve_audit_local(&session, &audit_record)
+        .await
+        .map_err(db_err)?;
     match ryuki_engine::integration_connections::delete_connection_returning(&id) {
-        Some(conn) => {
-            audit::record_audit_local(&session, &audit_for(conn.vendor_type, conn.site_scope))
-                .await;
+        Some(_) => {
+            audit_reservation.commit();
             Ok(Json(json!({"deleted": id})))
         }
         None => Err(integration_not_found(&id)),
@@ -3179,6 +3215,9 @@ pub async fn integration_test(
     Path(id): Path<String>,
 ) -> ApiResult {
     require_admin(&session)?;
+    // Authenticate the opaque authority before loading even credential locator
+    // metadata, not merely before resolving the secret material.
+    require_opaque_principal(&session)?;
 
     let (conn, typed_binding) = if let Some(pool) = get_db() {
         let row: Option<IntegrationConnectionRow> = sqlx::query_as(&format!(
@@ -3205,7 +3244,6 @@ pub async fn integration_test(
     // #2: guard BEFORE resolve_credentials — a scoped admin must never trigger
     // resolution/decryption of another site's credentials (finding #3).
     connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
-
     // Attempt credential resolution — the ResolvedCredentials is dropped immediately
     // after use and zeroized. Never included in the response.
     // Externally managed connections resolve through the adapter selected by
@@ -3366,7 +3404,9 @@ pub async fn integration_test(
             .await
             .map_err(db_err)?,
         None => {
-            audit::record_audit_local(&session, &audit_record).await;
+            audit::record_audit_local(&session, &audit_record)
+                .await
+                .map_err(db_err)?;
         }
     }
 
@@ -3577,6 +3617,7 @@ pub async fn integration_set_credential_expiry(
             Json(json!({"error": "database not configured; cannot persist credential expiry"})),
         ));
     };
+    require_opaque_principal(&session)?;
 
     // UPDATE ... RETURNING makes existence + write atomic — no check-then-write
     // TOCTOU window. A missing row yields no RETURNING and is a clean 404. The
@@ -4026,6 +4067,7 @@ pub async fn integration_circuit_record(
     // #2: an out-of-scope connection's breaker must 404 like a missing one — and
     // never accept a recorded outcome. tx rolls back on drop, nothing persists.
     connection_scope_guard(&session, site_scope.as_deref(), &id)?;
+    require_opaque_principal(&session)?;
 
     // DB clock inside the tx — shared across workers (no local-clock skew on the
     // persisted opened_at_unix / cooldown).
@@ -4103,6 +4145,7 @@ pub async fn integration_circuit_reset(
     // #2: an out-of-scope connection's breaker must 404 like a missing one — and
     // never be reset. tx rolls back on drop, nothing is cleared.
     connection_scope_guard(&session, site_scope.as_deref(), &id)?;
+    require_opaque_principal(&session)?;
     // Absence of a row IS the healthy default, so a reset just clears it. DELETE …
     // RETURNING the prior state so the audit reflects what was ACTUALLY reset: a row
     // can be persisted as 'closed' (a healthy upsert), so the mere existence of a row
@@ -4292,6 +4335,21 @@ pub mod integration_db_tests {
 
     fn test_request_id() -> Extension<crate::RequestId> {
         Extension(crate::RequestId(uuid::Uuid::new_v4().to_string()))
+    }
+
+    fn admitted_admin_session() -> AuthSession {
+        let principal_id = PrincipalId::from_uuid(uuid::Uuid::new_v4())
+            .expect("generated integration test principal");
+        AuthSession {
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
+            display_name: "Integration Test Admin".to_string(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            provider_mode: "integration-test".to_string(),
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+            ..AuthSession::default()
+        }
     }
 
     async fn cleanup_connection(pool: &PgPool, id: &str) {
@@ -6259,12 +6317,9 @@ pub mod integration_db_tests {
         let conn_id = format!("ic-del-audit-{}", uuid::Uuid::new_v4());
         seed_env_var_connection(pool, &conn_id, "RYUKI_INTEGRATION__DELAUDIT").await;
 
-        let resp = integration_delete(
-            Extension(AuthSession::static_dry_run()),
-            Path(conn_id.clone()),
-        )
-        .await
-        .expect("delete must succeed");
+        let resp = integration_delete(Extension(admitted_admin_session()), Path(conn_id.clone()))
+            .await
+            .expect("delete must succeed");
         assert_eq!(resp.0["deleted"], serde_json::json!(conn_id));
 
         // The row is gone.
@@ -6309,12 +6364,9 @@ pub mod integration_db_tests {
             return;
         };
         let unknown = format!("ic-del-missing-{}", uuid::Uuid::new_v4());
-        let err = integration_delete(
-            Extension(AuthSession::static_dry_run()),
-            Path(unknown.clone()),
-        )
-        .await
-        .expect_err("unknown id");
+        let err = integration_delete(Extension(admitted_admin_session()), Path(unknown.clone()))
+            .await
+            .expect_err("unknown id");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert!(
             delete_audit_row(pool, &unknown).await.is_none(),
@@ -6348,7 +6400,7 @@ pub mod integration_db_tests {
         std::env::set_var(env_key, "fixture-value");
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
-        let session = AuthSession::static_dry_run();
+        let session = admitted_admin_session();
         let _ = integration_test(
             Extension(session.clone()),
             test_request_id(),
@@ -6373,7 +6425,14 @@ pub mod integration_db_tests {
             1,
             "exactly one row"
         );
-        assert_eq!(row.0, session.user_id, "actor is the session user");
+        assert_eq!(
+            row.0,
+            session
+                .principal_id
+                .expect("admitted session principal")
+                .to_string(),
+            "actor is the opaque session principal"
+        );
         assert_eq!(row.1, "resolved");
         assert_eq!(row.2, "security");
         assert_eq!(row.3, "success");
@@ -6405,7 +6464,7 @@ pub mod integration_db_tests {
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
         let _ = integration_test(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             test_request_id(),
             Path(conn_id.clone()),
         )
@@ -6467,7 +6526,7 @@ pub mod integration_db_tests {
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
         let _ = integration_test(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             test_request_id(),
             Path(conn_id.clone()),
         )
@@ -6524,7 +6583,7 @@ pub mod integration_db_tests {
         .unwrap_or_else(|| "GENESIS".to_string());
 
         let _ = integration_test(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             test_request_id(),
             Path(conn_id.clone()),
         )
@@ -6569,7 +6628,7 @@ pub mod integration_db_tests {
 
         for _ in 0..2 {
             let _ = integration_test(
-                Extension(AuthSession::static_dry_run()),
+                Extension(admitted_admin_session()),
                 test_request_id(),
                 Path(conn_id.clone()),
             )
@@ -6602,10 +6661,15 @@ pub mod integration_db_tests {
         std::env::set_var(env_key, "fixture-value");
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
-        // Distinct admin identity so the assertion is meaningful.
-        let mut session = AuthSession::static_dry_run();
-        session.user_id = format!("r58-actor-{}", uuid::Uuid::new_v4());
-        let expected_actor = session.user_id.clone();
+        // Give the compatibility display projection a different UUID-shaped
+        // value so this proves audit attribution uses only the typed principal.
+        let mut session = admitted_admin_session();
+        session.display_user_id = uuid::Uuid::new_v4().to_string();
+        let expected_actor = session
+            .principal_id
+            .expect("admitted session principal")
+            .to_string();
+        assert_ne!(session.display_user_id, expected_actor);
 
         let _ = integration_test(Extension(session), test_request_id(), Path(conn_id.clone()))
             .await
@@ -6647,7 +6711,7 @@ pub mod integration_db_tests {
         std::env::set_var(env_key, "fixture-value");
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
-        let session = AuthSession::static_dry_run();
+        let session = admitted_admin_session();
         let _ = integration_test(Extension(session), test_request_id(), Path(conn_id.clone()))
             .await
             .expect("integration_test must succeed");
@@ -6703,7 +6767,7 @@ pub mod integration_db_tests {
             credential_secret_ref: None,
             inline_secret: inline_secret.to_string(),
         };
-        let resp = integration_create(Extension(AuthSession::static_dry_run()), Json(body))
+        let resp = integration_create(Extension(admitted_admin_session()), Json(body))
             .await
             .expect("create must succeed");
         resp.0["connection"]["id"]
@@ -6837,7 +6901,7 @@ pub mod integration_db_tests {
             inline_secret: new_secret.clone(),
         };
         let _ = integration_update(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             Path(conn_id.clone()),
             Json(upd),
         )
@@ -6893,7 +6957,7 @@ pub mod integration_db_tests {
             inline_secret: String::new(),
         };
         let _ = integration_update(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             Path(conn_id.clone()),
             Json(upd),
         )
@@ -6939,7 +7003,7 @@ pub mod integration_db_tests {
             expires_at: Some(Some("2027-01-01T00:00:00Z".to_string())),
         };
         let _ = integration_set_credential_expiry(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             Path(conn_id.clone()),
             Json(req),
         )
@@ -6964,7 +7028,7 @@ pub mod integration_db_tests {
             expires_at: Some(None),
         };
         let err = integration_set_credential_expiry(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admitted_admin_session()),
             Path(unknown.clone()),
             Json(req2),
         )
@@ -7056,7 +7120,7 @@ pub mod integration_db_tests {
                 .expect("insert breaker");
             }
             let _ = integration_circuit_reset(
-                Extension(AuthSession::static_dry_run()),
+                Extension(admitted_admin_session()),
                 Path(conn_id.to_string()),
             )
             .await
@@ -7118,6 +7182,26 @@ pub mod integration_db_tests {
 mod unit_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn security_sinks_require_typed_principal_not_display_projection() {
+        let spoofed_display = uuid::Uuid::new_v4().to_string();
+        let mut session = AuthSession::static_dry_run();
+        session.display_user_id = spoofed_display;
+
+        let error = require_opaque_principal(&session)
+            .expect_err("UUID-shaped display text must not become authority");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.1 .0["error"], "OPAQUE_PRINCIPAL_REQUIRED");
+
+        let principal_id = PrincipalId::from_uuid(uuid::Uuid::new_v4())
+            .expect("generated integration test principal");
+        session.principal_id = Some(principal_id);
+        assert_eq!(
+            require_opaque_principal(&session).expect("typed principal is admitted"),
+            principal_id
+        );
+    }
 
     #[test]
     fn encrypt_without_key_fails_with_key_unavailable() {

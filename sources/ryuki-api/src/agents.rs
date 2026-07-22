@@ -33,6 +33,7 @@ use chrono::{Duration, Utc};
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::{check_permission, AuthSession};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -296,10 +297,18 @@ const AGENT_JOB_LEASE_CONTRACT_SETTING: &str = "ryuki.agent_job_lease_contract";
 struct AgentRow {
     id: Uuid,
     agent_id: String,
+    principal_id: Uuid,
     #[allow(dead_code)]
     public_key: String,
     token_hash: String,
     status: String,
+}
+
+impl AgentRow {
+    fn opaque_principal(&self) -> ApiResult<PrincipalId> {
+        PrincipalId::from_uuid(self.principal_id)
+            .map_err(|_| forbidden("invalid agent principal authority"))
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -317,6 +326,7 @@ struct AgentEnrollmentChallengeRow {
     public_key: String,
     public_key_fingerprint: String,
     secret_hash: String,
+    created_by: String,
     status: String,
     active: bool,
 }
@@ -531,6 +541,15 @@ fn conflict(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
 
 fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (StatusCode::FORBIDDEN, Json(json!({"error": msg.into()})))
+}
+
+/// Resolve the only human-session identifier that may cross an authoritative
+/// write boundary. `display_user_id` is a compatibility/display projection and
+/// provider subjects are never accepted as a substitute for this opaque id.
+fn required_session_principal(session: &AuthSession) -> ApiResult<PrincipalId> {
+    session
+        .principal_id
+        .ok_or_else(|| forbidden("an admitted opaque principal is required for this operation"))
 }
 
 fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -1007,6 +1026,32 @@ pub(crate) async fn cleanup_expired_pending_agent_enrollments(
     .await
 }
 
+/// Allocate a stable internal agent principal inside the same transaction that
+/// creates the credential-bearing `agents` row. PostgreSQL supplies the random
+/// UUID; no identifier is copied or derived from `agent_id`, its key, or any
+/// other externally controlled label.
+async fn create_agent_principal_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    created_by: &str,
+) -> Result<PrincipalId, sqlx::Error> {
+    let principal_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO principals ( \
+             principal_kind, lifecycle_state, role_allowlist, \
+             site_authority_mode, site_scope, environment_authority_mode, \
+             environment_scope, created_by \
+         ) VALUES ( \
+             'agent', 'active', ARRAY[]::TEXT[], \
+             'revoked', ARRAY[]::TEXT[], 'revoked', ARRAY[]::TEXT[], $1 \
+         ) \
+         RETURNING principal_id",
+    )
+    .bind(created_by)
+    .fetch_one(&mut **tx)
+    .await?;
+    PrincipalId::from_uuid(principal_id)
+        .map_err(|_| sqlx::Error::Protocol("stored agent principal is invalid".into()))
+}
+
 /// Serialize registration admission across replicas, prune a bounded expired
 /// batch, enforce the exact global active-Pending quota, then insert atomically.
 async fn persist_pending_agent_registration(
@@ -1037,7 +1082,7 @@ async fn persist_pending_agent_registration(
     // establishes that trusted provisioning selected that exact key and
     // identity before registration became reachable.
     let challenge: Option<AgentEnrollmentChallengeRow> = sqlx::query_as(
-        "SELECT agent_id, platform, public_key, public_key_fingerprint, secret_hash, status, \
+        "SELECT agent_id, platform, public_key, public_key_fingerprint, secret_hash, created_by, status, \
                 (status = 'pending' AND expires_at > clock_timestamp()) AS active \
          FROM agent_enrollment_challenges \
          WHERE id = $1 \
@@ -1116,14 +1161,18 @@ async fn persist_pending_agent_registration(
 
     let token = generate_agent_token();
     let hash = sha256_hex(&token);
+    let principal_id = create_agent_principal_tx(&mut tx, &challenge.created_by)
+        .await
+        .map_err(db_err)?;
     let enrollment_id: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status, \
+        "INSERT INTO agents (agent_id, principal_id, platform, capabilities, public_key, token_hash, status, \
                              protocol_version, enrollment_challenge_id) \
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8) \
          ON CONFLICT DO NOTHING \
          RETURNING id",
     )
     .bind(registration.agent_id)
+    .bind(principal_id.into_uuid())
     .bind(registration.platform)
     .bind(capabilities_json)
     .bind(registration.public_key)
@@ -1222,14 +1271,19 @@ pub(crate) async fn seed_challenge_admitted_test_agent(
     .await
     .expect("seed trusted challenge for admitted-agent fixture");
 
+    let principal_id = create_agent_principal_tx(&mut tx, "test-provisioner")
+        .await
+        .expect("create opaque agent principal fixture");
+
     let enrollment_id: Uuid = sqlx::query_scalar(
         "INSERT INTO agents ( \
-             agent_id, platform, capabilities, public_key, token_hash, status, \
+             agent_id, principal_id, platform, capabilities, public_key, token_hash, status, \
              enrollment_challenge_id, last_seen_at \
-         ) VALUES ($1, $2, $3::jsonb, $4, $5, 'pending', $6, $7) \
+         ) VALUES ($1, $2, $3, $4::jsonb, $5, $6, 'pending', $7, $8) \
          RETURNING id",
     )
     .bind(agent_id)
+    .bind(principal_id.into_uuid())
     .bind(platform)
     .bind(capabilities)
     .bind(public_key)
@@ -1331,8 +1385,14 @@ async fn authenticate_agent(headers: &HeaderMap, pool: &PgPool) -> ApiResult<Age
 
     use subtle::ConstantTimeEq;
     let row = sqlx::query_as::<_, AgentRow>(
-        "SELECT id, agent_id, public_key, token_hash, status \
-         FROM agents WHERE token_hash = $1",
+        "SELECT agent.id, agent.agent_id, agent.principal_id, agent.public_key, \
+                agent.token_hash, agent.status \
+         FROM agents AS agent \
+         JOIN principals AS principal \
+           ON principal.principal_id = agent.principal_id \
+          AND principal.principal_kind = 'agent' \
+          AND principal.lifecycle_state = 'active' \
+         WHERE agent.token_hash = $1",
     )
     .bind(&hash)
     .fetch_optional(pool)
@@ -1353,7 +1413,44 @@ async fn authenticate_agent(headers: &HeaderMap, pool: &PgPool) -> ApiResult<Age
         )));
     }
 
+    // Convert at the admission boundary so malformed or nil storage can never
+    // flow as an authenticated machine identity even if a database constraint
+    // is disabled during an incident.
+    row.opaque_principal()?;
+
     Ok(row)
+}
+
+/// Revalidate and lock the exact enrollment/principal pair inside a consuming
+/// transaction. Authentication before the transaction is only a preliminary
+/// filter; revocation or principal deprovisioning must not race the sink.
+async fn lock_active_agent_principal_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    enrollment_id: Uuid,
+    expected_principal: PrincipalId,
+) -> Result<Option<PrincipalId>, sqlx::Error> {
+    let principal_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT agent.principal_id \
+         FROM agents AS agent \
+         JOIN principals AS principal \
+           ON principal.principal_id = agent.principal_id \
+          AND principal.principal_kind = 'agent' \
+          AND principal.lifecycle_state = 'active' \
+         WHERE agent.id = $1 \
+           AND agent.principal_id = $2 \
+           AND agent.status = 'approved' \
+         FOR SHARE OF agent, principal",
+    )
+    .bind(enrollment_id)
+    .bind(expected_principal.into_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    principal_id
+        .map(|value| {
+            PrincipalId::from_uuid(value)
+                .map_err(|_| sqlx::Error::Protocol("stored agent principal is invalid".into()))
+        })
+        .transpose()
 }
 
 /// Enrollment changes create durable workload credentials, so coarse `admin`
@@ -1400,6 +1497,7 @@ pub async fn admin_create_agent_enrollment_challenge(
             "agent enrollment requires a fresh interactive human admin session; API tokens and static/dry-run identities are not accepted",
         ));
     }
+    let actor_principal = required_session_principal(&session)?.to_string();
 
     validate_registration_text("agent_id", &body.agent_id, AGENT_ID_MAX_BYTES)?;
     validate_registration_text("platform", &body.platform, AGENT_PLATFORM_MAX_BYTES)?;
@@ -1496,7 +1594,9 @@ pub async fn admin_create_agent_enrollment_challenge(
     .bind(&fingerprint)
     .bind(&challenge_hash)
     .bind(ttl_seconds)
-    .bind(&session.user_id)
+    // `created_by` is a legacy TEXT evidence projection. Its source remains the
+    // already-admitted opaque principal, never the display/provider identity.
+    .bind(&actor_principal)
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -1656,10 +1756,14 @@ pub async fn admin_approve_agent(
                 challenge.public_key AS challenge_public_key, \
                 challenge.consumed_enrollment_id \
          FROM agents AS agent \
+         JOIN principals AS principal \
+           ON principal.principal_id = agent.principal_id \
+          AND principal.principal_kind = 'agent' \
+          AND principal.lifecycle_state = 'active' \
          LEFT JOIN agent_enrollment_challenges AS challenge \
            ON challenge.id = agent.enrollment_challenge_id \
          WHERE agent.agent_id = $1 \
-         FOR UPDATE OF agent",
+         FOR UPDATE OF agent FOR SHARE OF principal",
     )
     .bind(&agent_id)
     .fetch_optional(&mut *tx)
@@ -1854,13 +1958,20 @@ pub async fn admin_revoke_agent(
         .await
         .map_err(db_err)?;
 
-    let prior: Option<(Uuid, String, String)> =
-        sqlx::query_as("SELECT id, status, public_key FROM agents WHERE agent_id = $1 FOR UPDATE")
-            .bind(&agent_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-    let Some((enrollment_id, prior_status, stored_public_key)) = prior else {
+    let prior: Option<(Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT agent.id, agent.status, agent.public_key, principal.lifecycle_state \
+         FROM agents AS agent \
+         JOIN principals AS principal \
+           ON principal.principal_id = agent.principal_id \
+          AND principal.principal_kind = 'agent' \
+         WHERE agent.agent_id = $1 \
+         FOR UPDATE OF agent FOR SHARE OF principal",
+    )
+    .bind(&agent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some((enrollment_id, prior_status, stored_public_key, principal_state)) = prior else {
         return Err(not_found(format!("agent '{}' not found", agent_id)));
     };
     let stored_fingerprint = public_key_fingerprint(&stored_public_key);
@@ -1879,6 +1990,11 @@ pub async fn admin_revoke_agent(
             "status": "revoked",
             "already_revoked": true
         })));
+    }
+    if principal_state != "active" {
+        return Err(conflict(
+            "agent principal authority is not active and cannot be revoked again",
+        ));
     }
 
     let updated = sqlx::query(
@@ -1958,10 +2074,14 @@ pub(crate) async fn lease_pending_job(
         .execute(&mut *tx)
         .await?;
     let authority = sqlx::query_as::<_, AgentLeaseAuthorityRow>(
-        "SELECT id, platform, public_key, capabilities \
-         FROM agents \
-         WHERE agent_id = $1 AND status = 'approved' \
-         FOR UPDATE",
+        "SELECT agent.id, agent.platform, agent.public_key, agent.capabilities \
+         FROM agents AS agent \
+         JOIN principals AS principal \
+           ON principal.principal_id = agent.principal_id \
+          AND principal.principal_kind = 'agent' \
+          AND principal.lifecycle_state = 'active' \
+         WHERE agent.agent_id = $1 AND agent.status = 'approved' \
+         FOR UPDATE OF agent FOR SHARE OF principal",
     )
     .bind(agent_id)
     .fetch_optional(&mut *tx)
@@ -3319,6 +3439,45 @@ pub async fn post_job_result(
     post_job_result_with_pool(agent_id, job_id_str, headers, body, pool).await
 }
 
+/// Load the durable opaque identity bound to the exact enrollment currently
+/// named by a job. The readable `agent_id` remains display-only; it is never
+/// parsed, hashed, or copied into principal authority.
+async fn job_agent_audit_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: Uuid,
+) -> Result<AuthSession, sqlx::Error> {
+    let authority: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT agent.principal_id, agent.agent_id \
+         FROM agent_jobs AS job \
+         JOIN agents AS agent ON agent.agent_id = job.agent_id \
+         JOIN principals AS principal \
+           ON principal.principal_id = agent.principal_id \
+          AND principal.principal_kind = 'agent' \
+         WHERE job.id = $1 \
+         FOR SHARE OF agent, principal",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((principal_id, agent_id)) = authority else {
+        return Err(sqlx::Error::Protocol(
+            "job has no durable agent principal attribution".into(),
+        ));
+    };
+    let principal_id = PrincipalId::from_uuid(principal_id)
+        .map_err(|_| sqlx::Error::Protocol("stored agent principal is invalid".into()))?;
+    Ok(AuthSession {
+        display_user_id: format!("agent:{agent_id}"),
+        principal_id: Some(principal_id),
+        display_name: format!("Execution agent {agent_id} (signed job result)"),
+        roles: Vec::new(),
+        token_valid: false,
+        provider_mode: "agent-result".to_string(),
+        actor_class: ryuki_engine::auth::ActorClass::Workload,
+        ..Default::default()
+    })
+}
+
 /// Enrich the `execute` stage with the agent result, PRESERVING the existing
 /// history, and CAS-advance the request out of `executing` — the single-job
 /// (no step plan) request-advance authority, and also the terminal move for a
@@ -3413,25 +3572,10 @@ async fn advance_request_out_of_executing(
     // input (the agent's job result) and must appear in the hash-chained audit
     // trail like every other transition. Recorded only when the CAS actually
     // advanced — auditing a lost race would forge a transition that never
-    // happened. Actor is the machine identity of the agent whose result this
-    // is; no human session exists on this path.
+    // happened. Attribution is loaded from the durable random principal bound
+    // to the agent enrollment; the readable agent label remains display-only.
     if advanced == 1 {
-        let agent_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT agent_id FROM agent_jobs WHERE id = $1",
-        )
-        .bind(job_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .flatten();
-        let agent_principal = agent_id.as_deref().unwrap_or("unknown");
-        let actor = ryuki_engine::auth::AuthSession {
-            user_id: format!("agent:{agent_principal}"),
-            display_name: format!("Execution agent {agent_principal} (signed job result)"),
-            roles: Vec::new(),
-            token_valid: false,
-            provider_mode: "agent-result".to_string(),
-            ..Default::default()
-        };
+        let actor = job_agent_audit_session_tx(tx, job_id).await?;
         let request_id_str = request_id.to_string();
         crate::audit::record_audit_tx(
             tx,
@@ -3523,22 +3667,7 @@ async fn record_live_plan_awaiting_apply(
     .rows_affected();
 
     if recorded == 1 {
-        let agent_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT agent_id FROM agent_jobs WHERE id = $1",
-        )
-        .bind(job_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .flatten();
-        let agent_principal = agent_id.as_deref().unwrap_or("unknown");
-        let actor = ryuki_engine::auth::AuthSession {
-            user_id: format!("agent:{agent_principal}"),
-            display_name: format!("Execution agent {agent_principal} (signed job result)"),
-            roles: Vec::new(),
-            token_valid: false,
-            provider_mode: "agent-result".to_string(),
-            ..Default::default()
-        };
+        let actor = job_agent_audit_session_tx(tx, job_id).await?;
         let request_id_str = request_id.to_string();
         crate::audit::record_audit_tx(
             tx,
@@ -4070,6 +4199,7 @@ async fn post_job_result_with_pool(
 ) -> ApiResult<Json<serde_json::Value>> {
     // ── Step 1: authenticate + agent_id match ────────────────────────────────
     let agent = authenticate_agent(&headers, pool).await?;
+    let agent_principal = agent.opaque_principal()?;
 
     if agent.agent_id != agent_id {
         return Err(forbidden("token does not match path agent_id"));
@@ -4636,6 +4766,18 @@ async fn post_job_result_with_pool(
     // transaction: a job that records its result also advances its request, and
     // vice versa — never one without the other.
     let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // Close the authenticate-to-write race. Revocation and principal lifecycle
+    // writers take conflicting locks, so neither can commit between this exact
+    // binding check and the result/audit transaction.
+    if lock_active_agent_principal_tx(&mut tx, agent.id, agent_principal)
+        .await
+        .map_err(db_err)?
+        != Some(agent_principal)
+    {
+        tx.rollback().await.ok();
+        return Err(forbidden("agent principal authority is no longer active"));
+    }
 
     // Current-version freshness gates only the first terminal acceptance. An
     // exact idempotent replay arrives after the original backlink may have
@@ -6002,6 +6144,10 @@ async fn successful_plan_execution_authority(
                 j.evidence_digest, j.raw_plan_digest, eb.bytes \
          FROM agent_jobs j \
          JOIN agents a ON a.agent_id = j.agent_id \
+         JOIN principals p \
+           ON p.principal_id = a.principal_id \
+          AND p.principal_kind = 'agent' \
+          AND p.lifecycle_state = 'active' \
          JOIN evidence_blobs eb ON eb.digest = j.evidence_digest \
          WHERE j.id = $1 AND j.request_id = $2 AND j.platform = $3 \
            AND j.mode = 'LivePlan' AND j.status = 'Succeeded' \
@@ -6009,7 +6155,7 @@ async fn successful_plan_execution_authority(
            AND j.completed_at IS NOT NULL \
            AND j.raw_plan_digest = $4 AND j.signed_envelope IS NOT NULL \
            AND j.spec->>'state_key' = $5 \
-         FOR SHARE OF j, a",
+         FOR SHARE OF j, a, p",
     )
     .bind(approved_plan.job_id)
     .bind(request_id)
@@ -6210,6 +6356,12 @@ pub async fn create_live_apply_job(
             "live-apply approval requires a verified human administrator",
         ));
     }
+    let approver = session
+        .principal_id
+        .ok_or(CreateLiveApplyJobError::Invalid(
+            "live-apply approval requires an admitted opaque principal",
+        ))?
+        .to_string();
     // Invariant: this function only creates LiveApply jobs — the grant is
     // meaningless for any other mode, and the S5a-1 verifier only checks grants
     // on LiveApply results. Fail closed (return Err) rather than panic so a
@@ -6338,12 +6490,6 @@ pub async fn create_live_apply_job(
             "approved_plan_digest must be a 64-character SHA-256 hex string",
         ));
     }
-    let approver = session.user_id.as_str();
-    if approver.trim().is_empty() {
-        return Err(CreateLiveApplyJobError::Invalid(
-            "approver must not be empty",
-        ));
-    }
     let now = Utc::now();
     if expiry <= now {
         return Err(CreateLiveApplyJobError::Invalid(
@@ -6388,7 +6534,9 @@ pub async fn create_live_apply_job(
         approved_plan_digest: approved_plan_digest.to_string(),
         approved_plan_job_id: approved_plan.job_id,
         approved_plan_attempt_id: approved_plan.attempt_id,
-        approver: approver.to_string(),
+        // The protocol currently stores this evidence as text; its value is
+        // the canonical opaque principal, never a provider/display subject.
+        approver: approver.clone(),
         expiry,
         step_job_id: None,
         execution_authority: execution_authority.clone(),
@@ -6529,14 +6677,21 @@ pub async fn create_step_live_job(
         (JobMode::LiveApply, StepLiveJobAuthority::VerifiedHuman(session))
             if ryuki_engine::auth::check_human_signoff_permission(session, "admin") =>
         {
-            session.user_id.as_str()
+            session
+                .principal_id
+                .ok_or(CreateLiveApplyJobError::Invalid(
+                    "step live-apply approval requires an admitted opaque principal",
+                ))?
+                .to_string()
         }
         (JobMode::LiveApply, _) => {
             return Err(CreateLiveApplyJobError::Invalid(
                 "step live-apply approval requires a verified human administrator",
             ));
         }
-        (JobMode::LiveDestroy, StepLiveJobAuthority::SystemAutoTeardown) => "system:auto-teardown",
+        (JobMode::LiveDestroy, StepLiveJobAuthority::SystemAutoTeardown) => {
+            "system:auto-teardown".to_string()
+        }
         (JobMode::LiveDestroy, _) => {
             return Err(CreateLiveApplyJobError::Invalid(
                 "step live-destroy requires dedicated system teardown authority",
@@ -6664,7 +6819,7 @@ pub async fn create_step_live_job(
         approved_plan_digest: approved_plan_digest.to_string(),
         approved_plan_job_id: approved_plan.job_id,
         approved_plan_attempt_id: approved_plan.attempt_id,
-        approver: approver.to_string(),
+        approver: approver.clone(),
         expiry,
         step_job_id: Some(job_id),
         execution_authority: execution_authority.clone(),
@@ -6856,6 +7011,9 @@ pub async fn approve_live_apply_with(
     session: &AuthSession,
     body: &ApproveLiveApplyBody,
 ) -> ApiResult<Json<Value>> {
+    // Resolve before the signing/mutation path so even the response projection
+    // cannot fall back to a provider subject or display label.
+    let approver = required_session_principal(session)?.to_string();
     let request_resource_version =
         ryuki_protocol::RequestResourceVersion::try_from(body.request_resource_version)
             .map_err(|_| bad_request("request_resource_version must be positive"))?;
@@ -6914,7 +7072,7 @@ pub async fn approve_live_apply_with(
 
     Ok(Json(json!({
         "job_id": job_id,
-        "approver": session.user_id,
+        "approver": approver,
         "status": "Pending",
         "mode": "LiveApply"
     })))
@@ -7381,6 +7539,7 @@ pub async fn admin_requeue_dead_lettered_job(
     if !check_permission(&session, "admin") {
         return Err(forbidden("admin permission is required to requeue a job"));
     }
+    let actor_principal = required_session_principal(&session)?.to_string();
     let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
     let uid = Uuid::parse_str(&job_id)
         .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
@@ -7542,7 +7701,7 @@ pub async fn admin_requeue_dead_lettered_job(
             aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "to_status": "admin-requeued",
                 "platform": platform,
@@ -7593,6 +7752,7 @@ pub async fn admin_resolve_reconcile_required_job(
             "admin permission is required to resolve a reconcile-required job",
         ));
     }
+    let actor_principal = required_session_principal(&session)?.to_string();
     let reason = body.reason.trim();
     if reason.is_empty() {
         return Err(bad_request("a reconciliation reason is required"));
@@ -7750,7 +7910,7 @@ pub async fn admin_resolve_reconcile_required_job(
             aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "to_status": "reconcile-resolved",
                 "platform": platform,
@@ -7804,6 +7964,7 @@ pub async fn admin_cancel_pending_job(
     if !check_permission(&session, "admin") {
         return Err(forbidden("admin permission is required to cancel a job"));
     }
+    let actor_principal = required_session_principal(&session)?.to_string();
     let reason = body.reason.trim();
     if reason.is_empty() {
         return Err(bad_request("a cancellation reason is required"));
@@ -7932,7 +8093,7 @@ pub async fn admin_cancel_pending_job(
             aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "to_status": "admin-cancelled",
                 "platform": platform,
@@ -7985,6 +8146,7 @@ pub async fn admin_force_fail_job(
             "admin permission is required to force-fail a job",
         ));
     }
+    let actor_principal = required_session_principal(&session)?.to_string();
     let reason = body.reason.trim();
     if reason.is_empty() {
         return Err(bad_request("a force-fail reason is required"));
@@ -8127,7 +8289,7 @@ pub async fn admin_force_fail_job(
             aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "to_status": "admin-force-failed",
                 "platform": platform,
@@ -8171,6 +8333,7 @@ pub async fn admin_set_job_priority(
             "admin permission is required to reprioritize a job",
         ));
     }
+    let actor_principal = required_session_principal(&session)?.to_string();
     if !(0..=9).contains(&body.priority) {
         return Err(bad_request("priority must be between 0 and 9"));
     }
@@ -8253,7 +8416,7 @@ pub async fn admin_set_job_priority(
                     aggregate_id: &canonical_job_id,
                     site: None,
                     environment: None,
-                    actor: &session.user_id,
+                    actor: &actor_principal,
                     payload: json!({
                         "to_status": "admin-reprioritized",
                         "platform": platform,
@@ -8784,9 +8947,14 @@ mod tests {
         i32,
     );
 
+    fn opaque_test_principal() -> PrincipalId {
+        PrincipalId::from_uuid(Uuid::new_v4()).expect("non-nil random test principal")
+    }
+
     fn enrollment_human_admin_session(provider_mode: &str) -> AuthSession {
         AuthSession {
-            user_id: "test-enrollment-admin".to_string(),
+            display_user_id: "test-enrollment-admin".to_string(),
+            principal_id: Some(opaque_test_principal()),
             display_name: "Test Enrollment Admin".to_string(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
@@ -8800,14 +8968,19 @@ mod tests {
         }
     }
 
-    fn live_approver_session(user_id: &str) -> AuthSession {
+    fn live_approver_session(display_user_id: &str) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = user_id.to_string();
-        session.display_name = format!("{user_id} (test)");
+        session.display_user_id = display_user_id.to_string();
+        session.principal_id = Some(opaque_test_principal());
+        session.display_name = format!("{display_user_id} (test)");
         session.provider_mode = "local".to_string();
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session
+    }
+
+    fn operator_admin_session() -> AuthSession {
+        live_approver_session("test-operator-admin")
     }
 
     async fn install_live_approval_audit_failure_trigger(pool: &PgPool) {
@@ -8823,7 +8996,7 @@ mod tests {
             "CREATE FUNCTION ryuki_test_reject_live_approval_audit() RETURNS trigger \
              LANGUAGE plpgsql AS $$ \
              BEGIN \
-               IF NEW.actor_principal LIKE 'dbtest-live-audit-failure-%' THEN \
+               IF NEW.actor_display LIKE 'dbtest-live-audit-failure-%' THEN \
                  RAISE EXCEPTION 'injected live approval audit failure' USING ERRCODE = '23514'; \
                END IF; \
                RETURN NEW; \
@@ -8856,6 +9029,25 @@ mod tests {
     // -----------------------------------------------------------------------
     // Unit tests (no DB)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn authoritative_actor_resolution_ignores_display_identity_and_fails_closed() {
+        let mut display_only = AuthSession {
+            display_user_id: "provider-subject-that-looks-valid".to_string(),
+            ..Default::default()
+        };
+        let error = required_session_principal(&display_only)
+            .expect_err("a display/provider subject must not become authority");
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+
+        let principal = opaque_test_principal();
+        display_only.principal_id = Some(principal);
+        assert_eq!(
+            required_session_principal(&display_only)
+                .expect("an admitted opaque principal must remain authoritative"),
+            principal
+        );
+    }
 
     #[test]
     fn enrollment_human_gate_admits_verified_persisted_and_direct_providers() {
@@ -10180,10 +10372,12 @@ mod tests {
     #[tokio::test]
     async fn liveness_requires_admin() {
         let non_admin = AuthSession {
-            user_id: "u".into(),
+            display_user_id: "u".into(),
+            principal_id: Some(opaque_test_principal()),
             display_name: "U".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "test".into(),
             ..Default::default()
         };
@@ -10586,10 +10780,12 @@ mod tests {
 
     fn non_admin_session() -> AuthSession {
         AuthSession {
-            user_id: "requester-1".into(),
+            display_user_id: "requester-1".into(),
+            principal_id: Some(opaque_test_principal()),
             display_name: "Requester".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "test".into(),
             ..Default::default()
         }
@@ -10869,7 +11065,7 @@ mod tests {
             .expect("advance dead-lettered job parent version");
         let Err((requeue_status, requeue_body)) = admin_requeue_dead_lettered_job(
             Path(requeue_job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         else {
@@ -11603,7 +11799,7 @@ mod tests {
         let hash = sha256_hex(&token);
 
         let row = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, agent_id, public_key, token_hash, status \
+            "SELECT id, agent_id, principal_id, public_key, token_hash, status \
              FROM agents WHERE agent_id = $1",
         )
         .bind(&id)
@@ -11613,6 +11809,7 @@ mod tests {
 
         assert_eq!(row.status, "pending");
         assert_eq!(row.token_hash, hash);
+        assert!(row.opaque_principal().is_ok());
 
         cleanup_agent(&pool, &id).await;
         pool.close().await;
@@ -19366,7 +19563,9 @@ mod tests {
             .await,
             Err(CreateLiveApplyJobError::Invalid(_))
         ));
-        // Empty approver.
+        // A display/provider label cannot substitute for opaque authority.
+        let mut missing_principal = live_approver_session("display-only-approver");
+        missing_principal.principal_id = None;
         assert!(matches!(
             create_live_apply_job(
                 &pool,
@@ -19375,7 +19574,7 @@ mod tests {
                 &platform,
                 &spec,
                 &good,
-                &live_approver_session("  "),
+                &missing_principal,
                 future,
                 &cp_key,
             )
@@ -20142,6 +20341,10 @@ mod tests {
         };
 
         let approver_session = live_approver_session("sentinel-approver");
+        let approver_principal = approver_session
+            .principal_id
+            .expect("verified approver principal")
+            .to_string();
         let result = approve_live_apply_with(&pool, &cp_key, &approver_session, &body).await;
         assert!(
             result.is_ok(),
@@ -20154,7 +20357,7 @@ mod tests {
             serde_json::from_value(json_val["job_id"].clone()).expect("job_id must be a UUID");
         assert_eq!(json_val["status"], "Pending");
         assert_eq!(json_val["mode"], "LiveApply");
-        assert_eq!(json_val["approver"], "sentinel-approver");
+        assert_eq!(json_val["approver"], approver_principal);
 
         // Read stored live_context and verify the grant.
         #[derive(sqlx::FromRow)]
@@ -20183,7 +20386,7 @@ mod tests {
             "stored grant must verify with the CP public key"
         );
         assert_eq!(grant.approved_plan_digest, digest);
-        assert_eq!(grant.approver, "sentinel-approver");
+        assert_eq!(grant.approver, approver_principal);
         assert_eq!(grant.request_id, request_id);
         assert_eq!(grant.platform, platform);
         assert_eq!(grant.approved_plan_job_id, approved_plan.job_id);
@@ -20214,7 +20417,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("live-apply mint must append one canonical approval audit row");
-        assert_eq!(audit_row.actor_principal, approver_session.user_id);
+        assert_eq!(
+            audit_row.actor_principal,
+            approver_session
+                .principal_id
+                .expect("verified approver principal")
+                .to_string()
+        );
         assert_eq!(audit_row.actor_display, approver_session.display_name);
         assert_eq!(audit_row.actor_roles, approver_session.roles);
         assert_eq!(audit_row.provider_mode, approver_session.provider_mode);
@@ -20351,9 +20560,17 @@ mod tests {
         .expect("read raced live-approval audits");
         assert_eq!(job_count, 1, "unique live-apply slot must hold");
         assert_eq!(audit_actors.len(), 1, "the losing conflict emits no audit");
+        let principal_a = session_a
+            .principal_id
+            .expect("first verified approver principal")
+            .to_string();
+        let principal_b = session_b
+            .principal_id
+            .expect("second verified approver principal")
+            .to_string();
         assert!(
-            audit_actors[0] == session_a.user_id || audit_actors[0] == session_b.user_id,
-            "audit actor must be the verified winning session"
+            audit_actors[0] == principal_a || audit_actors[0] == principal_b,
+            "audit actor must be the opaque principal of the winning session"
         );
         let chain = crate::audit::verify_audit_chain(&pool)
             .await
@@ -20570,6 +20787,10 @@ mod tests {
         let digest = proto_sha256(b"plan-for-approver-test");
         let sentinel_approver = "session-derived-approver-not-from-body";
         let approver_session = live_approver_session(sentinel_approver);
+        let approver_principal = approver_session
+            .principal_id
+            .expect("verified approver principal")
+            .to_string();
 
         let mut spec = JobSpec {
             request_id,
@@ -20632,7 +20853,7 @@ mod tests {
         // The grant's approver must equal the verified session principal,
         // proving the body cannot influence it.
         assert_eq!(
-            grant.approver, sentinel_approver,
+            grant.approver, approver_principal,
             "grant.approver must come from the session, not the body"
         );
         let audit_actor: String = sqlx::query_scalar(
@@ -20643,7 +20864,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("approval audit actor");
-        assert_eq!(audit_actor, sentinel_approver);
+        assert_eq!(audit_actor, approver_principal);
         assert_eq!(grant.approver, audit_actor);
         assert!(verify_vlc(&grant, &cp_vk).is_ok(), "grant must verify");
         assert_eq!(
@@ -20772,11 +20993,13 @@ mod tests {
         // any pool access. We skip the DB guard for speed and still test the 403
         // branch correctly using the handler's in-handler auth check.
         let non_admin_session = AuthSession {
-            user_id: "non-admin-user".to_string(),
+            display_user_id: "non-admin-user".to_string(),
+            principal_id: Some(opaque_test_principal()),
             display_name: "Non Admin".to_string(),
             // Requester role has no "admin" permission.
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "test".to_string(),
             ..Default::default()
         };
@@ -23379,7 +23602,7 @@ mod tests {
 
         let Json(out) = admin_cancel_pending_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(CancelJobBody {
                 reason: "created in error; platform decommissioned".into(),
             }),
@@ -23425,7 +23648,7 @@ mod tests {
         // A second cancel of the now-Cancelled job → 409, no second audit.
         let again = admin_cancel_pending_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(CancelJobBody {
                 reason: "again".into(),
             }),
@@ -23458,7 +23681,7 @@ mod tests {
 
         let err = admin_cancel_pending_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(CancelJobBody {
                 reason: "too late".into(),
             }),
@@ -23516,7 +23739,7 @@ mod tests {
 
         let err = admin_cancel_pending_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(CancelJobBody {
                 reason: "operator tries to cancel a teardown".into(),
             }),
@@ -23555,7 +23778,7 @@ mod tests {
         let unknown = Uuid::new_v4();
         let err = admin_cancel_pending_job(
             Path(unknown.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(CancelJobBody {
                 reason: "nope".into(),
             }),
@@ -23657,7 +23880,7 @@ mod tests {
 
         let Json(out) = admin_force_fail_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ForceFailJobBody {
                 reason: "agent host is dead; killing the stuck job".into(),
             }),
@@ -23722,7 +23945,7 @@ mod tests {
         let lp = seed_job_with_mode(pool, &platform, req, "Leased", JobMode::LivePlan).await;
         let _ = admin_force_fail_job(
             Path(lp.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ForceFailJobBody {
                 reason: "stuck live-plan".into(),
             }),
@@ -23827,7 +24050,7 @@ mod tests {
         let la = seed_job_with_mode(pool, &platform, req, "Leased", JobMode::LiveApply).await;
         let e1 = admin_force_fail_job(
             Path(la.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ForceFailJobBody { reason: "x".into() }),
         )
         .await
@@ -23852,7 +24075,7 @@ mod tests {
         let run = seed_job_in_status(pool, &platform, req, "Running").await;
         let e2 = admin_force_fail_job(
             Path(run.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ForceFailJobBody { reason: "x".into() }),
         )
         .await
@@ -23863,7 +24086,7 @@ mod tests {
         let pend = seed_job_in_status(pool, &platform, req, "Pending").await;
         let e3 = admin_force_fail_job(
             Path(pend.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ForceFailJobBody { reason: "x".into() }),
         )
         .await
@@ -23885,7 +24108,7 @@ mod tests {
         let unknown = Uuid::new_v4();
         let e = admin_force_fail_job(
             Path(unknown.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ForceFailJobBody { reason: "x".into() }),
         )
         .await
@@ -24109,7 +24332,7 @@ mod tests {
 
         let Json(out) = admin_resolve_reconcile_required_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody {
                 reason: "reconciled the half-applied resources out-of-band".into(),
             }),
@@ -24146,7 +24369,7 @@ mod tests {
         // A second resolve of the now-Failed job → 409, no second audit.
         let again = admin_resolve_reconcile_required_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody {
                 reason: "again".into(),
             }),
@@ -24229,7 +24452,7 @@ mod tests {
 
         let Json(out) = admin_resolve_reconcile_required_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody {
                 reason: "provider and state dispositions reconciled".into(),
             }),
@@ -24353,7 +24576,7 @@ mod tests {
         .expect("force job to ReconcileRequired");
         let Json(_) = admin_resolve_reconcile_required_job(
             Path(job_id.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody {
                 reason: "reconciled the half-applied resources out-of-band".into(),
             }),
@@ -24492,7 +24715,7 @@ mod tests {
         let pending = seed_pending_job(pool, &platform).await;
         let conflict = admin_resolve_reconcile_required_job(
             Path(pending.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody { reason: "x".into() }),
         )
         .await
@@ -24502,7 +24725,7 @@ mod tests {
         // Unknown id → 404.
         let unknown = admin_resolve_reconcile_required_job(
             Path(Uuid::new_v4().to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody { reason: "x".into() }),
         )
         .await
@@ -24522,7 +24745,7 @@ mod tests {
         // Empty reason → 400 (admin, before the CAS).
         let empty = admin_resolve_reconcile_required_job(
             Path(pending.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(ReconcileBody {
                 reason: "   ".into(),
             }),
@@ -24631,7 +24854,7 @@ mod tests {
         // Out-of-range priority → 400.
         let bad = admin_set_job_priority(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(SetJobPriorityBody { priority: 99 }),
         )
         .await;
@@ -24640,7 +24863,7 @@ mod tests {
         // Happy: reprioritize the pending job to 9 → 200; the row is updated; audited.
         let Json(out) = admin_set_job_priority(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(SetJobPriorityBody { priority: 9 }),
         )
         .await
@@ -24697,7 +24920,7 @@ mod tests {
             .expect("commit reprioritize lease fixture");
         let conflict = admin_set_job_priority(
             Path(leased.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(SetJobPriorityBody { priority: 7 }),
         )
         .await;
@@ -24709,7 +24932,7 @@ mod tests {
         // Unknown id → 404.
         let unknown = admin_set_job_priority(
             Path(Uuid::new_v4().to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
             Json(SetJobPriorityBody { priority: 5 }),
         )
         .await;
@@ -25139,7 +25362,7 @@ mod tests {
 
         let Json(out) = admin_requeue_dead_lettered_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         .expect("requeue must succeed");
@@ -25204,7 +25427,7 @@ mod tests {
 
         let _ = admin_requeue_dead_lettered_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         .expect("requeue live plan");
@@ -25239,7 +25462,7 @@ mod tests {
         let pending = seed_pending_job(pool, &platform).await;
         let Err((s1, _)) = admin_requeue_dead_lettered_job(
             Path(pending.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         else {
@@ -25251,13 +25474,13 @@ mod tests {
         let job = seed_dead_lettered_job(pool, &platform, req).await;
         let _ = admin_requeue_dead_lettered_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         .expect("first requeue 200");
         let Err((s2, _)) = admin_requeue_dead_lettered_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         else {
@@ -25279,7 +25502,7 @@ mod tests {
         };
         for id in [Uuid::new_v4().to_string(), "not-a-uuid".to_string()] {
             let Err((status, _)) =
-                admin_requeue_dead_lettered_job(Path(id), Extension(AuthSession::static_dry_run()))
+                admin_requeue_dead_lettered_job(Path(id), Extension(operator_admin_session()))
                     .await
             else {
                 panic!("unknown/malformed id must 404");
@@ -25305,7 +25528,7 @@ mod tests {
             let job = seed_dead_lettered_job(pool, &platform, parent).await;
             let Err((status, _)) = admin_requeue_dead_lettered_job(
                 Path(job.to_string()),
-                Extension(AuthSession::static_dry_run()),
+                Extension(operator_admin_session()),
             )
             .await
             else {
@@ -25322,7 +25545,7 @@ mod tests {
         let orphan = seed_dead_lettered_job(pool, &platform, Uuid::new_v4()).await;
         let Err((status, _)) = admin_requeue_dead_lettered_job(
             Path(orphan.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         else {
@@ -25403,7 +25626,7 @@ mod tests {
         let job_c = seed_dead_lettered_job_full(pool, &platform, active, JobMode::LiveApply).await;
         let Err((sc, _)) = admin_requeue_dead_lettered_job(
             Path(job_c.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         else {
@@ -25453,7 +25676,7 @@ mod tests {
 
         let _ = admin_requeue_dead_lettered_job(
             Path(job.to_string()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(operator_admin_session()),
         )
         .await
         .expect("requeue 200");
@@ -25555,10 +25778,12 @@ mod tests {
 
     fn scoped_admin_session(site: &str) -> AuthSession {
         AuthSession {
-            user_id: "scoped-admin".into(),
+            display_user_id: "scoped-admin".into(),
+            principal_id: Some(opaque_test_principal()),
             display_name: "Scoped Admin".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "test".into(),
             site_scope: vec![site.to_string()],
             ..Default::default()

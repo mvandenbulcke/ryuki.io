@@ -526,9 +526,7 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("golden_images", true, true, true),
     TablePolicy::new("hardware_assets", true, true, true),
     TablePolicy::new("health_checks", true, true, true),
-    TablePolicy::new("human_authority_assignments", true, true, false),
     TablePolicy::new("idempotency_records", true, true, true),
-    TablePolicy::new("identity_authorities", true, true, false),
     TablePolicy::new("immutability_checks", true, true, true),
     TablePolicy::new("inbound_webhook_receipts", true, true, true),
     TablePolicy::new("incident_contexts", true, true, true),
@@ -545,6 +543,8 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("lb_pools", true, true, true),
     TablePolicy::new("lb_requests", true, true, true),
     TablePolicy::new("lb_virtual_servers", true, true, true),
+    TablePolicy::new("legacy_human_authority_evidence", false, false, false),
+    TablePolicy::new("legacy_identity_authority_evidence", false, false, false),
     TablePolicy::new("legal_holds", true, true, true),
     TablePolicy::new("linux_deployment_requests", true, true, true),
     TablePolicy::new("linux_distro_catalog", true, true, true),
@@ -571,6 +571,13 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("port_reservations", true, true, true),
     TablePolicy::new("portal_notification_reads", true, true, true),
     TablePolicy::new("portal_notifications", true, true, true),
+    TablePolicy::new("principal_key_tombstones", false, false, false),
+    TablePolicy::new("principal_key_versions", false, false, false),
+    TablePolicy::new("principal_keys", true, true, false),
+    TablePolicy::new("principal_link_events", false, false, false),
+    TablePolicy::new("principal_links", true, true, false),
+    TablePolicy::new("principal_provider_tombstones", true, false, false),
+    TablePolicy::new("principals", true, true, false),
     // Completion witnesses are written only by the one-shot migration role.
     // The serving role may inspect them for operations, but can never create,
     // mutate, or delete a witness.
@@ -3128,8 +3135,8 @@ async fn attest_application_acl(
     Ok(())
 }
 
-/// The runtime may directly invoke exactly three reviewed SECURITY DEFINER entry
-/// points. Every trigger, validator, and maintenance routine remains
+/// The runtime may directly invoke exactly six reviewed entry points. Every
+/// trigger, validator, and maintenance routine remains
 /// owner/trigger-only; PUBLIC, the ephemeral login, and grant options are
 /// denied across the complete public routine inventory.
 async fn attest_application_routine_acl(
@@ -3144,11 +3151,14 @@ async fn attest_application_routine_acl(
         login AS (
             SELECT oid FROM pg_catalog.pg_roles WHERE rolname = session_user
         ),
-        expected(signature) AS (
+        expected(signature, security_definer) AS (
             VALUES
-                ('public.reconcile_noisy_trigger_sites(integer)'::text),
-                ('public.append_audit_log(uuid,text,text,text[],text,text,text,text,text,text,jsonb,text)'::text),
-                ('public.ryuki_acquire_live_site_execution_epoch(text)'::text)
+                ('public.reconcile_noisy_trigger_sites(integer)'::text, TRUE),
+                ('public.append_audit_log(uuid,text,text,text[],text,text,text,text,text,text,jsonb,text)'::text, TRUE),
+                ('public.ryuki_acquire_live_site_execution_epoch(text)'::text, TRUE),
+                ('public.human_authority_lock_key(text,text,text)'::text, FALSE),
+                ('public.principal_registry_provider_lock_key(text)'::text, FALSE),
+                ('public.principal_registry_writer_contract_is_held(text,text,text)'::text, TRUE)
         ),
         routines AS (
             SELECT procedure.oid,
@@ -3162,20 +3172,20 @@ async fn attest_application_routine_acl(
             WHERE namespace.nspname = 'public'
         ),
         allowed AS (
-            SELECT routines.*
+            SELECT routines.*, expected.security_definer
             FROM expected
             JOIN routines
               ON routines.oid = pg_catalog.to_regprocedure(expected.signature)::oid
         )
         SELECT COALESCE((
             SELECT
-                (SELECT count(*) FROM expected) = 3
-                AND (SELECT count(*) FROM allowed) = 3
+                (SELECT count(*) FROM expected) = 6
+                AND (SELECT count(*) FROM allowed) = 6
                 AND NOT EXISTS (
                     SELECT 1
                     FROM allowed
                     WHERE allowed.prokind <> 'f'
-                       OR NOT allowed.prosecdef
+                       OR allowed.prosecdef <> allowed.security_definer
                        OR NOT pg_catalog.has_function_privilege(
                               app.oid, allowed.oid, 'EXECUTE'
                           )
@@ -3243,7 +3253,7 @@ async fn attest_application_routine_acl(
     .await?;
     if !exact {
         return Err(role_protocol_error(
-            "application routine privileges differ from the three reviewed entry-point policy",
+            "application routine privileges differ from the six reviewed entry-point policy",
         ));
     }
     Ok(())
@@ -4115,6 +4125,894 @@ async fn attest_live_site_execution_authority_chain(
     Ok(())
 }
 
+/// Pin the provider-neutral principal registry to its reviewed catalog shape.
+/// The serving role must never start against a partially applied or locally
+/// weakened cutover: opaque bindings, append-only version evidence, and the
+/// retired legacy identity columns are one atomic security contract.
+async fn attest_principal_registry_authority_chain(
+    connection: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    let columns_are_exact: bool = sqlx::query_scalar(
+        r#"
+        WITH expected_columns(
+            table_name, ordinal, column_name, type_name, not_null, default_expr
+        ) AS (
+            VALUES
+                ('principals', 1, 'principal_id', 'uuid', TRUE, 'gen_random_uuid'),
+                ('principals', 2, 'principal_kind', 'text', TRUE, '<none>'),
+                ('principals', 3, 'lifecycle_version', 'bigint', TRUE, '1'),
+                ('principals', 4, 'authority_version', 'bigint', TRUE, '1'),
+                ('principals', 5, 'lifecycle_state', 'text', TRUE, '<none>'),
+                ('principals', 6, 'role_allowlist', 'text[]', TRUE, '''{}'''),
+                ('principals', 7, 'site_authority_mode', 'text', TRUE, '<none>'),
+                ('principals', 8, 'site_scope', 'text[]', TRUE, '''{}'''),
+                ('principals', 9, 'environment_authority_mode', 'text', TRUE, '<none>'),
+                ('principals', 10, 'environment_scope', 'text[]', TRUE, '''{}'''),
+                ('principals', 11, 'created_by', 'text', TRUE, '<none>'),
+                ('principals', 12, 'created_at', 'timestamptz', TRUE, 'statement_timestamp'),
+                ('principals', 13, 'updated_at', 'timestamptz', TRUE, 'statement_timestamp'),
+                ('principals', 14, 'tombstoned_at', 'timestamptz', FALSE, '<none>'),
+
+                ('principal_provider_tombstones', 1, 'provider_tombstone_id', 'uuid', TRUE, 'gen_random_uuid'),
+                ('principal_provider_tombstones', 2, 'provider_id', 'text', TRUE, '<none>'),
+                ('principal_provider_tombstones', 3, 'tombstone_version', 'bigint', TRUE, '1'),
+                ('principal_provider_tombstones', 4, 'reason', 'text', TRUE, '<none>'),
+                ('principal_provider_tombstones', 5, 'tombstoned_by', 'text', TRUE, '<none>'),
+                ('principal_provider_tombstones', 6, 'tombstoned_at', 'timestamptz', TRUE, 'statement_timestamp'),
+
+                ('principal_keys', 1, 'principal_key_id', 'uuid', TRUE, 'gen_random_uuid'),
+                ('principal_keys', 2, 'provider_id', 'text', TRUE, '<none>'),
+                ('principal_keys', 3, 'issuer', 'text', TRUE, '<none>'),
+                ('principal_keys', 4, 'subject', 'text', TRUE, '<none>'),
+                ('principal_keys', 5, 'key_version', 'bigint', TRUE, '1'),
+                ('principal_keys', 6, 'authority_digest', 'bytea', TRUE, '<none>'),
+                ('principal_keys', 7, 'key_state', 'text', TRUE, '<none>'),
+                ('principal_keys', 8, 'transition_reason', 'text', TRUE, '<none>'),
+                ('principal_keys', 9, 'transitioned_by', 'text', TRUE, '<none>'),
+                ('principal_keys', 10, 'created_at', 'timestamptz', TRUE, 'statement_timestamp'),
+                ('principal_keys', 11, 'updated_at', 'timestamptz', TRUE, 'statement_timestamp'),
+                ('principal_keys', 12, 'tombstoned_at', 'timestamptz', FALSE, '<none>'),
+
+                ('principal_key_versions', 1, 'principal_key_id', 'uuid', TRUE, '<none>'),
+                ('principal_key_versions', 2, 'key_version', 'bigint', TRUE, '<none>'),
+                ('principal_key_versions', 3, 'authority_digest', 'bytea', TRUE, '<none>'),
+                ('principal_key_versions', 4, 'key_state', 'text', TRUE, '<none>'),
+                ('principal_key_versions', 5, 'transition_reason', 'text', TRUE, '<none>'),
+                ('principal_key_versions', 6, 'transitioned_by', 'text', TRUE, '<none>'),
+                ('principal_key_versions', 7, 'recorded_at', 'timestamptz', TRUE, '<none>'),
+
+                ('principal_links', 1, 'principal_link_id', 'uuid', TRUE, 'gen_random_uuid'),
+                ('principal_links', 2, 'principal_key_id', 'uuid', TRUE, '<none>'),
+                ('principal_links', 3, 'principal_id', 'uuid', TRUE, '<none>'),
+                ('principal_links', 4, 'link_version', 'bigint', TRUE, '1'),
+                ('principal_links', 5, 'link_state', 'text', TRUE, '<none>'),
+                ('principal_links', 6, 'transition_kind', 'text', TRUE, '<none>'),
+                ('principal_links', 7, 'transition_reason', 'text', TRUE, '<none>'),
+                ('principal_links', 8, 'transitioned_by', 'text', TRUE, '<none>'),
+                ('principal_links', 9, 'created_at', 'timestamptz', TRUE, 'statement_timestamp'),
+                ('principal_links', 10, 'updated_at', 'timestamptz', TRUE, 'statement_timestamp'),
+
+                ('principal_link_events', 1, 'event_id', 'uuid', TRUE, 'gen_random_uuid'),
+                ('principal_link_events', 2, 'principal_link_id', 'uuid', TRUE, '<none>'),
+                ('principal_link_events', 3, 'principal_key_id', 'uuid', TRUE, '<none>'),
+                ('principal_link_events', 4, 'principal_id', 'uuid', TRUE, '<none>'),
+                ('principal_link_events', 5, 'link_version', 'bigint', TRUE, '<none>'),
+                ('principal_link_events', 6, 'link_state', 'text', TRUE, '<none>'),
+                ('principal_link_events', 7, 'transition_kind', 'text', TRUE, '<none>'),
+                ('principal_link_events', 8, 'transition_reason', 'text', TRUE, '<none>'),
+                ('principal_link_events', 9, 'transitioned_by', 'text', TRUE, '<none>'),
+                ('principal_link_events', 10, 'occurred_at', 'timestamptz', TRUE, 'statement_timestamp'),
+
+                ('principal_key_tombstones', 1, 'key_tombstone_id', 'uuid', TRUE, 'gen_random_uuid'),
+                ('principal_key_tombstones', 2, 'principal_key_id', 'uuid', TRUE, '<none>'),
+                ('principal_key_tombstones', 3, 'provider_id', 'text', TRUE, '<none>'),
+                ('principal_key_tombstones', 4, 'issuer', 'text', TRUE, '<none>'),
+                ('principal_key_tombstones', 5, 'subject', 'text', TRUE, '<none>'),
+                ('principal_key_tombstones', 6, 'key_version', 'bigint', TRUE, '<none>'),
+                ('principal_key_tombstones', 7, 'reason', 'text', TRUE, '<none>'),
+                ('principal_key_tombstones', 8, 'tombstoned_by', 'text', TRUE, '<none>'),
+                ('principal_key_tombstones', 9, 'tombstoned_at', 'timestamptz', TRUE, 'statement_timestamp'),
+
+                ('sessions', NULL, 'principal_id', 'uuid', TRUE, '<none>'),
+                ('sessions', NULL, 'principal_lifecycle_version', 'bigint', TRUE, '<none>'),
+                ('sessions', NULL, 'principal_authority_version', 'bigint', TRUE, '<none>'),
+                ('sessions', NULL, 'principal_key_id', 'uuid', TRUE, '<none>'),
+                ('sessions', NULL, 'principal_key_version', 'bigint', TRUE, '<none>'),
+                ('sessions', NULL, 'principal_link_id', 'uuid', TRUE, '<none>'),
+                ('sessions', NULL, 'principal_link_version', 'bigint', TRUE, '<none>'),
+                ('sessions', NULL, 'site_authority_mode', 'text', TRUE, '<none>'),
+                ('sessions', NULL, 'site_scope', 'text[]', TRUE, '<none>'),
+                ('sessions', NULL, 'environment_authority_mode', 'text', TRUE, '<none>'),
+                ('sessions', NULL, 'environment_scope', 'text[]', TRUE, '<none>'),
+
+                ('api_tokens', NULL, 'issuing_principal_id', 'uuid', FALSE, '<none>'),
+                ('api_tokens', NULL, 'issuing_principal_lifecycle_version', 'bigint', FALSE, '<none>'),
+                ('api_tokens', NULL, 'issuing_principal_authority_version', 'bigint', FALSE, '<none>'),
+                ('api_tokens', NULL, 'principal_key_id', 'uuid', FALSE, '<none>'),
+                ('api_tokens', NULL, 'principal_key_version', 'bigint', FALSE, '<none>'),
+                ('api_tokens', NULL, 'principal_link_id', 'uuid', FALSE, '<none>'),
+                ('api_tokens', NULL, 'principal_link_version', 'bigint', FALSE, '<none>'),
+
+                ('requests', NULL, 'principal_binding_state', 'text', TRUE, '''legacy-quarantined'''),
+                ('requests', NULL, 'created_by_principal_id', 'uuid', FALSE, '<none>'),
+                ('requests', NULL, 'requester_principal_id', 'uuid', FALSE, '<none>'),
+                ('requests', NULL, 'owner_principal_id', 'uuid', FALSE, '<none>'),
+
+                ('request_approval_decisions', NULL, 'principal_binding_state', 'text', TRUE, '''legacy-quarantined'''),
+                ('request_approval_decisions', NULL, 'actor_principal_id', 'uuid', FALSE, '<none>'),
+                ('request_approval_decisions', NULL, 'actor_principal_lifecycle_version', 'bigint', FALSE, '<none>'),
+                ('request_approval_decisions', NULL, 'actor_principal_authority_version', 'bigint', FALSE, '<none>'),
+
+                ('agents', NULL, 'principal_id', 'uuid', TRUE, '<none>')
+        ),
+        exact_table_counts(table_name, column_count) AS (
+            VALUES
+                ('principals', 14),
+                ('principal_provider_tombstones', 6),
+                ('principal_keys', 12),
+                ('principal_key_versions', 7),
+                ('principal_links', 10),
+                ('principal_link_events', 10),
+                ('principal_key_tombstones', 9)
+        ),
+        target_tables AS (
+            SELECT expected.table_name, expected.column_count, class.oid
+            FROM exact_table_counts AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+             AND class.relkind = 'r'
+        ),
+        matching_columns AS (
+            SELECT expected.table_name, expected.column_name
+            FROM expected_columns AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+             AND class.relkind = 'r'
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = class.oid
+             AND attribute.attname = expected.column_name
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS default_value
+              ON default_value.adrelid = class.oid
+             AND default_value.adnum = attribute.attnum
+            WHERE (expected.ordinal IS NULL OR attribute.attnum = expected.ordinal)
+              AND attribute.atttypid = pg_catalog.to_regtype(expected.type_name)
+              AND attribute.attnotnull = expected.not_null
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+              AND LOWER(
+                    pg_catalog.regexp_replace(
+                        pg_catalog.regexp_replace(
+                            COALESCE(
+                                pg_catalog.pg_get_expr(
+                                    default_value.adbin,
+                                    default_value.adrelid
+                                ),
+                                '<none>'
+                            ),
+                            '::(text\[\]|text|bigint)',
+                            '',
+                            'g'
+                        ),
+                        '[[:space:]()]',
+                        '',
+                        'g'
+                    )
+                  ) = expected.default_expr
+        ),
+        forbidden_columns(table_name, column_name) AS (
+            VALUES
+                ('sessions', 'user_id'),
+                ('sessions', 'provider'),
+                ('sessions', 'identity_issuer'),
+                ('sessions', 'identity_subject'),
+                ('sessions', 'identity_authority_epoch'),
+                ('sessions', 'human_authority_version'),
+                ('api_tokens', 'owner_principal'),
+                ('api_tokens', 'issued_by_provider'),
+                ('api_tokens', 'issued_by_issuer'),
+                ('api_tokens', 'issued_by_subject'),
+                ('api_tokens', 'issued_by_identity_epoch'),
+                ('api_tokens', 'issued_by_human_authority_version'),
+                ('api_tokens', 'issued_by_roles'),
+                ('api_tokens', 'issued_by_site_authority_mode'),
+                ('api_tokens', 'issued_by_site_scope'),
+                ('api_tokens', 'issued_by_environment_authority_mode'),
+                ('api_tokens', 'issued_by_environment_scope'),
+                ('requests', 'created_by'),
+                ('requests', 'requester'),
+                ('requests', 'owner'),
+                ('request_approval_decisions', 'actor')
+        )
+        SELECT (SELECT COUNT(*) FROM target_tables) = 7
+           AND NOT EXISTS (
+               SELECT 1
+               FROM target_tables AS target
+               WHERE (
+                   SELECT COUNT(*)
+                   FROM pg_catalog.pg_attribute AS attribute
+                   WHERE attribute.attrelid = target.oid
+                     AND attribute.attnum > 0
+                     AND NOT attribute.attisdropped
+               ) <> target.column_count
+           )
+           AND (SELECT COUNT(*) FROM matching_columns) =
+               (SELECT COUNT(*) FROM expected_columns)
+           AND NOT EXISTS (
+               SELECT 1
+               FROM forbidden_columns AS forbidden
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = forbidden.table_name
+               JOIN pg_catalog.pg_attribute AS attribute
+                 ON attribute.attrelid = class.oid
+                AND attribute.attname = forbidden.column_name
+                AND attribute.attnum > 0
+                AND NOT attribute.attisdropped
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !columns_are_exact {
+        return Err(role_protocol_error(
+            "principal registry columns differ from the reviewed opaque binding contract",
+        ));
+    }
+
+    let constraints_and_indexes_are_exact: bool = sqlx::query_scalar(
+        r#"
+        WITH expected_keys(
+            expected_id,
+            table_name,
+            constraint_name,
+            constraint_kind,
+            column_names,
+            referenced_table,
+            referenced_column_names
+        ) AS (
+            VALUES
+                (1, 'principals', NULL::text, 'p', ARRAY['principal_id']::text[], NULL::text, NULL::text[]),
+                (2, 'principals', NULL, 'u', ARRAY['principal_id', 'lifecycle_version', 'authority_version'], NULL, NULL),
+                (3, 'principal_provider_tombstones', NULL, 'p', ARRAY['provider_tombstone_id'], NULL, NULL),
+                (4, 'principal_provider_tombstones', NULL, 'u', ARRAY['provider_id'], NULL, NULL),
+                (5, 'principal_keys', NULL, 'p', ARRAY['principal_key_id'], NULL, NULL),
+                (6, 'principal_keys', NULL, 'u', ARRAY['provider_id', 'issuer', 'subject'], NULL, NULL),
+                (7, 'principal_keys', NULL, 'u', ARRAY['principal_key_id', 'key_version'], NULL, NULL),
+                (8, 'principal_keys', NULL, 'u', ARRAY['principal_key_id', 'key_version', 'provider_id', 'issuer', 'subject'], NULL, NULL),
+                (9, 'principal_key_versions', NULL, 'p', ARRAY['principal_key_id', 'key_version'], NULL, NULL),
+                (10, 'principal_key_versions', NULL, 'f', ARRAY['principal_key_id'], 'principal_keys', ARRAY['principal_key_id']),
+                (11, 'principal_links', NULL, 'p', ARRAY['principal_link_id'], NULL, NULL),
+                (12, 'principal_links', NULL, 'u', ARRAY['principal_key_id'], NULL, NULL),
+                (13, 'principal_links', NULL, 'u', ARRAY['principal_link_id', 'link_version', 'principal_key_id', 'principal_id'], NULL, NULL),
+                (14, 'principal_links', NULL, 'u', ARRAY['principal_link_id', 'principal_key_id', 'principal_id'], NULL, NULL),
+                (15, 'principal_links', NULL, 'f', ARRAY['principal_key_id'], 'principal_keys', ARRAY['principal_key_id']),
+                (16, 'principal_links', NULL, 'f', ARRAY['principal_id'], 'principals', ARRAY['principal_id']),
+                (17, 'principal_link_events', NULL, 'p', ARRAY['event_id'], NULL, NULL),
+                (18, 'principal_link_events', NULL, 'u', ARRAY['principal_link_id', 'link_version'], NULL, NULL),
+                (19, 'principal_link_events', NULL, 'f', ARRAY['principal_link_id'], 'principal_links', ARRAY['principal_link_id']),
+                (20, 'principal_key_tombstones', NULL, 'p', ARRAY['key_tombstone_id'], NULL, NULL),
+                (21, 'principal_key_tombstones', NULL, 'u', ARRAY['principal_key_id'], NULL, NULL),
+                (22, 'principal_key_tombstones', NULL, 'u', ARRAY['provider_id', 'issuer', 'subject'], NULL, NULL),
+                (23, 'principal_key_tombstones', NULL, 'f', ARRAY['principal_key_id', 'key_version', 'provider_id', 'issuer', 'subject'], 'principal_keys', ARRAY['principal_key_id', 'key_version', 'provider_id', 'issuer', 'subject']),
+                (24, 'sessions', 'sessions_principal_fk', 'f', ARRAY['principal_id'], 'principals', ARRAY['principal_id']),
+                (25, 'sessions', 'sessions_exact_key_version_fk', 'f', ARRAY['principal_key_id', 'principal_key_version'], 'principal_key_versions', ARRAY['principal_key_id', 'key_version']),
+                (26, 'sessions', 'sessions_exact_link_fk', 'f', ARRAY['principal_link_id', 'principal_key_id', 'principal_id'], 'principal_links', ARRAY['principal_link_id', 'principal_key_id', 'principal_id']),
+                (27, 'api_tokens', 'api_tokens_principal_fk', 'f', ARRAY['issuing_principal_id'], 'principals', ARRAY['principal_id']),
+                (28, 'api_tokens', 'api_tokens_exact_key_version_fk', 'f', ARRAY['principal_key_id', 'principal_key_version'], 'principal_key_versions', ARRAY['principal_key_id', 'key_version']),
+                (29, 'api_tokens', 'api_tokens_exact_link_fk', 'f', ARRAY['principal_link_id', 'principal_key_id', 'issuing_principal_id'], 'principal_links', ARRAY['principal_link_id', 'principal_key_id', 'principal_id']),
+                (30, 'requests', 'requests_created_by_principal_fk', 'f', ARRAY['created_by_principal_id'], 'principals', ARRAY['principal_id']),
+                (31, 'requests', 'requests_requester_principal_fk', 'f', ARRAY['requester_principal_id'], 'principals', ARRAY['principal_id']),
+                (32, 'requests', 'requests_owner_principal_fk', 'f', ARRAY['owner_principal_id'], 'principals', ARRAY['principal_id']),
+                (33, 'request_approval_decisions', 'request_approval_actor_principal_fk', 'f', ARRAY['actor_principal_id'], 'principals', ARRAY['principal_id']),
+                (34, 'agents', 'agents_principal_id_key', 'u', ARRAY['principal_id'], NULL, NULL),
+                (35, 'agents', 'agents_principal_id_fkey', 'f', ARRAY['principal_id'], 'principals', ARRAY['principal_id'])
+        ),
+        resolved_keys AS (
+            SELECT expected.*,
+                   source_table.oid AS table_oid,
+                   referenced.oid AS referenced_table_oid,
+                   source_columns.attnums AS source_attnums,
+                   source_columns.resolved_count AS source_count,
+                   referenced_columns.attnums AS referenced_attnums,
+                   referenced_columns.resolved_count AS referenced_count
+            FROM expected_keys AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS source_table
+              ON source_table.relnamespace = namespace.oid
+             AND source_table.relname = expected.table_name
+             AND source_table.relkind = 'r'
+            LEFT JOIN pg_catalog.pg_class AS referenced
+              ON referenced.relnamespace = namespace.oid
+             AND referenced.relname = expected.referenced_table
+             AND referenced.relkind = 'r'
+            CROSS JOIN LATERAL (
+                SELECT pg_catalog.array_agg(attribute.attnum ORDER BY requested.ordinality) AS attnums,
+                       COUNT(*)::integer AS resolved_count
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = source_table.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS source_columns
+            LEFT JOIN LATERAL (
+                SELECT pg_catalog.array_agg(attribute.attnum ORDER BY requested.ordinality) AS attnums,
+                       COUNT(*)::integer AS resolved_count
+                FROM pg_catalog.unnest(expected.referenced_column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = referenced.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS referenced_columns ON expected.constraint_kind = 'f'
+        ),
+        matching_keys AS (
+            SELECT DISTINCT expected.expected_id
+            FROM resolved_keys AS expected
+            JOIN pg_catalog.pg_constraint AS constraint
+              ON constraint.conrelid = expected.table_oid
+             AND constraint.contype::text = expected.constraint_kind
+             AND constraint.conkey = expected.source_attnums
+             AND (expected.constraint_name IS NULL
+                  OR constraint.conname = expected.constraint_name)
+            LEFT JOIN pg_catalog.pg_index AS backing_index
+              ON backing_index.indexrelid = constraint.conindid
+            WHERE expected.source_count = pg_catalog.cardinality(expected.column_names)
+              AND constraint.conenforced
+              AND constraint.convalidated
+              AND NOT constraint.condeferrable
+              AND NOT constraint.condeferred
+              AND NOT constraint.connoinherit
+              AND (
+                  (
+                      expected.constraint_kind IN ('p', 'u')
+                      AND constraint.confrelid = 0
+                      AND backing_index.indrelid = expected.table_oid
+                      AND backing_index.indisvalid
+                      AND backing_index.indisready
+                      AND backing_index.indislive
+                      AND backing_index.indisunique
+                      AND backing_index.indimmediate
+                      AND backing_index.indpred IS NULL
+                      AND backing_index.indexprs IS NULL
+                      AND backing_index.indnkeyatts = pg_catalog.cardinality(expected.column_names)
+                      AND backing_index.indnatts = pg_catalog.cardinality(expected.column_names)
+                      AND backing_index.indkey::text = pg_catalog.array_to_string(
+                            expected.source_attnums,
+                            ' '
+                          )
+                  )
+                  OR
+                  (
+                      expected.constraint_kind = 'f'
+                      AND expected.referenced_table_oid IS NOT NULL
+                      AND expected.referenced_count =
+                          pg_catalog.cardinality(expected.referenced_column_names)
+                      AND constraint.confrelid = expected.referenced_table_oid
+                      AND constraint.confkey = expected.referenced_attnums
+                      AND constraint.confupdtype = 'r'
+                      AND constraint.confdeltype = 'r'
+                      AND constraint.confmatchtype = 's'
+                  )
+              )
+        ),
+        exact_new_key_counts(table_name, constraint_count) AS (
+            VALUES
+                ('principals', 2),
+                ('principal_provider_tombstones', 2),
+                ('principal_keys', 4),
+                ('principal_key_versions', 2),
+                ('principal_links', 6),
+                ('principal_link_events', 3),
+                ('principal_key_tombstones', 4)
+        ),
+        expected_check_groups(table_name, column_names, multiplicity) AS (
+            VALUES
+                ('principals', ARRAY['principal_kind']::text[], 1),
+                ('principals', ARRAY['lifecycle_version'], 1),
+                ('principals', ARRAY['authority_version'], 1),
+                ('principals', ARRAY['principal_id'], 1),
+                ('principals', ARRAY['created_by'], 1),
+                ('principals', ARRAY['role_allowlist'], 1),
+                ('principals', ARRAY['site_scope'], 1),
+                ('principals', ARRAY['environment_scope'], 1),
+                ('principals', ARRAY['principal_kind', 'lifecycle_state', 'role_allowlist', 'site_authority_mode', 'site_scope', 'environment_authority_mode', 'environment_scope'], 1),
+                ('principals', ARRAY['lifecycle_state', 'tombstoned_at'], 1),
+                ('principal_provider_tombstones', ARRAY['tombstone_version'], 1),
+                ('principal_provider_tombstones', ARRAY['provider_tombstone_id'], 1),
+                ('principal_provider_tombstones', ARRAY['provider_id'], 2),
+                ('principal_provider_tombstones', ARRAY['reason'], 1),
+                ('principal_provider_tombstones', ARRAY['tombstoned_by'], 1),
+                ('principal_keys', ARRAY['key_version'], 1),
+                ('principal_keys', ARRAY['authority_digest'], 1),
+                ('principal_keys', ARRAY['key_state'], 1),
+                ('principal_keys', ARRAY['principal_key_id'], 1),
+                ('principal_keys', ARRAY['provider_id'], 2),
+                ('principal_keys', ARRAY['issuer'], 1),
+                ('principal_keys', ARRAY['subject'], 1),
+                ('principal_keys', ARRAY['transition_reason'], 1),
+                ('principal_keys', ARRAY['transitioned_by'], 1),
+                ('principal_keys', ARRAY['key_state', 'tombstoned_at'], 1),
+                ('principal_key_versions', ARRAY['key_version'], 1),
+                ('principal_key_versions', ARRAY['authority_digest'], 1),
+                ('principal_key_versions', ARRAY['key_state'], 1),
+                ('principal_key_versions', ARRAY['transition_reason'], 1),
+                ('principal_key_versions', ARRAY['transitioned_by'], 1),
+                ('principal_links', ARRAY['link_version'], 1),
+                ('principal_links', ARRAY['link_state'], 1),
+                ('principal_links', ARRAY['transition_kind'], 1),
+                ('principal_links', ARRAY['principal_link_id'], 1),
+                ('principal_links', ARRAY['transition_reason'], 1),
+                ('principal_links', ARRAY['transitioned_by'], 1),
+                ('principal_link_events', ARRAY['link_version'], 1),
+                ('principal_link_events', ARRAY['link_state'], 1),
+                ('principal_link_events', ARRAY['event_id'], 1),
+                ('principal_link_events', ARRAY['transition_kind'], 1),
+                ('principal_link_events', ARRAY['transition_reason'], 1),
+                ('principal_link_events', ARRAY['transitioned_by'], 1),
+                ('principal_key_tombstones', ARRAY['key_version'], 1),
+                ('principal_key_tombstones', ARRAY['key_tombstone_id'], 1),
+                ('principal_key_tombstones', ARRAY['provider_id'], 2),
+                ('principal_key_tombstones', ARRAY['issuer'], 1),
+                ('principal_key_tombstones', ARRAY['subject'], 1),
+                ('principal_key_tombstones', ARRAY['reason'], 1),
+                ('principal_key_tombstones', ARRAY['tombstoned_by'], 1)
+        ),
+        resolved_check_groups AS (
+            SELECT expected.table_name,
+                   expected.multiplicity,
+                   class.oid AS table_oid,
+                   resolved.attnums
+            FROM expected_check_groups AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+            CROSS JOIN LATERAL (
+                SELECT pg_catalog.array_agg(attribute.attnum ORDER BY attribute.attnum) AS attnums
+                FROM pg_catalog.unnest(expected.column_names) AS requested(name)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = class.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+        ),
+        actual_check_groups AS (
+            SELECT class.relname::text AS table_name,
+                   ARRAY(
+                       SELECT item
+                       FROM pg_catalog.unnest(constraint.conkey) AS item
+                       ORDER BY item
+                   )::smallint[] AS attnums,
+                   COUNT(*)::integer AS multiplicity
+            FROM pg_catalog.pg_constraint AS constraint
+            JOIN pg_catalog.pg_class AS class ON class.oid = constraint.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            JOIN exact_new_key_counts AS target ON target.table_name = class.relname
+            WHERE namespace.nspname = 'public'
+              AND constraint.contype = 'c'
+              AND constraint.conenforced
+              AND constraint.convalidated
+              AND NOT constraint.condeferrable
+              AND NOT constraint.condeferred
+              AND NOT constraint.connoinherit
+            GROUP BY class.relname, constraint.conkey
+        ),
+        expected_named_checks(constraint_name, table_name, column_names) AS (
+            VALUES
+                ('sessions_roles_canonical_check', 'sessions', ARRAY['roles']::text[]),
+                ('sessions_site_authority_shape_check', 'sessions', ARRAY['site_authority_mode', 'site_scope']),
+                ('sessions_environment_authority_shape_check', 'sessions', ARRAY['environment_authority_mode', 'environment_scope']),
+                ('sessions_site_scope_members_check', 'sessions', ARRAY['site_scope']),
+                ('sessions_environment_scope_members_check', 'sessions', ARRAY['environment_scope']),
+                ('api_tokens_principal_binding_shape_check', 'api_tokens', ARRAY['token_valid', 'issuing_principal_id', 'issuing_principal_lifecycle_version', 'issuing_principal_authority_version', 'principal_key_id', 'principal_key_version', 'principal_link_id', 'principal_link_version', 'expires_at', 'created_at']),
+                ('api_tokens_site_scope_canonical_check', 'api_tokens', ARRAY['site_scope']),
+                ('api_tokens_environment_scope_canonical_check', 'api_tokens', ARRAY['environment_scope']),
+                ('requests_principal_binding_state_check', 'requests', ARRAY['principal_binding_state']),
+                ('requests_principal_binding_shape_check', 'requests', ARRAY['principal_binding_state', 'created_by_principal_id', 'requester_principal_id', 'owner_principal_id']),
+                ('request_approval_actor_binding_state_check', 'request_approval_decisions', ARRAY['principal_binding_state']),
+                ('request_approval_actor_binding_shape_check', 'request_approval_decisions', ARRAY['principal_binding_state', 'actor_principal_id', 'actor_principal_lifecycle_version', 'actor_principal_authority_version'])
+        ),
+        matching_named_checks AS (
+            SELECT expected.constraint_name
+            FROM expected_named_checks AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+            JOIN pg_catalog.pg_constraint AS constraint
+              ON constraint.conrelid = class.oid
+             AND constraint.conname = expected.constraint_name
+             AND constraint.contype = 'c'
+            CROSS JOIN LATERAL (
+                SELECT pg_catalog.array_agg(attribute.attnum ORDER BY attribute.attnum) AS attnums
+                FROM pg_catalog.unnest(expected.column_names) AS requested(name)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = class.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+            WHERE constraint.convalidated
+              AND constraint.conenforced
+              AND NOT constraint.condeferrable
+              AND NOT constraint.condeferred
+              AND NOT constraint.connoinherit
+              AND ARRAY(
+                    SELECT item
+                    FROM pg_catalog.unnest(constraint.conkey) AS item
+                    ORDER BY item
+                  )::smallint[] = resolved.attnums
+        ),
+        expected_indexes(
+            index_name, table_name, column_names, column_options, predicate
+        ) AS (
+            VALUES
+                ('sessions_principal_binding_idx', 'sessions', ARRAY['principal_id', 'principal_lifecycle_version', 'principal_authority_version', 'principal_key_id', 'principal_key_version', 'principal_link_id', 'principal_link_version']::text[], ARRAY[0,0,0,0,0,0,0]::smallint[], NULL::text),
+                ('api_tokens_principal_binding_idx', 'api_tokens', ARRAY['issuing_principal_id', 'issuing_principal_lifecycle_version', 'issuing_principal_authority_version', 'principal_key_id', 'principal_key_version', 'principal_link_id', 'principal_link_version'], ARRAY[0,0,0,0,0,0,0]::smallint[], NULL),
+                ('requests_requester_principal_idx', 'requests', ARRAY['requester_principal_id', 'created_at'], ARRAY[0,3]::smallint[], 'principal_binding_state=''exact-v1''::text'),
+                ('requests_owner_principal_idx', 'requests', ARRAY['owner_principal_id', 'created_at'], ARRAY[0,3]::smallint[], 'principal_binding_state=''exact-v1''::text'),
+                ('request_approval_actor_principal_idx', 'request_approval_decisions', ARRAY['actor_principal_id', 'actor_principal_lifecycle_version', 'actor_principal_authority_version', 'decided_at'], ARRAY[0,0,0,0]::smallint[], 'principal_binding_state=''exact-v1''::text')
+        ),
+        matching_indexes AS (
+            SELECT expected.index_name
+            FROM expected_indexes AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS source_table
+              ON source_table.relnamespace = namespace.oid
+             AND source_table.relname = expected.table_name
+            JOIN pg_catalog.pg_class AS index_class
+              ON index_class.relnamespace = namespace.oid
+             AND index_class.relname = expected.index_name
+             AND index_class.relkind = 'i'
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indrelid = source_table.oid
+             AND index_catalog.indexrelid = index_class.oid
+            JOIN pg_catalog.pg_am AS access_method
+              ON access_method.oid = index_class.relam
+            CROSS JOIN LATERAL (
+                SELECT pg_catalog.array_agg(attribute.attnum ORDER BY requested.ordinality) AS attnums
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = source_table.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+            WHERE access_method.amname = 'btree'
+              AND index_catalog.indisvalid
+              AND index_catalog.indisready
+              AND index_catalog.indislive
+              AND NOT index_catalog.indisunique
+              AND NOT index_catalog.indisprimary
+              AND NOT index_catalog.indisexclusion
+              AND index_catalog.indimmediate
+              AND index_catalog.indexprs IS NULL
+              AND index_catalog.indnkeyatts = pg_catalog.cardinality(expected.column_names)
+              AND index_catalog.indnatts = pg_catalog.cardinality(expected.column_names)
+              AND index_catalog.indkey::text = pg_catalog.array_to_string(
+                    resolved.attnums,
+                    ' '
+                  )
+              AND index_catalog.indoption::text = pg_catalog.array_to_string(
+                    expected.column_options,
+                    ' '
+                  )
+              AND pg_catalog.regexp_replace(
+                    pg_catalog.pg_get_expr(index_catalog.indpred, index_catalog.indrelid),
+                    '[[:space:]()]', '', 'g'
+                  ) IS NOT DISTINCT FROM expected.predicate
+        )
+        SELECT (SELECT COUNT(*) FROM matching_keys) =
+                   (SELECT COUNT(*) FROM expected_keys)
+           AND NOT EXISTS (
+               SELECT 1
+               FROM exact_new_key_counts AS expected
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = expected.table_name
+               WHERE (
+                   SELECT COUNT(*)
+                   FROM pg_catalog.pg_constraint AS constraint
+                   WHERE constraint.conrelid = class.oid
+                     AND constraint.contype IN ('p', 'u', 'f')
+               ) <> expected.constraint_count
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM resolved_check_groups AS expected
+               LEFT JOIN actual_check_groups AS actual
+                 ON actual.table_name = expected.table_name
+                AND actual.attnums = expected.attnums
+               WHERE actual.multiplicity IS DISTINCT FROM expected.multiplicity
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM actual_check_groups AS actual
+               LEFT JOIN resolved_check_groups AS expected
+                 ON expected.table_name = actual.table_name
+                AND expected.attnums = actual.attnums
+               WHERE expected.table_name IS NULL
+           )
+           AND (SELECT COUNT(*) FROM matching_named_checks) =
+                   (SELECT COUNT(*) FROM expected_named_checks)
+           AND (SELECT COUNT(*) FROM matching_indexes) =
+                   (SELECT COUNT(*) FROM expected_indexes)
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !constraints_and_indexes_are_exact {
+        return Err(role_protocol_error(
+            "principal registry constraints or indexes differ from the reviewed authority chain",
+        ));
+    }
+
+    let routines_and_triggers_are_exact: bool = sqlx::query_scalar(
+        r#"
+        WITH expected_routines(
+            signature,
+            source_sha256,
+            language_name,
+            return_type,
+            security_definer,
+            volatility,
+            parallel_safety,
+            function_config
+        ) AS (
+            VALUES
+                ('public.enforce_request_rework_approval_epoch()', 'b1debbaa648473e6a7b05907ff97264f28b1f28784736ac8d9d163a9583b599a', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL::text[]),
+                ('public.enforce_current_request_approval_epoch()', '1f3e7e51b85528e5fcc011d8c726289a44dd994b685c0a5abb4a74f6e720cbde', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.principal_registry_advisory_lock_is_held(bigint)', 'ce7574ce0c77283043a128bffa24287eb56f3057b8856f86f6b76b78a18ab34e', 'sql', 'pg_catalog.bool', FALSE, 's', 'u', NULL),
+                ('public.principal_registry_provider_lock_key(text)', 'f99703254188848ff5fdbd6110986724ea60d5bb00b823502568650312adb214', 'sql', 'pg_catalog.int8', FALSE, 'i', 's', NULL),
+                ('public.principal_registry_writer_contract_is_held(text,text,text)', '8c26393eda2903881fa432dc56837d86ddee39defcb184fcc41720e5b201d916', 'sql', 'pg_catalog.bool', TRUE, 's', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.reject_principal_registry_evidence_mutation()', '8e0862f12278ceda802a1b90c896da1fed4929bb767db8077788eff494d8f69e', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.enforce_principal_lifecycle()', '838cf16b820b3c2a89eda3356f9a6dbdfc57f4b31810886e9c8e7d8c0c7b3b54', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_agent_principal_binding()', '410e86c617278908bbd37cc7ae985f6a4d4a24bce2396c429c354e09b0bc3b0f', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_provider_tombstone()', '46cae1bc7a41cdcafee69b1a14d2b4b79e70645b58cfca1f2c3a95b3144f74a8', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_key_lifecycle()', 'f5f122c396a84c7c716c14f805394a88370caae1e483508fd3e548e37b2ebed1', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.append_principal_key_version()', '2f4259d0611a9d4b739f76b516cdde792afd6f0fdc7eb9dd5d7d5be92ec290e5', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.record_principal_key_tombstone()', 'dae3e68d8b9f397ea195cfdbb2aa8ab5786b7d81a71f3bac470e6d727f65ad50', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_link_lifecycle()', '3e8bdf94abf91d867fb4e9a315b430200eceb9e8ccdf09c133f74660fdfaeed1', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.append_principal_link_event()', '1a887d6f5178c3ed614a151163f5e502b9f4f114a54958db31a5b41fb2f3943f', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_bound_session()', '79f26dccbefd44c520e60bfca7f09b5a2547e8b95a43323cbb6bce1582e37706', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_bound_api_token()', 'd115f0bad58a7b8e45191769a2b356967a44c04b013e615ed36fe49b6bd82847', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_request_principal_binding()', '4dd1825ca5005f2fe22d4ed9fc340ccc1fae58b327100d145c23b6337d63938c', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.enforce_request_approval_principal_binding()', 'ca8ad9e6c22b959cfc795467317a99e4fc0db89a4881b754fba0377dab4b3d63', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.enforce_request_current_principal_approval_quorum()', '26032d774e8a70ae3be904a833056650e22cbaf93ae83b960d3d206585024c3f', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.reject_principal_registry_removal()', 'cabcef301e0c44b5e8bf8a5bdab7d6b69effa267f81ef26afee3742f7522ca3c', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.reject_principal_registry_append_only_mutation()', 'e5ff3829c77d911ee11935bd5b5017fe2ba1a67c69467c6a7004fb6dc37ee258', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.enforce_agent_enrollment_contract_v3()', '0eb894788a903851885e97a0304c48c7f13543abc58c4b2fd0f05e3789d731f9', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.human_authority_lock_key(text,text,text)', '1c3f6558db6b08d4044138fc279fc2fb8be509e79668e0501e53aabdc7da0892', 'sql', 'pg_catalog.int8', FALSE, 'i', 's', NULL),
+                ('public.enforce_api_token_last_used_at()', '9dfdeb6d6523375b911ff153635c1c8a517dbc7e5ad614d9ce09f5d33b33adf4', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.prevent_api_token_delete()', 'a635e00397701815d9e1c2caa742173c8f2696bae432be869f579ade3538804f', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.enforce_rejected_request_decision()', 'e7d2c04eed219cfc47d7e9c7da8f4f928cb88a64bec7804e4c01ed23c9357773', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
+                ('public.reject_request_approval_decision_removal()', 'c194b3c06b284c16fb720dd6d4b567201cf587c8a70faeee711fd9cdfbe56ae9', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL)
+        ),
+        matching_routines AS (
+            SELECT expected.signature
+            FROM expected_routines AS expected
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid = pg_catalog.to_regprocedure(expected.signature)
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE procedure.prokind = 'f'
+              AND procedure.prorettype = pg_catalog.to_regtype(expected.return_type)
+              AND procedure.prosecdef = expected.security_definer
+              AND NOT procedure.proleakproof
+              AND NOT procedure.proisstrict
+              AND procedure.provolatile::text = expected.volatility
+              AND procedure.proparallel::text = expected.parallel_safety
+              AND procedure.proconfig IS NOT DISTINCT FROM expected.function_config
+              AND language.lanname = expected.language_name
+              AND pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                    ),
+                    'hex'
+                  ) = expected.source_sha256
+        ),
+        expected_triggers(
+            table_name,
+            trigger_name,
+            function_signature,
+            trigger_type,
+            column_names,
+            predicate_kind,
+            constraint_trigger
+        ) AS (
+            VALUES
+                ('legacy_identity_authority_evidence', 'legacy_identity_authority_evidence_immutable', 'public.reject_principal_registry_evidence_mutation()', 31::smallint, ARRAY[]::text[], 0, FALSE),
+                ('legacy_identity_authority_evidence', 'legacy_identity_authority_evidence_no_truncate', 'public.reject_principal_registry_evidence_mutation()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('legacy_human_authority_evidence', 'legacy_human_authority_evidence_immutable', 'public.reject_principal_registry_evidence_mutation()', 31::smallint, ARRAY[]::text[], 0, FALSE),
+                ('legacy_human_authority_evidence', 'legacy_human_authority_evidence_no_truncate', 'public.reject_principal_registry_evidence_mutation()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principals', 'principals_lifecycle_guard', 'public.enforce_principal_lifecycle()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principals', 'principals_no_delete', 'public.reject_principal_registry_removal()', 11::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principals', 'principals_no_truncate', 'public.reject_principal_registry_removal()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('agents', 'agents_enrollment_contract_v3_insert', 'public.enforce_agent_enrollment_contract_v3()', 7::smallint, ARRAY[]::text[], 0, FALSE),
+                ('agents', 'agents_enrollment_contract_v3_mutation', 'public.enforce_agent_enrollment_contract_v3()', 19::smallint, ARRAY['agent_id', 'status', 'platform', 'capabilities', 'public_key', 'token_hash', 'enrollment_expires_at', 'enrollment_bounds_version', 'enrollment_challenge_id']::text[], 2, FALSE),
+                ('agents', 'agents_principal_binding_guard', 'public.enforce_agent_principal_binding()', 31::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_keys', 'principal_keys_lifecycle_guard', 'public.enforce_principal_key_lifecycle()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_keys', 'principal_keys_append_version', 'public.append_principal_key_version()', 21::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_keys', 'principal_keys_tombstone_evidence', 'public.record_principal_key_tombstone()', 17::smallint, ARRAY['key_state']::text[], 1, FALSE),
+                ('principal_keys', 'principal_keys_no_delete', 'public.reject_principal_registry_removal()', 11::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_keys', 'principal_keys_no_truncate', 'public.reject_principal_registry_removal()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_key_versions', 'principal_key_versions_no_update_or_delete', 'public.reject_principal_registry_append_only_mutation()', 27::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_key_versions', 'principal_key_versions_no_truncate', 'public.reject_principal_registry_append_only_mutation()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_links', 'principal_links_lifecycle_guard', 'public.enforce_principal_link_lifecycle()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_links', 'principal_links_append_event', 'public.append_principal_link_event()', 21::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_links', 'principal_links_no_delete', 'public.reject_principal_registry_removal()', 11::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_links', 'principal_links_no_truncate', 'public.reject_principal_registry_removal()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_link_events', 'principal_link_events_no_update_or_delete', 'public.reject_principal_registry_append_only_mutation()', 27::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_link_events', 'principal_link_events_no_truncate', 'public.reject_principal_registry_append_only_mutation()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_provider_tombstones', 'principal_provider_tombstone_insert_guard', 'public.enforce_principal_provider_tombstone()', 7::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_provider_tombstones', 'principal_provider_tombstones_no_update_or_delete', 'public.reject_principal_registry_append_only_mutation()', 27::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_provider_tombstones', 'principal_provider_tombstones_no_truncate', 'public.reject_principal_registry_append_only_mutation()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_key_tombstones', 'principal_key_tombstones_no_update_or_delete', 'public.reject_principal_registry_append_only_mutation()', 27::smallint, ARRAY[]::text[], 0, FALSE),
+                ('principal_key_tombstones', 'principal_key_tombstones_no_truncate', 'public.reject_principal_registry_append_only_mutation()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('sessions', 'sessions_principal_binding_guard', 'public.enforce_principal_bound_session()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('api_tokens', 'api_tokens_principal_binding_guard', 'public.enforce_principal_bound_api_token()', 23::smallint, ARRAY['id', 'name', 'token_hash', 'created_at', 'expires_at', 'roles', 'site_scope', 'environment_scope', 'token_valid', 'revoked_at', 'issuing_principal_id', 'issuing_principal_lifecycle_version', 'issuing_principal_authority_version', 'principal_key_id', 'principal_key_version', 'principal_link_id', 'principal_link_version', 'legacy_owner_label', 'legacy_issued_by_provider', 'legacy_issued_by_issuer', 'legacy_issued_by_subject', 'legacy_issued_by_identity_epoch', 'legacy_issued_by_human_authority_version', 'legacy_issued_by_roles', 'legacy_issued_by_site_authority_mode', 'legacy_issued_by_site_scope', 'legacy_issued_by_environment_authority_mode', 'legacy_issued_by_environment_scope']::text[], 0, FALSE),
+                ('api_tokens', 'api_tokens_last_used_at_guard', 'public.enforce_api_token_last_used_at()', 23::smallint, ARRAY['last_used_at']::text[], 0, FALSE),
+                ('api_tokens', 'api_tokens_delete_guard', 'public.prevent_api_token_delete()', 11::smallint, ARRAY[]::text[], 0, FALSE),
+                ('api_tokens', 'api_tokens_truncate_guard', 'public.prevent_api_token_delete()', 34::smallint, ARRAY[]::text[], 0, FALSE),
+                ('requests', 'trg_requests_00_principal_binding', 'public.enforce_request_principal_binding()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('requests', 'trg_requests_01_principal_approval_quorum', 'public.enforce_request_current_principal_approval_quorum()', 19::smallint, ARRAY['status']::text[], 0, FALSE),
+                ('requests', 'trg_requests_rework_approval_epoch', 'public.enforce_request_rework_approval_epoch()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('requests', 'trg_requests_rejection_evidence', 'public.enforce_rejected_request_decision()', 17::smallint, ARRAY['status']::text[], 0, TRUE),
+                ('request_approval_decisions', 'trg_request_approval_decision_00_principal_binding', 'public.enforce_request_approval_principal_binding()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('request_approval_decisions', 'trg_request_approval_decision_current_epoch', 'public.enforce_current_request_approval_epoch()', 23::smallint, ARRAY[]::text[], 0, FALSE),
+                ('request_approval_decisions', 'trg_request_approval_decision_no_delete', 'public.reject_request_approval_decision_removal()', 11::smallint, ARRAY[]::text[], 0, FALSE),
+                ('request_approval_decisions', 'trg_request_approval_decision_no_truncate', 'public.reject_request_approval_decision_removal()', 34::smallint, ARRAY[]::text[], 0, FALSE)
+        ),
+        resolved_triggers AS (
+            SELECT expected.*,
+                   class.oid AS table_oid,
+                   resolved.resolved_count,
+                   resolved.trigger_columns
+            FROM expected_triggers AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+             AND class.relkind = 'r'
+            CROSS JOIN LATERAL (
+                SELECT COUNT(attribute.attnum)::integer AS resolved_count,
+                       COALESCE(
+                           pg_catalog.string_agg(
+                               attribute.attnum::text,
+                               ' ' ORDER BY requested.ordinality
+                           ),
+                           ''
+                       ) AS trigger_columns
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = class.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+        ),
+        matching_triggers AS (
+            SELECT expected.trigger_name
+            FROM resolved_triggers AS expected
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = expected.table_oid
+             AND trigger.tgname = expected.trigger_name
+            WHERE expected.resolved_count = pg_catalog.cardinality(expected.column_names)
+              AND trigger.tgfoid = pg_catalog.to_regprocedure(expected.function_signature)
+              AND trigger.tgtype = expected.trigger_type
+              AND trigger.tgattr::text = expected.trigger_columns
+              AND trigger.tgenabled = 'A'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgparentid = 0
+              AND trigger.tgnargs = 0
+              AND pg_catalog.octet_length(trigger.tgargs) = 0
+              AND trigger.tgoldtable IS NULL
+              AND trigger.tgnewtable IS NULL
+              AND (
+                  (expected.predicate_kind = 0 AND trigger.tgqual IS NULL)
+                  OR (
+                      expected.predicate_kind = 1
+                      AND pg_catalog.regexp_replace(
+                            pg_catalog.pg_get_expr(trigger.tgqual, trigger.tgrelid),
+                            '[[:space:]()]', '', 'g'
+                          ) = 'new.key_state=''tombstoned''::textANDold.key_state<>''tombstoned''::text'
+                  )
+                  OR (
+                      expected.predicate_kind = 2
+                      AND pg_catalog.regexp_replace(
+                            pg_catalog.pg_get_expr(trigger.tgqual, trigger.tgrelid),
+                            '[[:space:]()]', '', 'g'
+                          ) = 'old.agent_idISDISTINCTFROMnew.agent_idORold.statusISDISTINCTFROMnew.statusORold.platformISDISTINCTFROMnew.platformORold.capabilitiesISDISTINCTFROMnew.capabilitiesORold.public_keyISDISTINCTFROMnew.public_keyORold.token_hashISDISTINCTFROMnew.token_hashORold.enrollment_expires_atISDISTINCTFROMnew.enrollment_expires_atORold.enrollment_bounds_versionISDISTINCTFROMnew.enrollment_bounds_versionORold.enrollment_challenge_idISDISTINCTFROMnew.enrollment_challenge_id'
+                  )
+              )
+              AND (
+                  (
+                      NOT expected.constraint_trigger
+                      AND trigger.tgconstraint = 0
+                      AND trigger.tgconstrrelid = 0
+                      AND trigger.tgconstrindid = 0
+                      AND NOT trigger.tgdeferrable
+                      AND NOT trigger.tginitdeferred
+                  )
+                  OR (
+                      expected.constraint_trigger
+                      AND trigger.tgconstraint <> 0
+                      AND trigger.tgconstrrelid = 0
+                      AND trigger.tgconstrindid = 0
+                      AND trigger.tgdeferrable
+                      AND trigger.tginitdeferred
+                  )
+              )
+        ),
+        exact_registry_trigger_counts(table_name, trigger_count) AS (
+            VALUES
+                ('legacy_identity_authority_evidence', 2),
+                ('legacy_human_authority_evidence', 2),
+                ('principals', 3),
+                ('principal_keys', 5),
+                ('principal_key_versions', 2),
+                ('principal_links', 4),
+                ('principal_link_events', 2),
+                ('principal_provider_tombstones', 3),
+                ('principal_key_tombstones', 2),
+                ('agents', 3)
+        )
+        SELECT (SELECT COUNT(*) FROM matching_routines) =
+                   (SELECT COUNT(*) FROM expected_routines)
+           AND (SELECT COUNT(*) FROM matching_triggers) =
+                   (SELECT COUNT(*) FROM expected_triggers)
+           AND NOT EXISTS (
+               SELECT 1
+               FROM exact_registry_trigger_counts AS expected
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = expected.table_name
+               WHERE (
+                   SELECT COUNT(*)
+                   FROM pg_catalog.pg_trigger AS trigger
+                   WHERE trigger.tgrelid = class.oid
+                     AND NOT trigger.tgisinternal
+               ) <> expected.trigger_count
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !routines_and_triggers_are_exact {
+        return Err(role_protocol_error(
+            "principal registry routine or ALWAYS-trigger definitions are not canonical",
+        ));
+    }
+
+    Ok(())
+}
+
 async fn attest_application_connection(
     connection: &mut PgConnection,
     contract: &ApplicationRoleContract,
@@ -4152,6 +5050,7 @@ async fn attest_application_connection(
     attest_request_resource_version_triggers(connection).await?;
     attest_request_authority_version_binding_triggers(connection).await?;
     attest_live_site_execution_authority_chain(connection).await?;
+    attest_principal_registry_authority_chain(connection).await?;
     let safe_boundary: bool = sqlx::query_scalar(
         r#"
         WITH app AS (
@@ -4956,7 +5855,7 @@ async fn reconcile_application_privileges_in_transaction(
 
     // Trigger and validation functions are invoked by PostgreSQL and do not
     // need caller EXECUTE. Deny every direct public routine call, then add back
-    // the three reviewed bounded entry points below.
+    // the six reviewed bounded entry points below.
     for (object_kind, signature) in public_routines {
         let statement =
             format!("REVOKE ALL PRIVILEGES ON {object_kind} {signature} FROM PUBLIC, {app}");
@@ -5047,6 +5946,24 @@ async fn reconcile_application_privileges_in_transaction(
     sqlx::query(&format!(
         "GRANT EXECUTE ON FUNCTION \
          public.ryuki_acquire_live_site_execution_epoch(text) TO {app}"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.human_authority_lock_key(text,text,text) TO {app}"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.principal_registry_provider_lock_key(text) TO {app}"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.principal_registry_writer_contract_is_held(text,text,text) TO {app}"
     ))
     .execute(&mut *connection)
     .await?;
@@ -7964,9 +8881,16 @@ mod tests {
             "gmsa_accounts",
             "container_requests",
             "k8s_namespaces",
+            "principal_keys",
+            "principal_links",
+            "principals",
         ] {
             assert_eq!(policies.get(name), Some(&(true, true, false)));
         }
+        assert_eq!(
+            policies.get("principal_provider_tombstones"),
+            Some(&(true, false, false))
+        );
         assert_eq!(
             policies.get("gmsa_host_assignments"),
             Some(&(true, true, true))
@@ -7978,7 +8902,12 @@ mod tests {
             "first_owner_privileged_domain_assignments",
             "k8s_cluster_registry",
             "k8s_cluster_environment_scopes",
+            "legacy_human_authority_evidence",
+            "legacy_identity_authority_evidence",
             "noisy_trigger_site_authority",
+            "principal_key_tombstones",
+            "principal_key_versions",
+            "principal_link_events",
             "production_migration_operations",
             "scheduler_protocol_versions",
         ] {
@@ -8651,6 +9580,121 @@ mod tests {
             .execute(&mut connection)
             .await
             .expect("restore canonical upstream epoch trigger function");
+    }
+
+    #[tokio::test]
+    async fn principal_registry_authority_chain_rejects_catalog_drift() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut connection = PgConnection::connect(&url)
+            .await
+            .expect("connect principal registry attestation test");
+        super::EMBEDDED_MIGRATOR
+            .run(&mut connection)
+            .await
+            .expect("apply principal registry migrations");
+
+        super::attest_principal_registry_authority_chain(&mut connection)
+            .await
+            .expect("canonical principal registry authority chain");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin principal key constraint drift fixture");
+        sqlx::query(
+            "ALTER TABLE public.sessions \
+             DROP CONSTRAINT sessions_exact_key_version_fk",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("drop exact key-version binding inside rollback-only fixture");
+        let drift_error = super::attest_principal_registry_authority_chain(&mut connection)
+            .await
+            .expect_err("missing exact key-version constraint must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("constraints or indexes differ from the reviewed authority chain"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore exact key-version constraint");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin principal binding index drift fixture");
+        sqlx::query("DROP INDEX public.sessions_principal_binding_idx")
+            .execute(&mut connection)
+            .await
+            .expect("drop principal binding index inside rollback-only fixture");
+        let drift_error = super::attest_principal_registry_authority_chain(&mut connection)
+            .await
+            .expect_err("missing principal binding index must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("constraints or indexes differ from the reviewed authority chain"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore principal binding index");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin principal trigger drift fixture");
+        sqlx::query(
+            "ALTER TABLE public.principal_keys \
+             DISABLE TRIGGER principal_keys_append_version",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("disable append-version trigger inside rollback-only fixture");
+        let drift_error = super::attest_principal_registry_authority_chain(&mut connection)
+            .await
+            .expect_err("disabled append-version trigger must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("routine or ALWAYS-trigger definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore append-version trigger");
+
+        sqlx::query("BEGIN")
+            .execute(&mut connection)
+            .await
+            .expect("begin principal routine substitution fixture");
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION public.principal_registry_provider_lock_key(
+                key_provider TEXT
+            )
+            RETURNS BIGINT
+            LANGUAGE SQL
+            IMMUTABLE
+            PARALLEL SAFE
+            AS $$
+                SELECT 0::BIGINT
+            $$
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("substitute provider lock-key routine inside rollback-only fixture");
+        let drift_error = super::attest_principal_registry_authority_chain(&mut connection)
+            .await
+            .expect_err("substituted principal routine body must fail attestation");
+        assert!(drift_error
+            .to_string()
+            .contains("routine or ALWAYS-trigger definitions are not canonical"));
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .expect("restore provider lock-key routine");
     }
 
     #[tokio::test]

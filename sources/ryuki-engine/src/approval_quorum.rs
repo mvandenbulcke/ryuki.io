@@ -19,7 +19,7 @@ pub struct ApprovalDecision {
     pub role: String,
     /// `approved` | `rejected` (case-insensitive).
     pub decision: String,
-    /// The verified approver principal (`AuthSession.user_id`).
+    /// The verified approver principal (`AuthSession.principal_id`).
     pub actor: String,
 }
 

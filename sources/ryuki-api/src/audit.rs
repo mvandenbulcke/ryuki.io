@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
 
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::AuthSession;
 
 // ---------------------------------------------------------------------------
@@ -253,6 +254,7 @@ pub fn security_audit<'a>(
 
 fn entry_from(
     reservation_id: uuid::Uuid,
+    actor_principal: PrincipalId,
     session: &AuthSession,
     record: &AuditRecord<'_>,
 ) -> AuditEntry {
@@ -260,7 +262,10 @@ fn entry_from(
         reservation_id,
         occurred_at: chrono::Utc::now().to_rfc3339(),
         request_id: record.request_id.map(str::to_string),
-        actor_principal: session.user_id.clone(),
+        // `audit_log.actor_principal` is an immutable legacy TEXT projection.
+        // Stringification happens only at this persistence/display seam; the
+        // authority input above remains the typed internal principal id.
+        actor_principal: actor_principal.to_string(),
         actor_display: session.display_name.clone(),
         actor_roles: session.roles.clone(),
         provider_mode: session.provider_mode.clone(),
@@ -274,6 +279,12 @@ fn entry_from(
     }
 }
 
+fn required_principal_id(session: &AuthSession) -> Result<PrincipalId, sqlx::Error> {
+    session.principal_id.ok_or_else(|| {
+        sqlx::Error::Protocol("audit attribution requires an admitted opaque principal".into())
+    })
+}
+
 /// Insert one audit row inside an EXISTING transaction. The transition's
 /// `UPDATE requests` and this INSERT commit atomically, so a row can never
 /// transition without its audit entry. Actor attribution is read from
@@ -283,6 +294,7 @@ pub async fn record_audit_tx(
     session: &AuthSession,
     record: &AuditRecord<'_>,
 ) -> Result<ryuki_engine::authorization::AuditReservationEvidence, sqlx::Error> {
+    let actor_principal = required_principal_id(session)?;
     let request_uuid = record
         .request_id
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
@@ -296,7 +308,10 @@ pub async fn record_audit_tx(
          )",
     )
     .bind(request_uuid)
-    .bind(&session.user_id)
+    // The pre-199 audit schema stores immutable actor evidence as TEXT. It is
+    // populated only from the typed internal id, never from a provider claim
+    // or compatibility display value.
+    .bind(actor_principal.to_string())
     .bind(&session.display_name)
     .bind(&session.roles)
     .bind(&session.provider_mode)
@@ -333,14 +348,16 @@ pub async fn record_audit(
 
 /// Append to the process-local audit store (no-DB / dry-run mode). Tagged
 /// non-durable when served so demo output is never mistaken for a real trail.
+/// An unbound compatibility/display identity is rejected before the store is
+/// touched.
 pub async fn record_audit_local(
     session: &AuthSession,
     record: &AuditRecord<'_>,
-) -> ryuki_engine::authorization::AuditReservationEvidence {
-    let reservation = reserve_audit_local(session, record).await;
+) -> Result<ryuki_engine::authorization::AuditReservationEvidence, sqlx::Error> {
+    let reservation = reserve_audit_local(session, record).await?;
     let evidence = reservation.evidence().clone();
     reservation.commit();
-    evidence
+    Ok(evidence)
 }
 
 /// Rollback-capable local audit reservation retained beside an in-memory
@@ -384,20 +401,21 @@ impl Drop for LocalAuditReservation {
 pub(crate) async fn reserve_audit_local(
     session: &AuthSession,
     record: &AuditRecord<'_>,
-) -> LocalAuditReservation {
+) -> Result<LocalAuditReservation, sqlx::Error> {
+    let actor_principal = required_principal_id(session)?;
     let reservation_id = uuid::Uuid::new_v4();
     let mut store = audit_store().lock().await;
-    store.push(entry_from(reservation_id, session, record));
+    store.push(entry_from(reservation_id, actor_principal, session, record));
     // Capacity trimming is deferred until commit. If permit issuance or its
     // currentness check fails, Drop removes only this reservation and cannot
     // accidentally evict an older committed audit entry.
-    LocalAuditReservation {
+    Ok(LocalAuditReservation {
         store,
         reservation_id,
         evidence: ryuki_engine::authorization::AuditReservationEvidence::local(reservation_id)
             .expect("generated local audit reservation id is non-nil"),
         committed: false,
-    }
+    })
 }
 
 /// Best-effort audit of a DENIED (403) attempt caught at the HANDLER level
@@ -414,13 +432,20 @@ pub async fn record_denied(pool: Option<&PgPool>, session: &AuthSession, record:
                 tracing::warn!(
                     error = %e,
                     action = record.action,
-                    actor = %session.user_id,
+                    actor_principal = ?session.principal_id,
                     "failed to record denied audit entry (best-effort)"
                 );
             }
         }
         None => {
-            let _reservation = record_audit_local(session, record).await;
+            if let Err(e) = record_audit_local(session, record).await {
+                tracing::warn!(
+                    error = %e,
+                    action = record.action,
+                    actor_principal = ?session.principal_id,
+                    "failed to record denied local audit entry (best-effort)"
+                );
+            }
         }
     }
 }
@@ -1296,6 +1321,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_attribution_rejects_compatibility_identity_without_internal_principal() {
+        let session = AuthSession {
+            display_user_id: "provider-subject-that-must-not-be-authority".into(),
+            ..AuthSession::default()
+        };
+
+        let error = required_principal_id(&session).expect_err("principal binding is required");
+        assert!(matches!(&error, sqlx::Error::Protocol(_)));
+        assert!(!error.to_string().contains(&session.display_user_id));
+    }
+
+    #[test]
     fn canonical_json_is_order_independent_and_deterministic() {
         // Same logical content, different key insertion order → same canonical
         // string (so an app-built value and a jsonb round-trip hash identically).
@@ -1469,6 +1506,10 @@ mod audit_chain_db_tests {
     use super::*;
     use crate::database::DB_TEST_SERIAL;
 
+    fn new_test_principal() -> PrincipalId {
+        PrincipalId::from_uuid(uuid::Uuid::new_v4()).expect("non-nil test principal")
+    }
+
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
@@ -1544,8 +1585,10 @@ mod audit_chain_db_tests {
             .await
             .expect("clear lock proof job");
 
+        let actor_principal = new_test_principal();
         let mut session = AuthSession::static_dry_run();
-        session.user_id = "audit-chain-tester".into();
+        session.display_user_id = "audit-chain-tester".into();
+        session.principal_id = Some(actor_principal);
         session.provider_mode = "entra-id".into();
         session.roles = vec!["approver".into(), "request".into()];
 
@@ -1649,11 +1692,12 @@ mod audit_chain_db_tests {
         };
         // audit_log is append-only (DELETE raises), so use a UNIQUE actor per run
         // — our rows are then the newest and isolated, no cleanup needed.
-        let actor = format!("audit-export-{}", uuid::Uuid::new_v4());
-        let actor = actor.as_str();
+        let actor_principal = new_test_principal();
+        let actor = actor_principal.to_string();
 
         let mut session = AuthSession::static_dry_run();
-        session.user_id = actor.into();
+        session.display_user_id = format!("audit-export-{}", uuid::Uuid::new_v4());
+        session.principal_id = Some(actor_principal);
         session.provider_mode = "entra-id".into();
         session.roles = vec!["approver".into()];
         for i in 0..3 {
@@ -1679,7 +1723,7 @@ mod audit_chain_db_tests {
         // MIN(id) yields exactly them in order.
         let min_id: i64 =
             sqlx::query_scalar("SELECT MIN(id) FROM audit_log WHERE actor_principal = $1")
-                .bind(actor)
+                .bind(&actor)
                 .fetch_one(pool)
                 .await
                 .unwrap();
@@ -1689,7 +1733,9 @@ mod audit_chain_db_tests {
         let p1 = export_audit(pool, None, None, start, 2).await.expect("p1");
         assert_eq!(p1.entries.len(), 2, "first page is limit-bounded");
         assert!(
-            p1.entries.iter().all(|e| e["actor_principal"] == actor),
+            p1.entries
+                .iter()
+                .all(|e| e["actor_principal"] == actor.as_str()),
             "only our rows are in this id window"
         );
         assert!(

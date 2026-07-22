@@ -11,8 +11,8 @@
 //!
 //! Only the keyed, fixed-width verifier is retained. Plaintext session bearers
 //! are never stored, logged, or used as cache keys. A positive entry is only
-//! admission evidence: every request still performs the authority-epoch SQL
-//! check before it is authenticated.
+//! admission evidence: every request still performs the exact principal/key/link
+//! version and lifecycle SQL check before it is authenticated.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -28,8 +28,10 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use ryuki_core::config::{AuthMode, RyukiConfig};
 use ryuki_core::types::ApiError;
+use ryuki_core::PrincipalId;
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
 
 use crate::session_credentials::SESSION_VERIFIER_LEN;
 
@@ -105,7 +107,7 @@ const ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE: SessionLookupSecurityLimitProfile =
         negative_cache_capacity: 4_096,
         // Positive entries are only admission hints and every request still
         // performs the SQL authority/version join. Keep this short as a second
-        // bound for an out-of-process assignment change that cannot
+        // bound for an out-of-process authority change that cannot
         // synchronously evict this replica.
         positive_cache_max_ttl_secs: 30,
         negative_cache_ttl_secs: 30,
@@ -197,21 +199,35 @@ pub(crate) struct SessionLookupAdmissionProof {
     authority: Option<SessionAuthorityCacheBinding>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CachedAssignmentStatus {
-    Active,
-}
-
-/// Non-PII provenance retained with a positive admission entry. The stable
-/// provider/issuer/subject tuple is represented only by a one-way fingerprint;
-/// the exact assignment generation is compared with the database result.
+/// Exact, provider-independent authority captured by a persisted session.
+///
+/// A cache hit is only an admission hint. The resolver must still compare
+/// every identifier and version with a database row joined to an active
+/// principal, key, and link. Provider subjects and their fingerprints are
+/// deliberately absent: neither is a principal authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionAuthorityCacheBinding {
-    pub authority_fingerprint: [u8; 32],
-    pub assignment_version: i64,
-    pub assignment_status: CachedAssignmentStatus,
-    pub site_global: bool,
-    pub environment_global: bool,
+    pub principal_id: PrincipalId,
+    pub principal_lifecycle_version: i64,
+    pub principal_authority_version: i64,
+    pub principal_key_id: Uuid,
+    pub principal_key_version: i64,
+    pub principal_link_id: Uuid,
+    pub principal_link_version: i64,
+}
+
+impl SessionAuthorityCacheBinding {
+    /// Reject impossible or legacy/sentinel bindings before they can become a
+    /// positive cache hint. Database lifecycle states are revalidated by the
+    /// resolver; only exact positive versions can participate in comparison.
+    fn is_well_formed(self) -> bool {
+        self.principal_lifecycle_version > 0
+            && self.principal_authority_version > 0
+            && self.principal_key_version > 0
+            && self.principal_link_version > 0
+            && !self.principal_key_id.is_nil()
+            && !self.principal_link_id.is_nil()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -433,7 +449,7 @@ pub(crate) struct SessionLookupAdmission {
 
 pub(crate) enum SessionLookupDecision {
     /// `None` means the outer middleware admitted a first lookup and supplied
-    /// a verifier-only proof; `Some` is cached assignment provenance.
+    /// a verifier-only proof; `Some` is an exact cached principal binding.
     KnownPositive(Option<SessionAuthorityCacheBinding>),
     CachedMiss,
     Unknown(SessionLookupGuard),
@@ -548,7 +564,7 @@ impl SessionLookupAdmission {
         if inner
             .positive
             .get(&verifier)
-            .is_some_and(|entry| entry.expires_at > now)
+            .is_some_and(|entry| entry.expires_at > now && entry.authority.is_well_formed())
         {
             saturating_increment(&self.telemetry.known_positive);
             return SessionLookupDecision::KnownPositive(Some(inner.positive[&verifier].authority));
@@ -600,7 +616,12 @@ impl SessionLookupAdmission {
         verifier: SessionVerifier,
         proof: Option<SessionLookupAdmissionProof>,
     ) -> SessionLookupDecision {
-        if let Some(proof) = proof.filter(|proof| proof.verifier == verifier) {
+        if let Some(proof) = proof.filter(|proof| {
+            proof.verifier == verifier
+                && proof
+                    .authority
+                    .is_none_or(SessionAuthorityCacheBinding::is_well_formed)
+        }) {
             SessionLookupDecision::KnownPositive(proof.authority)
         } else {
             self.try_admit(verifier)
@@ -613,6 +634,10 @@ impl SessionLookupAdmission {
         valid_for: Duration,
         authority: SessionAuthorityCacheBinding,
     ) {
+        if !authority.is_well_formed() {
+            self.record_miss(verifier);
+            return;
+        }
         let now = Instant::now();
         let valid_for = valid_for.min(self.positive_max_ttl);
         if valid_for.is_zero() {
@@ -643,11 +668,20 @@ impl SessionLookupAdmission {
         self.record_negative(verifier, true);
     }
 
-    pub(crate) fn evict_authority(&self, authority_fingerprint: [u8; 32]) {
+    #[cfg(test)]
+    pub(crate) fn evict_principal(&self, principal_id: PrincipalId) {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner
             .positive
-            .retain(|_, entry| entry.authority.authority_fingerprint != authority_fingerprint);
+            .retain(|_, entry| entry.authority.principal_id != principal_id);
+        // Stale queue nodes are pruned lazily and remain capacity-bounded.
+    }
+
+    pub(crate) fn evict_binding(&self, authority: SessionAuthorityCacheBinding) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        inner
+            .positive
+            .retain(|_, entry| entry.authority != authority);
         // Stale queue nodes are pruned lazily and remain capacity-bounded.
     }
 
@@ -894,11 +928,6 @@ pub(crate) fn register_positive_global(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn evict_authority_global(authority_fingerprint: [u8; 32]) {
-    global_admission().evict_authority(authority_fingerprint);
-}
-
 pub(crate) fn clear_positive_global() {
     global_admission().clear_positive();
 }
@@ -914,9 +943,10 @@ pub(crate) struct PrewarmReport {
     pub truncated: bool,
 }
 
-/// Bounded restart prewarm. Provider/issuer reconciliation runs first, so only
-/// sessions that survived the current configuration are considered. The SQL
-/// reads one extra row solely to make capacity truncation observable.
+/// Bounded restart prewarm. Only sessions whose exact principal, key, and link
+/// generations are still active are considered. Provider tombstones and a
+/// configuration mismatch fail closed. The SQL reads one extra row solely to
+/// make capacity truncation observable.
 pub(crate) async fn prewarm(
     pool: &PgPool,
     config: &RyukiConfig,
@@ -926,47 +956,42 @@ pub(crate) async fn prewarm(
         .positive_capacity
         .saturating_add(admission.prewarm_lookahead_rows);
     let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
-    let rows = sqlx::query_as::<
-        _,
-        (
-            Vec<u8>,
-            DateTime<Utc>,
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-        ),
-    >(
-        "SELECT s.bearer_verifier, s.expires_at, s.provider, s.identity_issuer, \
-                s.identity_subject, s.human_authority_version, \
-                s.site_authority_mode, s.environment_authority_mode \
+    let rows = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>, Uuid, i64, i64, Uuid, i64, Uuid, i64)>(
+        "SELECT s.bearer_verifier, s.expires_at, s.principal_id, \
+                s.principal_lifecycle_version, s.principal_authority_version, \
+                s.principal_key_id, s.principal_key_version, \
+                s.principal_link_id, s.principal_link_version \
          FROM sessions s \
-         JOIN identity_authorities a \
-           ON a.provider = s.provider \
-          AND a.issuer = s.identity_issuer \
-          AND a.subject = s.identity_subject \
-          AND a.authority_epoch = s.identity_authority_epoch \
-         JOIN human_authority_assignments h \
-           ON h.provider = s.provider \
-          AND h.issuer = s.identity_issuer \
-          AND h.subject = s.identity_subject \
-          AND h.assignment_version = s.human_authority_version \
-         WHERE s.expires_at > NOW() AND a.authority_status = 'active-scoped-v2' \
-           AND h.assignment_status = 'active' \
-           AND (s.provider = 'local' OR (a.last_asserted_at IS NOT NULL \
-                AND a.last_asserted_at >= NOW() - make_interval(secs => $1))) \
+         JOIN principals p \
+           ON p.principal_id = s.principal_id \
+          AND p.lifecycle_version = s.principal_lifecycle_version \
+          AND p.authority_version = s.principal_authority_version \
+         JOIN principal_keys k \
+           ON k.principal_key_id = s.principal_key_id \
+          AND k.key_version = s.principal_key_version \
+         JOIN principal_links l \
+           ON l.principal_link_id = s.principal_link_id \
+          AND l.link_version = s.principal_link_version \
+          AND l.principal_key_id = s.principal_key_id \
+          AND l.principal_id = s.principal_id \
+         WHERE s.expires_at > NOW() \
+           AND p.principal_kind = 'human' \
+           AND p.lifecycle_state = 'active' \
+           AND k.key_state = 'active' \
+           AND l.link_state = 'active' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM principal_provider_tombstones pt \
+             WHERE pt.provider_id = k.provider_id \
+           ) \
            AND ( \
-             ($2 = 'local' AND s.provider = 'local' AND s.identity_issuer = $3) \
-             OR ($2 = 'entra-id' AND ( \
-               (s.provider = 'entra-id' AND s.identity_issuer = $4) \
-               OR ($5 AND s.provider = 'oidc' AND s.identity_issuer = $6) \
+             ($1 = 'local' AND k.provider_id = 'local' AND k.issuer = $2) \
+             OR ($1 = 'entra-id' AND ( \
+               (k.provider_id = 'entra-id' AND k.issuer = $3) \
+               OR ($4 AND k.provider_id = 'oidc' AND k.issuer = $5) \
              )) \
            ) \
-         ORDER BY s.created_at DESC LIMIT $7",
+         ORDER BY s.created_at DESC LIMIT $6",
     )
-    .bind(config.session.federated_authority_max_staleness_secs as f64)
     .bind(config.auth_mode.as_str())
     .bind(crate::identity_authority::LOCAL_ISSUER)
     .bind(entra_issuer)
@@ -984,12 +1009,13 @@ pub(crate) async fn prewarm(
     for (
         verifier,
         expires_at,
-        provider,
-        issuer,
-        subject,
-        assignment_version,
-        site_mode,
-        environment_mode,
+        principal_id,
+        principal_lifecycle_version,
+        principal_authority_version,
+        principal_key_id,
+        principal_key_version,
+        principal_link_id,
+        principal_link_version,
     ) in rows.into_iter().take(admission.positive_capacity)
     {
         let Some(verifier) = verifier_from_slice(&verifier) else {
@@ -998,17 +1024,20 @@ pub(crate) async fn prewarm(
         let Ok(valid_for) = (expires_at - now).to_std() else {
             continue;
         };
+        let Ok(principal_id) = PrincipalId::from_uuid(principal_id) else {
+            continue;
+        };
         admission.record_hit(
             verifier,
             valid_for,
             SessionAuthorityCacheBinding {
-                authority_fingerprint: crate::human_authority::authority_fingerprint(
-                    &provider, &issuer, &subject,
-                ),
-                assignment_version,
-                assignment_status: CachedAssignmentStatus::Active,
-                site_global: site_mode == "global",
-                environment_global: environment_mode == "global",
+                principal_id,
+                principal_lifecycle_version,
+                principal_authority_version,
+                principal_key_id,
+                principal_key_version,
+                principal_link_id,
+                principal_link_version,
             },
         );
     }
@@ -1162,12 +1191,18 @@ mod tests {
     }
 
     fn authority(value: u8) -> SessionAuthorityCacheBinding {
+        let offset = u128::from(value);
         SessionAuthorityCacheBinding {
-            authority_fingerprint: [value; 32],
-            assignment_version: i64::from(value) + 1,
-            assignment_status: CachedAssignmentStatus::Active,
-            site_global: true,
-            environment_global: true,
+            principal_id: PrincipalId::from_uuid(Uuid::from_u128(
+                0x10000000_0000_4000_8000_000000000000 + offset,
+            ))
+            .expect("non-nil test principal"),
+            principal_lifecycle_version: i64::from(value) + 1,
+            principal_authority_version: i64::from(value) + 2,
+            principal_key_id: Uuid::from_u128(0x20000000_0000_4000_8000_000000000000 + offset),
+            principal_key_version: i64::from(value) + 3,
+            principal_link_id: Uuid::from_u128(0x30000000_0000_4000_8000_000000000000 + offset),
+            principal_link_version: i64::from(value) + 4,
         }
     }
 
@@ -1514,20 +1549,92 @@ mod tests {
     }
 
     #[test]
-    fn assignment_version_and_revocation_evict_cached_provenance() {
+    fn exact_principal_binding_and_revocation_evict_cached_provenance() {
         let admission = SessionLookupAdmission::for_tests(4, 4, 1, 4);
         let candidate = verifier(9);
         admission.record_hit(candidate, Duration::from_secs(60), authority(9));
         assert!(matches!(
             admission.try_admit(candidate),
             SessionLookupDecision::KnownPositive(Some(binding))
-                if binding.assignment_version == 10
+                if binding == authority(9)
         ));
-        admission.evict_authority([9; 32]);
+        admission.evict_principal(authority(9).principal_id);
         assert!(matches!(
             admission.try_admit(candidate),
             SessionLookupDecision::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn invalid_or_legacy_binding_never_becomes_a_positive_hint() {
+        let baseline = authority(10);
+        let mut invalid_bindings = Vec::new();
+        for mutate in [
+            |binding: &mut SessionAuthorityCacheBinding| binding.principal_lifecycle_version = 0,
+            |binding: &mut SessionAuthorityCacheBinding| binding.principal_authority_version = -1,
+            |binding: &mut SessionAuthorityCacheBinding| binding.principal_key_version = 0,
+            |binding: &mut SessionAuthorityCacheBinding| binding.principal_link_version = -1,
+            |binding: &mut SessionAuthorityCacheBinding| binding.principal_key_id = Uuid::nil(),
+            |binding: &mut SessionAuthorityCacheBinding| binding.principal_link_id = Uuid::nil(),
+        ] {
+            let mut invalid = baseline;
+            mutate(&mut invalid);
+            invalid_bindings.push(invalid);
+        }
+
+        for (index, invalid) in invalid_bindings.into_iter().enumerate() {
+            let admission = SessionLookupAdmission::for_tests(4, 4, 1, 4);
+            let candidate = verifier(10 + index);
+            admission.record_hit(candidate, Duration::from_secs(60), invalid);
+            assert!(matches!(
+                admission.try_admit(candidate),
+                SessionLookupDecision::CachedMiss
+            ));
+        }
+    }
+
+    #[test]
+    fn cache_binding_compares_every_id_and_generation() {
+        let baseline = authority(11);
+        let mut variants = Vec::new();
+
+        let mut changed = baseline;
+        changed.principal_id = authority(12).principal_id;
+        variants.push(changed);
+        let mut changed = baseline;
+        changed.principal_lifecycle_version += 1;
+        variants.push(changed);
+        let mut changed = baseline;
+        changed.principal_authority_version += 1;
+        variants.push(changed);
+        let mut changed = baseline;
+        changed.principal_key_id = authority(12).principal_key_id;
+        variants.push(changed);
+        let mut changed = baseline;
+        changed.principal_key_version += 1;
+        variants.push(changed);
+        let mut changed = baseline;
+        changed.principal_link_id = authority(12).principal_link_id;
+        variants.push(changed);
+        let mut changed = baseline;
+        changed.principal_link_version += 1;
+        variants.push(changed);
+
+        for (index, variant) in variants.into_iter().enumerate() {
+            let admission = SessionLookupAdmission::for_tests(4, 4, 1, 4);
+            let candidate = verifier(100 + index);
+            admission.record_hit(candidate, Duration::from_secs(60), baseline);
+            admission.evict_binding(variant);
+            assert!(matches!(
+                admission.try_admit(candidate),
+                SessionLookupDecision::KnownPositive(Some(binding)) if binding == baseline
+            ));
+            admission.evict_binding(baseline);
+            assert!(matches!(
+                admission.try_admit(candidate),
+                SessionLookupDecision::Unknown(_)
+            ));
+        }
     }
 
     #[test]

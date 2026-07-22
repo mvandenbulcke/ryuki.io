@@ -23,7 +23,7 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:cfd34b6174be1b317300f69794da54bef36dba55c859a599203e4693bf1d9c5c",
+        "content_digest": "sha256:8929886d8232d9cbd676edffda1fbba68eb0ad04647d2046bfd8cd821b1eb496",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
@@ -35,7 +35,7 @@
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:3f1930527e810ca7a79dca18f07d068025decae04c2a5f20d23b988b639cad43",
+        "content_digest": "sha256:6229fe9614fd9ac4d1265b9f054ac9fa08062d756bfc0fe817e35ee6e51b216c",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
@@ -47,19 +47,19 @@
       {
         "document_id": "source:ryuki-api-agents",
         "document_version": 1,
-        "content_digest": "sha256:92f28b8f0a62402a5a6f2410612eed60a9df1352eab2fad6945260f607b61072",
+        "content_digest": "sha256:6135bb4bfc18ef6e67700932b64ae081b1a8bed6f06a19af8f2af2b5a0218eda",
         "artifact_locator": "sources/ryuki-api/src/agents.rs"
       },
       {
         "document_id": "source:ryuki-api-request-authority",
         "document_version": 1,
-        "content_digest": "sha256:84d7ee126f32be78bb92e6840b6bc472728a98cadeb588373a609563616bef89",
+        "content_digest": "sha256:396bf12959f6752540b850f25d821d1fda30fb8e0f7fe43ab3c4eacb6fc78d19",
         "artifact_locator": "sources/ryuki-api/src/request_authority.rs"
       },
       {
         "document_id": "source:ryuki-api-request-read-repository",
         "document_version": 1,
-        "content_digest": "sha256:29587e1f2ae4f88ce803a6f767cb65a4ff273c7010bd6b34f13780d8d8165ad4",
+        "content_digest": "sha256:e3670c8701ddade889d9f4444a6371f6909af5f47fae287d22361d10344c5b34",
         "artifact_locator": "sources/ryuki-api/src/repos/requests.rs"
       },
       {
@@ -77,25 +77,25 @@
       {
         "document_id": "source:ryuki-api-database-boundary",
         "document_version": 1,
-        "content_digest": "sha256:f26391e77f4a6060f6bccaca00c46782e44bb2754fd99c6a1076febf4fb7d93e",
+        "content_digest": "sha256:d385f251c0388af3683b737b95da06437414648af625226cae2af6084a7164f8",
         "artifact_locator": "sources/ryuki-api/src/database.rs"
       },
       {
         "document_id": "source:ryuki-api-audit-repository",
         "document_version": 1,
-        "content_digest": "sha256:98d1c313202ff8d30d3b07eec988c98dbc6053dc160b9590626094acb2d3a5cf",
+        "content_digest": "sha256:3d2f2d44c0a6f79c872e52da4b03fe7495108a2ef155f182f1322953c6520fe4",
         "artifact_locator": "sources/ryuki-api/src/audit.rs"
       },
       {
         "document_id": "source:ryuki-api-entra-auth",
         "document_version": 1,
-        "content_digest": "sha256:fe701a72bacdb852bfcb0863d623617548c55c117df56df55002f1a01d50c2ea",
+        "content_digest": "sha256:57547c6946fffc9c197af248fc8527a88a153ede0dac702d4b2cb49c45a15cb7",
         "artifact_locator": "sources/ryuki-api/src/entra_auth.rs"
       },
       {
         "document_id": "source:ryuki-api-identity-authority",
         "document_version": 1,
-        "content_digest": "sha256:ee11a268ba872b1910189a5a0c4d545449e15a24d19f170775cdd1414adfb57b",
+        "content_digest": "sha256:a983595e22141b83d20a6a75a156c6a1633b3ac0ca06e9629e34b88190b1bd12",
         "artifact_locator": "sources/ryuki-api/src/identity_authority.rs"
       },
       {
@@ -107,7 +107,7 @@
       {
         "document_id": "source:ryuki-engine-authorization-kernel",
         "document_version": 1,
-        "content_digest": "sha256:58d85d97ba1178714fe28f1c31a58b6c4dd4853f25cebb3f838b4f80948a83eb",
+        "content_digest": "sha256:9954e8522125124118efda4ee87a98d9d31ebca0b1fd9b1338d9daf5df4c20b0",
         "artifact_locator": "sources/ryuki-engine/src/authorization.rs"
       }
     ]

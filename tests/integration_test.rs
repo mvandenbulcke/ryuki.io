@@ -49,7 +49,7 @@ const REQUESTS_LIST_ITEM_FIXTURE: &str = r#"{"request_id":"<uuid>","request_type
 #[test]
 fn engine_auth_session_serialization_matches_seam_fixture() {
     let session = ryuki_engine::auth::AuthSession {
-        user_id: "admin".to_string(),
+        display_user_id: "admin".to_string(),
         display_name: "admin".to_string(),
         roles: vec!["PlatformAdmin".to_string()],
         token_valid: true,
@@ -63,7 +63,7 @@ fn engine_auth_session_serialization_matches_seam_fixture() {
     let parsed: ryuki_engine::auth::AuthSession =
         serde_json::from_str(AUTH_SESSION_FIXTURE).unwrap();
     assert!(parsed.token_valid);
-    assert_eq!(parsed.user_id, "admin");
+    assert_eq!(parsed.display_user_id, "admin");
     assert_eq!(parsed.display_name, "admin");
     assert_eq!(parsed.roles, vec!["PlatformAdmin"]);
     assert_eq!(parsed.provider_mode, "local");

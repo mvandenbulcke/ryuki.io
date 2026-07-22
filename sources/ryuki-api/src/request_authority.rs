@@ -11,6 +11,7 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use ryuki_core::security_profile::SecurityProfile;
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::{ActorClass, AuthSession};
 use ryuki_engine::authorization::{
     ActorKind, AssuranceLevel, BindingDigest, BindingVersion, DeploymentProfile, ExplicitScope,
@@ -21,15 +22,14 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::human_authority::{
-    HumanAuthorityError, HumanAuthorityMode, InteractiveHumanAuthorityContext,
-};
+use crate::human_authority::{HumanAuthorityMode, InteractiveHumanAuthorityContext};
 use crate::security_contracts::RequestReadSecurityNamespace;
 
 const SESSION_BINDING_DIGEST_DOMAIN: &[u8] = b"ryuki-request-read-session-binding-v1";
 const DEVELOPMENT_CREDENTIAL_ID_DOMAIN: &[u8] = b"ryuki-request-read-development-credential-v1";
 const DEVELOPMENT_AUDIENCE_DOMAIN: &[u8] = b"ryuki-request-read-development-audience-v1";
 const DEVELOPMENT_KEY_ID_DOMAIN: &[u8] = b"ryuki-request-read-development-key-id-v1";
+const DEVELOPMENT_FIXTURE_PRINCIPAL_UUID: u128 = 0x018f_3f54_8f5e_7bb7_9f06_1f3c_c6f8_19d5;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RequestAuthorityError {
@@ -272,16 +272,20 @@ impl fmt::Debug for UnadmittedApiTokenRequestReadCredential {
 /// provider provenance, scopes, roles or monotonic versions.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct InteractiveRequestReadPrincipal {
-    principal_id: String,
+    principal_id: PrincipalId,
+    principal_lifecycle_version: BindingVersion,
+    principal_authority_version: BindingVersion,
+    principal_key_id: Uuid,
+    principal_key_version: BindingVersion,
+    principal_link_id: Uuid,
+    principal_link_version: BindingVersion,
     carrier_mode: String,
     source_provider: String,
     source_issuer: String,
     source_subject: String,
-    identity_epoch: BindingVersion,
     identity_authority_digest: [u8; 32],
     identity_last_asserted_at: Option<DateTime<Utc>>,
     identity_fresh_until: Option<DateTime<Utc>>,
-    assignment_version: BindingVersion,
     roles: Vec<String>,
     site_mode: HumanAuthorityMode,
     site_scope: Vec<String>,
@@ -299,13 +303,18 @@ impl InteractiveRequestReadPrincipal {
         identity_last_asserted_at: Option<DateTime<Utc>>,
         identity_fresh_until: Option<DateTime<Utc>>,
     ) -> Result<Self, RequestAuthorityError> {
+        let binding = authority.principal_binding;
+        validate_identifier(&authority.provider)?;
+        validate_identifier(&authority.issuer)?;
+        validate_identifier(&authority.subject)?;
         if !session.token_valid
             || session.actor_class != ActorClass::VerifiedHuman
             || identity_authority_digest == [0; 32]
-            || authority.provider.trim().is_empty()
-            || authority.issuer.trim().is_empty()
-            || authority.subject.trim().is_empty()
-            || authority.subject != session.user_id
+            || binding.principal_key_id.is_nil()
+            || binding.principal_link_id.is_nil()
+            || session.principal_id != Some(binding.principal_id)
+            || authority.identity_epoch != binding.principal_lifecycle_version
+            || authority.assignment_version != binding.principal_authority_version
             || authority.roles != session.roles
             || authority.site_scope != session.site_scope
             || authority.environment_scope != session.environment_scope
@@ -348,16 +357,20 @@ impl InteractiveRequestReadPrincipal {
         }
 
         Ok(Self {
-            principal_id: session.user_id.clone(),
+            principal_id: binding.principal_id,
+            principal_lifecycle_version: positive_i64_version(binding.principal_lifecycle_version)?,
+            principal_authority_version: positive_i64_version(binding.principal_authority_version)?,
+            principal_key_id: binding.principal_key_id,
+            principal_key_version: positive_i64_version(binding.principal_key_version)?,
+            principal_link_id: binding.principal_link_id,
+            principal_link_version: positive_i64_version(binding.principal_link_version)?,
             carrier_mode: session.provider_mode.clone(),
             source_provider: authority.provider.clone(),
             source_issuer: authority.issuer.clone(),
             source_subject: authority.subject.clone(),
-            identity_epoch: positive_i64_version(authority.identity_epoch)?,
             identity_authority_digest,
             identity_last_asserted_at,
             identity_fresh_until,
-            assignment_version: positive_i64_version(authority.assignment_version)?,
             roles: authority.roles.clone(),
             site_mode: authority.site_mode,
             site_scope: authority.site_scope.clone(),
@@ -373,11 +386,21 @@ impl fmt::Debug for InteractiveRequestReadPrincipal {
         formatter
             .debug_struct("InteractiveRequestReadPrincipal")
             .field("principal_id", &self.principal_id)
+            .field(
+                "principal_lifecycle_version",
+                &self.principal_lifecycle_version,
+            )
+            .field(
+                "principal_authority_version",
+                &self.principal_authority_version,
+            )
+            .field("principal_key_id", &self.principal_key_id)
+            .field("principal_key_version", &self.principal_key_version)
+            .field("principal_link_id", &self.principal_link_id)
+            .field("principal_link_version", &self.principal_link_version)
             .field("source_provider", &self.source_provider)
             .field("source_issuer", &"<redacted>")
             .field("source_subject", &"<redacted>")
-            .field("identity_epoch", &self.identity_epoch)
-            .field("assignment_version", &self.assignment_version)
             .field("identity_authority_digest", &"<redacted>")
             .finish()
     }
@@ -466,14 +489,14 @@ struct CredentialEvidence {
 enum RequestReadPrincipal {
     Interactive(Box<InteractiveRequestReadPrincipal>),
     DevelopmentFixture {
-        principal_id: String,
+        principal_id: PrincipalId,
         site_scope: Vec<String>,
         environment_scope: Vec<String>,
     },
     #[cfg(test)]
     TestFixture {
         actor_kind: ActorKind,
-        principal_id: String,
+        principal_id: PrincipalId,
         site_scope: Vec<String>,
         environment_scope: Vec<String>,
         policy_roles: BTreeSet<PolicyRole>,
@@ -569,6 +592,7 @@ impl RequestReadAuthority {
             || session.actor_class != ActorClass::Simulated
             || session.provider_mode != "static-dry-run"
             || session.token_valid
+            || session.principal_id.is_some()
             || !ryuki_engine::auth::check_permission(session, "admin")
         {
             return Err(RequestAuthorityError::InvalidBinding(
@@ -581,7 +605,7 @@ impl RequestReadAuthority {
                 namespace.deployment_id.as_bytes(),
                 namespace.trust_domain_id.as_bytes(),
                 namespace.provider_id.as_bytes(),
-                session.user_id.as_bytes(),
+                development_fixture_principal_id().as_uuid().as_bytes(),
             ],
         );
         let digests = RequestReadCredentialDigests::new(
@@ -621,7 +645,7 @@ impl RequestReadAuthority {
         Ok(Self::seal(
             namespace,
             RequestReadPrincipal::DevelopmentFixture {
-                principal_id: session.user_id.clone(),
+                principal_id: development_fixture_principal_id(),
                 site_scope: session.site_scope.clone(),
                 environment_scope: session.environment_scope.clone(),
             },
@@ -638,6 +662,9 @@ impl RequestReadAuthority {
     pub(crate) fn test_fixture(session: &AuthSession) -> Self {
         let now = Utc::now();
         let policy_roles = policy_roles_for_session(session);
+        let principal_id = session
+            .principal_id
+            .unwrap_or_else(development_fixture_principal_id);
         let namespace = RequestReadNamespace {
             deployment_id: "deployment:test".into(),
             trust_domain_id: "trust-domain:test".into(),
@@ -646,19 +673,19 @@ impl RequestReadAuthority {
             policy_version: BindingVersion::new(1).expect("positive test policy version"),
             policy_digest: BindingDigest::sha256(
                 b"ryuki-request-read-test-policy-v1",
-                session.user_id.as_bytes(),
+                principal_id.as_uuid().as_bytes(),
             ),
             action_registry_version: BindingVersion::new(1)
                 .expect("positive test action-registry version"),
             action_registry_digest: BindingDigest::sha256(
                 b"ryuki-request-read-test-action-registry-v1",
-                session.user_id.as_bytes(),
+                principal_id.as_uuid().as_bytes(),
             ),
             maximum_authority_version: BindingVersion::new(1)
                 .expect("positive test maximum-authority version"),
             maximum_authority_digest: BindingDigest::sha256(
                 b"ryuki-request-read-test-maximum-authority-v1",
-                session.user_id.as_bytes(),
+                principal_id.as_uuid().as_bytes(),
             ),
             provider_id: "provider:test-fixture".into(),
             provider_configuration_version: BindingVersion::new(1)
@@ -666,11 +693,6 @@ impl RequestReadAuthority {
             provider_lifecycle_version: BindingVersion::new(1)
                 .expect("positive test provider lifecycle version"),
             credential_source_provider: "test-fixture".into(),
-        };
-        let principal_id = if session.user_id.trim().is_empty() {
-            "principal:test-fixture".to_string()
-        } else {
-            session.user_id.clone()
         };
         let principal = RequestReadPrincipal::TestFixture {
             actor_kind: ActorKind::VerifiedHuman,
@@ -693,7 +715,7 @@ impl RequestReadAuthority {
             digests: RequestReadCredentialDigests::new(
                 digest_parts(
                     b"ryuki-request-read-test-credential-v1",
-                    &[session.user_id.as_bytes()],
+                    &[principal_id.as_uuid().as_bytes()],
                 ),
                 digest_parts(
                     b"ryuki-request-read-test-audience-v1",
@@ -868,7 +890,7 @@ impl RevalidatedRequestReadAuthority<'_> {
             RequestReadPrincipal::Interactive(principal) => {
                 session.token_valid
                     && session.actor_class == ActorClass::VerifiedHuman
-                    && session.user_id == principal.principal_id.as_str()
+                    && session.principal_id == Some(principal.principal_id)
                     && session.provider_mode == principal.carrier_mode.as_str()
                     && session.roles.as_slice() == principal.roles.as_slice()
                     && session.site_scope.as_slice() == principal.site_scope.as_slice()
@@ -876,14 +898,14 @@ impl RevalidatedRequestReadAuthority<'_> {
                         == principal.environment_scope.as_slice()
             }
             RequestReadPrincipal::DevelopmentFixture {
-                principal_id,
                 site_scope,
                 environment_scope,
+                ..
             } => {
                 !session.token_valid
                     && session.actor_class == ActorClass::Simulated
                     && session.provider_mode == "static-dry-run"
-                    && session.user_id == principal_id.as_str()
+                    && session.principal_id.is_none()
                     && session.site_scope.as_slice() == site_scope.as_slice()
                     && session.environment_scope.as_slice() == environment_scope.as_slice()
                     && ryuki_engine::auth::check_permission(session, "admin")
@@ -896,12 +918,10 @@ impl RevalidatedRequestReadAuthority<'_> {
                 policy_roles,
                 ..
             } => {
-                let expected_principal = if session.user_id.trim().is_empty() {
-                    "principal:test-fixture"
-                } else {
-                    session.user_id.as_str()
-                };
-                expected_principal == principal_id.as_str()
+                let expected_principal = session
+                    .principal_id
+                    .unwrap_or_else(development_fixture_principal_id);
+                expected_principal == *principal_id
                     && session.site_scope.as_slice() == site_scope.as_slice()
                     && session.environment_scope.as_slice() == environment_scope.as_slice()
                     && policy_roles_for_session(session) == *policy_roles
@@ -943,9 +963,9 @@ impl RevalidatedRequestReadAuthority<'_> {
             match &authority.principal {
                 RequestReadPrincipal::Interactive(principal) => (
                     ActorKind::VerifiedHuman,
-                    principal.principal_id.clone(),
-                    principal.identity_epoch,
-                    principal.assignment_version,
+                    principal.principal_id,
+                    principal.principal_lifecycle_version,
+                    principal.principal_authority_version,
                     (
                         explicit_scope(principal.site_mode, &principal.site_scope)?,
                         explicit_scope(principal.environment_mode, &principal.environment_scope)?,
@@ -958,7 +978,7 @@ impl RevalidatedRequestReadAuthority<'_> {
                     environment_scope,
                 } => (
                     ActorKind::DevelopmentFixture,
-                    principal_id.clone(),
+                    *principal_id,
                     authority.namespace.provider_lifecycle_version,
                     authority.namespace.provider_configuration_version,
                     (
@@ -976,7 +996,7 @@ impl RevalidatedRequestReadAuthority<'_> {
                     policy_roles,
                 } => (
                     *actor_kind,
-                    principal_id.clone(),
+                    *principal_id,
                     authority.namespace.provider_lifecycle_version,
                     authority.namespace.provider_configuration_version,
                     (
@@ -1039,50 +1059,69 @@ async fn revalidate_persisted_session(
     let matched = sqlx::query_scalar::<_, i32>(
         "SELECT 1 \
          FROM sessions s \
-         JOIN identity_authorities a \
-           ON a.provider = s.provider \
-          AND a.issuer = s.identity_issuer \
-          AND a.subject = s.identity_subject \
-          AND a.authority_epoch = s.identity_authority_epoch \
-         JOIN human_authority_assignments h \
-           ON h.provider = s.provider \
-          AND h.issuer = s.identity_issuer \
-          AND h.subject = s.identity_subject \
-          AND h.assignment_version = s.human_authority_version \
+         JOIN principal_keys k \
+           ON k.principal_key_id = s.principal_key_id \
+          AND k.key_version = s.principal_key_version \
+         JOIN principal_links l \
+           ON l.principal_link_id = s.principal_link_id \
+          AND l.link_version = s.principal_link_version \
+          AND l.principal_key_id = s.principal_key_id \
+          AND l.principal_id = s.principal_id \
+         JOIN principals p \
+           ON p.principal_id = s.principal_id \
+          AND p.lifecycle_version = s.principal_lifecycle_version \
+          AND p.authority_version = s.principal_authority_version \
          WHERE s.session_record_id = $1 \
            AND s.bearer_verifier = $2 \
-           AND s.user_id = $3 \
-           AND s.roles = $4 \
-           AND s.created_at = $5 \
-           AND s.expires_at = $6 \
-           AND s.expires_at > $7 \
-           AND s.provider = $8 \
-           AND s.identity_issuer = $9 \
-           AND s.identity_subject = $10 \
-           AND s.identity_authority_epoch = $11 \
-           AND s.human_authority_version = $12 \
-           AND s.site_authority_mode = $13 \
-           AND s.site_scope = $14 \
-           AND s.environment_authority_mode = $15 \
-           AND s.environment_scope = $16 \
-           AND a.authority_digest = $17 \
-           AND a.authority_status = 'active-scoped-v2' \
-           AND a.last_asserted_at IS NOT DISTINCT FROM $18 \
-           AND h.assignment_status = 'active' \
-           AND s.roles <@ h.role_allowlist \
-           AND (h.site_authority_mode = 'global' OR ( \
-                h.site_authority_mode = 'scoped' \
-                AND s.site_authority_mode = 'scoped' \
-                AND s.site_scope <@ h.site_scope)) \
-           AND (h.environment_authority_mode = 'global' OR ( \
-                h.environment_authority_mode = 'scoped' \
-                AND s.environment_authority_mode = 'scoped' \
-                AND s.environment_scope <@ h.environment_scope)) \
-         FOR SHARE OF s, a, h",
+           AND s.principal_id = $3 \
+           AND s.principal_lifecycle_version = $4 \
+           AND s.principal_authority_version = $5 \
+           AND s.principal_key_id = $6 \
+           AND s.principal_key_version = $7 \
+           AND s.principal_link_id = $8 \
+           AND s.principal_link_version = $9 \
+           AND s.roles = $10 \
+           AND s.created_at = $11 \
+           AND s.expires_at = $12 \
+           AND s.expires_at > $13 \
+           AND k.provider_id = $14 \
+           AND k.issuer = $15 \
+           AND k.subject = $16 \
+           AND k.key_state = 'active' \
+           AND l.link_state = 'active' \
+           AND p.lifecycle_state = 'active' \
+           AND $10::TEXT[] <@ p.role_allowlist \
+           AND s.site_authority_mode = $17 \
+           AND s.site_scope = $18 \
+           AND s.environment_authority_mode = $19 \
+           AND s.environment_scope = $20 \
+           AND (p.site_authority_mode = 'global' OR ( \
+                p.site_authority_mode = 'scoped' \
+                AND $17 = 'scoped' \
+                AND $18::TEXT[] <@ p.site_scope)) \
+           AND (p.environment_authority_mode = 'global' OR ( \
+                p.environment_authority_mode = 'scoped' \
+                AND $19 = 'scoped' \
+                AND $20::TEXT[] <@ p.environment_scope)) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM principal_provider_tombstones t \
+               WHERE t.provider_id = k.provider_id \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM principal_key_tombstones t \
+               WHERE t.principal_key_id = k.principal_key_id \
+           ) \
+         FOR SHARE OF s, k, l, p",
     )
     .bind(credential.session_record_id)
     .bind(credential.bearer_verifier_digest.as_slice())
-    .bind(&principal.principal_id)
+    .bind(principal.principal_id.into_uuid())
+    .bind(version_i64(principal.principal_lifecycle_version)?)
+    .bind(version_i64(principal.principal_authority_version)?)
+    .bind(principal.principal_key_id)
+    .bind(version_i64(principal.principal_key_version)?)
+    .bind(principal.principal_link_id)
+    .bind(version_i64(principal.principal_link_version)?)
     .bind(&principal.roles)
     .bind(credential.created_at)
     .bind(credential.window.expires_at)
@@ -1090,14 +1129,10 @@ async fn revalidate_persisted_session(
     .bind(&principal.source_provider)
     .bind(&principal.source_issuer)
     .bind(&principal.source_subject)
-    .bind(version_i64(principal.identity_epoch)?)
-    .bind(version_i64(principal.assignment_version)?)
     .bind(principal.site_mode.as_db())
     .bind(&principal.site_scope)
     .bind(principal.environment_mode.as_db())
     .bind(&principal.environment_scope)
-    .bind(principal.identity_authority_digest.as_slice())
-    .bind(principal.identity_last_asserted_at)
     .fetch_optional(&mut **tx)
     .await?;
     if matched.is_none() {
@@ -1113,38 +1148,53 @@ async fn revalidate_direct_federated(
     prepare_authority_reader(tx, principal).await?;
     let matched = sqlx::query_scalar::<_, i32>(
         "SELECT 1 \
-         FROM identity_authorities a \
-         JOIN human_authority_assignments h \
-           ON h.provider = a.provider \
-          AND h.issuer = a.issuer \
-          AND h.subject = a.subject \
-         WHERE a.provider = $1 \
-           AND a.issuer = $2 \
-           AND a.subject = $3 \
-           AND a.authority_epoch = $4 \
-           AND a.authority_digest = $5 \
-           AND a.authority_status = 'active-scoped-v2' \
-           AND a.last_asserted_at IS NOT DISTINCT FROM $6 \
-           AND h.assignment_version = $7 \
-           AND h.assignment_status = 'active' \
-           AND $8::TEXT[] <@ h.role_allowlist \
-           AND (h.site_authority_mode = 'global' OR ( \
-                h.site_authority_mode = 'scoped' \
-                AND $9 = 'scoped' \
-                AND $10::TEXT[] <@ h.site_scope)) \
-           AND (h.environment_authority_mode = 'global' OR ( \
-                h.environment_authority_mode = 'scoped' \
-                AND $11 = 'scoped' \
-                AND $12::TEXT[] <@ h.environment_scope)) \
-         FOR SHARE OF a, h",
+         FROM principal_keys k \
+         JOIN principal_links l \
+           ON l.principal_key_id = k.principal_key_id \
+         JOIN principals p \
+           ON p.principal_id = l.principal_id \
+         WHERE k.provider_id = $1 \
+           AND k.issuer = $2 \
+           AND k.subject = $3 \
+           AND k.principal_key_id = $4 \
+           AND k.key_version = $5 \
+           AND k.key_state = 'active' \
+           AND l.principal_link_id = $6 \
+           AND l.link_version = $7 \
+           AND l.link_state = 'active' \
+           AND p.principal_id = $8 \
+           AND p.lifecycle_version = $9 \
+           AND p.authority_version = $10 \
+           AND p.lifecycle_state = 'active' \
+           AND $11::TEXT[] <@ p.role_allowlist \
+           AND (p.site_authority_mode = 'global' OR ( \
+                p.site_authority_mode = 'scoped' \
+                AND $12 = 'scoped' \
+                AND $13::TEXT[] <@ p.site_scope)) \
+           AND (p.environment_authority_mode = 'global' OR ( \
+                p.environment_authority_mode = 'scoped' \
+                AND $14 = 'scoped' \
+                AND $15::TEXT[] <@ p.environment_scope)) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM principal_provider_tombstones t \
+               WHERE t.provider_id = k.provider_id \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM principal_key_tombstones t \
+               WHERE t.principal_key_id = k.principal_key_id \
+           ) \
+         FOR SHARE OF k, l, p",
     )
     .bind(&principal.source_provider)
     .bind(&principal.source_issuer)
     .bind(&principal.source_subject)
-    .bind(version_i64(principal.identity_epoch)?)
-    .bind(principal.identity_authority_digest.as_slice())
-    .bind(principal.identity_last_asserted_at)
-    .bind(version_i64(principal.assignment_version)?)
+    .bind(principal.principal_key_id)
+    .bind(version_i64(principal.principal_key_version)?)
+    .bind(principal.principal_link_id)
+    .bind(version_i64(principal.principal_link_version)?)
+    .bind(principal.principal_id.into_uuid())
+    .bind(version_i64(principal.principal_lifecycle_version)?)
+    .bind(version_i64(principal.principal_authority_version)?)
     .bind(&principal.roles)
     .bind(principal.site_mode.as_db())
     .bind(&principal.site_scope)
@@ -1162,7 +1212,7 @@ async fn prepare_authority_reader(
     tx: &mut Transaction<'_, Postgres>,
     principal: &InteractiveRequestReadPrincipal,
 ) -> Result<(), RequestAuthorityError> {
-    crate::human_authority::prepare_reader_tx(
+    crate::principal_registry::prepare_reader_tx(
         tx,
         &principal.source_provider,
         &principal.source_issuer,
@@ -1170,10 +1220,13 @@ async fn prepare_authority_reader(
     )
     .await
     .map_err(|error| match error {
-        HumanAuthorityError::Database(error) => RequestAuthorityError::Database(error),
-        HumanAuthorityError::NotActive
-        | HumanAuthorityError::EmptyIntersection
-        | HumanAuthorityError::InvalidAssignment(_) => RequestAuthorityError::StaleCredential,
+        crate::principal_registry::PrincipalRegistryError::Database(error) => {
+            RequestAuthorityError::Database(error)
+        }
+        crate::principal_registry::PrincipalRegistryError::NotActive
+        | crate::principal_registry::PrincipalRegistryError::InvalidStoredBinding => {
+            RequestAuthorityError::StaleCredential
+        }
     })
 }
 
@@ -1259,6 +1312,11 @@ fn positive_i64_version(value: i64) -> Result<BindingVersion, RequestAuthorityEr
     Ok(BindingVersion::new(value)?)
 }
 
+fn development_fixture_principal_id() -> PrincipalId {
+    PrincipalId::from_uuid(Uuid::from_u128(DEVELOPMENT_FIXTURE_PRINCIPAL_UUID))
+        .expect("the development-fixture principal UUID is non-nil")
+}
+
 fn version_i64(version: BindingVersion) -> Result<i64, RequestAuthorityError> {
     i64::try_from(version.get())
         .map_err(|_| RequestAuthorityError::InvalidBinding("authority version"))
@@ -1293,16 +1351,20 @@ fn binding_digest(
     match principal {
         RequestReadPrincipal::Interactive(principal) => {
             hash_u64(&mut hasher, 1);
-            hash_str(&mut hasher, &principal.principal_id);
+            hash_uuid(&mut hasher, principal.principal_id.as_uuid());
+            hash_u64(&mut hasher, principal.principal_lifecycle_version.get());
+            hash_u64(&mut hasher, principal.principal_authority_version.get());
+            hash_uuid(&mut hasher, &principal.principal_key_id);
+            hash_u64(&mut hasher, principal.principal_key_version.get());
+            hash_uuid(&mut hasher, &principal.principal_link_id);
+            hash_u64(&mut hasher, principal.principal_link_version.get());
             hash_str(&mut hasher, &principal.carrier_mode);
             hash_str(&mut hasher, &principal.source_provider);
             hash_str(&mut hasher, &principal.source_issuer);
             hash_str(&mut hasher, &principal.source_subject);
-            hash_u64(&mut hasher, principal.identity_epoch.get());
             hash_bytes(&mut hasher, &principal.identity_authority_digest);
             hash_optional_time(&mut hasher, principal.identity_last_asserted_at);
             hash_optional_time(&mut hasher, principal.identity_fresh_until);
-            hash_u64(&mut hasher, principal.assignment_version.get());
             hash_strings(&mut hasher, &principal.roles);
             hash_str(&mut hasher, principal.site_mode.as_db());
             hash_strings(&mut hasher, &principal.site_scope);
@@ -1315,7 +1377,7 @@ fn binding_digest(
             environment_scope,
         } => {
             hash_u64(&mut hasher, 2);
-            hash_str(&mut hasher, principal_id);
+            hash_uuid(&mut hasher, principal_id.as_uuid());
             hash_strings(&mut hasher, site_scope);
             hash_strings(&mut hasher, environment_scope);
         }
@@ -1329,7 +1391,7 @@ fn binding_digest(
         } => {
             hash_u64(&mut hasher, 3);
             hash_u64(&mut hasher, *actor_kind as u64);
-            hash_str(&mut hasher, principal_id);
+            hash_uuid(&mut hasher, principal_id.as_uuid());
             hash_strings(&mut hasher, site_scope);
             hash_strings(&mut hasher, environment_scope);
             for role in policy_roles {
@@ -1397,6 +1459,10 @@ fn hash_str(hasher: &mut Sha256, value: &str) {
     hash_bytes(hasher, value.as_bytes());
 }
 
+fn hash_uuid(hasher: &mut Sha256, value: &Uuid) {
+    hash_bytes(hasher, value.as_bytes());
+}
+
 fn hash_u64(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_be_bytes());
 }
@@ -1441,4 +1507,133 @@ fn lowercase_hex(value: &[u8; 32]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::principal_registry::PrincipalBinding;
+    use ryuki_engine::auth::{ActorClass, APP_ROLE_REQUESTER};
+
+    fn principal(value: u128) -> PrincipalId {
+        PrincipalId::from_uuid(Uuid::from_u128(value)).expect("non-nil test principal")
+    }
+
+    fn binding(principal_id: PrincipalId, key: u128, link: u128) -> PrincipalBinding {
+        PrincipalBinding {
+            principal_id,
+            principal_lifecycle_version: 3,
+            principal_authority_version: 7,
+            principal_key_id: Uuid::from_u128(key),
+            principal_key_version: 5,
+            principal_link_id: Uuid::from_u128(link),
+            principal_link_version: 11,
+        }
+    }
+
+    fn context(
+        principal_binding: PrincipalBinding,
+        provider: &str,
+        subject: &str,
+    ) -> InteractiveHumanAuthorityContext {
+        InteractiveHumanAuthorityContext {
+            principal_binding,
+            provider: provider.to_string(),
+            issuer: "https://issuer.example.test".to_string(),
+            subject: subject.to_string(),
+            identity_epoch: principal_binding.principal_lifecycle_version,
+            assignment_version: principal_binding.principal_authority_version,
+            roles: vec![APP_ROLE_REQUESTER.to_string()],
+            site_mode: HumanAuthorityMode::Global,
+            site_scope: Vec::new(),
+            environment_mode: HumanAuthorityMode::Global,
+            environment_scope: Vec::new(),
+        }
+    }
+
+    fn session(principal_id: PrincipalId, provider: &str) -> AuthSession {
+        AuthSession {
+            principal_id: Some(principal_id),
+            display_user_id: principal_id.to_string(),
+            display_name: "Opaque principal".to_string(),
+            roles: vec![APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: provider.to_string(),
+            actor_class: ActorClass::VerifiedHuman,
+            site_scope: Vec::new(),
+            environment_scope: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_subject_never_substitutes_for_registry_principal() {
+        let now = Utc::now();
+        let internal = principal(1);
+        let authority = context(binding(internal, 2, 3), "oidc-primary", "shared-subject");
+        let admitted = InteractiveRequestReadPrincipal::new(
+            &session(internal, "oidc-primary"),
+            &authority,
+            [7; 32],
+            Some(now),
+            Some(now + chrono::Duration::minutes(10)),
+        )
+        .expect("registry binding is admitted independently of source subject");
+
+        assert_eq!(admitted.principal_id, internal);
+        assert_eq!(admitted.source_subject, "shared-subject");
+        assert_ne!(admitted.principal_id.to_string(), admitted.source_subject);
+    }
+
+    #[test]
+    fn equal_subjects_from_distinct_providers_keep_distinct_owners() {
+        let now = Utc::now();
+        let first_id = principal(10);
+        let second_id = principal(20);
+        let first_context = context(
+            binding(first_id, 11, 12),
+            "oidc-primary",
+            "collision-subject",
+        );
+        let second_context = context(binding(second_id, 21, 22), "entra-id", "collision-subject");
+
+        let first = InteractiveRequestReadPrincipal::new(
+            &session(first_id, "oidc-primary"),
+            &first_context,
+            [1; 32],
+            Some(now),
+            Some(now + chrono::Duration::minutes(10)),
+        )
+        .expect("first provider binding");
+        let second = InteractiveRequestReadPrincipal::new(
+            &session(second_id, "entra-id"),
+            &second_context,
+            [2; 32],
+            Some(now),
+            Some(now + chrono::Duration::minutes(10)),
+        )
+        .expect("second provider binding");
+
+        assert_eq!(first.source_subject, second.source_subject);
+        assert_ne!(first.source_provider, second.source_provider);
+        assert_ne!(first.principal_id, second.principal_id);
+    }
+
+    #[test]
+    fn session_principal_must_equal_the_registry_binding() {
+        let now = Utc::now();
+        let bound = principal(30);
+        let substituted = principal(31);
+        let authority = context(binding(bound, 32, 33), "oidc-primary", "subject");
+
+        let error = InteractiveRequestReadPrincipal::new(
+            &session(substituted, "oidc-primary"),
+            &authority,
+            [3; 32],
+            Some(now),
+            Some(now + chrono::Duration::minutes(10)),
+        )
+        .expect_err("session substitution must fail closed");
+
+        assert!(matches!(error, RequestAuthorityError::InvalidBinding(_)));
+    }
 }

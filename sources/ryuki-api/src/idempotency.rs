@@ -6,7 +6,9 @@
 //! instead of re-creating the resource. See `docs/design/idempotency.md`.
 //!
 //! Pass-through (zero behavior change) when: the method is not mutating, there
-//! is no `Idempotency-Key` header, or no database is configured.
+//! is no `Idempotency-Key` header, or no database is configured. Once an
+//! authenticated session is present for an idempotent mutation, however, its
+//! opaque internal principal binding is mandatory even without a database.
 
 use axum::{
     body::Body,
@@ -15,6 +17,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::AuthSession;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -65,16 +68,16 @@ const IDEMPOTENCY_WRITER_CONTRACT_VERSION: &str = "2";
 
 async fn lock_idempotency_principal_and_mark_writer(
     tx: &mut Transaction<'_, Postgres>,
-    user_scope: &str,
+    principal_id: PrincipalId,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "SELECT pg_advisory_xact_lock( \
              hashtextextended( \
-                 'ryuki:idempotency:principal:'::TEXT || $1::TEXT, 0 \
+                 'ryuki:idempotency:principal:'::TEXT || $1::UUID::TEXT, 0 \
              ) \
          )",
     )
-    .bind(user_scope)
+    .bind(principal_id.into_uuid())
     .execute(&mut **tx)
     .await?;
     sqlx::query("SELECT set_config('ryuki.idempotency_writer_contract', $1, TRUE)")
@@ -112,7 +115,7 @@ pub fn request_fingerprint(method: &str, target: &str, body: &[u8]) -> String {
 /// level handlers may be skipped on replay, so a response is reusable only
 /// while the principal's provider, actor class, roles, and resource scopes are
 /// identical. Sorting makes the digest independent of claim/list ordering.
-fn authorization_context_digest(session: &AuthSession) -> String {
+fn authorization_context_digest(principal_id: PrincipalId, session: &AuthSession) -> String {
     fn add_set(hasher: &mut Sha256, values: &[String]) {
         let mut values = values.to_vec();
         values.sort_unstable();
@@ -125,10 +128,10 @@ fn authorization_context_digest(session: &AuthSession) -> String {
     }
 
     let mut hasher = Sha256::new();
-    for value in [&session.user_id, &session.provider_mode] {
-        hasher.update((value.len() as u64).to_be_bytes());
-        hasher.update(value.as_bytes());
-    }
+    hasher.update(b"ryuki-idempotency-authority-v2\0");
+    hasher.update(principal_id.as_uuid().as_bytes());
+    hasher.update((session.provider_mode.len() as u64).to_be_bytes());
+    hasher.update(session.provider_mode.as_bytes());
     let actor_class = session.actor_class.as_str();
     hasher.update((actor_class.len() as u64).to_be_bytes());
     hasher.update(actor_class.as_bytes());
@@ -140,13 +143,14 @@ fn authorization_context_digest(session: &AuthSession) -> String {
 }
 
 fn authorized_request_fingerprint(
+    principal_id: PrincipalId,
     session: &AuthSession,
     method: &str,
     target: &str,
     body: &[u8],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(authorization_context_digest(session).as_bytes());
+    hasher.update(authorization_context_digest(principal_id, session).as_bytes());
     hasher.update(b"\n");
     hasher.update(request_fingerprint(method, target, body).as_bytes());
     format!("{:x}", hasher.finalize())
@@ -256,6 +260,17 @@ fn idempotency_store_unavailable_response() -> Response {
         .into_response()
 }
 
+fn idempotency_principal_unavailable_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "error": "IDEMPOTENCY_PRINCIPAL_UNAVAILABLE",
+            "message": "an admitted principal is required for idempotent mutation"
+        })),
+    )
+        .into_response()
+}
+
 /// Claim one key while holding a transaction-scoped lock for the principal's
 /// aggregate budget. The separate lock statement is intentional: at READ
 /// COMMITTED, the following statement receives a fresh snapshot after a
@@ -263,14 +278,14 @@ fn idempotency_store_unavailable_response() -> Response {
 /// themselves against the same stale count.
 async fn claim_key_with_budget(
     pool: &PgPool,
-    user_scope: &str,
+    principal_id: PrincipalId,
     key: &str,
     fingerprint: &str,
     claim_id: &str,
     budget: PrincipalBudget,
 ) -> Result<ClaimOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    lock_idempotency_principal_and_mark_writer(&mut tx, user_scope).await?;
+    lock_idempotency_principal_and_mark_writer(&mut tx, principal_id).await?;
 
     // Lock an existing row before deciding that this is not fresh. Besides
     // preserving replay/conflict/takeover at quota, the row lock prevents the
@@ -278,9 +293,9 @@ async fn claim_key_with_budget(
     // check and its replacement with a full-size in-flight reservation.
     let existing_key = sqlx::query(
         "SELECT 1 FROM idempotency_records \
-         WHERE user_scope = $1 AND key = $2 FOR UPDATE",
+         WHERE user_scope = $1::UUID::TEXT AND key = $2 FOR UPDATE",
     )
-    .bind(user_scope)
+    .bind(principal_id.into_uuid())
     .bind(key)
     .fetch_optional(&mut *tx)
     .await?
@@ -297,9 +312,9 @@ async fn claim_key_with_budget(
                    ELSE response_bytes \
                  END \
                ), 0)::BIGINT \
-             FROM idempotency_records WHERE user_scope = $1",
+             FROM idempotency_records WHERE user_scope = $1::UUID::TEXT",
         )
-        .bind(user_scope)
+        .bind(principal_id.into_uuid())
         .bind(budget.in_flight_response_reservation)
         .fetch_one(&mut *tx)
         .await?;
@@ -317,7 +332,7 @@ async fn claim_key_with_budget(
     // principal is exactly at its row or byte ceiling.
     let claimed: Option<(String,)> = sqlx::query_as(
         "INSERT INTO idempotency_records (user_scope, key, fingerprint, claim_id) \
-         VALUES ($1, $2, $3, $4) \
+         VALUES ($1::UUID::TEXT, $2, $3, $4) \
          ON CONFLICT (user_scope, key) DO UPDATE \
             SET claim_id = EXCLUDED.claim_id, created_at = NOW(), \
                 response_status = NULL, response_body = NULL \
@@ -326,7 +341,7 @@ async fn claim_key_with_budget(
               AND idempotency_records.created_at < NOW() - make_interval(secs => $5) \
          RETURNING key",
     )
-    .bind(user_scope)
+    .bind(principal_id.into_uuid())
     .bind(key)
     .bind(fingerprint)
     .bind(claim_id)
@@ -339,9 +354,10 @@ async fn claim_key_with_budget(
     } else {
         let record: Option<(String, Option<i32>, Option<String>)> = sqlx::query_as(
             "SELECT fingerprint, response_status, response_body \
-             FROM idempotency_records WHERE user_scope = $1 AND key = $2",
+             FROM idempotency_records \
+             WHERE user_scope = $1::UUID::TEXT AND key = $2",
         )
-        .bind(user_scope)
+        .bind(principal_id.into_uuid())
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?;
@@ -361,21 +377,21 @@ async fn claim_key_with_budget(
 
 async fn seal_claim_response(
     pool: &PgPool,
-    user_scope: &str,
+    principal_id: PrincipalId,
     key: &str,
     claim_id: &str,
     status: i32,
     body: &str,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    lock_idempotency_principal_and_mark_writer(&mut tx, user_scope).await?;
+    lock_idempotency_principal_and_mark_writer(&mut tx, principal_id).await?;
     sqlx::query(
         "UPDATE idempotency_records SET response_status = $1, response_body = $2 \
-         WHERE user_scope = $3 AND key = $4 AND claim_id = $5",
+         WHERE user_scope = $3::UUID::TEXT AND key = $4 AND claim_id = $5",
     )
     .bind(status)
     .bind(body)
-    .bind(user_scope)
+    .bind(principal_id.into_uuid())
     .bind(key)
     .bind(claim_id)
     .execute(&mut *tx)
@@ -476,7 +492,13 @@ async fn idempotency_middleware_with_budget(
     let Some(session) = request.extensions().get::<AuthSession>().cloned() else {
         return next.run(request).await;
     };
-    let user_scope = session.user_id.clone();
+    let Some(principal_id) = session.principal_id else {
+        // A compatibility display value or provider subject must never become
+        // the replay namespace. Running the mutation without a bound internal
+        // principal would permit cross-provider collisions, so reject before
+        // the handler can execute even when the store is unavailable.
+        return idempotency_principal_unavailable_response();
+    };
     // Idempotency needs the durable store; without a DB, behave as before.
     let Some(pool) = get_db() else {
         return next.run(request).await;
@@ -498,8 +520,13 @@ async fn idempotency_middleware_with_budget(
             return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
         }
     };
-    let fingerprint =
-        authorized_request_fingerprint(&session, method.as_str(), &target, &body_bytes);
+    let fingerprint = authorized_request_fingerprint(
+        principal_id,
+        &session,
+        method.as_str(),
+        &target,
+        &body_bytes,
+    );
     let request = Request::from_parts(parts, Body::from(body_bytes));
 
     // A fresh fence token for THIS claim. Every finalizing UPDATE/DELETE below is
@@ -518,7 +545,7 @@ async fn idempotency_middleware_with_budget(
     // the conflict path (where a different fingerprint becomes a 422).
     let claim = match claim_key_with_budget(
         pool,
-        &user_scope,
+        principal_id,
         &key,
         &fingerprint,
         &claim_id,
@@ -553,9 +580,9 @@ async fn idempotency_middleware_with_budget(
             // response is returned regardless) so the stuck claim is visible.
             if let Err(error) = sqlx::query(
                 "DELETE FROM idempotency_records \
-                 WHERE user_scope = $1 AND key = $2 AND claim_id = $3",
+                 WHERE user_scope = $1::UUID::TEXT AND key = $2 AND claim_id = $3",
             )
-            .bind(&user_scope)
+            .bind(principal_id.into_uuid())
             .bind(&key)
             .bind(&claim_id)
             .execute(pool)
@@ -581,9 +608,9 @@ async fn idempotency_middleware_with_budget(
                 // visible rather than a silent lock-out.
                 if let Err(error) = sqlx::query(
                     "DELETE FROM idempotency_records \
-                     WHERE user_scope = $1 AND key = $2 AND claim_id = $3",
+                     WHERE user_scope = $1::UUID::TEXT AND key = $2 AND claim_id = $3",
                 )
-                .bind(&user_scope)
+                .bind(principal_id.into_uuid())
                 .bind(&key)
                 .bind(&claim_id)
                 .execute(pool)
@@ -607,9 +634,9 @@ async fn idempotency_middleware_with_budget(
             Err(_) => {
                 if let Err(error) = sqlx::query(
                     "DELETE FROM idempotency_records \
-                     WHERE user_scope = $1 AND key = $2 AND claim_id = $3",
+                     WHERE user_scope = $1::UUID::TEXT AND key = $2 AND claim_id = $3",
                 )
-                .bind(&user_scope)
+                .bind(principal_id.into_uuid())
                 .bind(&key)
                 .bind(&claim_id)
                 .execute(pool)
@@ -635,7 +662,7 @@ async fn idempotency_middleware_with_budget(
         // see the dedup store is unhealthy rather than silently locking the client out.
         if let Err(error) = seal_claim_response(
             pool,
-            &user_scope,
+            principal_id,
             &key,
             &claim_id,
             i32::from(status.as_u16()),
@@ -821,6 +848,10 @@ pub fn spawn_idempotency_sweep(pool: PgPool, interval_secs: u64) {
 mod tests {
     use super::*;
 
+    fn test_principal(value: &str) -> PrincipalId {
+        value.parse().expect("canonical non-nil test principal")
+    }
+
     #[test]
     fn fingerprint_is_deterministic_and_input_sensitive() {
         let a = request_fingerprint("POST", "/api/x", b"{\"n\":1}");
@@ -855,8 +886,10 @@ mod tests {
 
     #[test]
     fn authorization_context_digest_is_order_independent_but_scope_sensitive() {
+        let principal_id = test_principal("11111111-1111-4111-8111-111111111111");
         let mut first = AuthSession {
-            user_id: "principal".into(),
+            display_user_id: "non-authoritative-display".into(),
+            principal_id: Some(principal_id),
             provider_mode: "api-token".into(),
             token_valid: true,
             roles: vec!["Auditor".into(), "Operator".into()],
@@ -868,22 +901,24 @@ mod tests {
         reordered.roles.reverse();
         reordered.site_scope.reverse();
         assert_eq!(
-            authorization_context_digest(&first),
-            authorization_context_digest(&reordered)
+            authorization_context_digest(principal_id, &first),
+            authorization_context_digest(principal_id, &reordered)
         );
 
         first.site_scope = vec!["SITE-A".into()];
         assert_ne!(
-            authorization_context_digest(&first),
-            authorization_context_digest(&reordered),
+            authorization_context_digest(principal_id, &first),
+            authorization_context_digest(principal_id, &reordered),
             "a narrower token/session authority must not share replay state"
         );
     }
 
     #[test]
     fn authorized_fingerprint_changes_when_roles_or_scopes_change() {
+        let principal_id = test_principal("11111111-1111-4111-8111-111111111111");
         let base = AuthSession {
-            user_id: "principal".into(),
+            display_user_id: "non-authoritative-display".into(),
+            principal_id: Some(principal_id),
             provider_mode: "api-token".into(),
             token_valid: true,
             roles: vec!["Operator".into()],
@@ -891,34 +926,63 @@ mod tests {
             environment_scope: vec!["prod".into()],
             ..Default::default()
         };
-        let fingerprint = authorized_request_fingerprint(&base, "POST", "/api/x", b"{}");
+        let fingerprint =
+            authorized_request_fingerprint(principal_id, &base, "POST", "/api/x", b"{}");
 
         let mut changed = base.clone();
         changed.site_scope = vec!["SITE-B".into()];
         assert_ne!(
             fingerprint,
-            authorized_request_fingerprint(&changed, "POST", "/api/x", b"{}")
+            authorized_request_fingerprint(principal_id, &changed, "POST", "/api/x", b"{}")
         );
 
         changed = base.clone();
         changed.roles.push("Approver".into());
         assert_ne!(
             fingerprint,
-            authorized_request_fingerprint(&changed, "POST", "/api/x", b"{}")
+            authorized_request_fingerprint(principal_id, &changed, "POST", "/api/x", b"{}")
         );
 
         changed = base.clone();
         changed.environment_scope = vec!["staging".into()];
         assert_ne!(
             fingerprint,
-            authorized_request_fingerprint(&changed, "POST", "/api/x", b"{}")
+            authorized_request_fingerprint(principal_id, &changed, "POST", "/api/x", b"{}")
         );
 
         changed = base.clone();
         changed.actor_class = ryuki_engine::auth::ActorClass::Workload;
         assert_ne!(
             fingerprint,
-            authorized_request_fingerprint(&changed, "POST", "/api/x", b"{}")
+            authorized_request_fingerprint(principal_id, &changed, "POST", "/api/x", b"{}")
+        );
+    }
+
+    #[test]
+    fn opaque_principal_not_display_identity_defines_replay_authority() {
+        let first_principal = test_principal("11111111-1111-4111-8111-111111111111");
+        let second_principal = test_principal("22222222-2222-4222-8222-222222222222");
+        let first = AuthSession {
+            display_user_id: "same-provider-subject".into(),
+            principal_id: Some(first_principal),
+            provider_mode: "oidc".into(),
+            token_valid: true,
+            ..Default::default()
+        };
+        let mut same_principal_new_display = first.clone();
+        same_principal_new_display.display_user_id = "renamed-display".into();
+        let mut different_principal_same_display = first.clone();
+        different_principal_same_display.principal_id = Some(second_principal);
+
+        assert_eq!(
+            authorization_context_digest(first_principal, &first),
+            authorization_context_digest(first_principal, &same_principal_new_display),
+            "display changes are not authority changes"
+        );
+        assert_ne!(
+            authorization_context_digest(first_principal, &first),
+            authorization_context_digest(second_principal, &different_principal_same_display),
+            "different opaque principals cannot share replay authority"
         );
     }
 
@@ -1008,6 +1072,10 @@ mod db_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tower::ServiceExt;
 
+    fn test_principal(value: &str) -> PrincipalId {
+        value.parse().expect("canonical non-nil test principal")
+    }
+
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
@@ -1022,7 +1090,7 @@ mod db_tests {
         user_scope: &str,
     ) -> Transaction<'a, Postgres> {
         let mut tx = pool.begin().await.expect("begin current-writer tx");
-        lock_idempotency_principal_and_mark_writer(&mut tx, user_scope)
+        lock_idempotency_principal_and_mark_writer(&mut tx, test_principal(user_scope))
             .await
             .expect("current writer acquires its principal contract fence");
         tx
@@ -1059,7 +1127,8 @@ mod db_tests {
 
     fn session(user: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user.to_string();
+        s.display_user_id = "test-display-only".to_string();
+        s.principal_id = Some(test_principal(user));
         s
     }
 
@@ -1083,7 +1152,8 @@ mod db_tests {
         environment_scope: &[&str],
     ) -> AuthSession {
         AuthSession {
-            user_id: user.to_string(),
+            display_user_id: "Scoped API token".to_string(),
+            principal_id: Some(test_principal(user)),
             display_name: "Scoped API token".to_string(),
             roles: vec![ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string()],
             token_valid: true,
@@ -1136,13 +1206,34 @@ mod db_tests {
     }
 
     #[tokio::test]
+    async fn uuid_shaped_display_identity_cannot_claim_idempotency_authority() {
+        let session = AuthSession {
+            display_user_id: "10000000-0000-4000-8000-000000000099".into(),
+            principal_id: None,
+            token_valid: true,
+            provider_mode: "oidc".into(),
+            ..AuthSession::default()
+        };
+        let response = app_for_session(session)
+            .oneshot(post_req(Some("missing-principal"), "{}"))
+            .await
+            .expect("middleware response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let (_, replayed, body) = body_string(response).await;
+        assert!(!replayed);
+        assert!(body.contains("IDEMPOTENCY_PRINCIPAL_UNAVAILABLE"));
+        assert!(!body.contains("10000000-0000-4000-8000-000000000099"));
+    }
+
+    #[tokio::test]
     async fn writer_contract_rejects_legacy_writes_and_admits_current_writer() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-writer-contract";
+        let user = "10000000-0000-4000-8000-000000000001";
         let key = "contract-key";
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)
@@ -1173,7 +1264,7 @@ mod db_tests {
 
         let outcome = claim_key_with_budget(
             pool,
-            user,
+            test_principal(user),
             key,
             "current-fingerprint",
             "current-claim",
@@ -1205,7 +1296,7 @@ mod db_tests {
             Some("idempotency_records_writer_contract")
         );
 
-        seal_claim_response(pool, user, key, "current-claim", 200, "{}")
+        seal_claim_response(pool, test_principal(user), key, "current-claim", 200, "{}")
             .await
             .expect("contract-v2 finalizer holds the same principal fence");
         let sealed: (Option<i32>, Option<String>) = sqlx::query_as(
@@ -1233,7 +1324,7 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-user-a";
+        let user = "10000000-0000-4000-8000-000000000002";
         let key = "idem-test-replay-7c3";
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)
@@ -1309,7 +1400,7 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-same-owner-attenuated-tokens";
+        let user = "10000000-0000-4000-8000-000000000003";
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)
             .execute(pool)
@@ -1396,7 +1487,10 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let (ua, ub) = ("idem-test-scope-a", "idem-test-scope-b");
+        let (ua, ub) = (
+            "10000000-0000-4000-8000-000000000004",
+            "10000000-0000-4000-8000-000000000005",
+        );
         let key = "idem-test-shared-key";
         for u in [ua, ub] {
             sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
@@ -1460,7 +1554,10 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let (user, other_user) = ("idem-test-row-budget", "idem-test-row-budget-other");
+        let (user, other_user) = (
+            "10000000-0000-4000-8000-000000000006",
+            "10000000-0000-4000-8000-000000000007",
+        );
         for principal in [user, other_user] {
             sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
                 .bind(principal)
@@ -1571,8 +1668,9 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-byte-budget";
-        for principal in [user, "idem-test-byte-budget-utf8"] {
+        let user = "10000000-0000-4000-8000-000000000008";
+        let utf8_principal = "10000000-0000-4000-8000-000000000009";
+        for principal in [user, utf8_principal] {
             sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
                 .bind(principal)
                 .execute(pool)
@@ -1643,13 +1741,13 @@ mod db_tests {
         );
 
         let utf8_body = "{\"value\":\"é🙂\"}";
-        let mut writer_tx = current_writer_transaction(pool, "idem-test-byte-budget-utf8").await;
+        let mut writer_tx = current_writer_transaction(pool, utf8_principal).await;
         sqlx::query(
             "INSERT INTO idempotency_records \
              (user_scope, key, fingerprint, claim_id, response_status, response_body) \
              VALUES ($1, 'utf8-octets', 'fp', 'claim', 200, $2)",
         )
-        .bind("idem-test-byte-budget-utf8")
+        .bind(utf8_principal)
         .bind(utf8_body)
         .execute(&mut *writer_tx)
         .await
@@ -1657,15 +1755,16 @@ mod db_tests {
         writer_tx.commit().await.unwrap();
         let stored_octets: i64 = sqlx::query_scalar(
             "SELECT response_bytes FROM idempotency_records \
-             WHERE user_scope = 'idem-test-byte-budget-utf8' AND key = 'utf8-octets'",
+             WHERE user_scope = $1 AND key = 'utf8-octets'",
         )
+        .bind(utf8_principal)
         .fetch_one(pool)
         .await
         .unwrap();
         assert_eq!(stored_octets, utf8_body.len() as i64);
         assert!(stored_octets > utf8_body.chars().count() as i64);
 
-        for principal in [user, "idem-test-byte-budget-utf8"] {
+        for principal in [user, utf8_principal] {
             sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
                 .bind(principal)
                 .execute(pool)
@@ -1684,7 +1783,7 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-stale";
+        let user = "10000000-0000-4000-8000-000000000010";
         let key = "idem-test-stale-key";
         let full_budget = PrincipalBudget {
             max_rows: 1,
@@ -1699,8 +1798,13 @@ mod db_tests {
 
         // Plant an abandoned in-flight claim whose fingerprint MATCHES the retry
         // (an identical request that crashed mid-flight): null response, 10m old.
-        let matching_fp =
-            authorized_request_fingerprint(&session(user), "POST", "/t", b"{\"x\":1}");
+        let matching_fp = authorized_request_fingerprint(
+            test_principal(user),
+            &session(user),
+            "POST",
+            "/t",
+            b"{\"x\":1}",
+        );
         let mut writer_tx = current_writer_transaction(pool, user).await;
         sqlx::query(
             "INSERT INTO idempotency_records (user_scope, key, fingerprint, claim_id, created_at) \
@@ -1782,7 +1886,7 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-sweep";
+        let user = "10000000-0000-4000-8000-000000000011";
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)
             .execute(pool)
@@ -1873,7 +1977,7 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-nostore";
+        let user = "10000000-0000-4000-8000-000000000012";
         let key = "idem-test-nostore-key";
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)
@@ -1944,7 +2048,7 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let user = "idem-test-invalid-utf8";
+        let user = "10000000-0000-4000-8000-000000000013";
         let key = "idem-test-invalid-utf8-key";
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)

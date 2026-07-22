@@ -22,6 +22,7 @@ mod integration;
 mod oidc_callback;
 mod openapi;
 mod postgresql_tls_channel;
+mod principal_registry;
 mod repos;
 mod request_authority;
 mod scheduler;
@@ -65,6 +66,7 @@ use crate::database::MigrationStatus;
 use crate::entra_auth::EntraTokenValidator;
 use ryuki_core::config::{AuthMode, RyukiConfig, TrustedProxyNetwork};
 use ryuki_core::types::{ApiError, ValidationResult};
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::{AuthSession, OperationCapability};
 
 /// ProblemDetails error type alias: HTTP status code + structured ApiError JSON body.
@@ -110,16 +112,22 @@ async fn resolve_request_session(
     AuthSession,
     Option<&'static str>,
     Option<crate::request_authority::DirectFederatedCredential>,
+    Option<String>,
 ) {
     match auth_mode {
         AuthMode::MockDryRun | AuthMode::StaticDryRun => {
-            (AuthSession::static_dry_run(), None, None)
+            (AuthSession::static_dry_run(), None, None, None)
         }
         // Local mode without a persisted session is unauthenticated: zero
         // roles, token_valid=false. Both unsafe methods AND non-exempt reads
         // 401 until login (B3) — the portal sends X-Ryuki-Session-Id after the
         // local login flow.
-        AuthMode::Local => (unverified_session("local-unauthenticated"), None, None),
+        AuthMode::Local => (
+            unverified_session("local-unauthenticated"),
+            None,
+            None,
+            None,
+        ),
         // EntraId: a real bearer token is cryptographically validated by the
         // injected validator (RS256 + iss/aud/exp/nbf + JWKS). A missing header
         // or any failure path is unverified_entra().
@@ -130,11 +138,13 @@ async fn resolve_request_session(
                     outcome.session,
                     outcome.failure_reason,
                     outcome.request_read_credential,
+                    outcome.external_subject,
                 )
             }
             None => (
                 AuthSession::unverified_entra(),
                 Some("missing-bearer"),
+                None,
                 None,
             ),
         },
@@ -158,19 +168,21 @@ async fn auth_session_for_request(
 #[derive(sqlx::FromRow)]
 struct DbAuthSessionRow {
     session_record_id: Uuid,
-    user_id: String,
+    principal_id: Uuid,
+    principal_lifecycle_version: i64,
+    principal_authority_version: i64,
+    principal_key_id: Uuid,
+    principal_key_version: i64,
+    principal_link_id: Uuid,
+    principal_link_version: i64,
     display_name: String,
     roles: Vec<String>,
     bearer_verifier: Vec<u8>,
     expires_at: chrono::DateTime<chrono::Utc>,
     created_at: chrono::DateTime<chrono::Utc>,
-    provider: String,
-    identity_issuer: String,
-    identity_subject: String,
-    identity_authority_epoch: i64,
-    identity_authority_digest: Vec<u8>,
-    identity_last_asserted_at: Option<chrono::DateTime<chrono::Utc>>,
-    human_authority_version: i64,
+    provider_id: String,
+    issuer: String,
+    subject: String,
     site_authority_mode: String,
     site_scope: Vec<String>,
     environment_authority_mode: String,
@@ -180,12 +192,24 @@ struct DbAuthSessionRow {
 fn authority_context_from_db_row(
     row: &DbAuthSessionRow,
 ) -> Option<crate::human_authority::InteractiveHumanAuthorityContext> {
+    let principal_id = PrincipalId::from_uuid(row.principal_id).ok()?;
     Some(crate::human_authority::InteractiveHumanAuthorityContext {
-        provider: row.provider.clone(),
-        issuer: row.identity_issuer.clone(),
-        subject: row.identity_subject.clone(),
-        identity_epoch: row.identity_authority_epoch,
-        assignment_version: row.human_authority_version,
+        principal_binding: crate::principal_registry::PrincipalBinding {
+            principal_id,
+            principal_lifecycle_version: row.principal_lifecycle_version,
+            principal_authority_version: row.principal_authority_version,
+            principal_key_id: row.principal_key_id,
+            principal_key_version: row.principal_key_version,
+            principal_link_id: row.principal_link_id,
+            principal_link_version: row.principal_link_version,
+        },
+        provider: row.provider_id.clone(),
+        issuer: row.issuer.clone(),
+        subject: row.subject.clone(),
+        // These compatibility fields now expose the exact internal principal
+        // generations; provider subjects are provenance only.
+        identity_epoch: row.principal_lifecycle_version,
+        assignment_version: row.principal_authority_version,
         roles: row.roles.clone(),
         site_mode: crate::human_authority::HumanAuthorityMode::parse(&row.site_authority_mode)
             .ok()?,
@@ -200,7 +224,7 @@ fn authority_context_from_db_row(
 
 fn unverified_session(provider_mode: &str) -> AuthSession {
     AuthSession {
-        user_id: "unauthenticated".into(),
+        display_user_id: "unauthenticated".into(),
         display_name: "Unauthenticated".into(),
         roles: Vec::new(),
         token_valid: false,
@@ -210,9 +234,11 @@ fn unverified_session(provider_mode: &str) -> AuthSession {
     }
 }
 
-fn session_from_db_row(row: &DbAuthSessionRow) -> AuthSession {
-    AuthSession {
-        user_id: row.user_id.clone(),
+fn session_from_db_row(row: &DbAuthSessionRow) -> Option<AuthSession> {
+    let principal_id = PrincipalId::from_uuid(row.principal_id).ok()?;
+    Some(AuthSession {
+        display_user_id: principal_id.to_string(),
+        principal_id: Some(principal_id),
         display_name: row.display_name.clone(),
         roles: row.roles.clone(),
         token_valid: true,
@@ -224,7 +250,7 @@ fn session_from_db_row(row: &DbAuthSessionRow) -> AuthSession {
         provider_mode: "persisted-session".into(),
         site_scope: row.site_scope.clone(),
         environment_scope: row.environment_scope.clone(),
-    }
+    })
 }
 
 fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
@@ -258,21 +284,37 @@ fn persisted_request_read_authority(
         .as_slice()
         .try_into()
         .map_err(|_| RequestAuthorityError::InvalidBinding("session bearer verifier length"))?;
-    let identity_authority_digest: [u8; 32] = row
-        .identity_authority_digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-        RequestAuthorityError::InvalidBinding("identity authority digest length")
-    })?;
-    let identity_fresh_until = if row.provider == crate::identity_authority::LOCAL_PROVIDER {
+    let principal_lifecycle_version = row.principal_lifecycle_version.to_be_bytes();
+    let principal_authority_version = row.principal_authority_version.to_be_bytes();
+    let principal_key_version = row.principal_key_version.to_be_bytes();
+    let principal_link_version = row.principal_link_version.to_be_bytes();
+    let identity_authority_digest = request_read_digest(
+        b"ryuki-request-read-principal-binding-v1",
+        &[
+            row.principal_id.as_bytes(),
+            &principal_lifecycle_version,
+            &principal_authority_version,
+            row.principal_key_id.as_bytes(),
+            &principal_key_version,
+            row.principal_link_id.as_bytes(),
+            &principal_link_version,
+            row.provider_id.as_bytes(),
+            row.issuer.as_bytes(),
+            row.subject.as_bytes(),
+        ],
+    );
+    // A persisted federated session is minted only after a fresh provider
+    // assertion. Its creation time is therefore the conservative freshness
+    // origin after migration 199; provider subject data remains provenance and
+    // never becomes the principal identifier.
+    let identity_last_asserted_at =
+        (row.provider_id != crate::identity_authority::LOCAL_PROVIDER).then_some(row.created_at);
+    let identity_fresh_until = if row.provider_id == crate::identity_authority::LOCAL_PROVIDER {
         None
     } else {
-        let last_asserted_at =
-            row.identity_last_asserted_at
-                .ok_or(RequestAuthorityError::InvalidBinding(
-                    "federated assertion time is missing",
-                ))?;
+        let last_asserted_at = identity_last_asserted_at.ok_or(
+            RequestAuthorityError::InvalidBinding("federated assertion time is missing"),
+        )?;
         let staleness = i64::try_from(config.session.federated_authority_max_staleness_secs)
             .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
         Some(
@@ -287,14 +329,14 @@ fn persisted_request_read_authority(
         session,
         authority,
         identity_authority_digest,
-        row.identity_last_asserted_at,
+        identity_last_asserted_at,
         identity_fresh_until,
     )?;
     let namespace = crate::config_store::security_contract_context_if_initialized()
         .ok_or(RequestAuthorityError::InvalidBinding(
             "security-contract context is unavailable",
         ))?
-        .request_read_security_namespace(&config.auth_mode, &row.provider)
+        .request_read_security_namespace(&config.auth_mode, &row.provider_id)
         .map_err(|reason| {
             tracing::warn!(reason, "request-read security namespace was not admitted");
             RequestAuthorityError::InvalidBinding("security-contract namespace")
@@ -526,7 +568,7 @@ pub fn sha256_hex(plaintext: &str) -> String {
 struct ApiTokenRow {
     id: Uuid,
     name: String,
-    owner_principal: String,
+    issuing_principal_id: Uuid,
     roles: Vec<String>,
     token_valid: bool,
     token_hash: String,
@@ -535,52 +577,46 @@ struct ApiTokenRow {
 }
 
 const API_TOKEN_LOOKUP_SQL: &str =
-    "SELECT t.id, t.name, t.owner_principal, t.roles, t.token_valid, t.token_hash, \
+    "SELECT t.id, t.name, t.issuing_principal_id, t.roles, t.token_valid, t.token_hash, \
             t.site_scope, t.environment_scope \
      FROM api_tokens t \
-     JOIN identity_authorities a \
-       ON a.provider = t.issued_by_provider \
-      AND a.issuer = t.issued_by_issuer \
-      AND a.subject = t.issued_by_subject \
-      AND a.authority_epoch = t.issued_by_identity_epoch \
-     JOIN human_authority_assignments h \
-       ON h.provider = t.issued_by_provider \
-      AND h.issuer = t.issued_by_issuer \
-      AND h.subject = t.issued_by_subject \
-      AND h.assignment_version = t.issued_by_human_authority_version \
+     JOIN principal_keys k \
+       ON k.principal_key_id = t.principal_key_id \
+      AND k.key_version = t.principal_key_version \
+      AND k.key_state = 'active' \
+     JOIN principal_links l \
+       ON l.principal_link_id = t.principal_link_id \
+      AND l.link_version = t.principal_link_version \
+      AND l.principal_key_id = t.principal_key_id \
+      AND l.principal_id = t.issuing_principal_id \
+      AND l.link_state = 'active' \
+     JOIN principals p \
+       ON p.principal_id = t.issuing_principal_id \
+      AND p.lifecycle_version = t.issuing_principal_lifecycle_version \
+      AND p.authority_version = t.issuing_principal_authority_version \
+      AND p.lifecycle_state = 'active' \
+      AND p.principal_kind = 'human' \
      WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND t.token_valid \
        AND t.expires_at > NOW() \
-       AND a.authority_status = 'active-scoped-v2' \
-       AND h.assignment_status = 'active' \
-       AND t.owner_principal = t.issued_by_subject \
-       AND t.issued_by_roles <@ h.role_allowlist \
-       AND t.roles <@ t.issued_by_roles \
+       AND cardinality(t.roles) > 0 \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM principal_provider_tombstones pt \
+         WHERE pt.provider_id = k.provider_id \
+       ) \
+       AND t.roles <@ p.role_allowlist \
        AND ( \
-         h.site_authority_mode = 'global' \
-         OR (h.site_authority_mode = 'scoped' \
-           AND t.issued_by_site_authority_mode = 'scoped' \
-           AND t.issued_by_site_scope <@ h.site_scope) \
+         (t.site_scope IS NULL AND p.site_authority_mode = 'global') \
+         OR (t.site_scope IS NOT NULL AND t.site_scope <> '' \
+           AND (p.site_authority_mode = 'global' \
+             OR string_to_array(t.site_scope, ',') <@ p.site_scope)) \
        ) \
        AND ( \
-         h.environment_authority_mode = 'global' \
-         OR (h.environment_authority_mode = 'scoped' \
-           AND t.issued_by_environment_authority_mode = 'scoped' \
-           AND t.issued_by_environment_scope <@ h.environment_scope) \
+         (t.environment_scope IS NULL AND p.environment_authority_mode = 'global') \
+         OR (t.environment_scope IS NOT NULL AND t.environment_scope <> '' \
+           AND (p.environment_authority_mode = 'global' \
+             OR string_to_array(t.environment_scope, ',') <@ p.environment_scope)) \
        ) \
-       AND ( \
-         (t.site_scope IS NULL AND t.issued_by_site_authority_mode = 'global') \
-         OR (t.site_scope IS NOT NULL \
-           AND (t.issued_by_site_authority_mode = 'global' \
-             OR string_to_array(t.site_scope, ',') <@ t.issued_by_site_scope)) \
-       ) \
-       AND ( \
-         (t.environment_scope IS NULL \
-           AND t.issued_by_environment_authority_mode = 'global') \
-         OR (t.environment_scope IS NOT NULL \
-           AND (t.issued_by_environment_authority_mode = 'global' \
-             OR string_to_array(t.environment_scope, ',') \
-                <@ t.issued_by_environment_scope)) \
-       )";
+     FOR UPDATE OF t";
 
 /// Parse a persisted scope column (a comma-separated TEXT, or NULL) into the
 /// authorized-scope list: trimmed, non-empty values. NULL/empty ⇒ `[]` =
@@ -617,10 +653,13 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
         }
     };
     let provenance = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT issued_by_provider, issued_by_issuer, issued_by_subject \
-         FROM api_tokens \
-         WHERE token_hash = $1 AND revoked_at IS NULL AND token_valid \
-           AND expires_at > NOW()",
+        "SELECT k.provider_id, k.issuer, k.subject \
+         FROM api_tokens t \
+         JOIN principal_keys k \
+           ON k.principal_key_id = t.principal_key_id \
+          AND k.key_version = t.principal_key_version \
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND t.token_valid \
+           AND t.expires_at > NOW()",
     )
     .bind(&hash_hex)
     .fetch_optional(&mut *tx)
@@ -671,8 +710,13 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
         } else if let Err(error) = tx.commit().await {
             tracing::warn!(error = %error, token_id = %row.id, "api token last_used_at commit failed");
         }
+        let principal_id = match PrincipalId::from_uuid(row.issuing_principal_id) {
+            Ok(principal_id) => principal_id,
+            Err(_) => return unverified_session("api-token-invalid"),
+        };
         AuthSession {
-            user_id: row.owner_principal,
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             display_name: row.name,
             roles: row.roles,
             token_valid: row.token_valid,
@@ -850,34 +894,52 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     // 'oidc' flow that shares its validator) — never a mock/dry-run/local
     // session, which would otherwise let a leftover admin cookie in.
     let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
-    let query = "SELECT s.session_record_id, s.user_id, s.display_name, s.roles, \
-                s.bearer_verifier, s.expires_at, s.created_at, \
-                s.provider, s.identity_issuer, s.identity_subject, \
-                s.identity_authority_epoch, a.authority_digest AS identity_authority_digest, \
-                a.last_asserted_at AS identity_last_asserted_at, \
-                s.human_authority_version, s.site_authority_mode, s.site_scope, \
+    let query = "SELECT s.session_record_id, s.principal_id, \
+                s.principal_lifecycle_version, s.principal_authority_version, \
+                s.principal_key_id, s.principal_key_version, \
+                s.principal_link_id, s.principal_link_version, \
+                s.display_name, s.roles, s.bearer_verifier, s.expires_at, s.created_at, \
+                k.provider_id, k.issuer, k.subject, \
+                s.site_authority_mode, s.site_scope, \
                 s.environment_authority_mode, s.environment_scope \
          FROM sessions s \
-         JOIN identity_authorities a \
-           ON a.provider = s.provider \
-          AND a.issuer = s.identity_issuer \
-          AND a.subject = s.identity_subject \
-          AND a.authority_epoch = s.identity_authority_epoch \
-         JOIN human_authority_assignments h \
-           ON h.provider = s.provider \
-          AND h.issuer = s.identity_issuer \
-          AND h.subject = s.identity_subject \
-          AND h.assignment_version = s.human_authority_version \
+         JOIN principal_keys k \
+           ON k.principal_key_id = s.principal_key_id \
+          AND k.key_version = s.principal_key_version \
+          AND k.key_state = 'active' \
+         JOIN principal_links l \
+           ON l.principal_link_id = s.principal_link_id \
+          AND l.link_version = s.principal_link_version \
+          AND l.principal_key_id = s.principal_key_id \
+          AND l.principal_id = s.principal_id \
+          AND l.link_state = 'active' \
+         JOIN principals p \
+           ON p.principal_id = s.principal_id \
+          AND p.lifecycle_version = s.principal_lifecycle_version \
+          AND p.authority_version = s.principal_authority_version \
+          AND p.lifecycle_state = 'active' \
+          AND p.principal_kind = 'human' \
          WHERE s.bearer_verifier = $1 AND s.expires_at > NOW() \
-           AND a.authority_status = 'active-scoped-v2' \
-           AND h.assignment_status = 'active' \
-           AND (s.provider = 'local' OR (a.last_asserted_at IS NOT NULL \
-                AND a.last_asserted_at >= NOW() - make_interval(secs => $2))) \
+           AND cardinality(s.roles) > 0 \
+           AND s.roles <@ p.role_allowlist \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM principal_provider_tombstones pt \
+             WHERE pt.provider_id = k.provider_id \
+           ) \
+           AND (p.site_authority_mode = 'global' OR ( \
+             s.site_authority_mode = 'scoped' AND s.site_scope <@ p.site_scope \
+           )) \
+           AND (p.environment_authority_mode = 'global' OR ( \
+             s.environment_authority_mode = 'scoped' \
+             AND s.environment_scope <@ p.environment_scope \
+           )) \
+           AND (k.provider_id = 'local' OR \
+                s.created_at >= NOW() - make_interval(secs => $2)) \
            AND ( \
-             ($3 = 'local' AND s.provider = 'local' AND s.identity_issuer = $4) \
+             ($3 = 'local' AND k.provider_id = 'local' AND k.issuer = $4) \
              OR ($3 = 'entra-id' AND ( \
-               (s.provider = 'entra-id' AND s.identity_issuer = $5) \
-               OR ($6 AND s.provider = 'oidc' AND s.identity_issuer = $7) \
+               (k.provider_id = 'entra-id' AND k.issuer = $5) \
+               OR ($6 AND k.provider_id = 'oidc' AND k.issuer = $7) \
              )) \
            )";
     let lookup_observation = admission.start_database_lookup();
@@ -903,21 +965,18 @@ async fn auth_session_from_persisted_session_with_authority_admission(
             if bool::from(verifier.as_slice().ct_eq(row.bearer_verifier.as_slice())) {
                 let authority_binding =
                     crate::session_lookup_admission::SessionAuthorityCacheBinding {
-                        authority_fingerprint: crate::human_authority::authority_fingerprint(
-                            &row.provider,
-                            &row.identity_issuer,
-                            &row.identity_subject,
-                        ),
-                        assignment_version: row.human_authority_version,
-                        assignment_status:
-                            crate::session_lookup_admission::CachedAssignmentStatus::Active,
-                        site_global: row.site_authority_mode == "global",
-                        environment_global: row.environment_authority_mode == "global",
+                        principal_id: PrincipalId::from_uuid(row.principal_id).ok()?,
+                        principal_lifecycle_version: row.principal_lifecycle_version,
+                        principal_authority_version: row.principal_authority_version,
+                        principal_key_id: row.principal_key_id,
+                        principal_key_version: row.principal_key_version,
+                        principal_link_id: row.principal_link_id,
+                        principal_link_version: row.principal_link_version,
                     };
                 if let Some(cached) = cached_authority.filter(|cached| *cached != authority_binding)
                 {
-                    admission.evict_authority(cached.authority_fingerprint);
-                    admission.evict_authority(authority_binding.authority_fingerprint);
+                    admission.evict_binding(cached);
+                    admission.evict_binding(authority_binding);
                     return Some((
                         unverified_session("session-authority-cache-stale"),
                         source,
@@ -938,7 +997,15 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                         None,
                     ));
                 };
-                let admitted_session = session_from_db_row(&row);
+                let Some(admitted_session) = session_from_db_row(&row) else {
+                    admission.record_miss(verifier);
+                    return Some((
+                        unverified_session("session-principal-id-invalid"),
+                        source,
+                        None,
+                        None,
+                    ));
+                };
                 let request_read = match persisted_request_read_authority(
                     &row,
                     config,
@@ -1457,7 +1524,7 @@ fn interactive_authority_matches_session(
         && !authority.subject.trim().is_empty()
         && authority.identity_epoch > 0
         && authority.assignment_version > 0
-        && authority.subject == session.user_id
+        && session.principal_id == Some(authority.principal_binding.principal_id)
         && authority.roles == session.roles
         && authority.site_scope == session.site_scope
         && authority.environment_scope == session.environment_scope
@@ -1893,7 +1960,7 @@ fn is_notifications_self_service_path(path: &str) -> bool {
 /// The user's own scope-preferences endpoint (#59) is self-service: the PUT is
 /// authorized at the ordinary read tier (`audit` OR `request`) rather than the
 /// fail-closed `admin` default, because every authenticated user holds one of
-/// those tiers and the handler's keying on the VERIFIED `session.user_id` (never
+/// those tiers and the handler's keying on the typed `session.principal_id` (never
 /// a client-supplied id) is the real authorization boundary — exactly like the
 /// notifications self-service mutations. Scoped to the exact path so nothing
 /// else is affected.
@@ -2010,15 +2077,19 @@ async fn auth_middleware(
                     (session, Some(source), None, authority, request_read)
                 }
                 None => {
-                    let (validated, reason, direct_credential) = resolve_request_session(
-                        auth_mode.clone(),
-                        auth_header,
-                        &authenticator_runtime.entra_bearer_validator(),
-                    )
-                    .await;
+                    let (validated, reason, direct_credential, external_subject) =
+                        resolve_request_session(
+                            auth_mode.clone(),
+                            auth_header,
+                            &authenticator_runtime.entra_bearer_validator(),
+                        )
+                        .await;
                     if auth_mode == AuthMode::EntraId
                         && validated.token_valid
-                        && !validated.is_verified_human()
+                        && !matches!(
+                            validated.actor_class,
+                            ryuki_engine::auth::ActorClass::VerifiedHuman
+                        )
                     {
                         tracing::warn!(
                             actor_class = ?validated.actor_class,
@@ -2032,12 +2103,14 @@ async fn auth_middleware(
                             None,
                         )
                     } else if auth_mode == AuthMode::EntraId && validated.token_valid {
-                        let normalized = if let Some(pool) = crate::database::get_db() {
+                        let normalized = if let (Some(pool), Some(external_subject)) =
+                            (crate::database::get_db(), external_subject.as_deref())
+                        {
                             crate::identity_authority::admit_federated_bearer(
                                 pool,
                                 "entra-id",
                                 &crate::identity_authority::configured_entra_issuer(app_config),
-                                &validated.user_id,
+                                external_subject,
                                 &validated.display_name,
                                 &validated.roles,
                                 validated.actor_class,
@@ -2144,7 +2217,7 @@ async fn auth_middleware(
         // Self-service mutations (notification mark-read, the user's own scope
         // preferences) are gated like reads (audit OR request), not as ordinary
         // mutations (which would fall to the admin default); the handler's keying
-        // on the verified session.user_id is the real boundary.
+        // on the verified session.principal_id is the real boundary.
         let self_service = is_self_service_mutation(&method, &path);
         let operation_capability = if !self_service {
             operation_capability_for(&method, &path)
@@ -3367,9 +3440,7 @@ async fn main() {
             Ok(inventory) => {
                 eprintln!(
                     "embedded migrations applied and verified (count={}, latest={:?}, inventory={})",
-                    inventory.embedded_count,
-                    inventory.latest_version,
-                    inventory.content_digest,
+                    inventory.embedded_count, inventory.latest_version, inventory.content_digest,
                 );
                 if let Some(operation) = inventory.production_operation.as_ref() {
                     eprintln!(
@@ -4686,6 +4757,22 @@ mod tests {
     use axum::http::StatusCode;
     use tower::ServiceExt;
 
+    fn test_principal_id() -> PrincipalId {
+        PrincipalId::from_uuid(Uuid::new_v4()).expect("generated principal id")
+    }
+
+    fn test_principal_binding() -> crate::principal_registry::PrincipalBinding {
+        crate::principal_registry::PrincipalBinding {
+            principal_id: test_principal_id(),
+            principal_lifecycle_version: 1,
+            principal_authority_version: 1,
+            principal_key_id: Uuid::new_v4(),
+            principal_key_version: 1,
+            principal_link_id: Uuid::new_v4(),
+            principal_link_version: 1,
+        }
+    }
+
     #[derive(Clone)]
     struct GlobalConcurrencyTestGates {
         login_started: Arc<tokio::sync::Semaphore>,
@@ -5286,87 +5373,46 @@ mod tests {
         let provider = "local";
         let issuer = "urn:ryuki:test:api-token-lookup";
         let subject = "session-boundary-query-user";
-        let digest = Sha256::digest(format!("api-token-test\0{provider}\0{issuer}\0{subject}"));
-        let mut identity_tx = pool.begin().await.expect("begin token identity seed");
-        crate::human_authority::prepare_writer_tx(&mut identity_tx, provider, issuer, subject)
-            .await
-            .expect("prepare token identity writer");
-        crate::human_authority::mark_governed_identity_reactivation_tx(&mut identity_tx)
-            .await
-            .expect("mark token identity reactivation");
-        let identity_epoch: i64 = sqlx::query_scalar(
-            "INSERT INTO identity_authorities \
-             (provider, issuer, subject, authority_epoch, authority_digest, authority_status, \
-              last_asserted_at) \
-             VALUES ($1, $2, $3, 1, $4, 'active-scoped-v2', NOW()) \
-             ON CONFLICT (provider, issuer, subject) DO UPDATE SET \
-               authority_epoch = CASE \
-                 WHEN identity_authorities.authority_status <> 'active-scoped-v2' \
-                   OR identity_authorities.authority_digest <> EXCLUDED.authority_digest \
-                 THEN identity_authorities.authority_epoch + 1 \
-                 ELSE identity_authorities.authority_epoch \
-               END, \
-               authority_digest = EXCLUDED.authority_digest, \
-               authority_status = 'active-scoped-v2', last_asserted_at = NOW() \
-             RETURNING authority_epoch",
-        )
-        .bind(provider)
-        .bind(issuer)
-        .bind(subject)
-        .bind(digest.as_slice())
-        .fetch_one(&mut *identity_tx)
-        .await
-        .expect("seed token identity");
-        identity_tx
-            .commit()
-            .await
-            .expect("commit token identity seed");
-        crate::human_authority::persist_governed_assignment(
-            &pool,
+        let roles = vec!["Auditor".to_string()];
+        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+        let mut token_tx = pool.begin().await.expect("begin API token seed");
+        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+            &mut token_tx,
             provider,
             issuer,
             subject,
-            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&[
-                "Auditor".to_string()
-            ]),
+            &crate::principal_registry::InitialHumanAuthority {
+                authority_digest: &authority_digest,
+                roles: &roles,
+                site_mode: "global",
+                site_scope: &[],
+                environment_mode: "global",
+                environment_scope: &[],
+                created_by: "api-token-lookup-test",
+            },
         )
         .await
-        .expect("seed token human authority");
-        let assignment_version: i64 = sqlx::query_scalar(
-            "SELECT assignment_version FROM human_authority_assignments \
-             WHERE provider = $1 AND issuer = $2 AND subject = $3",
-        )
-        .bind(provider)
-        .bind(issuer)
-        .bind(subject)
-        .fetch_one(&pool)
-        .await
-        .expect("read token human authority version");
-        let mut token_tx = pool.begin().await.expect("begin API token seed");
-        crate::human_authority::prepare_writer_tx(&mut token_tx, provider, issuer, subject)
-            .await
-            .expect("prepare API token writer");
+        .expect("seed exact token issuer binding");
         sqlx::query(
             "INSERT INTO api_tokens \
-             (id, name, owner_principal, token_hash, roles, token_valid, expires_at, \
-              issued_by_provider, issued_by_issuer, issued_by_subject, \
-              issued_by_identity_epoch, issued_by_human_authority_version, issued_by_roles, \
-              issued_by_site_authority_mode, issued_by_site_scope, \
-              issued_by_environment_authority_mode, issued_by_environment_scope) \
-             VALUES ($1, $2, $3, $4, $5, TRUE, NOW() + INTERVAL '1 hour', \
-                     $6, $7, $8, $9, $10, $5, 'global', ARRAY[]::TEXT[], \
-                     'global', ARRAY[]::TEXT[])",
+             (id, name, token_hash, roles, token_valid, expires_at, \
+              issuing_principal_id, issuing_principal_lifecycle_version, \
+              issuing_principal_authority_version, principal_key_id, principal_key_version, \
+              principal_link_id, principal_link_version) \
+             VALUES ($1, $2, $3, $4, TRUE, NOW() + INTERVAL '1 hour', \
+                     $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(token_id)
         .bind("session-boundary-query-test")
-        .bind(subject)
         .bind(&token_hash)
-        .bind(vec!["Auditor".to_string()])
-        .bind(provider)
-        .bind(issuer)
-        .bind(subject)
-        .bind(identity_epoch)
-        .bind(assignment_version)
+        .bind(&roles)
+        .bind(binding.principal_id.into_uuid())
+        .bind(binding.principal_lifecycle_version)
+        .bind(binding.principal_authority_version)
+        .bind(binding.principal_key_id)
+        .bind(binding.principal_key_version)
+        .bind(binding.principal_link_id)
+        .bind(binding.principal_link_version)
         .execute(&mut *token_tx)
         .await
         .expect("seed API token");
@@ -5375,7 +5421,8 @@ mod tests {
         let session = resolve_api_token(&plaintext, &pool).await;
         assert!(session.token_valid);
         assert_eq!(session.provider_mode, "api-token");
-        assert_eq!(session.user_id, "session-boundary-query-user");
+        assert_eq!(session.principal_id, Some(binding.principal_id));
+        assert_eq!(session.display_user_id, binding.principal_id.to_string());
         let last_used_at: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar("SELECT last_used_at FROM api_tokens WHERE id = $1")
                 .bind(token_id)
@@ -5995,28 +6042,37 @@ mod tests {
 
     #[test]
     fn test_db_session_row_maps_to_verified_session() {
+        let principal_id = Uuid::new_v4();
         let session = session_from_db_row(&DbAuthSessionRow {
             session_record_id: Uuid::new_v4(),
-            user_id: "platform-engineer".into(),
+            principal_id,
+            principal_lifecycle_version: 1,
+            principal_authority_version: 1,
+            principal_key_id: Uuid::new_v4(),
+            principal_key_version: 1,
+            principal_link_id: Uuid::new_v4(),
+            principal_link_version: 1,
             display_name: "Platform Engineer".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
             bearer_verifier: random_bearer_verifier_fixture(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             created_at: chrono::Utc::now(),
-            provider: "local".into(),
-            identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
-            identity_subject: "platform-engineer".into(),
-            identity_authority_epoch: 1,
-            identity_authority_digest: rand::random::<[u8; 32]>().to_vec(),
-            identity_last_asserted_at: None,
-            human_authority_version: 1,
+            provider_id: "local".into(),
+            issuer: crate::identity_authority::LOCAL_ISSUER.into(),
+            subject: "platform-engineer".into(),
             site_authority_mode: "scoped".into(),
             site_scope: vec!["SITE-A".into()],
             environment_authority_mode: "global".into(),
             environment_scope: vec![],
-        });
+        })
+        .expect("generated row has a non-nil principal id");
 
         assert_eq!(session.provider_mode, "persisted-session");
+        assert_eq!(session.display_user_id, principal_id.to_string());
+        assert_eq!(
+            session.principal_id,
+            Some(PrincipalId::from_uuid(principal_id).unwrap())
+        );
         assert!(session.token_valid);
         assert!(session
             .roles
@@ -6175,24 +6231,27 @@ mod tests {
     fn verified_persisted_session() -> AuthSession {
         session_from_db_row(&DbAuthSessionRow {
             session_record_id: Uuid::new_v4(),
-            user_id: "admin".into(),
+            principal_id: Uuid::new_v4(),
+            principal_lifecycle_version: 1,
+            principal_authority_version: 1,
+            principal_key_id: Uuid::new_v4(),
+            principal_key_version: 1,
+            principal_link_id: Uuid::new_v4(),
+            principal_link_version: 1,
             display_name: "admin".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
             bearer_verifier: random_bearer_verifier_fixture(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             created_at: chrono::Utc::now(),
-            provider: "local".into(),
-            identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
-            identity_subject: "admin".into(),
-            identity_authority_epoch: 1,
-            identity_authority_digest: rand::random::<[u8; 32]>().to_vec(),
-            identity_last_asserted_at: None,
-            human_authority_version: 1,
+            provider_id: "local".into(),
+            issuer: crate::identity_authority::LOCAL_ISSUER.into(),
+            subject: "admin".into(),
             site_authority_mode: "global".into(),
             site_scope: vec![],
             environment_authority_mode: "global".into(),
             environment_scope: vec![],
         })
+        .expect("generated row has a non-nil principal id")
     }
 
     fn random_bearer_verifier_fixture() -> Vec<u8> {
@@ -7587,8 +7646,10 @@ mod tests {
             ("local", "urn:ryuki:local", "persisted-session"),
             ("entra-id", "https://issuer.example/tenant", "entra-id"),
         ] {
+            let principal_binding = test_principal_binding();
             let session = AuthSession {
-                user_id: "human-subject".into(),
+                display_user_id: principal_binding.principal_id.to_string(),
+                principal_id: Some(principal_binding.principal_id),
                 display_name: "Verified Human".into(),
                 roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
                 token_valid: true,
@@ -7598,9 +7659,10 @@ mod tests {
                 environment_scope: vec!["prod".into()],
             };
             let authority = InteractiveHumanAuthorityContext {
+                principal_binding,
                 provider: provider.into(),
                 issuer: issuer.into(),
-                subject: session.user_id.clone(),
+                subject: "external-human-subject".into(),
                 identity_epoch: 2,
                 assignment_version: 7,
                 roles: session.roles.clone(),
@@ -7633,6 +7695,11 @@ mod tests {
             assert!(!interactive_authority_matches_session(&session, None));
             let mut mismatched = authority.clone();
             mismatched.subject = "different-subject".into();
+            assert!(interactive_authority_matches_session(
+                &session,
+                Some(&mismatched)
+            ));
+            mismatched.principal_binding.principal_id = test_principal_id();
             assert!(!interactive_authority_matches_session(
                 &session,
                 Some(&mismatched)
@@ -7657,8 +7724,10 @@ mod tests {
             "/api/admin/platform-settings"
         ));
 
+        let principal_binding = test_principal_binding();
         let session = AuthSession {
-            user_id: "global-human".into(),
+            display_user_id: principal_binding.principal_id.to_string(),
+            principal_id: Some(principal_binding.principal_id),
             roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
             actor_class: ActorClass::VerifiedHuman,
@@ -7666,9 +7735,10 @@ mod tests {
             ..AuthSession::default()
         };
         let mut authority = InteractiveHumanAuthorityContext {
+            principal_binding,
             provider: "local".into(),
             issuer: "urn:ryuki:local".into(),
-            subject: session.user_id.clone(),
+            subject: "local-admin-login-name".into(),
             identity_epoch: 1,
             assignment_version: 1,
             roles: session.roles.clone(),
@@ -7791,11 +7861,14 @@ mod tests {
     /// (ordinary reads need `audit`, sensitive reads need `admin`) is built so
     /// an Auditor reads ordinary GETs but is refused sensitive ones.
     fn auditor_session() -> AuthSession {
+        let principal_id = test_principal_id();
         AuthSession {
-            user_id: "auditor-1".into(),
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             display_name: "Auditor One".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "persisted-session".into(),
             ..Default::default()
         }
@@ -7897,10 +7970,13 @@ mod tests {
     #[test]
     fn test_network_inventory_reads_are_admin_only_but_contract_stays_requester_readable() {
         let auditor = auditor_session();
+        let principal_id = test_principal_id();
         let requester = AuthSession {
-            user_id: "network-requester".into(),
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "persisted-session".into(),
             ..Default::default()
         };
@@ -7928,10 +8004,13 @@ mod tests {
 
     #[test]
     fn test_requester_read_manifest_is_closed_and_shape_exact() {
+        let principal_id = test_principal_id();
         let requester = AuthSession {
-            user_id: "requester".into(),
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "persisted-session".into(),
             ..Default::default()
         };
@@ -8015,13 +8094,18 @@ mod tests {
     /// under `/shift/`) stays ordinary-readable.
     #[test]
     fn test_shift_queue_reads_require_execute() {
-        let role = |r: &str| AuthSession {
-            user_id: "u".into(),
-            display_name: "u".into(),
-            roles: vec![r.to_string()],
-            token_valid: true,
-            provider_mode: "persisted-session".into(),
-            ..Default::default()
+        let role = |r: &str| {
+            let principal_id = test_principal_id();
+            AuthSession {
+                display_user_id: principal_id.to_string(),
+                principal_id: Some(principal_id),
+                display_name: "u".into(),
+                roles: vec![r.to_string()],
+                token_valid: true,
+                actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+                provider_mode: "persisted-session".into(),
+                ..Default::default()
+            }
         };
         let operator = role(ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR); // holds execute
         let auditor = auditor_session(); // holds audit, not execute
@@ -8151,11 +8235,14 @@ mod tests {
             // A Requester (holds only `request`) reads only explicitly
             // classified self-owned/static surfaces. Unclassified operational
             // reads fail closed to audit.
+            let principal_id = test_principal_id();
             let requester = AuthSession {
-                user_id: "req-1".into(),
+                display_user_id: principal_id.to_string(),
+                principal_id: Some(principal_id),
                 display_name: "Requester One".into(),
                 roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
                 token_valid: true,
+                actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
                 provider_mode: "persisted-session".into(),
                 ..Default::default()
             };
@@ -8200,11 +8287,14 @@ mod tests {
         assert!(!is_audit_read_path("/api/activity"));
 
         let auditor = auditor_session();
+        let principal_id = test_principal_id();
         let requester = AuthSession {
-            user_id: "req-1".into(),
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             display_name: "Requester One".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "persisted-session".into(),
             ..Default::default()
         };

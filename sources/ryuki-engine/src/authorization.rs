@@ -14,6 +14,7 @@ use std::num::NonZeroU64;
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
+use ryuki_core::PrincipalId;
 use serde::Serialize;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
@@ -305,7 +306,7 @@ impl fmt::Debug for ExplicitScope {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 struct PrincipalVersionBinding {
-    principal_id: String,
+    principal_id: PrincipalId,
     lifecycle_version: BindingVersion,
     authority_version: BindingVersion,
 }
@@ -381,7 +382,7 @@ pub struct ResolvedResource {
     tenant_id: Option<String>,
     site_id: Option<String>,
     environment_id: Option<String>,
-    owner_principal_id: Option<String>,
+    owner_principal_id: Option<PrincipalId>,
     resource_version: BindingVersion,
     /// Exact version-set digest for protected child state returned with this
     /// resource. `resource_version` remains the monotonic parent authority;
@@ -577,7 +578,7 @@ enum ObligationEvidence {
         assurance: AssuranceLevel,
     },
     MakerChecker {
-        checker_principal_id: String,
+        checker_principal_id: PrincipalId,
         approval_version: BindingVersion,
     },
     Quorum {
@@ -758,7 +759,7 @@ pub struct RequestReadExpectedAuthority {
 /// that participates in a decision and permit seal.
 pub struct RequestReadPrincipalEvidence {
     pub actor_kind: ActorKind,
-    pub principal_id: String,
+    pub principal_id: PrincipalId,
     pub deployment_id: String,
     pub trust_domain_id: String,
     pub tenant_id: Option<String>,
@@ -791,7 +792,7 @@ pub struct RequestReadResourceEvidence {
     pub tenant_id: Option<String>,
     pub site_id: String,
     pub environment_id: String,
-    pub owner_principal_id: String,
+    pub owner_principal_id: PrincipalId,
     pub resource_version: BindingVersion,
     pub state_digest: BindingDigest,
     pub sensitivity: ResourceSensitivity,
@@ -1074,7 +1075,6 @@ impl AuthorizationKernel {
                 ))?;
         let now = self.now();
         for value in [
-            evidence.principal_id.as_str(),
             evidence.deployment_id.as_str(),
             evidence.trust_domain_id.as_str(),
             evidence.credential_id.as_str(),
@@ -1167,7 +1167,6 @@ impl AuthorizationKernel {
             || !valid_identifier(&evidence.trust_domain_id)
             || !valid_identifier(&evidence.site_id)
             || !valid_identifier(&evidence.environment_id)
-            || !valid_identifier(&evidence.owner_principal_id)
             || evidence.deployment_id != expected.deployment_id
             || evidence.trust_domain_id != expected.trust_domain_id
             || evidence.tenant_id != expected.tenant_id
@@ -1396,8 +1395,8 @@ impl AuthorizationKernel {
             Some(DenialReason::EffectiveSubjectMismatch)
         } else if action == Action::RequestRead
             && !policy_can_read_any(principal)
-            && resource.owner_principal_id.as_deref()
-                != Some(principal.effective_subject.principal_id.as_str())
+            && resource.owner_principal_id.as_ref()
+                != Some(&principal.effective_subject.principal_id)
         {
             Some(DenialReason::OwnerMismatch)
         } else if !self.delegation_enabled
@@ -1785,7 +1784,9 @@ impl AuthorizationKernel {
                 ObligationIssuerKind::ApprovalRepository,
                 "issuer:approval:test",
                 ObligationEvidence::MakerChecker {
-                    checker_principal_id: "principal:checker".into(),
+                    checker_principal_id: "018f3f54-8f5e-7bb7-9f06-1f3cc6f819d2"
+                        .parse()
+                        .expect("canonical non-nil checker principal id"),
                     approval_version: BindingVersion::new(1).expect("positive test version"),
                 },
             ),
@@ -1962,8 +1963,7 @@ fn obligation_evidence_is_valid(
             checker_principal_id,
             ..
         } => {
-            valid_identifier(checker_principal_id)
-                && checker_principal_id != &principal.actor.principal_id
+            checker_principal_id != &principal.actor.principal_id
                 && checker_principal_id != &principal.effective_subject.principal_id
         }
         ObligationEvidence::Quorum {
@@ -2071,6 +2071,15 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    const ACTOR_PRINCIPAL_ID: &str = "018f3f54-8f5e-7bb7-9f06-1f3cc6f819d0";
+    const OTHER_PRINCIPAL_ID: &str = "018f3f54-8f5e-7bb7-9f06-1f3cc6f819d1";
+    const SUBSTITUTED_PRINCIPAL_ID: &str = "018f3f54-8f5e-7bb7-9f06-1f3cc6f819d3";
+    const EFFECTIVE_OTHER_PRINCIPAL_ID: &str = "018f3f54-8f5e-7bb7-9f06-1f3cc6f819d4";
+
+    fn principal_id(value: &str) -> PrincipalId {
+        value.parse().expect("canonical non-nil principal id")
+    }
+
     fn version(value: u64) -> BindingVersion {
         BindingVersion::new(value).unwrap()
     }
@@ -2124,12 +2133,12 @@ mod tests {
         VerifiedPrincipal {
             actor_kind: ActorKind::VerifiedHuman,
             actor: PrincipalVersionBinding {
-                principal_id: "principal:actor".into(),
+                principal_id: principal_id(ACTOR_PRINCIPAL_ID),
                 lifecycle_version: version(3),
                 authority_version: version(9),
             },
             effective_subject: PrincipalVersionBinding {
-                principal_id: "principal:actor".into(),
+                principal_id: principal_id(ACTOR_PRINCIPAL_ID),
                 lifecycle_version: version(3),
                 authority_version: version(9),
             },
@@ -2181,7 +2190,7 @@ mod tests {
             tenant_id: Some("tenant:one".into()),
             site_id: Some("site:one".into()),
             environment_id: Some("env:prod".into()),
-            owner_principal_id: Some("principal:actor".into()),
+            owner_principal_id: Some(principal_id(ACTOR_PRINCIPAL_ID)),
             resource_version: version(22),
             state_digest: None,
             sensitivity: ResourceSensitivity::Confidential,
@@ -2366,7 +2375,7 @@ mod tests {
         );
 
         let mut wrong_owner = base_resource.clone();
-        wrong_owner.owner_principal_id = Some("principal:other".into());
+        wrong_owner.owner_principal_id = Some(principal_id(OTHER_PRINCIPAL_ID));
         assert_eq!(
             kernel
                 .decide(&base_principal, Action::RequestRead, &wrong_owner)
@@ -2486,7 +2495,7 @@ mod tests {
             .find(|receipt| receipt.binding.kind == ObligationKind::MakerChecker)
             .expect("maker/checker receipt exists");
         maker_checker.binding.evidence = ObligationEvidence::MakerChecker {
-            checker_principal_id: approving_principal.actor.principal_id.clone(),
+            checker_principal_id: approving_principal.actor.principal_id,
             approval_version: version(2),
         };
         resign_receipt(&kernel, maker_checker);
@@ -2547,9 +2556,9 @@ mod tests {
         let now = test_now();
         let kernel = kernel(DeploymentProfile::Test);
         let mut substituted = principal(now, Action::RequestRead);
-        substituted.effective_subject.principal_id = "principal:substituted".into();
+        substituted.effective_subject.principal_id = principal_id(SUBSTITUTED_PRINCIPAL_ID);
         let mut target = resource(Action::RequestRead);
-        target.owner_principal_id = Some("principal:substituted".into());
+        target.owner_principal_id = Some(principal_id(SUBSTITUTED_PRINCIPAL_ID));
 
         let decision = kernel.decide(&substituted, Action::RequestRead, &target);
         assert_eq!(decision.status(), DecisionStatus::Deny);
@@ -2653,7 +2662,8 @@ mod tests {
             |permit| permit.binding.decision.semantics = AuthorizationSemantics::Global,
             |permit| permit.binding.decision.principal.actor_kind = ActorKind::Service,
             |permit| {
-                permit.binding.decision.principal.actor.principal_id = "principal:other".into()
+                permit.binding.decision.principal.actor.principal_id =
+                    principal_id(OTHER_PRINCIPAL_ID)
             },
             |permit| permit.binding.decision.principal.actor.lifecycle_version = version(30),
             |permit| permit.binding.decision.principal.actor.authority_version = version(90),
@@ -2663,7 +2673,7 @@ mod tests {
                     .decision
                     .principal
                     .effective_subject
-                    .principal_id = "principal:effective:other".into()
+                    .principal_id = principal_id(EFFECTIVE_OTHER_PRINCIPAL_ID)
             },
             |permit| {
                 permit
@@ -2760,7 +2770,8 @@ mod tests {
             |permit| permit.binding.decision.resource.site_id = Some("site:other".into()),
             |permit| permit.binding.decision.resource.environment_id = Some("env:other".into()),
             |permit| {
-                permit.binding.decision.resource.owner_principal_id = Some("principal:other".into())
+                permit.binding.decision.resource.owner_principal_id =
+                    Some(principal_id(OTHER_PRINCIPAL_ID))
             },
             |permit| permit.binding.decision.resource.resource_version = version(23),
             |permit| permit.binding.decision.resource.sensitivity = ResourceSensitivity::Restricted,
@@ -2871,6 +2882,32 @@ mod tests {
     }
 
     #[test]
+    fn principal_ids_preserve_the_canonical_string_serialization_contract() {
+        let principal = principal(test_now(), Action::RequestRead);
+        let resource = resource(Action::RequestRead);
+
+        let principal_json = serde_json::to_value(principal).expect("principal serializes");
+        assert_eq!(principal_json["actor"]["principal_id"], ACTOR_PRINCIPAL_ID);
+        assert_eq!(
+            principal_json["effective_subject"]["principal_id"],
+            ACTOR_PRINCIPAL_ID
+        );
+
+        let resource_json = serde_json::to_value(resource).expect("resource serializes");
+        assert_eq!(resource_json["owner_principal_id"], ACTOR_PRINCIPAL_ID);
+
+        let checker = ObligationEvidence::MakerChecker {
+            checker_principal_id: principal_id(OTHER_PRINCIPAL_ID),
+            approval_version: version(1),
+        };
+        let checker_json = serde_json::to_value(checker).expect("checker evidence serializes");
+        assert_eq!(
+            checker_json["MakerChecker"]["checker_principal_id"],
+            OTHER_PRINCIPAL_ID
+        );
+    }
+
+    #[test]
     fn permit_domains_and_kernel_owned_lifetime_are_not_interchangeable() {
         let now = test_now();
         let kernel = kernel(DeploymentProfile::Test);
@@ -2950,8 +2987,8 @@ mod tests {
         let (principal, resource, transaction, permit) = instance_permit(&kernel, now);
         let debug = format!("{kernel:?} {principal:?} {resource:?} {transaction:?} {permit:?}");
         for forbidden in [
-            "principal:actor",
-            "principal:subject",
+            ACTOR_PRINCIPAL_ID,
+            SUBSTITUTED_PRINCIPAL_ID,
             "credential:one",
             "provider:one",
             "request:one",

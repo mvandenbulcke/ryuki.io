@@ -1,3 +1,4 @@
+use ryuki_core::PrincipalId;
 use serde::{Deserialize, Serialize};
 
 pub const APP_ROLE_PLATFORM_ADMIN: &str = "PlatformAdmin";
@@ -140,7 +141,21 @@ impl ActorClass {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthSession {
-    pub user_id: String,
+    /// Compatibility projection exposed under the historical `user_id` wire
+    /// key. Admitted sessions project their opaque principal UUID here;
+    /// unverified and simulated sessions use fixed non-authoritative labels.
+    /// Security decisions must never read this string.
+    #[serde(rename = "user_id")]
+    pub display_user_id: String,
+    /// Stable, provider-independent authority for an admitted session.
+    ///
+    /// It is deliberately excluded from serialized session projections so a
+    /// caller cannot turn a UUID-shaped provider subject or display value into
+    /// authority by deserializing an `AuthSession`. Admission code alone sets
+    /// this field after validating an exact principal/key/link binding. `None`
+    /// is the fail-closed state for unverified projections.
+    #[serde(skip)]
+    pub principal_id: Option<PrincipalId>,
     pub display_name: String,
     pub roles: Vec<String>,
     pub token_valid: bool,
@@ -171,7 +186,7 @@ pub struct AuthSession {
 impl AuthSession {
     pub fn static_dry_run() -> Self {
         Self {
-            user_id: "static-user".to_string(),
+            display_user_id: "static-user".to_string(),
             display_name: "Platform Operator (Static)".to_string(),
             roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: false,
@@ -183,7 +198,7 @@ impl AuthSession {
 
     pub fn unverified_entra() -> Self {
         Self {
-            user_id: "unverified-entra-user".to_string(),
+            display_user_id: "unverified-entra-user".to_string(),
             display_name: "Unverified Entra ID User".to_string(),
             roles: vec![],
             token_valid: false,
@@ -195,7 +210,9 @@ impl AuthSession {
     /// Whether this request carries fresh server-side proof of an admitted
     /// human actor. Token validity remains an independent mandatory condition.
     pub const fn is_verified_human(&self) -> bool {
-        self.token_valid && matches!(self.actor_class, ActorClass::VerifiedHuman)
+        self.principal_id.is_some()
+            && self.token_valid
+            && matches!(self.actor_class, ActorClass::VerifiedHuman)
     }
 }
 
@@ -407,6 +424,26 @@ fn base64_decode_internal(input: &str) -> Option<Vec<u8>> {
 /// superuser semantics, and a role that merely holds `audit` never leaks into
 /// the mutating permissions.
 pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
+    let admitted_actor = session.principal_id.is_some()
+        && session.token_valid
+        && matches!(
+            session.actor_class,
+            ActorClass::VerifiedHuman | ActorClass::Workload
+        );
+    // Credential-free modes retain their historical coarse RBAC only for an
+    // explicitly labelled dry-run projection. This branch cannot create human
+    // approval evidence and never grants authority to a token-bearing or
+    // provider-backed unverified session.
+    let simulated_dry_run = session.principal_id.is_none()
+        && matches!(session.actor_class, ActorClass::Simulated)
+        && !session.token_valid
+        && matches!(
+            session.provider_mode.as_str(),
+            "static-dry-run" | "mock-dry-run"
+        );
+    if !admitted_actor && !simulated_dry_run {
+        return false;
+    }
     // `approve` represents durable human judgment. An admin-capable workload
     // may still perform explicitly authorized machine operations, but it can
     // never satisfy an approval role resolution or create human evidence.
@@ -565,6 +602,12 @@ pub fn get_entra_config_from_env(tenant_id: &str, client_id: &str, instance: &st
 mod tests {
     use super::*;
 
+    fn test_principal_id() -> PrincipalId {
+        "11111111-1111-4111-8111-111111111111"
+            .parse()
+            .expect("canonical non-nil test principal")
+    }
+
     #[test]
     fn test_default_entra_config_is_disabled() {
         let config = EntraConfig::default();
@@ -577,17 +620,22 @@ mod tests {
     #[test]
     fn test_static_session_has_expected_roles() {
         let session = AuthSession::static_dry_run();
-        assert_eq!(session.user_id, "static-user");
+        assert_eq!(session.display_user_id, "static-user");
+        assert_eq!(session.principal_id, None);
         assert!(!session.token_valid);
         assert_eq!(session.provider_mode, "static-dry-run");
         assert!(session.roles.contains(&APP_ROLE_PLATFORM_ADMIN.to_string()));
         assert_eq!(session.roles.len(), 1);
+        assert!(check_permission(&session, "admin"));
+        assert!(check_permission(&session, "request"));
+        assert!(!check_permission(&session, "approve"));
     }
 
     #[test]
     fn test_unverified_entra_session_has_no_roles() {
         let session = AuthSession::unverified_entra();
-        assert_eq!(session.user_id, "unverified-entra-user");
+        assert_eq!(session.display_user_id, "unverified-entra-user");
+        assert_eq!(session.principal_id, None);
         assert!(!session.token_valid);
         assert_eq!(session.provider_mode, "entra-id-unverified");
         assert!(session.roles.is_empty());
@@ -603,8 +651,7 @@ mod tests {
 
     #[test]
     fn test_check_permission_returns_false_for_non_matching_role() {
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_REQUESTER.to_string()];
+        let session = session_for_role(APP_ROLE_REQUESTER);
         assert!(check_permission(&session, "request"));
         assert!(!check_permission(&session, "admin"));
         assert!(!check_permission(&session, "execute"));
@@ -612,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_check_permission_empty_roles() {
-        let mut session = AuthSession::static_dry_run();
+        let mut session = session_for_role(APP_ROLE_REQUESTER);
         session.roles = vec![];
         assert!(!check_permission(&session, "admin"));
         assert!(!check_permission(&session, "audit"));
@@ -696,14 +743,66 @@ mod tests {
 
     #[test]
     fn test_auth_session_serialization_round_trip() {
-        let session = AuthSession::static_dry_run();
+        let session = verified_human_for_role(APP_ROLE_PLATFORM_ADMIN);
         let json = serde_json::to_string(&session).unwrap();
         let deserialized: AuthSession = serde_json::from_str(&json).unwrap();
-        assert_eq!(session.user_id, deserialized.user_id);
+        assert_eq!(deserialized.principal_id, None);
+        assert_eq!(session.display_user_id, deserialized.display_user_id);
         assert_eq!(session.display_name, deserialized.display_name);
         assert_eq!(session.roles, deserialized.roles);
         assert_eq!(session.token_valid, deserialized.token_valid);
         assert_eq!(session.provider_mode, deserialized.provider_mode);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["user_id"].as_str(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert!(value.get("principal_id").is_none());
+        assert!(!check_permission(&deserialized, "admin"));
+    }
+
+    #[test]
+    fn uuid_shaped_wire_identity_cannot_deserialize_as_session_authority() {
+        let payload = serde_json::json!({
+            "user_id": "11111111-1111-4111-8111-111111111111",
+            "display_name": "External User",
+            "roles": ["PlatformAdmin"],
+            "token_valid": true,
+            "provider_mode": "oidc"
+        });
+        let session = serde_json::from_value::<AuthSession>(payload).unwrap();
+        assert_eq!(
+            session.display_user_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(session.principal_id, None);
+        assert_eq!(session.actor_class, ActorClass::Unknown);
+        assert!(!check_permission(&session, "admin"));
+        assert!(!check_permission(&session, "request"));
+    }
+
+    #[test]
+    fn unverified_projection_preserves_the_non_authoritative_wire_key() {
+        let value = serde_json::to_value(AuthSession::unverified_entra()).unwrap();
+        assert_eq!(
+            value.get("user_id").and_then(serde_json::Value::as_str),
+            Some("unverified-entra-user")
+        );
+        assert!(value.get("principal_id").is_none());
+    }
+
+    #[test]
+    fn absent_principal_fails_every_permission_check() {
+        let session = AuthSession {
+            roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            actor_class: ActorClass::VerifiedHuman,
+            ..AuthSession::default()
+        };
+        for permission in ["admin", "approve", "audit", "execute", "request"] {
+            assert!(!check_permission(&session, permission));
+        }
+        assert!(!session.is_verified_human());
     }
 
     #[test]
@@ -797,7 +896,8 @@ mod tests {
 
     fn verified_human_for_role(role: &str) -> AuthSession {
         AuthSession {
-            user_id: "verified-human".to_string(),
+            display_user_id: test_principal_id().to_string(),
+            principal_id: Some(test_principal_id()),
             display_name: "Verified Human".to_string(),
             roles: vec![role.to_string()],
             token_valid: true,
@@ -835,8 +935,7 @@ mod tests {
     fn test_superuser_does_not_leak_to_audit_only_roles() {
         // Auditor holds only `audit`, never `admin`, so the superuser fallthrough
         // does not apply: it must remain locked out of every mutating permission.
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_AUDITOR.to_string()];
+        let session = session_for_role(APP_ROLE_AUDITOR);
         assert!(check_permission(&session, "audit"));
         assert!(!check_permission(&session, "execute"));
         assert!(!check_permission(&session, "request"));
@@ -848,8 +947,7 @@ mod tests {
     fn test_operator_holds_execute_but_not_admin_tier() {
         // A plain operator holds `execute`/`audit` and passes execute, but the
         // superuser fallthrough never grants it approve/request/admin.
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_VMWARE_OPERATOR.to_string()];
+        let session = session_for_role(APP_ROLE_VMWARE_OPERATOR);
         assert!(check_permission(&session, "execute"));
         assert!(check_permission(&session, "audit"));
         assert!(!check_permission(&session, "approve"));
@@ -869,24 +967,58 @@ mod tests {
 
     #[test]
     fn non_human_actor_classes_cannot_resolve_approval() {
-        for actor_class in [
-            ActorClass::Workload,
-            ActorClass::Unknown,
-            ActorClass::Simulated,
-        ] {
-            let session = AuthSession {
-                user_id: "non-human".to_string(),
-                roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+        let workload = AuthSession {
+            display_user_id: test_principal_id().to_string(),
+            principal_id: Some(test_principal_id()),
+            roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            provider_mode: "api-token".to_string(),
+            actor_class: ActorClass::Workload,
+            ..AuthSession::default()
+        };
+        assert!(!check_permission(&workload, "approve"));
+        assert!(!check_human_signoff_permission(&workload, "admin"));
+        assert!(check_permission(&workload, "admin"));
+        assert!(check_permission(&workload, "execute"));
+
+        let unknown = AuthSession {
+            display_user_id: test_principal_id().to_string(),
+            principal_id: Some(test_principal_id()),
+            roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            actor_class: ActorClass::Unknown,
+            ..AuthSession::default()
+        };
+        assert!(!check_permission(&unknown, "admin"));
+        assert!(!check_permission(&unknown, "execute"));
+    }
+
+    #[test]
+    fn simulated_authority_is_limited_to_non_token_dry_run_modes() {
+        let static_session = AuthSession::static_dry_run();
+        assert!(check_permission(&static_session, "admin"));
+        let mock_session = AuthSession {
+            provider_mode: "mock-dry-run".to_string(),
+            ..AuthSession::static_dry_run()
+        };
+        assert!(check_permission(&mock_session, "admin"));
+
+        for session in [
+            AuthSession {
                 token_valid: true,
-                provider_mode: "same-carrier-for-every-class".to_string(),
-                actor_class,
-                ..AuthSession::default()
-            };
-            assert!(!check_permission(&session, "approve"));
-            assert!(!check_human_signoff_permission(&session, "admin"));
-            // Workloads keep their explicitly governed non-signoff authority.
-            assert!(check_permission(&session, "admin"));
-            assert!(check_permission(&session, "execute"));
+                ..AuthSession::static_dry_run()
+            },
+            AuthSession {
+                provider_mode: "entra-id".to_string(),
+                ..AuthSession::static_dry_run()
+            },
+            AuthSession {
+                actor_class: ActorClass::Unknown,
+                ..AuthSession::static_dry_run()
+            },
+        ] {
+            assert!(!check_permission(&session, "admin"));
+            assert!(!check_permission(&session, "execute"));
         }
     }
 
@@ -904,15 +1036,18 @@ mod tests {
         session.token_valid = false;
         assert!(!session.is_verified_human());
         assert!(!check_permission(&session, "approve"));
+        assert!(!check_permission(&session, "admin"));
     }
 
     fn session_for_role(role: &str) -> AuthSession {
         AuthSession {
-            user_id: "capability-test-user".to_string(),
+            display_user_id: test_principal_id().to_string(),
+            principal_id: Some(test_principal_id()),
             display_name: "Capability Test User".to_string(),
             roles: vec![role.to_string()],
             token_valid: true,
             provider_mode: "test-provider".to_string(),
+            actor_class: ActorClass::Workload,
             ..AuthSession::default()
         }
     }

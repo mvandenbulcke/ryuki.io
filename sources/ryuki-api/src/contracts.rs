@@ -13,6 +13,7 @@ use axum::{
 use hmac::Mac;
 use ryuki_core::config::{AuthMode, LOCAL_AUTH_MAX_FIELD_BYTES};
 use ryuki_core::types::{ApiError, PlatformConfig};
+use ryuki_core::PrincipalId;
 use ryuki_engine::auth::{
     check_human_signoff_permission, check_operation_capability, check_permission, get_rbac_roles,
     AuthSession, OperationCapability,
@@ -36,6 +37,37 @@ struct PaginationParams {
     offset: Option<usize>,
 }
 
+/// Return the opaque, registry-assigned principal carried by an admitted
+/// session. Compatibility display strings must never be promoted back into
+/// authorization, ownership, separation-of-duties, or audit identity.
+fn authenticated_principal_id(
+    session: &AuthSession,
+) -> Result<PrincipalId, (StatusCode, Json<Value>)> {
+    session.principal_id.ok_or_else(status_403)
+}
+
+/// Test-only stand-in for the random opaque registry allocator. Reusing a
+/// label within one test process returns the same independently random ID;
+/// the label is never copied or hashed into principal authority.
+#[cfg(test)]
+fn test_principal_id(label: &str) -> PrincipalId {
+    static IDS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, PrincipalId>>> =
+        OnceLock::new();
+    let ids = IDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut ids = ids.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *ids.entry(label.to_string()).or_insert_with(|| {
+        PrincipalId::from_uuid(Uuid::new_v4()).expect("generated test principal is non-nil")
+    })
+}
+
+#[cfg(test)]
+fn bind_test_principal(session: &mut AuthSession, label: &str) -> PrincipalId {
+    let principal_id = test_principal_id(label);
+    session.display_user_id = principal_id.to_string();
+    session.principal_id = Some(principal_id);
+    principal_id
+}
+
 /// DB-backed proofs for the firmware exception maker/checker and atomic-audit
 /// boundary. They skip only when no database URL was supplied.
 #[cfg(test)]
@@ -55,10 +87,13 @@ mod firmware_exception_handler_security_tests {
         Some(pool)
     }
 
-    fn actor(user_id: &str, roles: &[&str]) -> AuthSession {
+    fn actor(display_user_id: &str, roles: &[&str]) -> AuthSession {
+        let principal_id =
+            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
         AuthSession {
-            user_id: user_id.into(),
-            display_name: format!("Firmware test actor {user_id}"),
+            display_user_id: display_user_id.into(),
+            principal_id: Some(principal_id),
+            display_name: format!("Firmware test actor {display_user_id}"),
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             token_valid: true,
             actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
@@ -132,6 +167,10 @@ mod firmware_exception_handler_security_tests {
             "firmware-maker-checker-combined",
             &[APP_ROLE_WINTEL_LINUX_OPERATOR, APP_ROLE_DATACENTER_APPROVER],
         );
+        let maker_principal_id = maker
+            .principal_id
+            .expect("verified test maker has an opaque principal")
+            .to_string();
         let Json(created) = firmware_request_exception(
             AuthExtractor(maker.clone()),
             Json(FirmwareExceptionRequest {
@@ -148,7 +187,7 @@ mod firmware_exception_handler_security_tests {
             .to_string();
         assert_eq!(
             created["exception"]["requested_by"].as_str(),
-            Some(maker.user_id.as_str()),
+            Some(maker_principal_id.as_str()),
             "maker identity comes only from the verified session"
         );
         assert_eq!(created["exception"]["status"], "Pending");
@@ -176,6 +215,10 @@ mod firmware_exception_handler_security_tests {
         assert_eq!(still_pending, ("Pending".into(), 1, None));
 
         let checker = actor("firmware-distinct-checker", &[APP_ROLE_DATACENTER_APPROVER]);
+        let checker_principal_id = checker
+            .principal_id
+            .expect("verified test checker has an opaque principal")
+            .to_string();
         let Json(approved) = firmware_approve_exception(
             AuthExtractor(checker.clone()),
             Path(exception_id.clone()),
@@ -187,7 +230,7 @@ mod firmware_exception_handler_security_tests {
         .expect("distinct approval-capable checker succeeds");
         assert_eq!(
             approved["exception"]["approved_by"].as_str(),
-            Some(checker.user_id.as_str())
+            Some(checker_principal_id.as_str())
         );
         assert_eq!(approved["exception"]["status"], "Approved");
         assert_eq!(approved["exception"]["version"], 2);
@@ -3281,6 +3324,7 @@ pub(crate) struct DbRequestRow {
     pub(crate) approval_epoch: i64,
     pub(crate) requester: Option<String>,
     pub(crate) owner: Option<String>,
+    pub(crate) requester_principal_id: Option<Uuid>,
     pub(crate) evidence_manifest_id: Option<String>,
 }
 
@@ -3289,11 +3333,12 @@ pub(crate) struct DbRequestRow {
 /// place and the column order stays in lockstep with the struct's `FromRow`
 /// (sqlx::query_as matches by position for the tuple-less struct case via name,
 /// but a single source of truth keeps all ~10 sites identical).
-pub(crate) const REQUEST_COLUMNS: &str =
-    "id, request_type, status, stage, site, environment, name, cpu, \
-     memory_gb, justification, created_by, created_at, updated_at, payload, stages, \
-     approval_route, plan, validation_results, criticality, required_approval_roles, requester, \
-     owner, evidence_manifest_id, approval_epoch, resource_version";
+pub(crate) const REQUEST_COLUMNS: &str = "id, request_type, status, stage, site, environment, name, cpu, \
+     memory_gb, justification, created_by_principal_id::text AS created_by, created_at, updated_at, \
+     payload, stages, approval_route, plan, validation_results, criticality, \
+     required_approval_roles, requester_principal_id::text AS requester, \
+     owner_principal_id::text AS owner, requester_principal_id, evidence_manifest_id, \
+     approval_epoch, resource_version";
 
 // ─── Request store (in-memory fallback) ───
 
@@ -3335,7 +3380,6 @@ pub(crate) struct LocalRequestReadBinding {
     pub(crate) status: ryuki_engine::models::RequestStatus,
     pub(crate) site: String,
     pub(crate) environment: String,
-    pub(crate) requester: String,
     pub(crate) owner: String,
 }
 
@@ -3356,7 +3400,6 @@ impl LocalRequestReadLease {
             status: request.status.clone(),
             site: request.site.clone(),
             environment: request.environment.clone(),
-            requester: request.requester.clone(),
             owner: request.owner.clone(),
         })
     }
@@ -3546,7 +3589,10 @@ fn local_request_input_rejection(
     if body.justification.len() > MAX_LOCAL_REQUEST_JUSTIFICATION_BYTES {
         return Some("justification exceeds the local request-store field limit");
     }
-    if session.user_id.len() > MAX_LOCAL_REQUEST_PRINCIPAL_BYTES {
+    let Some(principal_id) = session.principal_id else {
+        return Some("authenticated session has no opaque principal binding");
+    };
+    if principal_id.to_string().len() > MAX_LOCAL_REQUEST_PRINCIPAL_BYTES {
         return Some("authenticated principal exceeds the local request-store field limit");
     }
     if body.fields.len() > MAX_LOCAL_REQUEST_FIELDS {
@@ -5396,6 +5442,7 @@ async fn ad_quarantine_recovery_review(
     if !check_human_signoff_permission(&session, "execute") {
         return Err(status_403());
     }
+    let requester_principal = authenticated_principal_id(&session)?.to_string();
     let reason = body.reason.trim();
     if reason.is_empty() || reason.len() > 1024 {
         return Err(status_400(
@@ -5445,7 +5492,7 @@ async fn ad_quarantine_recovery_review(
         computer_id,
         updated_at,
         reason,
-        &session.user_id,
+        &requester_principal,
     )
     .await
     .map_err(|error| {
@@ -5493,6 +5540,7 @@ async fn ad_quarantine_recovery_approve(
     if !check_human_signoff_permission(&session, "admin") {
         return Err(status_403());
     }
+    let approver_principal = authenticated_principal_id(&session)?.to_string();
     let review_id = Uuid::parse_str(&review_id).map_err(|_| status_404(&review_id))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -5527,17 +5575,20 @@ async fn ad_quarantine_recovery_approve(
             "quarantine recovery review is not pending and fresh",
         ));
     }
-    if review.requested_by == session.user_id {
+    if review.requested_by == approver_principal {
         return Err(status_409(
             "quarantine recovery requester cannot approve their own review",
         ));
     }
 
-    let approved =
-        crate::repos::ad_computers::approve_recovery_review(&mut tx, review_id, &session.user_id)
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| status_409("quarantine recovery review changed concurrently"))?;
+    let approved = crate::repos::ad_computers::approve_recovery_review(
+        &mut tx,
+        review_id,
+        &approver_principal,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("quarantine recovery review changed concurrently"))?;
     audit::record_audit_tx(
         &mut tx,
         &session,
@@ -5573,6 +5624,7 @@ async fn ad_quarantine_recovery_apply(
     if !check_human_signoff_permission(&session, "admin") {
         return Err(status_403());
     }
+    let applying_principal = authenticated_principal_id(&session)?.to_string();
     let review_id = Uuid::parse_str(&review_id).map_err(|_| status_404(&review_id))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -5611,7 +5663,7 @@ async fn ad_quarantine_recovery_apply(
             "quarantine recovery review is not approved and fresh",
         ));
     }
-    if review.requested_by == session.user_id {
+    if review.requested_by == applying_principal {
         return Err(status_409(
             "quarantine recovery requester cannot apply their own review",
         ));
@@ -6223,6 +6275,7 @@ async fn recertify_share_with_evidence(
     id: &str,
     evidence_id: &str,
 ) -> ApiResult {
+    let reviewer_principal = authenticated_principal_id(session)?.to_string();
     let (current, subject) = crate::repos::file_share_ntfs::lock_recertification_subject(tx, id)
         .await
         .map_err(db_error)?
@@ -6236,7 +6289,7 @@ async fn recertify_share_with_evidence(
             .await
             .map_err(db_error)?
     {
-        if existing.reviewer != session.user_id {
+        if existing.reviewer != reviewer_principal {
             return Err((
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -6267,7 +6320,7 @@ async fn recertify_share_with_evidence(
     let evaluation = file_share_ntfs::evaluate_share_recertification(
         &subject,
         Some(&evidence),
-        &session.user_id,
+        &reviewer_principal,
         now,
     );
     let decision = file_share_ntfs::RecertificationDecision {
@@ -6276,7 +6329,7 @@ async fn recertify_share_with_evidence(
         share_id: subject.share_id.clone(),
         share_version: subject.share_version,
         site: subject.site.clone(),
-        reviewer: session.user_id.clone(),
+        reviewer: reviewer_principal,
         reviewed_at: now.to_rfc3339(),
         evidence_source: evidence.source.clone(),
         acl_snapshot_version: evidence.acl_snapshot_version.clone(),
@@ -7352,7 +7405,8 @@ struct ShiftQueuePolicy {
 }
 
 impl ShiftQueuePolicy {
-    fn from_session(session: &AuthSession) -> Self {
+    fn from_session(session: &AuthSession) -> Option<Self> {
+        let principal = session.principal_id?.to_string();
         let normalize = |values: &[String]| {
             let mut result: Vec<String> = values
                 .iter()
@@ -7368,15 +7422,15 @@ impl ShiftQueuePolicy {
         let environments = normalize(&session.environment_scope);
         let all_sites = sites.is_empty();
         let all_environments = environments.is_empty();
-        Self {
+        Some(Self {
             sites,
             environments,
-            principal: session.user_id.clone(),
+            principal,
             all_sites,
             all_environments,
             allow_global: all_sites && all_environments,
             bypass_owner: check_permission(session, "admin"),
-        }
+        })
     }
 
     fn repository_access(&self) -> crate::repos::shift_queue::ShiftQueueAccess<'_> {
@@ -7396,7 +7450,7 @@ fn shift_queue_admit(session: &AuthSession) -> Result<ShiftQueuePolicy, (StatusC
     if !check_permission(session, "execute") {
         return Err(status_403());
     }
-    Ok(ShiftQueuePolicy::from_session(session))
+    ShiftQueuePolicy::from_session(session).ok_or_else(status_403)
 }
 
 fn shift_queue_limit(limit: Option<i64>) -> i64 {
@@ -7786,7 +7840,7 @@ async fn shift_acknowledge(
              acknowledged_at = $2, updated_at = $2 \
              WHERE id = $3 AND resolved = false AND acknowledged = false",
         )
-        .bind(&session.user_id)
+        .bind(&policy.principal)
         .bind(now)
         .bind(uid)
         .execute(&mut *tx)
@@ -7817,7 +7871,7 @@ async fn shift_acknowledge(
         return Ok(Json(json!({
             "status": "acknowledged",
             "id": id,
-            "acknowledged_by": session.user_id,
+            "acknowledged_by": &policy.principal,
             "acknowledged_at": now.to_rfc3339(),
             "source": "database",
         })));
@@ -7825,7 +7879,7 @@ async fn shift_acknowledge(
     if is_scoped(&session) {
         return Err(status_404(&id));
     }
-    shift_queue::acknowledge_item(&id, &session.user_id)
+    shift_queue::acknowledge_item(&id, &policy.principal)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -7872,7 +7926,7 @@ async fn shift_assign(
              WHERE id = $4 AND resolved = false",
         )
         .bind(&body.user)
-        .bind(&session.user_id)
+        .bind(&policy.principal)
         .bind(now)
         .bind(uid)
         .execute(&mut *tx)
@@ -7904,7 +7958,7 @@ async fn shift_assign(
             "status": "assigned",
             "id": id,
             "assigned_to": body.user,
-            "assigned_by": session.user_id,
+            "assigned_by": &policy.principal,
             "source": "database",
         })));
     }
@@ -8269,8 +8323,8 @@ async fn shift_my_items(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let user = match requested {
-        None => session.user_id.clone(),
-        Some(value) if value == session.user_id => session.user_id.clone(),
+        None => policy.principal.clone(),
+        Some(value) if value == policy.principal => policy.principal.clone(),
         Some(value) if check_permission(&session, "admin") => value.to_string(),
         Some(_) => return Err(status_403()),
     };
@@ -8636,6 +8690,17 @@ async fn emergency_initiate(
     Json(body): Json<EmergencyInitiateRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
     require_emergency_human_admin(&session, "EMERGENCY_INITIATE_FAILED")?;
+    let initiating_principal = session
+        .principal_id
+        .ok_or_else(|| {
+            problem_details(
+                StatusCode::FORBIDDEN,
+                "EMERGENCY_INITIATE_FAILED",
+                "break-glass operations require an opaque principal binding",
+                None::<&str>,
+            )
+        })?
+        .to_string();
     // Initiator = authenticated caller (from request extensions), never a
     // client body field — break-glass audit must name the real principal.
     // #2: scoped principals may only initiate in their own site; env-scoped
@@ -8683,7 +8748,7 @@ async fn emergency_initiate(
         .bind(id)
         .bind(&body.description)
         .bind(&body.systems)
-        .bind(&session.user_id)
+        .bind(&initiating_principal)
         .bind(&body.reason)
         .bind(&body.site)
         .bind(now)
@@ -8731,7 +8796,7 @@ async fn emergency_initiate(
             "source": "database",
             "change_id": id.to_string(),
             "status": "Initiated",
-            "initiated_by": session.user_id,
+            "initiated_by": &initiating_principal,
             "site": body.site,
             "created_at": now.to_rfc3339(),
             "dry_run": true,
@@ -8740,7 +8805,7 @@ async fn emergency_initiate(
     match emergency_change::initiate_emergency(
         &body.description,
         body.systems,
-        &session.user_id,
+        &initiating_principal,
         &body.reason,
         &body.site,
     ) {
@@ -8759,11 +8824,22 @@ async fn emergency_approve(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ProblemDetails> {
     require_emergency_human_admin(&session, "EMERGENCY_APPROVE_FAILED")?;
+    let approving_principal = session
+        .principal_id
+        .ok_or_else(|| {
+            problem_details(
+                StatusCode::FORBIDDEN,
+                "EMERGENCY_APPROVE_FAILED",
+                "break-glass operations require an opaque principal binding",
+                None::<&str>,
+            )
+        })?
+        .to_string();
     if let Some(pool) = get_db() {
         // #2: out-of-scope (or absent) -> the canonical 404 before the CAS.
         emergency_scope_preload_guard(pool, &session, &id, "EMERGENCY_APPROVE_FAILED").await?;
         let now = chrono::Utc::now();
-        let approved_by = session.user_id.clone();
+        let approved_by = approving_principal;
         let audit_entry = format!(
             "EMERGENCY human approval by {} at {}",
             approved_by,
@@ -10337,6 +10413,7 @@ async fn maintenance_calendar_schedule(
     // #2: a scoped principal may only schedule maintenance for its own site.
     guard_body_site_scope(&session, &body.site)?;
     if let Some(pool) = get_db() {
+        let created_by = authenticated_principal_id(&session)?.to_string();
         // 1. Pure validation — no store read, no push.
         let window = maintenance_calendar::validate_window_inputs(
             &body.site,
@@ -10388,7 +10465,7 @@ async fn maintenance_calendar_schedule(
         .bind(&window.end_time)
         .bind(&window.reason)
         .bind(&window.affected_cis)
-        .bind(&session.user_id)
+        .bind(&created_by)
         .fetch_one(pool)
         .await
         .map_err(db_error)?;
@@ -10724,6 +10801,7 @@ async fn patch_approve(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PatchActionRequest>,
 ) -> ApiResult {
+    let approver_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
@@ -10744,7 +10822,7 @@ async fn patch_approve(
     // approver = the authenticated caller, recorded in the wave's approval audit
     // trail (never a hardcoded string).
     let approved =
-        patch_engine::approve_patch_wave(&wave, &session.user_id).map_err(|e| status_409(&e))?;
+        patch_engine::approve_patch_wave(&wave, &approver_principal).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::patch_waves::transition(&mut tx, before, &approved, None)
@@ -11383,9 +11461,8 @@ async fn software_plan(
     AuthExtractor(session): AuthExtractor,
     Json(mut body): Json<software_deployment::DeploymentRequest>,
 ) -> ApiResult {
-    if session.user_id.trim().is_empty() || session.user_id != session.user_id.trim() {
-        return Err(status_403());
-    }
+    let principal_id = authenticated_principal_id(&session)?;
+    let principal = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let requested_server = body.server_name.clone();
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -11459,7 +11536,7 @@ async fn software_plan(
     body.environment = environment;
     body.package_id = package.id.clone();
     body.target_version = package.version.clone();
-    body.requester = session.user_id.clone();
+    body.requester = principal;
     let package_authority = software_deployment::DeploymentPackageAuthority {
         id: package.id.clone(),
         name: package.name.clone(),
@@ -11536,10 +11613,7 @@ async fn software_approve(
     // and injected into request extensions), never a client-supplied body field.
     // Audit integrity requires attributing the approval to the real principal —
     // a caller must not be able to claim someone else (or "admin") approved.
-    let approver = session.user_id.clone();
-    if approver.trim().is_empty() || approver != approver.trim() {
-        return Err(status_403());
-    }
+    let approver = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let Some(authorization) = lock_software_deployment_authorization(&mut tx, &id, &session)
@@ -12299,8 +12373,11 @@ mod os_baseline_scope_unit_tests {
     };
 
     fn session(role: &str, sites: &[&str], environments: &[&str]) -> AuthSession {
+        let principal_id =
+            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
         AuthSession {
-            user_id: format!("baseline-test-{role}"),
+            display_user_id: format!("baseline-test-{role}"),
+            principal_id: Some(principal_id),
             display_name: "Baseline Scope Test".into(),
             roles: vec![role.to_string()],
             token_valid: true,
@@ -12452,10 +12529,13 @@ mod os_baseline_handler_db_tests {
         Some(pool)
     }
 
-    fn operator(user_id: &str, site: Option<&str>) -> AuthSession {
+    fn operator(display_user_id: &str, site: Option<&str>) -> AuthSession {
+        let principal_id =
+            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
         AuthSession {
-            user_id: user_id.into(),
-            display_name: format!("Baseline Operator {user_id}"),
+            display_user_id: display_user_id.into(),
+            principal_id: Some(principal_id),
+            display_name: format!("Baseline Operator {display_user_id}"),
             roles: vec![APP_ROLE_WINTEL_LINUX_OPERATOR.to_string()],
             token_valid: true,
             actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
@@ -12465,8 +12545,8 @@ mod os_baseline_handler_db_tests {
         }
     }
 
-    fn requester(user_id: &str) -> AuthSession {
-        let mut session = operator(user_id, None);
+    fn requester(display_user_id: &str) -> AuthSession {
+        let mut session = operator(display_user_id, None);
         session.roles = vec![APP_ROLE_REQUESTER.to_string()];
         session
     }
@@ -12862,7 +12942,13 @@ mod os_baseline_handler_db_tests {
         .expect("read baseline audit");
         assert_eq!(audits.len(), 1, "one commit must append exactly one audit");
         let audit = &audits[0];
-        assert_eq!(audit.0, actor);
+        assert_eq!(
+            audit.0,
+            session
+                .principal_id
+                .expect("verified test operator has an opaque principal")
+                .to_string()
+        );
         assert_eq!(audit.1.as_deref(), Some(session.display_name.as_str()));
         assert_eq!(audit.2, session.roles);
         assert_eq!(audit.3, session.provider_mode);
@@ -13301,6 +13387,7 @@ async fn legal_hold_place(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: a scoped principal may only place a legal hold in its own site.
     guard_body_site_scope(&session, &req.site)?;
+    let initiating_principal = authenticated_principal_id(&session)?.to_string();
     // initiated_by = authenticated caller (from request extensions), never a client
     // body field — the hold audit must name the real principal.
     let hold_type = match req.hold_type.to_lowercase().as_str() {
@@ -13323,7 +13410,7 @@ async fn legal_hold_place(
         &req.target,
         hold_type,
         &req.reason,
-        &session.user_id,
+        &initiating_principal,
         &req.site,
     ) {
         Ok(hold) => hold,
@@ -13606,6 +13693,7 @@ async fn legal_hold_release(
     if !check_human_signoff_permission(&session, "execute") {
         return Err(status_403());
     }
+    let releasing_principal = authenticated_principal_id(&session)?.to_string();
     // released_by = authenticated caller (from request extensions), never a client
     // body field — the release audit must name the real principal.
     if let Some(pool) = get_db() {
@@ -13634,7 +13722,7 @@ async fn legal_hold_release(
         let audit_entry = serde_json::to_string(&serde_json::json!([{
             "timestamp": now,
             "action": "hold_released",
-            "by": session.user_id,
+            "by": &releasing_principal,
             "detail": "Hold released",
         }]))
         .unwrap_or_else(|_| "[]".into());
@@ -13648,7 +13736,7 @@ async fn legal_hold_release(
              RETURNING {LEGAL_HOLD_COLUMNS}"
         ))
         .bind(&id)
-        .bind(&session.user_id)
+        .bind(&releasing_principal)
         .bind(&now)
         .bind(audit_entry)
         .fetch_optional(&mut *tx)
@@ -13683,7 +13771,7 @@ async fn legal_hold_release(
     if is_scoped(&session) {
         return Err(status_503_no_db());
     }
-    match legal_hold::release_hold(&id, &session.user_id) {
+    match legal_hold::release_hold(&id, &releasing_principal) {
         Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
@@ -16201,13 +16289,14 @@ fn normalize_local_login_username(username: &str) -> Option<&str> {
 /// fixture tests; field changes break the portal DTO).
 fn local_login_response_body(
     session_token: &str,
+    principal_id: ryuki_core::PrincipalId,
     username: &str,
     roles: &[String],
     expires_at: &chrono::DateTime<chrono::Utc>,
 ) -> Value {
     json!({
         "session_token": session_token,
-        "user_id": username,
+        "user_id": principal_id,
         "display_name": username,
         "roles": roles,
         "token_valid": true,
@@ -16292,6 +16381,7 @@ async fn auth_local_login(
 
     let response_body = local_login_response_body(
         credential.bearer(),
+        created.principal_id,
         &user.username,
         &created.roles,
         &created.expires_at,
@@ -16324,10 +16414,9 @@ async fn auth_local_login(
 /// for the `session.logout` audit row before the row is deleted.
 #[derive(sqlx::FromRow)]
 struct LogoutSessionRow {
-    user_id: String,
+    principal_id: Uuid,
     display_name: String,
     roles: Vec<String>,
-    provider: String,
 }
 
 #[derive(Debug)]
@@ -16368,7 +16457,7 @@ async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure>
     let mut tx = pool.begin().await.map_err(LogoutFailure::Database)?;
     let row: Option<LogoutSessionRow> = sqlx::query_as(
         "DELETE FROM sessions WHERE bearer_verifier = $1 \
-         RETURNING user_id, display_name, roles, provider",
+         RETURNING principal_id, display_name, roles",
     )
     .bind(verifier.as_slice())
     .fetch_optional(&mut *tx)
@@ -16376,12 +16465,15 @@ async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure>
     .map_err(LogoutFailure::Database)?;
 
     if let Some(row) = row {
+        let principal_id = PrincipalId::from_uuid(row.principal_id)
+            .map_err(|_| LogoutFailure::AdmissionUnavailable)?;
         let actor = AuthSession {
-            user_id: row.user_id,
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             display_name: row.display_name,
             roles: row.roles,
             token_valid: true,
-            provider_mode: row.provider,
+            provider_mode: "persisted-session".into(),
             ..Default::default()
         };
         audit::record_audit_tx(
@@ -17182,6 +17274,7 @@ async fn aiops_review(
     if !check_human_signoff_permission(&session, "execute") {
         return Err(status_403());
     }
+    let reviewer_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let suggestion = crate::repos::aiops::get(pool, &id)
         .await
@@ -17198,7 +17291,7 @@ async fn aiops_review(
     let updated = crate::repos::aiops::review(
         pool,
         &id,
-        &session.user_id,
+        &reviewer_principal,
         session.actor_class,
         expected,
         &suggestion.site,
@@ -17429,8 +17522,11 @@ mod human_evidence_actor_gate_unit_tests {
     use ryuki_engine::auth::{ActorClass, APP_ROLE_PLATFORM_ADMIN};
 
     fn actor(actor_class: ActorClass, provider_mode: &str) -> AuthSession {
+        let principal_id =
+            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
         AuthSession {
-            user_id: "human-shaped-subject".into(),
+            display_user_id: "human-shaped-subject".into(),
+            principal_id: Some(principal_id),
             display_name: "Human Shaped Subject".into(),
             roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
@@ -17638,6 +17734,19 @@ fn require_verified_external_admin_permission(
     session: &AuthSession,
     auth_mode: &AuthMode,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
+    // Authentication failure is distinct from an authenticated principal that
+    // lacks the administrator role. Keep this check ahead of coarse RBAC so an
+    // absent/stale principal binding is always reported as re-authentication,
+    // never as a role oracle.
+    if !session.is_verified_human() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError::new(
+                "VERIFIED_ADMIN_REQUIRED",
+                "Verified external admin authentication is required for platform settings writes",
+            )),
+        ));
+    }
     require_admin_permission(session)?;
     if is_interactive_external_admin(session) {
         return Ok(());
@@ -18084,9 +18193,6 @@ fn generate_api_token() -> String {
 struct CreateTokenRequest {
     /// Operator-facing credential name stored with the token metadata.
     name: String,
-    /// Audited actor for the credential. Until a governed service-principal
-    /// registry exists this must exactly equal the authenticated human subject.
-    owner_principal: String,
     #[serde(default)]
     /// Application role names from `GET /api/admin/rbac-roles`; unknown names
     /// are rejected with `400 UNKNOWN_ROLE`.
@@ -18193,7 +18299,7 @@ fn token_authority_is_bounded_by_issuer(
         return false;
     };
     session.is_verified_human()
-        && authority.subject == session.user_id
+        && session.principal_id == Some(authority.principal_binding.principal_id)
         && authority.roles == session_roles
         && authority.site_scope == session.site_scope
         && authority.environment_scope == session.environment_scope
@@ -18259,7 +18365,7 @@ fn api_token_db_required() -> (StatusCode, Json<ApiError>) {
 struct TokenListRow {
     id: Uuid,
     name: String,
-    owner_principal: String,
+    issuing_principal_id: Option<Uuid>,
     roles: Vec<String>,
     site_scope: Option<String>,
     environment_scope: Option<String>,
@@ -18300,6 +18406,9 @@ async fn admin_tokens_create(
             )),
         ));
     }
+    let issuing_authority = issuing_authority
+        .as_ref()
+        .ok_or_else(token_authority_exceeds_caller_problem)?;
 
     if let Some(unknown) = find_unknown_role(&body.roles) {
         return Err((
@@ -18308,16 +18417,6 @@ async fn admin_tokens_create(
                 "UNKNOWN_ROLE",
                 "Requested role is not a known application role",
                 unknown.to_string(),
-            )),
-        ));
-    }
-
-    if body.owner_principal != session.user_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::new(
-                "TOKEN_ACTOR_MISMATCH",
-                "API token actor must equal the authenticated issuing subject",
             )),
         ));
     }
@@ -18360,19 +18459,14 @@ async fn admin_tokens_create(
     let auth_mode = crate::config_store::get_app_config().auth_mode.clone();
     let token_valid =
         matches!(auth_mode, AuthMode::EntraId | AuthMode::Local) && session.token_valid;
-    if token_valid {
-        let authority = issuing_authority
-            .as_ref()
-            .ok_or_else(token_authority_exceeds_caller_problem)?;
-        if !token_authority_is_bounded_by_issuer(
-            &session,
-            authority,
-            &requested_roles,
-            &requested_site_scope.values,
-            &requested_environment_scope.values,
-        ) {
-            return Err(token_authority_exceeds_caller_problem());
-        }
+    if !token_authority_is_bounded_by_issuer(
+        &session,
+        issuing_authority,
+        &requested_roles,
+        &requested_site_scope.values,
+        &requested_environment_scope.values,
+    ) {
+        return Err(token_authority_exceeds_caller_problem());
     }
 
     // Parse syntax before touching the database, then bind every lifetime
@@ -18432,89 +18526,42 @@ async fn admin_tokens_create(
     let plaintext = generate_api_token();
     let token_hash = crate::sha256_hex(&plaintext);
 
-    if let Some(authority) = &issuing_authority {
-        map_api_token_result(
-            crate::human_authority::prepare_writer_tx(
-                &mut tx,
-                &authority.provider,
-                &authority.issuer,
-                &authority.subject,
-            )
-            .await,
-            "create-authority-lock",
-        )?;
-    }
-    let issued_by_roles = issuing_authority
-        .as_ref()
-        .map(|authority| authority.roles.clone())
-        .unwrap_or_default();
-    let issued_by_site_scope = issuing_authority
-        .as_ref()
-        .map(|authority| authority.site_scope.clone())
-        .unwrap_or_default();
-    let issued_by_environment_scope = issuing_authority
-        .as_ref()
-        .map(|authority| authority.environment_scope.clone())
-        .unwrap_or_default();
+    map_api_token_result(
+        crate::human_authority::prepare_writer_tx(
+            &mut tx,
+            &issuing_authority.provider,
+            &issuing_authority.issuer,
+            &issuing_authority.subject,
+        )
+        .await,
+        "create-authority-lock",
+    )?;
+    let principal_binding = issuing_authority.principal_binding;
     let row: TokenListRow = map_api_token_result(
         sqlx::query_as::<_, TokenListRow>(
             "INSERT INTO api_tokens \
-             (name, owner_principal, token_hash, roles, site_scope, environment_scope, \
-              token_valid, expires_at, issued_by_provider, issued_by_issuer, issued_by_subject, \
-              issued_by_identity_epoch, issued_by_human_authority_version, issued_by_roles, \
-              issued_by_site_authority_mode, issued_by_site_scope, \
-              issued_by_environment_authority_mode, issued_by_environment_scope) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18) \
-             RETURNING id, name, owner_principal, roles, site_scope, environment_scope, \
+             (name, token_hash, roles, site_scope, environment_scope, token_valid, expires_at, \
+              issuing_principal_id, issuing_principal_lifecycle_version, \
+              issuing_principal_authority_version, principal_key_id, principal_key_version, \
+              principal_link_id, principal_link_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             RETURNING id, name, issuing_principal_id, roles, site_scope, environment_scope, \
                        token_valid, created_at, expires_at, last_used_at, revoked_at",
         )
         .bind(&body.name)
-        .bind(&body.owner_principal)
         .bind(&token_hash)
         .bind(&requested_roles)
         .bind(&requested_site_scope.persisted)
         .bind(&requested_environment_scope.persisted)
         .bind(token_valid)
         .bind(expires_at)
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.provider.as_str()),
-        )
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.issuer.as_str()),
-        )
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.subject.as_str()),
-        )
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.identity_epoch),
-        )
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.assignment_version),
-        )
-        .bind(&issued_by_roles)
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.site_mode.as_db()),
-        )
-        .bind(&issued_by_site_scope)
-        .bind(
-            issuing_authority
-                .as_ref()
-                .map(|authority| authority.environment_mode.as_db()),
-        )
-        .bind(&issued_by_environment_scope)
+        .bind(principal_binding.principal_id.into_uuid())
+        .bind(principal_binding.principal_lifecycle_version)
+        .bind(principal_binding.principal_authority_version)
+        .bind(principal_binding.principal_key_id)
+        .bind(principal_binding.principal_key_version)
+        .bind(principal_binding.principal_link_id)
+        .bind(principal_binding.principal_link_version)
         .fetch_one(&mut *tx)
         .await,
         "create",
@@ -18532,7 +18579,7 @@ async fn admin_tokens_create(
                 json!({
                     "token_id": row.id,
                     "name": row.name,
-                    "owner_principal": row.owner_principal,
+                    "issuing_principal_id": row.issuing_principal_id,
                     "roles": row.roles,
                     "site_scope": row.site_scope,
                     "environment_scope": row.environment_scope,
@@ -18548,11 +18595,11 @@ async fn admin_tokens_create(
 
     // Audit line: actor + action + token metadata. NEVER the plaintext or hash.
     tracing::info!(
-        actor = %session.user_id,
+        actor = %session.display_user_id,
         action = "api-token-create",
         token_id = %row.id,
         token_name = %row.name,
-        owner_principal = %row.owner_principal,
+        issuing_principal_id = ?row.issuing_principal_id,
         roles = ?row.roles,
         site_scope = ?row.site_scope,
         environment_scope = ?row.environment_scope,
@@ -18570,7 +18617,7 @@ async fn admin_tokens_create(
         Json(json!({
             "id": row.id,
             "name": row.name,
-            "owner_principal": row.owner_principal,
+            "issuing_principal_id": row.issuing_principal_id,
             "roles": row.roles,
             "site_scope": row.site_scope,
             "environment_scope": row.environment_scope,
@@ -18617,7 +18664,7 @@ async fn admin_tokens_list(
 
     let rows: Vec<TokenListRow> = map_api_token_result(
         sqlx::query_as::<_, TokenListRow>(
-            "SELECT id, name, owner_principal, roles, site_scope, environment_scope, \
+            "SELECT id, name, issuing_principal_id, roles, site_scope, environment_scope, \
                     token_valid, created_at, expires_at, last_used_at, revoked_at \
              FROM api_tokens ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
         )
@@ -18655,7 +18702,7 @@ fn token_row_to_json(row: TokenListRow) -> Value {
     json!({
         "id": row.id,
         "name": row.name,
-        "owner_principal": row.owner_principal,
+        "issuing_principal_id": row.issuing_principal_id,
         "roles": row.roles,
         "site_scope": row.site_scope,
         "environment_scope": row.environment_scope,
@@ -18683,7 +18730,7 @@ async fn admin_tokens_get(
     };
     let row: Option<TokenListRow> = map_api_token_result(
         sqlx::query_as::<_, TokenListRow>(
-            "SELECT id, name, owner_principal, roles, site_scope, environment_scope, \
+            "SELECT id, name, issuing_principal_id, roles, site_scope, environment_scope, \
                     token_valid, created_at, expires_at, last_used_at, revoked_at \
              FROM api_tokens WHERE id = $1",
         )
@@ -18715,20 +18762,23 @@ async fn admin_tokens_revoke(
     };
 
     let mut tx = map_api_token_result(pool.begin().await, "revoke-begin")?;
-    // Read provenance without locking the token row. The shared writer order is
-    // authority identity -> assignment -> credential; taking the token lock
-    // first would invert lifecycle invalidation and could deadlock.
-    let provenance: Option<(Option<String>, Option<String>, Option<String>)> =
-        map_api_token_result(
-            sqlx::query_as(
-                "SELECT issued_by_provider, issued_by_issuer, issued_by_subject \
-                 FROM api_tokens WHERE id = $1 AND revoked_at IS NULL",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await,
-            "revoke-provenance",
-        )?;
+    // Read the provider-qualified key only as lock-order provenance. The
+    // credential owner is the opaque issuing_principal_id, and the update
+    // trigger revalidates its exact principal/key/link generations.
+    let provenance: Option<(String, String, String)> = map_api_token_result(
+        sqlx::query_as(
+            "SELECT k.provider_id, k.issuer, k.subject \
+             FROM api_tokens t \
+             JOIN principal_keys k \
+               ON k.principal_key_id = t.principal_key_id \
+              AND k.key_version = t.principal_key_version \
+             WHERE t.id = $1 AND t.revoked_at IS NULL AND t.token_valid",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await,
+        "revoke-provenance",
+    )?;
     let Some((provider, issuer, subject)) = provenance else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -18738,23 +18788,10 @@ async fn admin_tokens_revoke(
             )),
         ));
     };
-    match (provider, issuer, subject) {
-        (Some(provider), Some(issuer), Some(subject)) => {
-            map_api_token_result(
-                crate::human_authority::prepare_writer_tx(&mut tx, &provider, &issuer, &subject)
-                    .await,
-                "revoke-authority-lock",
-            )?;
-        }
-        (None, None, None) => {
-            // Pre-v182 inactive evidence rows have no human provenance and the
-            // database trigger permits only their monotonic revocation.
-        }
-        _ => {
-            tracing::error!(token_id = %id, "API token has partial issuing provenance");
-            return Err(api_token_persistence_problem());
-        }
-    }
+    map_api_token_result(
+        crate::human_authority::prepare_writer_tx(&mut tx, &provider, &issuer, &subject).await,
+        "revoke-authority-lock",
+    )?;
     let result = map_api_token_result(
         sqlx::query(
             "UPDATE api_tokens SET token_valid = FALSE, revoked_at = NOW() \
@@ -18795,7 +18832,7 @@ async fn admin_tokens_revoke(
     map_api_token_result(tx.commit().await, "revoke-commit")?;
 
     tracing::info!(
-        actor = %session.user_id,
+        actor = %session.display_user_id,
         action = "api-token-revoke",
         token_id = %id,
         "api token revoked"
@@ -18807,10 +18844,10 @@ async fn admin_tokens_revoke(
 #[derive(sqlx::FromRow)]
 struct SessionListRow {
     id: Uuid,
-    user_id: String,
+    principal_id: Uuid,
     display_name: String,
     roles: Vec<String>,
-    provider: String,
+    provider_id: String,
     created_at: chrono::DateTime<chrono::Utc>,
     expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -18834,9 +18871,33 @@ async fn admin_sessions_list(
 
     let rows: Vec<SessionListRow> = map_api_token_result(
         sqlx::query_as::<_, SessionListRow>(
-            "SELECT session_record_id AS id, user_id, display_name, roles, provider, created_at, expires_at \
-             FROM sessions WHERE expires_at > NOW() \
-             ORDER BY created_at DESC, session_record_id DESC \
+            "SELECT s.session_record_id AS id, s.principal_id, s.display_name, s.roles, \
+                    k.provider_id, s.created_at, s.expires_at \
+             FROM sessions s \
+             JOIN principal_keys k \
+               ON k.principal_key_id = s.principal_key_id \
+              AND k.key_version = s.principal_key_version \
+             JOIN principal_links l \
+               ON l.principal_link_id = s.principal_link_id \
+              AND l.link_version = s.principal_link_version \
+              AND l.principal_key_id = s.principal_key_id \
+              AND l.principal_id = s.principal_id \
+             JOIN principals p \
+               ON p.principal_id = s.principal_id \
+              AND p.lifecycle_version = s.principal_lifecycle_version \
+              AND p.authority_version = s.principal_authority_version \
+             WHERE s.expires_at > NOW() AND k.key_state = 'active' \
+               AND l.link_state = 'active' AND p.lifecycle_state = 'active' \
+               AND p.principal_kind = 'human' \
+               AND cardinality(s.roles) > 0 AND s.roles <@ p.role_allowlist \
+               AND (p.site_authority_mode = 'global' OR ( \
+                    s.site_authority_mode = 'scoped' AND s.site_scope <@ p.site_scope)) \
+               AND (p.environment_authority_mode = 'global' OR ( \
+                    s.environment_authority_mode = 'scoped' \
+                    AND s.environment_scope <@ p.environment_scope)) \
+               AND NOT EXISTS (SELECT 1 FROM principal_provider_tombstones t \
+                               WHERE t.provider_id = k.provider_id) \
+             ORDER BY s.created_at DESC, s.session_record_id DESC \
              LIMIT $1 OFFSET $2",
         )
         .bind(limit)
@@ -18849,9 +18910,35 @@ async fn admin_sessions_list(
     // Filtered total (same WHERE, no limit/offset) so pagination reflects the
     // filtered (active-only) set rather than the whole table.
     let total: i64 = map_api_token_result(
-        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE expires_at > NOW()")
-            .fetch_one(pool)
-            .await,
+        sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM sessions s \
+             JOIN principal_keys k \
+               ON k.principal_key_id = s.principal_key_id \
+              AND k.key_version = s.principal_key_version \
+             JOIN principal_links l \
+               ON l.principal_link_id = s.principal_link_id \
+              AND l.link_version = s.principal_link_version \
+              AND l.principal_key_id = s.principal_key_id \
+              AND l.principal_id = s.principal_id \
+             JOIN principals p \
+               ON p.principal_id = s.principal_id \
+              AND p.lifecycle_version = s.principal_lifecycle_version \
+              AND p.authority_version = s.principal_authority_version \
+             WHERE s.expires_at > NOW() AND k.key_state = 'active' \
+               AND l.link_state = 'active' AND p.lifecycle_state = 'active' \
+               AND p.principal_kind = 'human' \
+               AND cardinality(s.roles) > 0 AND s.roles <@ p.role_allowlist \
+               AND (p.site_authority_mode = 'global' OR ( \
+                    s.site_authority_mode = 'scoped' AND s.site_scope <@ p.site_scope)) \
+               AND (p.environment_authority_mode = 'global' OR ( \
+                    s.environment_authority_mode = 'scoped' \
+                    AND s.environment_scope <@ p.environment_scope)) \
+               AND NOT EXISTS (SELECT 1 FROM principal_provider_tombstones t \
+                               WHERE t.provider_id = k.provider_id)",
+        )
+        .fetch_one(pool)
+        .await,
         "list-sessions-count",
     )?;
 
@@ -18860,10 +18947,10 @@ async fn admin_sessions_list(
         .map(|row| {
             json!({
                 "id": row.id,
-                "user_id": row.user_id,
+                "principal_id": row.principal_id,
                 "display_name": row.display_name,
                 "roles": row.roles,
-                "provider": row.provider,
+                "provider_id": row.provider_id,
                 "created_at": row.created_at,
                 "expires_at": row.expires_at,
             })
@@ -18895,8 +18982,32 @@ async fn admin_sessions_get(
 
     let row: Option<SessionListRow> = map_api_token_result(
         sqlx::query_as::<_, SessionListRow>(
-            "SELECT session_record_id AS id, user_id, display_name, roles, provider, created_at, expires_at \
-             FROM sessions WHERE session_record_id = $1",
+            "SELECT s.session_record_id AS id, s.principal_id, s.display_name, s.roles, \
+                    k.provider_id, s.created_at, s.expires_at \
+             FROM sessions s \
+             JOIN principal_keys k \
+               ON k.principal_key_id = s.principal_key_id \
+              AND k.key_version = s.principal_key_version \
+             JOIN principal_links l \
+               ON l.principal_link_id = s.principal_link_id \
+              AND l.link_version = s.principal_link_version \
+              AND l.principal_key_id = s.principal_key_id \
+              AND l.principal_id = s.principal_id \
+             JOIN principals p \
+               ON p.principal_id = s.principal_id \
+              AND p.lifecycle_version = s.principal_lifecycle_version \
+              AND p.authority_version = s.principal_authority_version \
+             WHERE s.session_record_id = $1 AND k.key_state = 'active' \
+               AND l.link_state = 'active' AND p.lifecycle_state = 'active' \
+               AND p.principal_kind = 'human' \
+               AND cardinality(s.roles) > 0 AND s.roles <@ p.role_allowlist \
+               AND (p.site_authority_mode = 'global' OR ( \
+                    s.site_authority_mode = 'scoped' AND s.site_scope <@ p.site_scope)) \
+               AND (p.environment_authority_mode = 'global' OR ( \
+                    s.environment_authority_mode = 'scoped' \
+                    AND s.environment_scope <@ p.environment_scope)) \
+               AND NOT EXISTS (SELECT 1 FROM principal_provider_tombstones t \
+                               WHERE t.provider_id = k.provider_id)",
         )
         .bind(id)
         .fetch_optional(pool)
@@ -18907,10 +19018,10 @@ async fn admin_sessions_get(
     match row {
         Some(row) => Ok(Json(json!({
             "id": row.id,
-            "user_id": row.user_id,
+            "principal_id": row.principal_id,
             "display_name": row.display_name,
             "roles": row.roles,
-            "provider": row.provider,
+            "provider_id": row.provider_id,
             "created_at": row.created_at,
             "expires_at": row.expires_at,
         }))),
@@ -18936,12 +19047,12 @@ async fn admin_sessions_revoke(
     };
 
     let mut tx = map_api_token_result(pool.begin().await, "revoke-session-begin")?;
-    // RETURNING the subject so the audit row names WHOSE session was revoked,
-    // not just the opaque session id.
-    let revoked: Option<(String, String, Vec<u8>)> = map_api_token_result(
-        sqlx::query_as::<_, (String, String, Vec<u8>)>(
+    // RETURNING the opaque principal so the audit row identifies whose
+    // session was revoked without promoting provider subject provenance.
+    let revoked: Option<(Uuid, String, Vec<u8>)> = map_api_token_result(
+        sqlx::query_as::<_, (Uuid, String, Vec<u8>)>(
             "DELETE FROM sessions WHERE session_record_id = $1 \
-             RETURNING user_id, display_name, bearer_verifier",
+             RETURNING principal_id, display_name, bearer_verifier",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -18949,7 +19060,7 @@ async fn admin_sessions_revoke(
         "revoke-session",
     )?;
 
-    let Some((subject_user, subject_display, bearer_verifier)) = revoked else {
+    let Some((subject_principal_id, subject_display, bearer_verifier)) = revoked else {
         // Tx rolls back on drop — no session deleted, no audit row.
         return Err((
             StatusCode::NOT_FOUND,
@@ -18968,7 +19079,7 @@ async fn admin_sessions_revoke(
                 "revoked",
                 json!({
                     "session_record_id": id,
-                    "subject_user": subject_user,
+                    "subject_principal_id": subject_principal_id,
                     "subject_display": subject_display,
                 }),
             ),
@@ -18980,7 +19091,7 @@ async fn admin_sessions_revoke(
     crate::session_lookup_admission::mark_negative_global(&bearer_verifier);
 
     tracing::info!(
-        actor = %session.user_id,
+        actor = %session.display_user_id,
         action = "session-revoke",
         session_record_id = %id,
         "session revoked by admin"
@@ -19187,11 +19298,14 @@ mod functional_operation_capability_tests {
     use super::*;
 
     fn session_for(role: &str) -> AuthSession {
+        let principal_id = PrincipalId::from_uuid(Uuid::new_v4()).expect("non-nil test principal");
         AuthSession {
-            user_id: "functional-capability-test".to_string(),
+            display_user_id: "functional-capability-test".to_string(),
+            principal_id: Some(principal_id),
             display_name: "Functional Capability Test".to_string(),
             roles: vec![role.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "test-provider".to_string(),
             ..AuthSession::default()
         }
@@ -19492,6 +19606,7 @@ async fn apply_transition_audited(
         &current.environment,
         &uid.to_string(),
     )?;
+    let actor_principal = authenticated_principal_id(session)?.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
 
     // The CAS binds status, approval epoch, and the database-owned resource
@@ -19601,7 +19716,7 @@ async fn apply_transition_audited(
                     aggregate_id: &aggregate_id,
                     site: Some(&row.site),
                     environment: Some(&row.environment),
-                    actor: &session.user_id,
+                    actor: &actor_principal,
                     payload: json!({
                         "to_status": "request-concluded-before-dispatch",
                         "platform": job.platform,
@@ -19670,6 +19785,8 @@ async fn commit_transition_side_effects(
     approval_basis_resource_version: Option<i64>,
     notify_owner: bool,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    let actor_principal_id = authenticated_principal_id(session)?;
+    let actor_principal = actor_principal_id.to_string();
     audit::record_audit_tx(
         &mut tx,
         session,
@@ -19695,9 +19812,17 @@ async fn commit_transition_side_effects(
     if let (Some(role), Some(decision)) = (approval_role, approval_decision) {
         let inserted = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor, reason, \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version, reason, \
                   approval_basis_resource_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             SELECT $1, $2, $3, $4, 'exact-v1', p.principal_id, \
+                    p.lifecycle_version, p.authority_version, $5, $6 \
+             FROM principals p \
+             WHERE p.principal_id = $7 \
+               AND p.lifecycle_state = 'active' \
+               AND p.principal_kind = 'human' \
+               AND $3::text = ANY(p.role_allowlist) \
              ON CONFLICT (request_id, approval_epoch, role) \
              DO NOTHING",
         )
@@ -19705,9 +19830,9 @@ async fn commit_transition_side_effects(
         .bind(row.approval_epoch)
         .bind(role)
         .bind(decision)
-        .bind(&session.user_id)
         .bind(approval_reason)
         .bind(approval_basis_resource_version)
+        .bind(actor_principal_id.into_uuid())
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -19732,7 +19857,7 @@ async fn commit_transition_side_effects(
             aggregate_id: request_id,
             site: Some(&row.site),
             environment: Some(&row.environment),
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "from_status": from_status,
                 "to_status": &row.status,
@@ -19812,6 +19937,8 @@ async fn apply_approval_decision_audited(
     if approval_role_for(session).as_deref() != Some(role) {
         return Err(ordinary_approval_role_required());
     }
+    let actor_principal_id = authenticated_principal_id(session)?;
+    let actor_principal = actor_principal_id.to_string();
 
     let request_id = uid.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -19838,6 +19965,10 @@ async fn apply_approval_decision_audited(
             "the request changed after it was reviewed; refresh before approving",
         ));
     }
+    if current.requester_principal_id == Some(actor_principal_id.into_uuid()) {
+        tx.rollback().await.ok();
+        return Err(status_403());
+    }
     // Validate the approval on the LOCKED row via the engine's from-status guard:
     // a non-Planned (terminal / already-decided) request yields the engine's clear
     // 400 ("Cannot approve request in status ..."), NOT a misleading 409. Running it
@@ -19846,7 +19977,7 @@ async fn apply_approval_decision_audited(
     // persisted partial and cannot drop their route/evidence. Before the idempotent
     // short-circuit so re-approving a non-approvable request still 400s.
     let request = db_row_to_request(&current, &request_id);
-    let approved = match request_lifecycle::approve_request(&request, &session.user_id) {
+    let approved = match request_lifecycle::approve_request(&request, &actor_principal) {
         Ok(a) => a,
         Err(e) => {
             tx.rollback().await.ok();
@@ -19856,9 +19987,18 @@ async fn apply_approval_decision_audited(
 
     let req = current.required_approval_roles.max(1) as usize;
 
-    let decision_sql = "SELECT role, decision, actor FROM request_approval_decisions \
-         WHERE request_id = $1 AND approval_epoch = $2 \
-           AND approval_basis_resource_version = $3";
+    let decision_sql = "SELECT d.role, d.decision, d.actor_principal_id::text \
+         FROM request_approval_decisions d \
+         JOIN principals p \
+           ON p.principal_id = d.actor_principal_id \
+          AND p.lifecycle_version = d.actor_principal_lifecycle_version \
+          AND p.authority_version = d.actor_principal_authority_version \
+          AND p.lifecycle_state = 'active' \
+          AND p.principal_kind = 'human' \
+          AND d.role = ANY(p.role_allowlist) \
+         WHERE d.request_id = $1 AND d.approval_epoch = $2 \
+           AND d.approval_basis_resource_version = $3 \
+           AND d.principal_binding_state = 'exact-v1'";
     let to_decisions = |rows: Vec<(String, String, String)>| -> Vec<ApprovalDecision> {
         // Destructure to distinct names so the per-decision role is never confused
         // with the session's `role` used in the short-circuit comparison below.
@@ -19899,17 +20039,25 @@ async fn apply_approval_decision_audited(
     // writer won after the read and must abort this whole transaction.
     let inserted = sqlx::query(
         "INSERT INTO request_approval_decisions \
-             (request_id, approval_epoch, role, decision, actor, reason, \
+             (request_id, approval_epoch, role, decision, principal_binding_state, \
+              actor_principal_id, actor_principal_lifecycle_version, \
+              actor_principal_authority_version, reason, \
               approval_basis_resource_version) \
-         VALUES ($1, $2, $3, 'approved', $4, NULL, $5) \
+         SELECT $1, $2, $3, 'approved', 'exact-v1', p.principal_id, \
+                p.lifecycle_version, p.authority_version, NULL, $4 \
+         FROM principals p \
+         WHERE p.principal_id = $5 \
+           AND p.lifecycle_state = 'active' \
+           AND p.principal_kind = 'human' \
+           AND $3::text = ANY(p.role_allowlist) \
          ON CONFLICT (request_id, approval_epoch, role) \
          DO NOTHING",
     )
     .bind(uid)
     .bind(current.approval_epoch)
     .bind(role)
-    .bind(&session.user_id)
     .bind(current.resource_version)
+    .bind(actor_principal_id.into_uuid())
     .execute(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -20093,7 +20241,7 @@ async fn record_local_transition(
     from_stage: Option<&str>,
     to_status: &str,
     to_stage: &str,
-) {
+) -> Result<(), (StatusCode, Json<Value>)> {
     audit::record_audit_local(
         session,
         &AuditRecord {
@@ -20107,7 +20255,9 @@ async fn record_local_transition(
             outcome: "applied",
         },
     )
-    .await;
+    .await
+    .map(|_| ())
+    .map_err(db_error)
 }
 
 fn map_engine_error(e: String) -> (StatusCode, Json<Value>) {
@@ -20379,6 +20529,8 @@ async fn requests_create(
         .await;
         return Err(status_403());
     }
+    let principal_id = authenticated_principal_id(&session)?;
+    let principal = principal_id.to_string();
     // Canonicalize before the scope check and persistence. Site scopes use the
     // same exact uppercase key, so case aliases cannot bypass or accidentally
     // fail authorization.
@@ -20405,14 +20557,14 @@ async fn requests_create(
         "standard",
     )
     .map_err(map_engine_error)?;
-    // Anchor the requester to the VERIFIED session principal, not the
-    // client-supplied name. The DB path uses created_by=session.user_id; the
+    // Anchor the requester to the verified opaque session principal, not the
+    // client-supplied name. The DB path writes the typed principal UUID; the
     // in-memory (no-DB) path must match so the cancel SoD check ("requester ==
     // caller") cannot be forged by setting the request name. Owner mirrors the
     // requester so the create response matches the persisted (created_by-backed)
     // value rather than echoing the request name.
-    request.requester = session.user_id.clone();
-    request.owner = session.user_id.clone();
+    request.requester = principal.clone();
+    request.owner = principal;
     // Populate metadata from the allowlisted per-type intake fields so resolver
     // logic (OS-based offering discrimination) is available on the in-memory
     // path. Matches `payload_to_metadata` on the DB path — only METADATA_ALLOWLIST
@@ -20450,14 +20602,17 @@ async fn requests_create(
         let stages_json = serde_json::to_value(&request.stages).unwrap_or_else(|_| json!([]));
         let approval_route_json =
             serde_json::to_value(&request.approval_route).unwrap_or_else(|_| json!([]));
-        // created_by is the VERIFIED requester principal from the session — it
-        // is the requester anchor the cancel SoD check matches against. Never a
-        // client-supplied value. requester/owner mirror it (the SoD anchor).
+        // All three security identities are the same exact opaque principal at
+        // intake. The compatibility TEXT columns are database-owned UUID-text
+        // projections; provider subject/display provenance is never written as
+        // authorization identity.
         let row = sqlx::query_as::<_, DbRequestRow>(&format!(
             "INSERT INTO requests \
-             (request_type, site, environment, name, cpu, memory_gb, justification, created_by, \
-              payload, stages, approval_route, criticality, requester, owner) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $8, $8) \
+             (request_type, site, environment, name, cpu, memory_gb, justification, \
+              payload, stages, approval_route, criticality, principal_binding_state, \
+              created_by_principal_id, requester_principal_id, owner_principal_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, \
+                     $11, 'exact-v1', $12, $12, $12) \
              RETURNING {REQUEST_COLUMNS}"
         ))
         .bind(&body.request_type)
@@ -20467,11 +20622,11 @@ async fn requests_create(
         .bind(cpu_i32)
         .bind(memory_i32)
         .bind(&body.justification)
-        .bind(&session.user_id)
         .bind(&payload)
         .bind(&stages_json)
         .bind(&approval_route_json)
         .bind(criticality)
+        .bind(principal_id.into_uuid())
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -20579,7 +20734,8 @@ async fn requests_create(
             outcome: "applied",
         },
     )
-    .await;
+    .await
+    .map_err(db_error)?;
     Ok(Json(serde_json::to_value(&request).unwrap_or_default()))
 }
 
@@ -20790,12 +20946,12 @@ fn request_is_owned_by(principal: &str, requester: Option<&str>, created_by: Opt
 /// the existing broad operational view. A request-only principal is constrained
 /// to its own verified principal id. Any other direct handler caller fails closed;
 /// the normal router gate already rejects that case before reaching this code.
-fn request_read_owner(session: &AuthSession) -> Result<Option<&str>, (StatusCode, Json<Value>)> {
+fn request_read_owner(session: &AuthSession) -> Result<Option<String>, (StatusCode, Json<Value>)> {
     if check_permission(session, "audit") {
         return Ok(None);
     }
-    if check_permission(session, "request") && !session.user_id.trim().is_empty() {
-        return Ok(Some(session.user_id.as_str()));
+    if check_permission(session, "request") {
+        return Ok(Some(authenticated_principal_id(session)?.to_string()));
     }
     Err(status_403())
 }
@@ -20810,15 +20966,14 @@ fn request_owner_guard_or_404(
 ) -> Result<(), (StatusCode, Json<Value>)> {
     match request_read_owner(session)? {
         None => Ok(()),
-        Some(principal) if request_is_owned_by(principal, requester, created_by) => Ok(()),
+        Some(principal) if request_is_owned_by(&principal, requester, created_by) => Ok(()),
         Some(_) => Err(status_404(request_id)),
     }
 }
 
-/// SQL equivalent of [`authoritative_requester`]. Keep this expression shared
-/// by the page and count queries so pagination metadata cannot widen visibility.
-const REQUEST_OWNER_SQL: &str =
-    "COALESCE(NULLIF(BTRIM(requester), ''), NULLIF(BTRIM(created_by), ''))";
+/// Exact opaque requester binding used by both the page and count queries so
+/// pagination metadata cannot widen object visibility.
+const REQUEST_OWNER_SQL: &str = "requester_principal_id";
 
 /// Map a client `sort` value to an ALLOWLISTED column name. Never interpolate a
 /// raw client string into SQL — an unknown value falls back to `created_at`, so
@@ -20918,6 +21073,27 @@ async fn requests_list(
     Query(params): Query<RequestListParams>,
 ) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let request_owner = request_read_owner(&session)?;
+    // Continuation cursors are bound to the admitted opaque principal. The
+    // deliberately credential-free dry-run administrator has no principal by
+    // design, so bind its non-authoritative demo cursor to a fixed mode key;
+    // request-only access can never reach this exception.
+    let session_principal = match session.principal_id {
+        Some(principal_id) => principal_id.to_string(),
+        None if request_owner.is_none()
+            && matches!(
+                session.actor_class,
+                ryuki_engine::auth::ActorClass::Simulated
+            )
+            && !session.token_valid
+            && matches!(
+                session.provider_mode.as_str(),
+                "static-dry-run" | "mock-dry-run"
+            ) =>
+        {
+            "simulated-dry-run".to_string()
+        }
+        None => return Err(status_403()),
+    };
     // Blank filters are treated as "no filter".
     let norm = |o: &Option<String>| {
         o.as_deref()
@@ -20961,8 +21137,8 @@ async fn requests_list(
     }
     let offset = bounded_request_list_offset(raw_offset).map_err(status_400)?;
     let cursor_scope = request_list_cursor_scope(&[
-        Some(session.user_id.as_str()),
-        request_owner,
+        Some(session_principal.as_str()),
+        request_owner.as_deref(),
         f_status.as_deref(),
         f_site.as_deref(),
         f_env.as_deref(),
@@ -21000,7 +21176,7 @@ async fn requests_list(
             ("site", &f_site),
             ("environment", &f_env),
             ("request_type", &f_type),
-            ("created_by", &f_creator),
+            ("created_by_principal_id::text", &f_creator),
         ] {
             if let Some(v) = val {
                 binds.push(v.as_str());
@@ -21010,9 +21186,9 @@ async fn requests_list(
         // Object-level authorization is an independent mandatory predicate for
         // request-only principals. It is never replaced by the caller's optional
         // `created_by` filter, so naming a foreign principal cannot widen access.
-        if let Some(owner) = request_owner {
+        if let Some(owner) = request_owner.as_deref() {
             binds.push(owner);
-            preds.push(format!("{REQUEST_OWNER_SQL} = ${}", binds.len()));
+            preds.push(format!("{REQUEST_OWNER_SQL} = ${}::uuid", binds.len()));
         }
         if let Some(v) = &f_q_like {
             binds.push(v.as_str());
@@ -21160,6 +21336,7 @@ async fn requests_list(
     let store = request_store().lock().await;
     let matches_request = |r: &ryuki_engine::models::Request| {
         request_owner
+            .as_deref()
             .is_none_or(|owner| request_is_owned_by(owner, Some(r.requester.as_str()), None))
             && f_status.as_deref().is_none_or(|s| r.status.as_str() == s)
             && f_site.as_deref().is_none_or(|s| r.site == s)
@@ -21402,7 +21579,7 @@ async fn requests_approve_live_apply(
     // by-id guard applies. Admin permission alone does not imply unrestricted scope.
     let (
         request_site,
-        requester,
+        requester_principal_id,
         current_resource_version,
         current_status,
         current_stage,
@@ -21412,14 +21589,14 @@ async fn requests_approve_live_apply(
         (
             String,
             String,
-            Option<String>,
+            Option<Uuid>,
             i64,
             String,
             String,
             sqlx::types::Json<serde_json::Value>,
         ),
     >(
-        "SELECT site, environment, requester, resource_version, status, stage, stages \
+        "SELECT site, environment, requester_principal_id, resource_version, status, stage, stages \
              FROM requests WHERE id = $1",
     )
     .bind(uid)
@@ -21427,13 +21604,28 @@ async fn requests_approve_live_apply(
     .await
     .map_err(db_error)?
     {
-        Some((site, environment, requester, resource_version, status, stage, stages)) => {
+        Some((
+            site,
+            environment,
+            requester_principal_id,
+            resource_version,
+            status,
+            stage,
+            stages,
+        )) => {
             scope_guard_or_404(&session, &site, &environment, &request_id)?;
-            (site, requester, resource_version, status, stage, stages.0)
+            (
+                site,
+                requester_principal_id,
+                resource_version,
+                status,
+                stage,
+                stages.0,
+            )
         }
         None => return Err(status_404(&request_id)),
     };
-    if requester.as_deref() == Some(session.user_id.as_str()) {
+    if requester_principal_id == Some(authenticated_principal_id(&session)?.into_uuid()) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -21684,7 +21876,7 @@ async fn requests_step_approve_live_apply(
     scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
     // Separation of duties: the requester must not approve their own live apply.
-    if current.requester.as_deref() == Some(session.user_id.as_str()) {
+    if current.requester_principal_id == Some(authenticated_principal_id(&session)?.into_uuid()) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -21727,8 +21919,8 @@ async fn requests_execution_job(
         // #2: the parent request's scope, used only for the by-id scope guard.
         site: String,
         environment: String,
-        // C017: ownership belongs to the parent request. requester is
-        // authoritative; created_by supports legacy rows.
+        // C017: both compatibility strings are projections of exact opaque
+        // principal UUID columns; legacy labels never authorize job reads.
         requester: Option<String>,
         created_by: Option<String>,
     }
@@ -21751,7 +21943,9 @@ async fn requests_execution_job(
              ) THEN TRUE \
            ELSE FALSE \
          END AS verification_ready, \
-         j.created_at, j.completed_at, r.site, r.environment, r.requester, r.created_by \
+         j.created_at, j.completed_at, r.site, r.environment, \
+         r.requester_principal_id::text AS requester, \
+         r.created_by_principal_id::text AS created_by \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 \
          ORDER BY j.created_at DESC, j.id DESC LIMIT 1",
@@ -22043,7 +22237,7 @@ async fn requests_validate(
         "validated",
         "validate",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -22724,7 +22918,7 @@ async fn requests_plan(
         "planned",
         "plan",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
 }
@@ -22816,6 +23010,7 @@ async fn approve_one(
     if approval_role_for(session).as_deref() != Some(role) {
         return Err(ordinary_approval_role_required());
     }
+    let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
@@ -22913,7 +23108,7 @@ async fn approve_one(
         ));
     }
 
-    let mut approved = request_lifecycle::approve_request(&store[idx], &session.user_id)
+    let mut approved = request_lifecycle::approve_request(&store[idx], &actor_principal)
         .map_err(map_engine_error)?;
 
     // B8: snapshot prior status/stage before overwriting store[idx].
@@ -22930,7 +23125,7 @@ async fn approve_one(
         "approved",
         "approve",
     )
-    .await;
+    .await?;
 
     // Shape parity with the DB arm: the bare request object PLUS a `quorum`
     // sibling. No decision ledger exists here, so synthesize the single-approval
@@ -22939,7 +23134,7 @@ async fn approve_one(
         &[ryuki_engine::approval_quorum::ApprovalDecision {
             role: role.to_string(),
             decision: "approved".to_string(),
-            actor: session.user_id.clone(),
+            actor: actor_principal,
         }],
         1,
         1,
@@ -23033,7 +23228,7 @@ async fn requests_lock(
         "locked",
         "lock",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
 }
@@ -23260,7 +23455,7 @@ async fn requests_execute(
         to_status,
         "execute",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
@@ -23794,6 +23989,7 @@ mod step_materialization_unit_tests {
     }
 
     fn sample_current_row(request: &ryuki_engine::models::Request) -> DbRequestRow {
+        let principal_id = Uuid::new_v4();
         DbRequestRow {
             id: Uuid::parse_str(&request.id).unwrap_or_else(|_| Uuid::new_v4()),
             resource_version: request.resource_version,
@@ -23806,7 +24002,7 @@ mod step_materialization_unit_tests {
             cpu: 2,
             memory_gb: 4,
             justification: None,
-            created_by: Some("requester-unit".to_string()),
+            created_by: Some(principal_id.to_string()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             payload: json!({}),
@@ -23817,8 +24013,9 @@ mod step_materialization_unit_tests {
             criticality: "standard".to_string(),
             required_approval_roles: 1,
             approval_epoch: 1,
-            requester: Some("requester-unit".to_string()),
-            owner: Some("owner-unit".to_string()),
+            requester: Some(principal_id.to_string()),
+            owner: Some(principal_id.to_string()),
+            requester_principal_id: Some(principal_id),
             evidence_manifest_id: None,
         }
     }
@@ -24033,19 +24230,44 @@ mod step_materialization_db_tests {
     /// pattern), returns its id.
     async fn seed_locked_request(pool: &PgPool, payload: serde_json::Value) -> Uuid {
         let id = Uuid::new_v4();
+        let roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
+        let subject = format!("step-materialization-{id}");
+        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+        let mut tx = pool.begin().await.expect("begin exact request seed");
+        let authority = crate::principal_registry::InitialHumanAuthority {
+            authority_digest: &authority_digest,
+            roles: &roles,
+            site_mode: "global",
+            site_scope: &[],
+            environment_mode: "global",
+            environment_scope: &[],
+            created_by: "step-materialization-test",
+        };
+        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+            &mut tx,
+            "step-materialization-test",
+            "https://step-materialization.test",
+            &subject,
+            &authority,
+        )
+        .await
+        .expect("seed exact request principal");
         sqlx::query(
             "INSERT INTO requests \
                  (id, request_type, status, stage, site, environment, name, cpu, \
-                  memory_gb, created_by, payload) \
+                  memory_gb, payload, principal_binding_state, \
+                  created_by_principal_id, requester_principal_id, owner_principal_id) \
              VALUES \
                  ($1, 'server-deployment', 'locked', 'lock', 'DEFRA', 'production', \
-                  'step-plan-db-test', 2, 4, 'requester-db', $2::jsonb)",
+                  'step-plan-db-test', 2, 4, $2::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(id)
         .bind(payload)
-        .execute(pool)
+        .bind(binding.principal_id.into_uuid())
+        .execute(&mut *tx)
         .await
         .expect("seed locked request");
+        tx.commit().await.expect("commit exact request seed");
         id
     }
 
@@ -24636,14 +24858,40 @@ mod step_authoring_db_tests {
         Some(pool)
     }
 
-    fn admin_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+    async fn admin_session(pool: &PgPool, subject: &str) -> AuthSession {
+        let roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
+        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+        let mut tx = pool.begin().await.expect("begin principal seed");
+        let authority = crate::principal_registry::InitialHumanAuthority {
+            authority_digest: &authority_digest,
+            roles: &roles,
+            site_mode: "global",
+            site_scope: &[],
+            environment_mode: "global",
+            environment_scope: &[],
+            created_by: "step-authoring-test",
+        };
+        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+            &mut tx,
+            "step-authoring-test",
+            "https://step-authoring.test",
+            subject,
+            &authority,
+        )
+        .await
+        .expect("seed exact test principal binding");
+        tx.commit().await.expect("commit principal seed");
+        AuthSession {
+            display_user_id: format!("{subject} (test)"),
+            principal_id: Some(binding.principal_id),
+            display_name: format!("{subject} (test)"),
+            roles,
+            token_valid: true,
+            provider_mode: "local".into(),
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+            site_scope: vec![],
+            environment_scope: vec![],
+        }
     }
 
     fn create_body(name: &str, deployment_profile: Option<&str>) -> CreateRequest {
@@ -24706,7 +24954,7 @@ mod step_authoring_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let admin = admin_session("step-author-managed");
+        let admin = admin_session(pool, "step-author-managed").await;
 
         let Ok(Json(created)) = requests_create(
             AuthExtractor(admin.clone()),
@@ -24764,7 +25012,7 @@ mod step_authoring_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let admin = admin_session("step-author-normal");
+        let admin = admin_session(pool, "step-author-normal").await;
 
         let Ok(Json(created)) = requests_create(
             AuthExtractor(admin.clone()),
@@ -24798,7 +25046,7 @@ mod step_authoring_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let admin = admin_session("step-author-get");
+        let admin = admin_session(pool, "step-author-get").await;
         let p = |s: &str| Path(s.to_string());
 
         let Ok(Json(managed)) = requests_create(
@@ -24883,7 +25131,7 @@ mod step_authoring_db_tests {
         };
         let cp_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
         crate::cp_identity::init_cp_key_for_test(cp_key.clone());
-        let admin = admin_session("step-author-la-guard");
+        let admin = admin_session(pool, "step-author-la-guard").await;
 
         let Ok(Json(created)) = requests_create(
             AuthExtractor(admin.clone()),
@@ -24972,7 +25220,7 @@ mod step_authoring_db_tests {
         };
         let cp_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
         crate::cp_identity::init_cp_key_for_test(cp_key.clone());
-        let admin = admin_session("step-author-la-normal");
+        let admin = admin_session(pool, "step-author-la-normal").await;
 
         let Ok(Json(created)) = requests_create(
             AuthExtractor(admin.clone()),
@@ -25312,7 +25560,7 @@ async fn requests_verify(
         &to_status,
         "verify",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -25434,7 +25682,7 @@ async fn requests_protect(
         &to_status,
         "protect",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -25557,7 +25805,7 @@ async fn requests_publish(
         &to_status,
         "publish",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -25681,7 +25929,7 @@ async fn requests_retire(
         &to_status,
         "retire",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -25792,6 +26040,7 @@ async fn reject_one(
     if approval_role_for(session).as_deref() != Some(role) {
         return Err(ordinary_approval_role_required());
     }
+    let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
@@ -25821,7 +26070,7 @@ async fn reject_one(
         .await?;
 
         let request = db_row_to_request(&current, request_id);
-        let mut rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
+        let mut rejected = request_lifecycle::reject_request(&request, &actor_principal, reason)
             .map_err(map_engine_error)?;
 
         // #4 lock-ordering: apply_transition_audited's CAS `UPDATE requests`
@@ -25908,7 +26157,7 @@ async fn reject_one(
         ));
     }
 
-    let mut rejected = request_lifecycle::reject_request(&store[idx], &session.user_id, reason)
+    let mut rejected = request_lifecycle::reject_request(&store[idx], &actor_principal, reason)
         .map_err(map_engine_error)?;
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
@@ -25931,7 +26180,8 @@ async fn reject_one(
             outcome: "applied",
         },
     )
-    .await;
+    .await
+    .map_err(db_error)?;
 
     Ok(serde_json::to_value(&rejected).unwrap_or_default())
 }
@@ -25973,6 +26223,7 @@ async fn rework_one(
     if !check_permission(session, "approve") {
         return Err(status_403());
     }
+    let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
@@ -25989,7 +26240,7 @@ async fn rework_one(
         scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
         let request = db_row_to_request(&current, request_id);
-        let mut reworked = request_lifecycle::rework_request(&request, &session.user_id, reason)
+        let mut reworked = request_lifecycle::rework_request(&request, &actor_principal, reason)
             .map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&reworked.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Intake);
@@ -26036,7 +26287,7 @@ async fn rework_one(
     {
         return Err(status_404(request_id));
     }
-    let mut reworked = request_lifecycle::rework_request(&store[idx], &session.user_id, reason)
+    let mut reworked = request_lifecycle::rework_request(&store[idx], &actor_principal, reason)
         .map_err(map_engine_error)?;
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
@@ -26055,7 +26306,8 @@ async fn rework_one(
             outcome: "applied",
         },
     )
-    .await;
+    .await
+    .map_err(db_error)?;
     Ok(serde_json::to_value(&reworked).unwrap_or_default())
 }
 
@@ -26176,7 +26428,8 @@ async fn fail_one(
             outcome: "applied",
         },
     )
-    .await;
+    .await
+    .map_err(db_error)?;
     Ok(serde_json::to_value(&failed).unwrap_or_default())
 }
 
@@ -26212,6 +26465,7 @@ async fn cancel_one(
     request_id: &str,
     reason: &str,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
+    let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
@@ -26232,7 +26486,7 @@ async fn cancel_one(
         }
 
         let request = db_row_to_request(&current, request_id);
-        let mut cancelled = request_lifecycle::cancel_request(&request, &session.user_id, reason)
+        let mut cancelled = request_lifecycle::cancel_request(&request, &actor_principal, reason)
             .map_err(map_engine_error)?;
 
         let stages_json = serde_json::to_value(&cancelled.stages).unwrap_or_else(|_| json!([]));
@@ -26278,7 +26532,7 @@ async fn cancel_one(
         return Err(status_403());
     }
 
-    let mut cancelled = request_lifecycle::cancel_request(&store[idx], &session.user_id, reason)
+    let mut cancelled = request_lifecycle::cancel_request(&store[idx], &actor_principal, reason)
         .map_err(map_engine_error)?;
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
@@ -26298,7 +26552,8 @@ async fn cancel_one(
             outcome: "applied",
         },
     )
-    .await;
+    .await
+    .map_err(db_error)?;
 
     Ok(serde_json::to_value(&cancelled).unwrap_or_default())
 }
@@ -26753,8 +27008,11 @@ async fn requests_batch_approve(
 /// SoD gate for cancel: an admin may cancel any request; a requester may cancel
 /// only their own (session principal == the request's creator).
 fn cancel_permitted(session: &AuthSession, created_by: Option<&str>) -> bool {
+    let created_by_principal = created_by.and_then(|value| value.parse::<PrincipalId>().ok());
     check_permission(session, "admin")
-        || (check_permission(session, "request") && created_by == Some(session.user_id.as_str()))
+        || (check_permission(session, "request")
+            && created_by_principal.is_some()
+            && created_by_principal == session.principal_id)
 }
 
 /// Separation-of-duties outcome for an approve/reject decision (see
@@ -26775,7 +27033,8 @@ enum SodDecision {
 /// dry-run modes every caller shares the `static-user` principal, so a self-match
 /// is not a real SoD violation and yields `Warn`. Pure — the mode is passed in.
 fn sod_decision(session: &AuthSession, created_by: Option<&str>, mode: &AuthMode) -> SodDecision {
-    if created_by != Some(session.user_id.as_str()) {
+    let created_by_principal = created_by.and_then(|value| value.parse::<PrincipalId>().ok());
+    if created_by_principal.is_none() || created_by_principal != session.principal_id {
         return SodDecision::Allow;
     }
     match mode {
@@ -26803,7 +27062,7 @@ async fn check_sod(
         SodDecision::Allow => Ok(()),
         SodDecision::Warn => {
             tracing::warn!(
-                actor = %session.user_id,
+                actor = %session.display_user_id,
                 request = %request_id,
                 action,
                 "SoD: self-approval permitted in dry-run mode; would be denied under live identity"
@@ -26930,7 +27189,7 @@ fn reject_control_chars(field: &str, value: &str) -> Result<(), (StatusCode, Jso
 }
 
 /// GET /api/me/preferences — the CURRENT user's scope preferences (#59).
-/// Keyed on the verified `session.user_id`; returns nulls when none are set.
+/// Keyed on the verified opaque session principal; returns nulls when none are set.
 /// Self-service (any authenticated user); empty + `durable:false` with no DB.
 async fn user_preferences_get(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let Some(pool) = get_db() else {
@@ -26940,10 +27199,11 @@ async fn user_preferences_get(AuthExtractor(session): AuthExtractor) -> ApiResul
             "durable": false,
         })));
     };
+    let principal = authenticated_principal_id(&session)?.to_string();
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT preferred_site, preferred_environment FROM user_preferences WHERE user_id = $1",
     )
-    .bind(&session.user_id)
+    .bind(&principal)
     .fetch_optional(pool)
     .await
     .map_err(db_error)?;
@@ -26957,7 +27217,7 @@ async fn user_preferences_get(AuthExtractor(session): AuthExtractor) -> ApiResul
 
 /// PUT /api/me/preferences — set the CURRENT user's scope preferences (#59).
 /// Full replace (absent/null/empty clears a field). Keyed on the verified
-/// `session.user_id` — a client cannot write another user's preferences.
+/// opaque session principal — a client cannot write another user's preferences.
 /// Self-service; 503 with no DB.
 async fn user_preferences_put(
     AuthExtractor(session): AuthExtractor,
@@ -26972,6 +27232,7 @@ async fn user_preferences_put(
             Json(json!({"error": "database not configured; cannot persist preferences"})),
         ));
     };
+    let principal = authenticated_principal_id(&session)?.to_string();
     // #15: scope preferences (preferred_site/environment) gate which infrastructure
     // a principal sees — a security-relevant mutation. Persist + audit atomically so
     // a change leaves a durable trail. The detail carries only the new scope values
@@ -26986,7 +27247,7 @@ async fn user_preferences_put(
            preferred_environment = EXCLUDED.preferred_environment, \
            updated_at = NOW()",
     )
-    .bind(&session.user_id)
+    .bind(&principal)
     .bind(&site)
     .bind(&env)
     .execute(&mut *tx)
@@ -27000,7 +27261,7 @@ async fn user_preferences_put(
             None,
             "updated",
             json!({
-                "subject_user_id": &session.user_id,
+                "subject_principal_id": &principal,
                 "preferred_site": &site,
                 "preferred_environment": &env,
             }),
@@ -27086,15 +27347,17 @@ async fn requests_approval_quorum(
     // 404 an unknown request so "no approvals yet" is distinguishable from "no
     // such request". The same SELECT yields site/environment for the scope guard
     // and required_approval_roles for the default thresholds.
-    let exists: Option<(String, String, i32, i64)> = sqlx::query_as(
-        "SELECT site, environment, required_approval_roles, approval_epoch \
+    let exists: Option<(String, String, i32, i64, i64)> = sqlx::query_as(
+        "SELECT site, environment, required_approval_roles, approval_epoch, resource_version \
          FROM requests WHERE id = $1",
     )
     .bind(uid)
     .fetch_optional(pool)
     .await
     .map_err(db_error)?;
-    let Some((site, environment, required_approval_roles, approval_epoch)) = exists else {
+    let Some((site, environment, required_approval_roles, approval_epoch, resource_version)) =
+        exists
+    else {
         return Err(status_404(&request_id));
     };
     // #2: an out-of-scope request's quorum is a 404 (same as unknown — no oracle).
@@ -27107,11 +27370,23 @@ async fn requests_approval_quorum(
     let required_approvers = q.required_approvers.unwrap_or(req);
 
     let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT role, decision, actor FROM request_approval_decisions \
-         WHERE request_id = $1 AND approval_epoch = $2 ORDER BY decided_at, id",
+        "SELECT d.role, d.decision, d.actor_principal_id::text AS actor \
+         FROM request_approval_decisions d \
+         JOIN principals p \
+           ON p.principal_id = d.actor_principal_id \
+          AND p.lifecycle_version = d.actor_principal_lifecycle_version \
+          AND p.authority_version = d.actor_principal_authority_version \
+          AND p.lifecycle_state = 'active' \
+          AND p.principal_kind = 'human' \
+          AND d.role = ANY(p.role_allowlist) \
+         WHERE d.request_id = $1 AND d.approval_epoch = $2 \
+           AND d.approval_basis_resource_version = $3 \
+           AND d.principal_binding_state = 'exact-v1' \
+         ORDER BY d.decided_at, d.id",
     )
     .bind(uid)
     .bind(approval_epoch)
+    .bind(resource_version)
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
@@ -27197,9 +27472,11 @@ async fn requests_approval_decisions(
         reason: Option<String>,
     }
     let rows: Vec<DecisionRow> = sqlx::query_as(
-        "SELECT approval_epoch, role, decision, actor, decided_at, reason \
+        "SELECT approval_epoch, role, decision, actor_principal_id::text AS actor, \
+                decided_at, reason \
          FROM request_approval_decisions \
-         WHERE request_id = $1 ORDER BY approval_epoch ASC, decided_at ASC, id ASC",
+         WHERE request_id = $1 AND principal_binding_state = 'exact-v1' \
+         ORDER BY approval_epoch ASC, decided_at ASC, id ASC",
     )
     .bind(uid)
     .fetch_all(pool)
@@ -27553,8 +27830,9 @@ async fn events_alert_ack(
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
     ack_alert_one(&session, pool, event_id, note).await?;
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     Ok(Json(
-        json!({"acknowledged": true, "event_id": event_id, "acknowledged_by": session.user_id}),
+        json!({"acknowledged": true, "event_id": event_id, "acknowledged_by": actor_principal}),
     ))
 }
 
@@ -27574,6 +27852,7 @@ async fn ack_alert_one(
     note: Option<&str>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     operation_capability_guard(session, OperationCapability::MonitoringAlertAcknowledge)?;
+    let actor_principal = authenticated_principal_id(session)?.to_string();
     // Only an alert-worthy, authorized event is ackable. The repository applies
     // both predicates in the mutating statement; false covers missing, non-alert,
     // orphaned request links, and out-of-scope rows without an existence oracle.
@@ -27585,7 +27864,7 @@ async fn ack_alert_one(
     if !crate::repos::domain_events::ack_alert(
         pool,
         event_id,
-        &session.user_id,
+        &actor_principal,
         note,
         &alert_aggregate_types,
         &alert_statuses,
@@ -28342,7 +28621,8 @@ async fn audit_log_verify(
             })),
         ));
     };
-    match audit::enqueue_or_join_audit_verification(pool, &session.user_id).await {
+    let requester_principal = authenticated_principal_id(&session)?.to_string();
+    match audit::enqueue_or_join_audit_verification(pool, &requester_principal).await {
         Ok(job) => {
             let status = if job.is_terminal() {
                 StatusCode::OK
@@ -32251,6 +32531,7 @@ async fn vm_day2_plan(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<VmDay2PlanRequest>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // #2: scoped principals may only plan a day-2 op within their own site AND
     // environment (vm_day2_operations is dual-axis).
@@ -32285,7 +32566,7 @@ async fn vm_day2_plan(
     // in-memory use but not for the UUID primary key column. Replace it with a
     // proper UUID so the repo can bind it correctly.
     op.id = Uuid::new_v4().to_string();
-    vm_operations::bind_vm_day2_governance(&mut op, &session.user_id)
+    vm_operations::bind_vm_day2_governance(&mut op, &actor_principal)
         .map_err(|e| status_409(&e))?;
 
     crate::repos::vm_day2_operations::insert(pool, &op)
@@ -32351,6 +32632,7 @@ async fn vm_day2_approve(
     if !check_permission(&session, "approve") {
         return Err(status_403());
     }
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
         .await
@@ -32367,12 +32649,12 @@ async fn vm_day2_approve(
         .map(|governance| governance.planned_by.as_str())
         .filter(|principal| !principal.trim().is_empty())
         .ok_or_else(|| status_409("operation has no trusted planner; replan required"))?;
-    if planned_by == session.user_id {
+    if planned_by == actor_principal {
         return Err(status_403());
     }
 
     let approved =
-        vm_operations::approve_vm_day2_change(&op, &session.user_id).map_err(|e| status_409(&e))?;
+        vm_operations::approve_vm_day2_change(&op, &actor_principal).map_err(|e| status_409(&e))?;
     let ok = crate::repos::vm_day2_operations::approve_transition(pool, &approved)
         .await
         .map_err(db_error)?;
@@ -32391,6 +32673,7 @@ async fn vm_day2_lock(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<VmDay2ActionRequest>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
         .await
@@ -32402,7 +32685,7 @@ async fn vm_day2_lock(
         return Err(status_409("operation must be Approved before lock"));
     }
     let locked =
-        vm_operations::lock_vm_day2_change(&op, &session.user_id).map_err(|e| status_409(&e))?;
+        vm_operations::lock_vm_day2_change(&op, &actor_principal).map_err(|e| status_409(&e))?;
     let ok = crate::repos::vm_day2_operations::acquire_lock_transition(pool, &locked)
         .await
         .map_err(db_error)?;
@@ -32536,9 +32819,10 @@ async fn snapshot_plan(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<SnapshotPlanRequest>,
 ) -> ApiResult {
-    if !check_permission(&session, "execute") || session.user_id.trim().is_empty() {
+    if !check_permission(&session, "execute") {
         return Err(status_403());
     }
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     // Resolve and lock the immutable CMDB identity in the SAME transaction as
@@ -32589,7 +32873,7 @@ async fn snapshot_plan(
         &configuration_item.id,
         &session.site_scope,
         &session.environment_scope,
-        &session.user_id,
+        &actor_principal,
     )
     .await
     .map_err(db_error)?;
@@ -32964,6 +33248,7 @@ async fn backup_restore_plan(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<RestorePlanRequest>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     // #2 dual-axis WRITE: a scoped principal may only plan a restore whose target
     // site AND environment are both within its scope (body-supplied → 403, no
     // existence oracle).
@@ -32985,7 +33270,7 @@ async fn backup_restore_plan(
         &body.target_site,
         &body.target_environment,
         &body.owner,
-        &session.user_id,
+        &actor_principal,
     )
     .map_err(|e| status_400(&e))?;
 
@@ -33041,6 +33326,7 @@ async fn backup_restore_approve(
     Extension(session): Extension<AuthSession>,
     Json(body): Json<RestoreActionRequest>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let r = crate::repos::restore_requests::get(pool, &body.restore_id)
@@ -33062,14 +33348,14 @@ async fn backup_restore_approve(
         .get("planned_by")
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| status_409("restore has no trusted planner; replan before approval"))?;
-    if planned_by == &session.user_id {
+    if planned_by == &actor_principal {
         return Err(status_403());
     }
 
     let before = crate::repos::restore_requests::status_str(&r.status);
     // Approver = authenticated caller (from request extensions), never a
     // client-supplied body field — the audit trail must name the real principal.
-    let approver = session.user_id.as_str();
+    let approver = actor_principal.as_str();
 
     let approved = backup_engine::approve_restore(&r, approver).map_err(|e| status_409(&e))?;
 
@@ -33954,6 +34240,7 @@ async fn decommission_approve(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -33969,7 +34256,7 @@ async fn decommission_approve(
 
     // Approver = authenticated caller (from request extensions), never a
     // client-supplied body field — the audit trail must name the real principal.
-    let approved = server_decommission::approve_decommission(&req, &session.user_id)
+    let approved = server_decommission::approve_decommission(&req, &actor_principal)
         .map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -34004,6 +34291,7 @@ async fn decommission_quarantine(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -34056,7 +34344,7 @@ async fn decommission_quarantine(
             aggregate_id: &quarantined.id,
             site: Some(&req.site),
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "from_status": before,
                 "to_status": crate::repos::decommissions::status_str(&quarantined.status),
@@ -34076,6 +34364,7 @@ async fn decommission_execute(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -34123,7 +34412,7 @@ async fn decommission_execute(
             aggregate_id: &executed.id,
             site: Some(&req.site),
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "from_status": before,
                 "to_status": crate::repos::decommissions::status_str(&executed.status),
@@ -34165,6 +34454,7 @@ async fn decommission_rollback(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -34214,7 +34504,7 @@ async fn decommission_rollback(
             aggregate_id: &rolled_back.id,
             site: Some(&req.site),
             environment: None,
-            actor: &session.user_id,
+            actor: &actor_principal,
             payload: json!({
                 "from_status": before,
                 "to_status": crate::repos::decommissions::status_str(&rolled_back.status),
@@ -34617,13 +34907,14 @@ async fn app_env_approve(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
+    let actor_principal = authenticated_principal_id(&session)?.to_string();
     let tiers = app_environment::seed_examples();
     let target = tiers
         .iter()
         .find(|t| t.id == id)
         .ok_or_else(|| status_404(&id))?;
     // approved_by = the authenticated caller, not a hardcoded string.
-    match app_environment::approve_environment(target, &session.user_id) {
+    match app_environment::approve_environment(target, &actor_principal) {
         Ok(approved) => Ok(Json(serde_json::to_value(approved).unwrap())),
         Err(e) => Err(status_409(&e)),
     }
@@ -37127,6 +37418,7 @@ fn snow_may_mutate_all_owners(session: &AuthSession) -> bool {
 async fn snow_authorized_row(
     pool: &sqlx::PgPool,
     session: &AuthSession,
+    actor: &str,
     id: Uuid,
 ) -> Result<Option<ServiceNowRow>, sqlx::Error> {
     let access = snow_access_clause(2, 3, 4, 5);
@@ -37138,7 +37430,7 @@ async fn snow_authorized_row(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_read_all_owners(session))
-    .bind(session.user_id.trim())
+    .bind(actor)
     .fetch_optional(pool)
     .await
 }
@@ -37146,6 +37438,7 @@ async fn snow_authorized_row(
 async fn snow_authorized_action_row(
     pool: &sqlx::PgPool,
     session: &AuthSession,
+    actor: &str,
     id: Uuid,
 ) -> Result<Option<ServiceNowRow>, sqlx::Error> {
     let access = snow_access_clause(2, 3, 4, 5);
@@ -37157,7 +37450,7 @@ async fn snow_authorized_action_row(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_mutate_all_owners(session))
-    .bind(session.user_id.trim())
+    .bind(actor)
     .fetch_optional(pool)
     .await
 }
@@ -37165,6 +37458,7 @@ async fn snow_authorized_action_row(
 async fn snow_authorized_pending_rows(
     pool: &sqlx::PgPool,
     session: &AuthSession,
+    actor: &str,
 ) -> Result<Vec<ServiceNowRow>, sqlx::Error> {
     let access = snow_access_clause(1, 2, 3, 4);
     sqlx::query_as(&format!(
@@ -37175,7 +37469,7 @@ async fn snow_authorized_pending_rows(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_read_all_owners(session))
-    .bind(session.user_id.trim())
+    .bind(actor)
     .fetch_all(pool)
     .await
 }
@@ -37183,6 +37477,7 @@ async fn snow_authorized_pending_rows(
 async fn snow_authorized_history_rows(
     pool: &sqlx::PgPool,
     session: &AuthSession,
+    actor: &str,
     ci_name: &str,
 ) -> Result<Vec<ServiceNowRow>, sqlx::Error> {
     let access = snow_access_clause(2, 3, 4, 5);
@@ -37195,7 +37490,7 @@ async fn snow_authorized_history_rows(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_read_all_owners(session))
-    .bind(session.user_id.trim())
+    .bind(actor)
     .fetch_all(pool)
     .await
 }
@@ -37210,10 +37505,10 @@ async fn persist_servicenow_draft(
     payload_summary: &str,
     metadata: Value,
 ) -> Result<PersistedServiceNowDraft, (StatusCode, Json<Value>)> {
-    let actor = session.user_id.trim();
-    if actor.is_empty() {
+    let Some(principal_id) = session.principal_id else {
         return Err(status_403());
-    }
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ci: Option<ServiceNowCiBinding> = sqlx::query_as(
@@ -37326,7 +37621,7 @@ async fn persist_servicenow_draft(
     .bind(site)
     .bind(environment)
     .bind(ci_owner)
-    .bind(actor)
+    .bind(&actor)
     .execute(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -37528,9 +37823,13 @@ async fn servicenow_validate(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let uuid = parse_snow_id(&id)?;
-    let row = snow_authorized_action_row(pool, &session, uuid)
+    let row = snow_authorized_action_row(pool, &session, &actor, uuid)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
@@ -37560,11 +37859,15 @@ async fn servicenow_approve(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let uuid = parse_snow_id(&id)?;
     // This remains a provider-neutral, read-only acknowledgement. The row-level
     // scope/owner predicate still applies before exposing its state.
-    let row = snow_authorized_action_row(pool, &session, uuid)
+    let row = snow_authorized_action_row(pool, &session, &actor, uuid)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
@@ -37587,6 +37890,10 @@ async fn servicenow_submit(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let uuid = parse_snow_id(&id)?;
     let access = snow_access_clause(2, 3, 4, 5);
@@ -37600,7 +37907,7 @@ async fn servicenow_submit(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_mutate_all_owners(&session))
-    .bind(session.user_id.trim())
+    .bind(&actor)
     .execute(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -37638,7 +37945,7 @@ async fn servicenow_submit(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_mutate_all_owners(&session))
-    .bind(session.user_id.trim())
+    .bind(&actor)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -37653,9 +37960,13 @@ async fn servicenow_status(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let uuid = parse_snow_id(&id)?;
-    let row = snow_authorized_row(pool, &session, uuid)
+    let row = snow_authorized_row(pool, &session, &actor, uuid)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
@@ -37663,8 +37974,12 @@ async fn servicenow_status(
 }
 
 async fn servicenow_pending(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let rows = snow_authorized_pending_rows(pool, &session)
+    let rows = snow_authorized_pending_rows(pool, &session, &actor)
         .await
         .map_err(db_error)?;
     let items: Vec<Value> = rows.iter().map(snow_row_to_summary_json).collect();
@@ -37679,6 +37994,10 @@ async fn servicenow_cancel(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let uuid = parse_snow_id(&id)?;
     let access = snow_access_clause(2, 3, 4, 5);
@@ -37691,7 +38010,7 @@ async fn servicenow_cancel(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_mutate_all_owners(&session))
-    .bind(session.user_id.trim())
+    .bind(&actor)
     .execute(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -37725,7 +38044,7 @@ async fn servicenow_cancel(
     .bind(&session.site_scope)
     .bind(&session.environment_scope)
     .bind(snow_may_mutate_all_owners(&session))
-    .bind(session.user_id.trim())
+    .bind(&actor)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_error)?;
@@ -37741,8 +38060,12 @@ async fn servicenow_history(
     AuthExtractor(session): AuthExtractor,
     Path(ci): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let rows = snow_authorized_history_rows(pool, &session, &ci)
+    let rows = snow_authorized_history_rows(pool, &session, &actor, &ci)
         .await
         .map_err(db_error)?;
     let entries: Vec<Value> = rows.iter().map(snow_row_to_history_json).collect();
@@ -37792,7 +38115,8 @@ mod servicenow_scope_contract_tests {
         environment: Option<&str>,
     ) -> AuthSession {
         AuthSession {
-            user_id: actor.to_string(),
+            display_user_id: actor.to_string(),
+            principal_id: Some(test_principal_id(actor)),
             display_name: actor.to_string(),
             roles: vec![role.to_string()],
             token_valid: true,
@@ -37930,6 +38254,8 @@ mod servicenow_scope_contract_tests {
         let stage = format!("stage-{}", &suffix[..8]);
         let alice = format!("alice-{}", &suffix[..8]);
         let bob = format!("bob-{}", &suffix[..8]);
+        let alice_actor = test_principal_id(&alice).to_string();
+        let bob_actor = test_principal_id(&bob).to_string();
 
         for site in [&site_a, &site_b] {
             sqlx::query(
@@ -38081,7 +38407,7 @@ mod servicenow_scope_contract_tests {
                 site: Some(&site_a),
                 environment: Some(&prod),
                 ci_owner: Some("team-a"),
-                requested_by: Some(&alice),
+                requested_by: Some(&alice_actor),
             },
             QueueSeed {
                 id: foreign_owner,
@@ -38093,7 +38419,7 @@ mod servicenow_scope_contract_tests {
                 site: Some(&site_a),
                 environment: Some(&prod),
                 ci_owner: Some("team-a"),
-                requested_by: Some(&bob),
+                requested_by: Some(&bob_actor),
             },
             QueueSeed {
                 id: foreign_site,
@@ -38105,7 +38431,7 @@ mod servicenow_scope_contract_tests {
                 site: Some(&site_b),
                 environment: Some(&prod),
                 ci_owner: Some("team-b"),
-                requested_by: Some(&alice),
+                requested_by: Some(&alice_actor),
             },
             QueueSeed {
                 id: foreign_env,
@@ -38117,7 +38443,7 @@ mod servicenow_scope_contract_tests {
                 site: Some(&site_a),
                 environment: Some(&stage),
                 ci_owner: Some("team-a"),
-                requested_by: Some(&alice),
+                requested_by: Some(&alice_actor),
             },
             QueueSeed {
                 // Exact shape produced by a pre-169 writer: it remains valid
@@ -38144,7 +38470,7 @@ mod servicenow_scope_contract_tests {
                 site: Some(&site_a),
                 environment: Some(&prod),
                 ci_owner: Some("team-a"),
-                requested_by: Some(&alice),
+                requested_by: Some(&alice_actor),
             },
         ] {
             insert_queue(&pool, seed).await;
@@ -38180,41 +38506,61 @@ mod servicenow_scope_contract_tests {
             Some(&site_a),
             Some(&prod),
         );
+        let requester_actor = requester
+            .principal_id
+            .expect("requester test principal")
+            .to_string();
+        let auditor_actor = scoped_auditor
+            .principal_id
+            .expect("auditor test principal")
+            .to_string();
+        let admin_actor = scoped_admin
+            .principal_id
+            .expect("admin test principal")
+            .to_string();
 
-        assert!(snow_authorized_row(&pool, &requester, own)
-            .await
-            .expect("own lookup")
-            .is_some());
-        for hidden in [foreign_owner, foreign_site, foreign_env, legacy, drifted] {
-            assert!(snow_authorized_row(&pool, &requester, hidden)
-                .await
-                .expect("requester hidden lookup")
-                .is_none());
-        }
-        assert!(snow_authorized_row(&pool, &scoped_auditor, foreign_owner)
-            .await
-            .expect("auditor same-scope lookup")
-            .is_some());
         assert!(
-            snow_authorized_action_row(&pool, &scoped_auditor, foreign_owner)
+            snow_authorized_row(&pool, &requester, &requester_actor, own)
+                .await
+                .expect("own lookup")
+                .is_some()
+        );
+        for hidden in [foreign_owner, foreign_site, foreign_env, legacy, drifted] {
+            assert!(
+                snow_authorized_row(&pool, &requester, &requester_actor, hidden)
+                    .await
+                    .expect("requester hidden lookup")
+                    .is_none()
+            );
+        }
+        assert!(
+            snow_authorized_row(&pool, &scoped_auditor, &auditor_actor, foreign_owner)
+                .await
+                .expect("auditor same-scope lookup")
+                .is_some()
+        );
+        assert!(
+            snow_authorized_action_row(&pool, &scoped_auditor, &auditor_actor, foreign_owner)
                 .await
                 .expect("auditor cross-owner action lookup")
                 .is_none()
         );
         assert!(
-            snow_authorized_action_row(&pool, &scoped_admin, foreign_owner)
+            snow_authorized_action_row(&pool, &scoped_admin, &admin_actor, foreign_owner)
                 .await
                 .expect("admin cross-owner action lookup")
                 .is_some()
         );
         for hidden in [foreign_site, foreign_env, legacy, drifted] {
-            assert!(snow_authorized_row(&pool, &scoped_auditor, hidden)
-                .await
-                .expect("auditor hidden lookup")
-                .is_none());
+            assert!(
+                snow_authorized_row(&pool, &scoped_auditor, &auditor_actor, hidden)
+                    .await
+                    .expect("auditor hidden lookup")
+                    .is_none()
+            );
         }
 
-        let requester_pending = snow_authorized_pending_rows(&pool, &requester)
+        let requester_pending = snow_authorized_pending_rows(&pool, &requester, &requester_actor)
             .await
             .expect("requester pending list");
         assert_eq!(
@@ -38224,9 +38570,10 @@ mod servicenow_scope_contract_tests {
                 .collect::<Vec<_>>(),
             vec![own.to_string()]
         );
-        let auditor_history = snow_authorized_history_rows(&pool, &scoped_auditor, &ci_names[1])
-            .await
-            .expect("auditor history");
+        let auditor_history =
+            snow_authorized_history_rows(&pool, &scoped_auditor, &auditor_actor, &ci_names[1])
+                .await
+                .expect("auditor history");
         assert_eq!(auditor_history.len(), 1);
         assert_eq!(auditor_history[0].id, foreign_owner.to_string());
 
@@ -38239,7 +38586,7 @@ mod servicenow_scope_contract_tests {
         .bind(&requester.site_scope)
         .bind(&requester.environment_scope)
         .bind(snow_may_mutate_all_owners(&requester))
-        .bind(requester.user_id.trim())
+        .bind(&requester_actor)
         .execute(&pool)
         .await
         .expect("foreign-owner transition is evaluated");
@@ -38252,7 +38599,12 @@ mod servicenow_scope_contract_tests {
         .bind(&scoped_operator.site_scope)
         .bind(&scoped_operator.environment_scope)
         .bind(snow_may_mutate_all_owners(&scoped_operator))
-        .bind(scoped_operator.user_id.trim())
+        .bind(
+            scoped_operator
+                .principal_id
+                .expect("operator test principal")
+                .to_string(),
+        )
         .execute(&pool)
         .await
         .expect("foreign-owner operator transition is evaluated");
@@ -38265,7 +38617,7 @@ mod servicenow_scope_contract_tests {
         .bind(&scoped_admin.site_scope)
         .bind(&scoped_admin.environment_scope)
         .bind(snow_may_mutate_all_owners(&scoped_admin))
-        .bind(scoped_admin.user_id.trim())
+        .bind(&admin_actor)
         .execute(&pool)
         .await
         .expect("same-scope auditor transition is evaluated");
@@ -38311,7 +38663,7 @@ mod servicenow_scope_contract_tests {
             .await
             .expect("deactivate current ServiceNow site authority");
         assert!(
-            snow_authorized_row(&pool, &requester, own)
+            snow_authorized_row(&pool, &requester, &requester_actor, own)
                 .await
                 .expect("inactive-site lookup")
                 .is_none(),
@@ -39102,6 +39454,10 @@ async fn outage_notices_acknowledge(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let notice = crate::repos::outage_comms::get(pool, &id)
         .await
@@ -39114,7 +39470,7 @@ async fn outage_notices_acknowledge(
     let mut tx = pool.begin().await.map_err(db_error)?;
     // Acknowledger = authenticated caller (from request extensions), never a
     // client body field — the audit trail must name the real principal.
-    let ack = crate::repos::outage_comms::acknowledge(&mut tx, &id, &session.user_id, &from_status)
+    let ack = crate::repos::outage_comms::acknowledge(&mut tx, &id, &actor, &from_status)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
@@ -39692,7 +40048,7 @@ mod image_factory_audit_db_tests {
 
     fn actor_session(actor: &str) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = actor.to_string();
+        bind_test_principal(&mut session, actor);
         session.display_name = format!("{actor} (test)");
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
@@ -40788,6 +41144,10 @@ async fn runbook_start(
     Extension(session): Extension<AuthSession>,
     Json(body): Json<RunbookStartRequest>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // #2: scoped principals may only start a runbook in their own site;
     // env-scoped principals are rejected (runbook_executions is site-only).
@@ -40795,7 +41155,7 @@ async fn runbook_start(
 
     // actor = authenticated caller (from request extensions), never a client
     // body field — the audit trail must name the real principal.
-    let exec = runbook_execution::build_execution(&body.runbook_id, &body.site, &session.user_id)
+    let exec = runbook_execution::build_execution(&body.runbook_id, &body.site, &actor)
         .map_err(|e| status_400(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -40895,6 +41255,10 @@ async fn runbook_approve(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
@@ -40903,7 +41267,7 @@ async fn runbook_approve(
         .ok_or_else(|| status_404(&id))?;
     // #2: out-of-scope -> 404 before the status-409 leak.
     scope_guard_or_404(&session, &exec.site, "", &id)?;
-    if exec.started_by.trim() == session.user_id.trim() {
+    if exec.started_by.trim() == actor {
         return Err(status_403());
     }
 
@@ -40911,8 +41275,8 @@ async fn runbook_approve(
 
     // Approver = authenticated caller (from request extensions), never a
     // client-supplied body field — the audit trail must name the real principal.
-    let updated = runbook_execution::approve_execution_pure(&exec, &session.user_id)
-        .map_err(|e| status_409(&e))?;
+    let updated =
+        runbook_execution::approve_execution_pure(&exec, &actor).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
@@ -41356,13 +41720,13 @@ async fn firmware_request_exception(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<FirmwareExceptionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     // requested_by is the authenticated maker, never client payload data.
-    firmware_lifecycle::validate_exception_request(
-        &body.reason,
-        &session.user_id,
-        body.expiry_days,
-    )
-    .map_err(|e| status_400(&e))?;
+    firmware_lifecycle::validate_exception_request(&body.reason, &actor, body.expiry_days)
+        .map_err(|e| status_400(&e))?;
     let expiry_days = i32::try_from(body.expiry_days)
         .map_err(|_| status_400("expiryDays is outside the supported range"))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -41376,7 +41740,7 @@ async fn firmware_request_exception(
         &mut tx,
         &body.device_id,
         &body.reason,
-        &session.user_id,
+        &actor,
         expiry_days,
     )
     .await
@@ -41433,6 +41797,10 @@ async fn firmware_approve_exception(
     if !check_permission(&session, "approve") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     if body.expected_version <= 0 {
         return Err(status_400("expectedVersion must be greater than zero"));
     }
@@ -41451,7 +41819,7 @@ async fn firmware_approve_exception(
         &mut tx,
         &id,
         body.expected_version,
-        &session.user_id,
+        &actor,
     )
     .await
     .map_err(db_error)?;
@@ -42250,6 +42618,10 @@ async fn access_review_start(
     if !check_human_signoff_permission(&session, "approve") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
         .await
@@ -42257,12 +42629,11 @@ async fn access_review_start(
         .ok_or_else(|| status_404(&id))?;
     // #2: out-of-scope -> 404 before the review-guard / write.
     scope_guard_or_404(&session, &review.site, "", &id)?;
-    access_recertification::start_review_guard(&review, &session.user_id)
-        .map_err(|e| status_400(&e))?;
+    access_recertification::start_review_guard(&review, &actor).map_err(|e| status_400(&e))?;
     let before = review.status.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
     let (updated, _) =
-        crate::repos::access_recertification::start(&mut tx, &id, &session.user_id, updated_at)
+        crate::repos::access_recertification::start(&mut tx, &id, &actor, updated_at)
             .await
             .map_err(db_error)?
             .ok_or_else(|| {
@@ -42294,6 +42665,10 @@ async fn access_review_approve(
     if !check_human_signoff_permission(&session, "approve") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let justification = body.justification.as_deref().unwrap_or("");
     reject_control_chars("justification", justification)?;
@@ -42306,9 +42681,8 @@ async fn access_review_approve(
         .ok_or_else(|| status_404(&id))?;
     // #2: out-of-scope -> 404 before the review-guard / write.
     scope_guard_or_404(&session, &review.site, "", &id)?;
-    access_recertification::designated_reviewer_guard(&review, &session.user_id)
-        .map_err(|_| status_403())?;
-    access_recertification::approve_review_guard(&review, &session.user_id, justification)
+    access_recertification::designated_reviewer_guard(&review, &actor).map_err(|_| status_403())?;
+    access_recertification::approve_review_guard(&review, &actor, justification)
         .map_err(|e| status_400(&e))?;
     let expected_nrd: chrono::DateTime<chrono::Utc> =
         chrono::DateTime::parse_from_rfc3339(&review.next_review_due)
@@ -42323,7 +42697,7 @@ async fn access_review_approve(
     let (updated, _) = crate::repos::access_recertification::approve(
         &mut tx,
         &id,
-        &session.user_id,
+        &actor,
         justification,
         &expected_status,
         updated_at,
@@ -42356,6 +42730,10 @@ async fn access_review_revoke(
     if !check_human_signoff_permission(&session, "approve") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let reason = body.reason.as_deref().unwrap_or("");
     reject_control_chars("reason", reason)?;
@@ -42368,16 +42746,15 @@ async fn access_review_revoke(
         .ok_or_else(|| status_404(&id))?;
     // #2: out-of-scope -> 404 before the review-guard / write.
     scope_guard_or_404(&session, &review.site, "", &id)?;
-    access_recertification::designated_reviewer_guard(&review, &session.user_id)
-        .map_err(|_| status_403())?;
-    access_recertification::revoke_review_guard(&review, &session.user_id, reason)
+    access_recertification::designated_reviewer_guard(&review, &actor).map_err(|_| status_403())?;
+    access_recertification::revoke_review_guard(&review, &actor, reason)
         .map_err(|e| status_400(&e))?;
     let expected_status = review.status.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
     let (updated, _) = crate::repos::access_recertification::revoke(
         &mut tx,
         &id,
-        &session.user_id,
+        &actor,
         reason,
         &expected_status,
         updated_at,
@@ -42409,6 +42786,10 @@ async fn access_review_exempt(
     if !check_human_signoff_permission(&session, "approve") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     reject_control_chars("justification", &body.justification)?;
     if body.justification.trim().is_empty() {
@@ -42424,11 +42805,10 @@ async fn access_review_exempt(
         .ok_or_else(|| status_404(&id))?;
     // #2: out-of-scope -> 404 before the review-guard / write.
     scope_guard_or_404(&session, &review.site, "", &id)?;
-    access_recertification::designated_reviewer_guard(&review, &session.user_id)
-        .map_err(|_| status_403())?;
+    access_recertification::designated_reviewer_guard(&review, &actor).map_err(|_| status_403())?;
     access_recertification::exempt_review_guard(
         &review,
-        &session.user_id,
+        &actor,
         &body.justification,
         &body.exemption_expiry,
     )
@@ -42446,7 +42826,7 @@ async fn access_review_exempt(
     let (updated, _) = crate::repos::access_recertification::exempt(
         &mut tx,
         &id,
-        &session.user_id,
+        &actor,
         &body.justification,
         expiry,
         &expected_status,
@@ -43444,6 +43824,10 @@ async fn ipam_reserve_ip(
     Extension(session): Extension<AuthSession>,
     Json(b): Json<IpamReserveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     if let Some(pool) = get_db() {
         // Load the target subnet and its existing reservations, then let the
         // pure engine builder validate + allocate the next free IP. Persisting
@@ -43502,7 +43886,7 @@ async fn ipam_reserve_ip(
             &existing,
             &b.hostname,
             &b.purpose,
-            &session.user_id,
+            &actor,
             b.ttl_days,
         )
         .map_err(|e| status_400(&e))?;
@@ -43572,15 +43956,9 @@ async fn ipam_reserve_ip(
             "subnet": serde_json::to_value(&updated_subnet).unwrap_or_default(),
         })));
     }
-    dns_ipam::reserve_ip(
-        &b.subnet_id,
-        &b.hostname,
-        &b.purpose,
-        &session.user_id,
-        b.ttl_days,
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    dns_ipam::reserve_ip(&b.subnet_id, &b.hostname, &b.purpose, &actor, b.ttl_days)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn ipam_release_ip(
     Extension(session): Extension<AuthSession>,
@@ -43916,6 +44294,10 @@ async fn firewall_rule_create(
     Extension(session): Extension<AuthSession>,
     Json(b): Json<FwCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     // #2: a scoped principal may only create a firewall rule in its own site.
     guard_body_site_scope(&session, &b.site)?;
     if let Some(pool) = get_db() {
@@ -43942,7 +44324,7 @@ async fn firewall_rule_create(
         .map_err(|e| status_400(&e))?;
         // created_by = authenticated caller (from request extensions), not the
         // engine default — so the persisted row and response name the real creator.
-        rule.created_by = session.user_id.clone();
+        rule.created_by = actor;
         // Persist + audit ATOMICALLY: a firewall rule never lands without its
         // durable audit_log row (#7).
         let mut tx = pool.begin().await.map_err(db_error)?;
@@ -45095,6 +45477,10 @@ async fn k8s_namespace_provision(
     AuthExtractor(session): AuthExtractor,
     Json(b): Json<K8sProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     // #2: a namespace is keyed on BOTH site and environment — a scoped principal
     // may only provision within both of its scopes.
     guard_body_scope_dual(&session, &b.site, &b.environment)?;
@@ -45139,7 +45525,7 @@ async fn k8s_namespace_provision(
 
     let (ns, req) = container_namespace::build_namespace_and_request(
         &b.name,
-        &session.user_id,
+        &actor,
         &authority.scope_id,
         &authority.cluster,
         &authority.site,
@@ -46174,6 +46560,10 @@ async fn compliance_control_assess(
     if !check_human_signoff_permission(&session, "admin") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     // actor = authenticated caller (from request extensions), never a client
     // body field — the audit trail must name the real principal.
     if b.evidence_ref.trim().is_empty() {
@@ -46203,7 +46593,7 @@ async fn compliance_control_assess(
         pool,
         &id,
         &status,
-        &session.user_id,
+        &actor,
         &b.evidence_ref,
     )
     .await
@@ -46454,6 +46844,10 @@ async fn compliance_finding_waive(
     if !check_human_signoff_permission(&session, "admin") {
         return Err(status_403());
     }
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     // approved_by = authenticated caller (from request extensions), never a client
     // body field — the waiver's approval must name the real principal.
     if b.reason.trim().is_empty() {
@@ -46487,11 +46881,7 @@ async fn compliance_finding_waive(
     use crate::repos::compliance_reporting::MutationOutcome;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let outcome = crate::repos::compliance_reporting::create_waiver(
-        &mut *tx,
-        &id,
-        &b.reason,
-        &session.user_id,
-        &b.expiry,
+        &mut *tx, &id, &b.reason, &actor, &b.expiry,
     )
     .await
     .map_err(db_error)?;
@@ -46520,7 +46910,7 @@ async fn compliance_finding_waive(
         "waiver": {
             "finding_id": &id,
             "reason": &b.reason,
-            "approved_by": &session.user_id,
+            "approved_by": &actor,
             "expiry": &b.expiry,
             "created_at": chrono::Utc::now().to_rfc3339()
         },
@@ -47096,6 +47486,10 @@ async fn secrets_rotate(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let actor = principal_id.to_string();
     // rotated_by = authenticated caller (from request extensions), never a client
     // body field — the rotation audit must name the real principal.
     if let Some(pool) = get_db() {
@@ -47127,11 +47521,8 @@ async fn secrets_rotate(
             .fetch_one(pool)
             .await
             .map_err(db_error)?;
-        let (updated, run) = secrets_rotation::rotate_secret_record(
-            &secret,
-            &session.user_id,
-            run_count.max(0) as usize,
-        );
+        let (updated, run) =
+            secrets_rotation::rotate_secret_record(&secret, &actor, run_count.max(0) as usize);
 
         let mut tx = pool.begin().await.map_err(db_error)?;
         // Guard `status <> 'retired'` INSIDE the write so a deregister that
@@ -47192,7 +47583,7 @@ async fn secrets_rotate(
     if is_scoped(&session) {
         return Err(status_503_no_db());
     }
-    secrets_rotation::rotate_secret(&id, &session.user_id)
+    secrets_rotation::rotate_secret(&id, &actor)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -50248,11 +50639,13 @@ mod unit_tests {
     }
 
     fn test_request(id: &str) -> ryuki_engine::models::Request {
+        let requester = test_principal_id("test-request-requester").to_string();
+        let owner = test_principal_id("test-request-owner").to_string();
         let mut request = request_lifecycle::create_request(
             "windows-server-deployment",
             ryuki_engine::models::RequestType::ServerDeployment,
-            "alice",
-            "bob",
+            &requester,
+            &owner,
             "DEFRA",
             "production",
             "standard",
@@ -50264,6 +50657,7 @@ mod unit_tests {
 
     fn static_admin_operator_session() -> AuthSession {
         let mut session = AuthSession::static_dry_run();
+        bind_test_principal(&mut session, "static-admin-operator");
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session.provider_mode = "test-verified-human".into();
@@ -50404,7 +50798,7 @@ mod unit_tests {
     #[tokio::test]
     async fn test_auth_session_returns_injected_session() {
         let mut session = AuthSession::unverified_entra();
-        session.user_id = "session-user".to_string();
+        session.display_user_id = "session-user".to_string();
         let Json(body) = auth_session(Extension(session)).await;
         assert_eq!(body["user_id"], "session-user");
         assert_eq!(body["provider_mode"], "entra-id-unverified");
@@ -50449,6 +50843,7 @@ mod unit_tests {
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session.provider_mode = "persisted-session".into();
+        bind_test_principal(&mut session, "persisted-settings-admin");
         let Err((status, Json(body))) =
             require_verified_external_admin_permission(&session, &AuthMode::EntraId)
         else {
@@ -50467,6 +50862,7 @@ mod unit_tests {
         session.provider_mode = "entra-id".into();
         session.site_scope.clear();
         session.environment_scope.clear();
+        bind_test_principal(&mut session, "global-settings-admin");
 
         // This pure guard runs before validation or either persistence path in
         // `admin_platform_settings_update` and `admin_platform_settings_reset`.
@@ -50481,6 +50877,7 @@ mod unit_tests {
         session.provider_mode = "entra-id".into();
         session.site_scope = vec!["BRU".into()];
         session.environment_scope.clear();
+        bind_test_principal(&mut session, "site-settings-admin");
 
         let Err((status, Json(body))) =
             require_verified_external_admin_permission(&session, &AuthMode::EntraId)
@@ -50499,6 +50896,7 @@ mod unit_tests {
         session.provider_mode = "entra-id".into();
         session.site_scope.clear();
         session.environment_scope = vec!["production".into()];
+        bind_test_principal(&mut session, "environment-settings-admin");
 
         let Err((status, Json(body))) =
             require_verified_external_admin_permission(&session, &AuthMode::EntraId)
@@ -50517,6 +50915,7 @@ mod unit_tests {
         session.provider_mode = "entra-id".into();
         session.site_scope = vec!["BRU".into()];
         session.environment_scope = vec!["production".into()];
+        bind_test_principal(&mut session, "dual-scoped-settings-admin");
 
         let Err((status, Json(body))) =
             require_verified_external_admin_permission(&session, &AuthMode::EntraId)
@@ -50537,6 +50936,7 @@ mod unit_tests {
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session.provider_mode = "persisted-session".into();
+        bind_test_principal(&mut session, "local-settings-admin");
         assert!(
             require_verified_external_admin_permission(&session, &AuthMode::Local).is_ok(),
             "an explicitly Global verified local admin must be able to write settings in local auth mode"
@@ -50562,6 +50962,7 @@ mod unit_tests {
         session.token_valid = false;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session.provider_mode = "persisted-session".into();
+        bind_test_principal(&mut session, "stale-local-settings-admin");
         let Err((status, _)) =
             require_verified_external_admin_permission(&session, &AuthMode::Local)
         else {
@@ -50695,19 +51096,24 @@ mod unit_tests {
     #[test]
     fn test_local_login_response_matches_canonical_fixture() {
         let session_token = crate::session_credentials::generate_session_bearer();
+        let principal_id =
+            ryuki_core::PrincipalId::from_uuid(Uuid::new_v4()).expect("generated principal id");
         let expires_at = chrono::Utc::now();
         let mut body = local_login_response_body(
             session_token.as_str(),
+            principal_id,
             "admin",
             &["PlatformAdmin".to_string()],
             &expires_at,
         );
 
         assert_eq!(body["session_token"], json!(session_token.as_str()));
+        assert_eq!(body["user_id"], json!(principal_id.to_string()));
         assert!(body.get("session_id").is_none());
         assert_eq!(body["expires_at"], json!(expires_at.to_rfc3339()));
 
         body["session_token"] = json!("<session-token>");
+        body["user_id"] = json!("admin");
         body["expires_at"] = json!("<rfc3339>");
         let fixture: Value = serde_json::from_str(LOCAL_LOGIN_RESPONSE_FIXTURE).unwrap();
         assert_eq!(body, fixture);
@@ -50716,7 +51122,8 @@ mod unit_tests {
     #[test]
     fn test_engine_auth_session_serializes_canonical_seam_shape() {
         let session = AuthSession {
-            user_id: "admin".into(),
+            display_user_id: "admin".into(),
+            principal_id: Some(test_principal_id("canonical-admin")),
             display_name: "admin".into(),
             roles: vec!["PlatformAdmin".into()],
             token_valid: true,
@@ -51358,7 +51765,7 @@ mod unit_tests {
     #[test]
     fn test_local_me_response_requires_verified_session_in_local_mode() {
         let unverified = AuthSession {
-            user_id: "unauthenticated".into(),
+            display_user_id: "unauthenticated".into(),
             display_name: "Unauthenticated".into(),
             roles: Vec::new(),
             token_valid: false,
@@ -51381,10 +51788,12 @@ mod unit_tests {
         // persisted sessions resolve with provider_mode "persisted-session";
         // the gate is token_valid, never the provider_mode string.
         let session = AuthSession {
-            user_id: "admin".into(),
+            display_user_id: "admin".into(),
+            principal_id: Some(test_principal_id("local-me-admin")),
             display_name: "admin".into(),
             roles: vec!["PlatformAdmin".into()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "persisted-session".into(),
             ..Default::default()
         };
@@ -51631,15 +52040,17 @@ mod unit_tests {
         let bob = format!("bob-{suffix}");
         let own_id = format!("request-own-{suffix}");
         let foreign_id = format!("request-foreign-{suffix}");
+        let alice_principal = test_principal_id(&alice).to_string();
+        let bob_principal = test_principal_id(&bob).to_string();
 
         let mut own = test_request(&own_id);
         own.site = site.clone();
-        own.requester = alice.clone();
-        own.owner = alice.clone();
+        own.requester = alice_principal.clone();
+        own.owner = alice_principal;
         let mut foreign = test_request(&foreign_id);
         foreign.site = site.clone();
-        foreign.requester = bob.clone();
-        foreign.owner = bob.clone();
+        foreign.requester = bob_principal.clone();
+        foreign.owner = bob_principal.clone();
         request_store().lock().await.extend([own, foreign]);
 
         let requester = single_role_session(&alice, ryuki_engine::auth::APP_ROLE_REQUESTER);
@@ -51672,7 +52083,7 @@ mod unit_tests {
             AuthExtractor(requester.clone()),
             Query(RequestListParams {
                 site: Some(site.clone()),
-                created_by: Some(bob.clone()),
+                created_by: Some(bob_principal),
                 limit: Some(100),
                 include_total: Some(true),
                 ..Default::default()
@@ -51741,12 +52152,14 @@ mod unit_tests {
         let bob = format!("policy-bob-{suffix}");
         let own_id = format!("policy-own-{suffix}");
         let foreign_id = format!("policy-foreign-{suffix}");
+        let alice_principal = test_principal_id(&alice).to_string();
+        let bob_principal = test_principal_id(&bob).to_string();
 
         let mut own = test_request(&own_id);
-        own.requester = alice.clone();
-        own.owner = alice.clone();
+        own.requester = alice_principal.clone();
+        own.owner = alice_principal;
         let mut foreign = test_request(&foreign_id);
-        foreign.requester = bob;
+        foreign.requester = bob_principal;
         foreign.owner = foreign.requester.clone();
         request_store().lock().await.extend([own, foreign]);
 
@@ -51835,10 +52248,12 @@ mod unit_tests {
     #[test]
     fn test_token_row_maps_to_api_token_session() {
         let session = AuthSession {
-            user_id: "svc-backup".to_string(),
+            display_user_id: "svc-backup".to_string(),
+            principal_id: Some(test_principal_id("svc-backup")),
             display_name: "Nightly backup runner".to_string(),
             roles: vec![ryuki_engine::auth::APP_ROLE_BACKUP_OPERATOR.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::Workload,
             provider_mode: "api-token".to_string(),
             ..Default::default()
         };
@@ -51847,23 +52262,25 @@ mod unit_tests {
         assert!(!check_permission(&session, "admin"));
     }
 
-    /// Dry-run-minted tokens carry token_valid=false forever, so they pass
-    /// coarse check_permission for their roles but are rejected by the
-    /// verified-external-admin gate regardless of provider_mode.
+    /// Dry-run-minted tokens carry token_valid=false forever, so role labels
+    /// cannot grant even coarse permission and the verified-external-admin gate
+    /// rejects them regardless of provider_mode.
     #[test]
     fn test_dry_run_minted_token_rejected_by_verified_admin_gate() {
         let session = AuthSession {
-            user_id: "svc-admin".to_string(),
+            display_user_id: "svc-admin".to_string(),
+            principal_id: Some(test_principal_id("dry-run-svc-admin")),
             display_name: "Dry-run admin token".to_string(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             // minted under MockDryRun/StaticDryRun -> token_valid persisted FALSE
             token_valid: false,
+            actor_class: ryuki_engine::auth::ActorClass::Workload,
             provider_mode: "api-token".to_string(),
             ..Default::default()
         };
-        // It still holds the coarse admin permission via its roles...
-        assert!(require_admin_permission(&session).is_ok());
-        // ...but can never satisfy the verified-external-admin gate — not even in
+        // Invalid bearer evidence cannot activate the stored role labels.
+        assert!(require_admin_permission(&session).is_err());
+        // It can never satisfy the verified-external-admin gate — not even in
         // local auth mode (the bootstrap exception never admits api-tokens).
         let Err((status, Json(body))) =
             require_verified_external_admin_permission(&session, &AuthMode::Local)
@@ -51881,10 +52298,12 @@ mod unit_tests {
     #[test]
     fn test_valid_api_token_rejected_by_verified_admin_gate() {
         let session = AuthSession {
-            user_id: "svc-admin".to_string(),
+            display_user_id: "svc-admin".to_string(),
+            principal_id: Some(test_principal_id("live-svc-admin")),
             display_name: "Live admin token".to_string(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::Workload,
             provider_mode: "api-token".to_string(),
             ..Default::default()
         };
@@ -51906,7 +52325,8 @@ mod unit_tests {
     #[test]
     fn test_interactive_external_admin_only_for_verified_entra() {
         let entra = AuthSession {
-            user_id: "u".to_string(),
+            display_user_id: "u".to_string(),
+            principal_id: Some(test_principal_id("interactive-entra-admin")),
             display_name: "Verified admin".to_string(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
@@ -51933,7 +52353,6 @@ mod unit_tests {
         session.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
         let body = CreateTokenRequest {
             name: "x".into(),
-            owner_principal: "svc".into(),
             roles: vec![],
             site_scope: None,
             environment_scope: None,
@@ -51953,15 +52372,38 @@ mod unit_tests {
 
     #[tokio::test]
     async fn test_admin_tokens_create_rejects_unknown_role() {
-        let session = AuthSession {
+        let mut session = AuthSession {
             token_valid: true,
             actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "local".into(),
             ..AuthSession::static_dry_run()
         };
+        bind_test_principal(&mut session, "unknown-role-admin");
+        let principal_id = session.principal_id.expect("bound test principal");
+        let principal_binding = crate::principal_registry::PrincipalBinding {
+            principal_id,
+            principal_lifecycle_version: 1,
+            principal_authority_version: 1,
+            principal_key_id: Uuid::new_v4(),
+            principal_key_version: 1,
+            principal_link_id: Uuid::new_v4(),
+            principal_link_version: 1,
+        };
+        let issuing_authority = crate::human_authority::InteractiveHumanAuthorityContext {
+            principal_binding,
+            provider: "local".into(),
+            issuer: crate::identity_authority::LOCAL_ISSUER.into(),
+            subject: "unknown-role-admin".into(),
+            identity_epoch: principal_binding.principal_lifecycle_version,
+            assignment_version: principal_binding.principal_authority_version,
+            roles: session.roles.clone(),
+            site_mode: crate::human_authority::HumanAuthorityMode::Global,
+            site_scope: vec![],
+            environment_mode: crate::human_authority::HumanAuthorityMode::Global,
+            environment_scope: vec![],
+        };
         let body = CreateTokenRequest {
             name: "x".into(),
-            owner_principal: "svc".into(),
             roles: vec!["NotARole".into()],
             site_scope: None,
             environment_scope: None,
@@ -51969,7 +52411,7 @@ mod unit_tests {
         };
         let Err((status, Json(err))) = admin_tokens_create(
             AuthExtractor(session),
-            InteractiveHumanAuthorityExtractor(None),
+            InteractiveHumanAuthorityExtractor(Some(issuing_authority)),
             Json(body),
         )
         .await
@@ -52001,7 +52443,8 @@ mod unit_tests {
     #[test]
     fn credential_administration_requires_global_verified_human() {
         let global_human = AuthSession {
-            user_id: "global-admin".into(),
+            display_user_id: "global-admin".into(),
+            principal_id: Some(test_principal_id("global-admin")),
             display_name: "Global admin".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
@@ -52046,8 +52489,19 @@ mod unit_tests {
 
     #[test]
     fn derived_token_authority_is_an_exact_subset_of_human_context() {
+        let principal_id = test_principal_id("derived-token-issuer");
+        let principal_binding = crate::principal_registry::PrincipalBinding {
+            principal_id,
+            principal_lifecycle_version: 7,
+            principal_authority_version: 11,
+            principal_key_id: Uuid::new_v4(),
+            principal_key_version: 13,
+            principal_link_id: Uuid::new_v4(),
+            principal_link_version: 17,
+        };
         let session = AuthSession {
-            user_id: "issuer-subject".into(),
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
             display_name: "Issuer".into(),
             roles: vec!["Auditor".into(), "PlatformAdmin".into()],
             token_valid: true,
@@ -52057,9 +52511,10 @@ mod unit_tests {
             environment_scope: vec!["prod".into()],
         };
         let authority = crate::human_authority::InteractiveHumanAuthorityContext {
+            principal_binding,
             provider: "entra-id".into(),
             issuer: "https://issuer.example/tenant/v2.0".into(),
-            subject: session.user_id.clone(),
+            subject: "issuer-subject".into(),
             identity_epoch: 7,
             assignment_version: 11,
             roles: session.roles.clone(),
@@ -52101,9 +52556,23 @@ mod unit_tests {
             subject: "same-display-different-subject".into(),
             ..authority.clone()
         };
-        assert!(!token_authority_is_bounded_by_issuer(
+        assert!(token_authority_is_bounded_by_issuer(
             &session,
             &wrong_subject,
+            &["Auditor".into()],
+            &["SITE-A".into()],
+            &["prod".into()],
+        ));
+        let wrong_principal = crate::human_authority::InteractiveHumanAuthorityContext {
+            principal_binding: crate::principal_registry::PrincipalBinding {
+                principal_id: test_principal_id("different-token-issuer"),
+                ..principal_binding
+            },
+            ..authority.clone()
+        };
+        assert!(!token_authority_is_bounded_by_issuer(
+            &session,
+            &wrong_principal,
             &["Auditor".into()],
             &["SITE-A".into()],
             &["prod".into()],
@@ -52141,7 +52610,7 @@ mod unit_tests {
         let row = TokenListRow {
             id: Uuid::new_v4(),
             name: "svc-account".into(),
-            owner_principal: "ops-team".into(),
+            issuing_principal_id: Some(Uuid::new_v4()),
             roles: vec!["requester".into()],
             site_scope: Some("DEFRA".into()),
             environment_scope: None,
@@ -52158,7 +52627,7 @@ mod unit_tests {
             "the token hash must NEVER be exposed"
         );
         assert_eq!(json["name"], "svc-account");
-        assert_eq!(json["owner_principal"], "ops-team");
+        assert!(json["issuing_principal_id"].as_str().is_some());
         assert_eq!(json["token_valid"], true);
     }
 
@@ -52178,7 +52647,7 @@ mod unit_tests {
 
     fn single_role_session(user_id: &str, role: &str) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = user_id.to_string();
+        bind_test_principal(&mut session, user_id);
         session.display_name = format!("{user_id} (test)");
         session.provider_mode = "local".to_string();
         session.roles = vec![role.to_string()];
@@ -52190,7 +52659,8 @@ mod unit_tests {
     /// Build an in-memory request advanced to Planned (the decision point).
     async fn seed_planned_request(id: &str, requester: &str) {
         let mut request = test_request(id);
-        request.requester = requester.to_string();
+        request.requester = test_principal_id(requester).to_string();
+        request.owner = request.requester.clone();
         request.approval_route.push("Datacenter Approver".into());
         request_store().lock().await.push(request);
 
@@ -52243,6 +52713,10 @@ mod unit_tests {
     #[test]
     fn sod_decision_blocks_self_approval_only_under_live_identity() {
         let alice = single_role_session("alice", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let alice_principal = alice
+            .principal_id
+            .expect("alice test principal")
+            .to_string();
         // A different creator (or unknown creator) is never a self-approval.
         assert_eq!(
             sod_decision(&alice, Some("bob"), &AuthMode::EntraId),
@@ -52254,20 +52728,20 @@ mod unit_tests {
         );
         // Self-approval under live identity → hard block.
         assert_eq!(
-            sod_decision(&alice, Some("alice"), &AuthMode::EntraId),
+            sod_decision(&alice, Some(&alice_principal), &AuthMode::EntraId),
             SodDecision::Block
         );
         assert_eq!(
-            sod_decision(&alice, Some("alice"), &AuthMode::Local),
+            sod_decision(&alice, Some(&alice_principal), &AuthMode::Local),
             SodDecision::Block
         );
         // Self-approval in dry-run → warn-only (every caller is `static-user`).
         assert_eq!(
-            sod_decision(&alice, Some("alice"), &AuthMode::MockDryRun),
+            sod_decision(&alice, Some(&alice_principal), &AuthMode::MockDryRun),
             SodDecision::Warn
         );
         assert_eq!(
-            sod_decision(&alice, Some("alice"), &AuthMode::StaticDryRun),
+            sod_decision(&alice, Some(&alice_principal), &AuthMode::StaticDryRun),
             SodDecision::Warn
         );
     }
@@ -52326,7 +52800,10 @@ mod unit_tests {
             .iter()
             .find(|e| e["action"] == "request.reject")
             .expect("reject audit entry present");
-        assert_eq!(reject["actor_principal"], "approver-1");
+        assert_eq!(
+            reject["actor_principal"],
+            test_principal_id("approver-1").to_string()
+        );
         assert_eq!(reject["to_status"], "rejected");
         assert_eq!(reject["detail"]["reason"], "insufficient capacity");
         assert_eq!(
@@ -52506,7 +52983,7 @@ mod unit_tests {
         assert!(entries.iter().any(|e| {
             e["action"] == "request.reject"
                 && e["outcome"] == "denied"
-                && e["actor_principal"] == "auditor-1"
+                && e["actor_principal"] == test_principal_id("auditor-1").to_string()
         }));
     }
 
@@ -53836,7 +54313,8 @@ mod unit_tests {
         let id = format!("req-test-{}", Uuid::new_v4());
         // A fresh intake request owned by requester-2.
         let mut request = test_request(&id);
-        request.requester = "requester-2".to_string();
+        request.requester = test_principal_id("requester-2").to_string();
+        request.owner = request.requester.clone();
         request_store().lock().await.push(request);
 
         let requester = single_role_session("requester-2", ryuki_engine::auth::APP_ROLE_REQUESTER);
@@ -53862,7 +54340,10 @@ mod unit_tests {
             .iter()
             .find(|e| e["action"] == "request.cancel")
             .expect("cancel audit entry present");
-        assert_eq!(cancel["actor_principal"], "requester-2");
+        assert_eq!(
+            cancel["actor_principal"],
+            test_principal_id("requester-2").to_string()
+        );
         assert_eq!(cancel["to_status"], "cancelled");
         assert_eq!(cancel["detail"]["reason"], "no longer needed");
     }
@@ -53871,7 +54352,8 @@ mod unit_tests {
     async fn requests_cancel_rejected_for_non_owning_requester() {
         let id = format!("req-test-{}", Uuid::new_v4());
         let mut request = test_request(&id);
-        request.requester = "requester-owner".to_string();
+        request.requester = test_principal_id("requester-owner").to_string();
+        request.owner = request.requester.clone();
         request_store().lock().await.push(request);
 
         // A different requester does not own this request.
@@ -53916,7 +54398,8 @@ mod unit_tests {
         assert!(cancel_permitted(&admin, None));
 
         let owner = single_role_session("u-owner", ryuki_engine::auth::APP_ROLE_REQUESTER);
-        assert!(cancel_permitted(&owner, Some("u-owner")));
+        let owner_principal = test_principal_id("u-owner").to_string();
+        assert!(cancel_permitted(&owner, Some(&owner_principal)));
         assert!(!cancel_permitted(&owner, Some("someone-else")));
         assert!(!cancel_permitted(&owner, None));
 
@@ -53943,7 +54426,7 @@ mod unit_tests {
     #[tokio::test]
     async fn requests_audit_requires_audit_permission() {
         let no_roles = AuthSession {
-            user_id: "anon".to_string(),
+            display_user_id: "anon".to_string(),
             display_name: "No roles".to_string(),
             roles: vec![],
             token_valid: false,
@@ -53978,7 +54461,7 @@ mod unit_tests {
     #[tokio::test]
     async fn activity_audit_feed_requires_audit_permission() {
         let no_roles = AuthSession {
-            user_id: "anon".to_string(),
+            display_user_id: "anon".to_string(),
             display_name: "No roles".to_string(),
             roles: vec![],
             token_valid: false,
@@ -54122,7 +54605,7 @@ mod unit_tests {
     #[tokio::test]
     async fn request_evidence_pack_requires_audit_permission() {
         let no_roles = AuthSession {
-            user_id: "anon".to_string(),
+            display_user_id: "anon".to_string(),
             display_name: "No roles".to_string(),
             roles: vec![],
             token_valid: false,
@@ -54387,7 +54870,8 @@ mod unit_tests {
     #[tokio::test]
     async fn approval_quorum_requires_audit_permission() {
         let no_perm = AuthSession {
-            user_id: "u".into(),
+            display_user_id: "u".into(),
+            principal_id: Some(test_principal_id("approval-quorum-no-perm")),
             display_name: "U".into(),
             roles: vec![],
             token_valid: true,
@@ -54652,7 +55136,8 @@ mod unit_tests {
     async fn cmdb_ci_get_rbac_403_and_no_db_503() {
         // A request-only Requester (no audit, not a superuser) → 403.
         let requester = AuthSession {
-            user_id: "req-user".into(),
+            display_user_id: "req-user".into(),
+            principal_id: Some(test_principal_id("cmdb-requester")),
             display_name: "R".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
@@ -54681,7 +55166,8 @@ mod unit_tests {
     #[tokio::test]
     async fn approval_decisions_requires_audit_permission() {
         let no_perm = AuthSession {
-            user_id: "u".into(),
+            display_user_id: "u".into(),
+            principal_id: Some(test_principal_id("approval-decisions-no-perm")),
             display_name: "U".into(),
             roles: vec![],
             token_valid: true,
@@ -54783,6 +55269,10 @@ mod unit_tests {
     /// the given site/environment scopes, to exercise the scope gate in isolation.
     fn scoped_session(site: &[&str], environment: &[&str]) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
+        bind_test_principal(&mut s, "scope-gate-platform-admin");
+        s.token_valid = true;
+        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
+        s.provider_mode = "test-verified-human".into();
         s.site_scope = site.iter().map(|x| x.to_string()).collect();
         s.environment_scope = environment.iter().map(|x| x.to_string()).collect();
         s
@@ -55154,7 +55644,7 @@ mod unit_tests {
 
         // An unrestricted principal still sees everything (no regression).
         assert!(requests_get_for_test(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(static_admin_operator_session()),
             Path(id.clone())
         )
         .await
@@ -55685,10 +56175,7 @@ mod unit_tests {
         assert!(
             serde_json::from_str::<LocalLoginRequest>(r#"{"username":"u","password":"p"}"#).is_ok()
         );
-        assert!(serde_json::from_str::<CreateTokenRequest>(
-            r#"{"name":"n","owner_principal":"o"}"#
-        )
-        .is_ok());
+        assert!(serde_json::from_str::<CreateTokenRequest>(r#"{"name":"n"}"#).is_ok());
         // An extra/typo'd field is a HARD error, never silently dropped.
         assert!(
             serde_json::from_str::<LocalLoginRequest>(
@@ -55698,11 +56185,9 @@ mod unit_tests {
             "unknown field on login must be rejected"
         );
         assert!(
-            serde_json::from_str::<CreateTokenRequest>(
-                r#"{"name":"n","owner_principal":"o","evil":1}"#
-            )
-            .is_err(),
-            "unknown field on token-create must be rejected"
+            serde_json::from_str::<CreateTokenRequest>(r#"{"name":"n","owner_principal":"o"}"#)
+                .is_err(),
+            "caller-supplied token ownership must be rejected"
         );
     }
 
@@ -55733,7 +56218,8 @@ mod unit_tests {
     #[tokio::test]
     async fn metric_budget_and_slo_delete_require_execute_and_db() {
         let no_perm = || AuthSession {
-            user_id: "u".into(),
+            display_user_id: "u".into(),
+            principal_id: Some(test_principal_id("budget-slo-no-perm")),
             display_name: "U".into(),
             roles: vec![],
             token_valid: true,
@@ -55818,7 +56304,7 @@ mod db_lifecycle_tests {
 
     fn approver_session() -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = "approver-db".into();
+        bind_test_principal(&mut s, "approver-db");
         s.display_name = "Approver DB".into();
         s.provider_mode = "local".into();
         s.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
@@ -55829,7 +56315,7 @@ mod db_lifecycle_tests {
 
     fn request_read_session(user_id: &str, role: &str) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = user_id.to_string();
+        bind_test_principal(&mut session, user_id);
         session.display_name = format!("{user_id} (DB read test)");
         session.roles = vec![role.to_string()];
         session.token_valid = true;
@@ -55844,7 +56330,8 @@ mod db_lifecycle_tests {
         environments: &[&str],
     ) -> AuthSession {
         AuthSession {
-            user_id: user_id.to_string(),
+            display_user_id: user_id.to_string(),
+            principal_id: Some(test_principal_id(user_id)),
             display_name: format!("{user_id} (monitoring DB test)"),
             roles: vec![ryuki_engine::auth::APP_ROLE_MONITORING_OPERATOR.to_string()],
             token_valid: true,
@@ -55861,13 +56348,20 @@ mod db_lifecycle_tests {
     /// Seeds one request row directly in the given status/stage, returns its id.
     async fn seed_request(pool: &PgPool, status: &str, stage: &str) -> Uuid {
         let id = Uuid::new_v4();
+        let roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        let (_, binding) = seed_test_principal_binding(pool, "local", "requester-db", &roles).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
-             VALUES ($1, 'server-deployment', $2, $3, 'DEFRA', 'production', 'db-test', 2, 4, 'requester-db')",
+            "INSERT INTO requests \
+             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+              principal_binding_state, created_by_principal_id, requester_principal_id, \
+              owner_principal_id) \
+             VALUES ($1, 'server-deployment', $2, $3, 'DEFRA', 'production', 'db-test', 2, 4, \
+                     'exact-v1', $4, $4, $4)",
         )
         .bind(id)
         .bind(status)
         .bind(stage)
+        .bind(binding.principal_id.into_uuid())
         .execute(pool)
         .await
         .expect("seed request");
@@ -55875,14 +56369,21 @@ mod db_lifecycle_tests {
     }
 
     async fn seed_current_epoch_approval(pool: &PgPool, id: Uuid) {
+        let roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
+        let (_, binding) = seed_test_principal_binding(pool, "local", "approver-db", &roles).await;
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-             (request_id, approval_epoch, role, decision, actor) \
-             SELECT id, approval_epoch, $2, 'approved', 'approver-db' \
+             (request_id, approval_epoch, role, decision, principal_binding_state, \
+              actor_principal_id, actor_principal_lifecycle_version, \
+              actor_principal_authority_version) \
+             SELECT id, approval_epoch, $2, 'approved', 'exact-v1', $3, $4, $5 \
              FROM requests WHERE id = $1",
         )
         .bind(id)
         .bind(ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER)
+        .bind(binding.principal_id.into_uuid())
+        .bind(binding.principal_lifecycle_version)
+        .bind(binding.principal_authority_version)
         .execute(pool)
         .await
         .expect("seed current-epoch request approval");
@@ -55966,7 +56467,7 @@ mod db_lifecycle_tests {
         // Out-of-scope (GBLON) → 404 from the after-load scope guard, BEFORE any
         // engine logic (so it is not a state oracle either).
         let mut gblon = AuthSession::static_dry_run();
-        gblon.user_id = "op-gblon".into();
+        bind_test_principal(&mut gblon, "op-gblon");
         gblon.site_scope = vec!["GBLON".into()];
         let denied = requests_plan(Path(id_s.clone()), AuthExtractor(gblon)).await;
         assert!(
@@ -55976,7 +56477,7 @@ mod db_lifecycle_tests {
 
         // In-scope (DEFRA/production) → passes the gate and the transition runs.
         let mut defra = AuthSession::static_dry_run();
-        defra.user_id = "op-defra".into();
+        bind_test_principal(&mut defra, "op-defra");
         defra.site_scope = vec!["DEFRA".into()];
         defra.environment_scope = vec!["production".into()];
         let allowed = requests_plan(Path(id_s.clone()), AuthExtractor(defra)).await;
@@ -58215,8 +58716,12 @@ mod db_lifecycle_tests {
         let namespace_name = format!("requester-audit-{}", &suffix[..8]);
         let actor_id = format!("k8s-provisioner-{}", &suffix[..8]);
         let mut actor = scoped_session(&["DEFRA"], &["Dev"]);
-        actor.user_id = actor_id.clone();
+        bind_test_principal(&mut actor, &actor_id);
         actor.display_name = format!("Kubernetes provisioner {actor_id}");
+        let actor_principal = actor
+            .principal_id
+            .expect("Kubernetes test actor has an opaque principal")
+            .to_string();
 
         let Json(response) = k8s_namespace_provision(
             AuthExtractor(actor.clone()),
@@ -58240,7 +58745,7 @@ mod db_lifecycle_tests {
             .as_str()
             .expect("request id")
             .to_string();
-        assert_eq!(response["request"]["requester"], actor_id);
+        assert_eq!(response["request"]["requester"], actor_principal);
 
         let persisted_requester: String =
             sqlx::query_scalar("SELECT requester FROM container_requests WHERE id = $1")
@@ -58248,7 +58753,7 @@ mod db_lifecycle_tests {
                 .fetch_one(pool)
                 .await
                 .expect("persisted container requester");
-        assert_eq!(persisted_requester, actor.user_id);
+        assert_eq!(persisted_requester, actor_principal);
 
         let (audit_actor, to_status, detail_json, prev_hash, entry_hash): (
             String,
@@ -58264,18 +58769,18 @@ mod db_lifecycle_tests {
                AND detail ->> 'namespace_id' = $2 \
              ORDER BY id DESC LIMIT 1",
         )
-        .bind(&actor.user_id)
+        .bind(&actor_principal)
         .bind(&namespace_id)
         .fetch_one(pool)
         .await
         .expect("namespace provisioning audit row");
         let detail: Value =
             serde_json::from_str(&detail_json).expect("namespace audit detail JSON");
-        assert_eq!(audit_actor, actor.user_id);
+        assert_eq!(audit_actor, actor_principal);
         assert_eq!(to_status, "provisioned");
         assert_eq!(detail["namespace_id"], namespace_id);
         assert_eq!(detail["request_id"], request_id);
-        assert_eq!(detail["requester"], actor_id);
+        assert_eq!(detail["requester"], actor_principal);
         assert_eq!(detail["cluster"], "defra-aks-01");
         assert_eq!(detail["site"], "DEFRA");
         assert_eq!(detail["environment"], "Dev");
@@ -58306,8 +58811,12 @@ mod db_lifecycle_tests {
         let namespace_name = format!("audit-rollback-{}", &suffix[..8]);
         let actor_id = format!("k8s-audit-rollback-{}", &suffix[..8]);
         let mut actor = scoped_session(&["DEFRA"], &["Dev"]);
-        actor.user_id = actor_id.clone();
+        bind_test_principal(&mut actor, &actor_id);
         actor.display_name = format!("Kubernetes rollback probe {actor_id}");
+        let actor_principal = actor
+            .principal_id
+            .expect("Kubernetes rollback actor has an opaque principal")
+            .to_string();
 
         let function_name = format!("reject_k8s_audit_{suffix}");
         let trigger_name = format!("reject_k8s_audit_trigger_{suffix}");
@@ -58315,7 +58824,7 @@ mod db_lifecycle_tests {
             "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
              BEGIN \
                IF NEW.action = 'k8s-namespace-provision' \
-                  AND NEW.actor_principal = '{actor_id}' THEN \
+                  AND NEW.actor_principal = '{actor_principal}' THEN \
                  RAISE EXCEPTION 'injected namespace audit failure' \
                    USING ERRCODE = '23514'; \
                END IF; \
@@ -58380,7 +58889,7 @@ mod db_lifecycle_tests {
             "SELECT COUNT(*) FROM audit_log \
              WHERE action = 'k8s-namespace-provision' AND actor_principal = $1",
         )
-        .bind(&actor.user_id)
+        .bind(&actor_principal)
         .fetch_one(pool)
         .await
         .expect("count rolled-back namespace audit rows");
@@ -58563,6 +59072,7 @@ mod db_lifecycle_tests {
     struct SeededSession {
         record_id: Uuid,
         session_token: String,
+        principal_id: ryuki_core::PrincipalId,
     }
 
     fn install_test_session_config() -> ryuki_core::config::SessionConfig {
@@ -58578,70 +59088,48 @@ mod db_lifecycle_tests {
         cfg.session
     }
 
-    async fn seed_test_identity_authority(
+    async fn seed_test_principal_binding(
         pool: &PgPool,
         provider: &str,
         subject: &str,
-    ) -> (String, i64, i64) {
+        roles: &[String],
+    ) -> (String, crate::principal_registry::PrincipalBinding) {
         let issuer = if provider == crate::identity_authority::LOCAL_PROVIDER {
             crate::identity_authority::LOCAL_ISSUER.to_string()
         } else {
             format!("urn:ryuki:test:{provider}")
         };
-        let digest = Sha256::digest(format!("test-authority\0{provider}\0{issuer}\0{subject}"));
-        let mut identity_tx = pool.begin().await.expect("begin identity seed");
-        crate::human_authority::prepare_writer_tx(&mut identity_tx, provider, &issuer, subject)
-            .await
-            .expect("prepare identity seed writer");
-        crate::human_authority::mark_governed_identity_reactivation_tx(&mut identity_tx)
-            .await
-            .expect("mark governed identity seed reactivation");
-        let epoch = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO identity_authorities \
-             (provider, issuer, subject, authority_epoch, authority_digest, authority_status, \
-              last_asserted_at) \
-             VALUES ($1, $2, $3, 1, $4, 'active-scoped-v2', NOW()) \
-             ON CONFLICT (provider, issuer, subject) DO UPDATE SET \
-               authority_epoch = CASE \
-                 WHEN identity_authorities.authority_status <> 'active-scoped-v2' \
-                   OR identity_authorities.authority_digest <> EXCLUDED.authority_digest \
-                 THEN identity_authorities.authority_epoch + 1 \
-                 ELSE identity_authorities.authority_epoch \
-               END, \
-               authority_digest = EXCLUDED.authority_digest, \
-               authority_status = 'active-scoped-v2', last_asserted_at = NOW(), updated_at = NOW() \
-             RETURNING authority_epoch",
-        )
-        .bind(provider)
-        .bind(&issuer)
-        .bind(subject)
-        .bind(digest.as_slice())
-        .fetch_one(&mut *identity_tx)
-        .await
-        .expect("seed identity authority");
-        identity_tx.commit().await.expect("commit identity seed");
-        crate::human_authority::persist_governed_assignment(
-            pool,
+        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+        let mut tx = pool.begin().await.expect("begin principal binding seed");
+        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+            &mut tx,
             provider,
             &issuer,
             subject,
-            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&[
-                "Auditor".to_string()
-            ]),
+            &crate::principal_registry::InitialHumanAuthority {
+                authority_digest: &authority_digest,
+                roles,
+                site_mode: "global",
+                site_scope: &[],
+                environment_mode: "global",
+                environment_scope: &[],
+                created_by: "contracts-db-test",
+            },
         )
         .await
-        .expect("seed human authority assignment");
-        let version: i64 = sqlx::query_scalar(
-            "SELECT assignment_version FROM human_authority_assignments \
-             WHERE provider = $1 AND issuer = $2 AND subject = $3",
-        )
-        .bind(provider)
-        .bind(&issuer)
-        .bind(subject)
-        .fetch_one(pool)
-        .await
-        .expect("read human authority version");
-        (issuer, epoch, version)
+        .expect("seed exact principal binding");
+        tx.commit().await.expect("commit principal binding seed");
+        (issuer, binding)
+    }
+
+    async fn seed_request_principal(
+        pool: &PgPool,
+        subject: &str,
+    ) -> crate::principal_registry::PrincipalBinding {
+        let roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        seed_test_principal_binding(pool, "local", subject, &roles)
+            .await
+            .1
     }
 
     async fn seed_session(pool: &PgPool, user_id: &str) -> SeededSession {
@@ -58649,27 +59137,32 @@ mod db_lifecycle_tests {
         let record_id = Uuid::new_v4();
         let credential = crate::session_credentials::issue_session_credential(&session)
             .expect("issue test session");
-        let (issuer, epoch, authority_version) =
-            seed_test_identity_authority(pool, "local", user_id).await;
+        let roles = vec!["Auditor".to_string()];
+        let (issuer, binding) = seed_test_principal_binding(pool, "local", user_id, &roles).await;
         let mut session_tx = pool.begin().await.expect("begin session seed");
         crate::human_authority::prepare_writer_tx(&mut session_tx, "local", &issuer, user_id)
             .await
             .expect("prepare session seed writer");
         sqlx::query(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, user_id, display_name, email, roles, provider, \
-              identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
+             (session_record_id, bearer_verifier, principal_id, principal_lifecycle_version, \
+              principal_authority_version, principal_key_id, principal_key_version, \
+              principal_link_id, principal_link_version, display_name, email, roles, \
               site_authority_mode, site_scope, environment_authority_mode, environment_scope) \
-             VALUES ($1, $2, $3, $4, NULL, ARRAY['Auditor']::TEXT[], 'local', $5, $3, $6, $7, \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, \
                      'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[])",
         )
         .bind(record_id)
         .bind(credential.verifier().as_slice())
-        .bind(user_id)
+        .bind(binding.principal_id.into_uuid())
+        .bind(binding.principal_lifecycle_version)
+        .bind(binding.principal_authority_version)
+        .bind(binding.principal_key_id)
+        .bind(binding.principal_key_version)
+        .bind(binding.principal_link_id)
+        .bind(binding.principal_link_version)
         .bind(format!("{user_id} display"))
-        .bind(issuer)
-        .bind(epoch)
-        .bind(authority_version)
+        .bind(&roles)
         .execute(&mut *session_tx)
         .await
         .expect("seed session");
@@ -58677,6 +59170,7 @@ mod db_lifecycle_tests {
         SeededSession {
             record_id,
             session_token: credential.bearer().to_string(),
+            principal_id: binding.principal_id,
         }
     }
 
@@ -61049,6 +61543,7 @@ mod db_lifecycle_tests {
             return;
         };
         let site = "TESTMETER-9q";
+        let binding = seed_request_principal(pool, "metering-test-requester").await;
         sqlx::query("DELETE FROM requests WHERE site = $1")
             .bind(site)
             .execute(pool)
@@ -61056,12 +61551,17 @@ mod db_lifecycle_tests {
             .ok();
         for status in ["intake", "intake", "completed"] {
             sqlx::query(
-                "INSERT INTO requests (id, request_type, status, stage, site, environment, name) \
-                 VALUES ($1, 'server-deployment', $2, 'intake', $3, 'production', 'metering-test')",
+                "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, \
+                  principal_binding_state, created_by_principal_id, requester_principal_id, \
+                  owner_principal_id) \
+                 VALUES ($1, 'server-deployment', $2, 'intake', $3, 'production', \
+                         'metering-test', 'exact-v1', $4, $4, $4)",
             )
             .bind(uuid::Uuid::new_v4())
             .bind(status)
             .bind(site)
+            .bind(binding.principal_id.into_uuid())
             .execute(pool)
             .await
             .expect("insert request");
@@ -61100,6 +61600,7 @@ mod db_lifecycle_tests {
             return;
         };
         let site = "TESTCHARGE-3k";
+        let binding = seed_request_principal(pool, "chargeback-test-requester").await;
         // A VALID request_type (mig 109 CHECK); the chargeback math is independent
         // of which type. cost_rates has no seed data + the DB-test serial lock, so
         // setting/clearing this type's rate cannot collide.
@@ -61128,12 +61629,17 @@ mod db_lifecycle_tests {
         .expect("set rate");
         for _ in 0..4 {
             sqlx::query(
-                "INSERT INTO requests (id, request_type, status, stage, site, environment, name) \
-                 VALUES ($1, $2, 'intake', 'intake', $3, 'production', 'charge-test')",
+                "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, \
+                  principal_binding_state, created_by_principal_id, requester_principal_id, \
+                  owner_principal_id) \
+                 VALUES ($1, $2, 'intake', 'intake', $3, 'production', 'charge-test', \
+                         'exact-v1', $4, $4, $4)",
             )
             .bind(uuid::Uuid::new_v4())
             .bind(rtype)
             .bind(site)
+            .bind(binding.principal_id.into_uuid())
             .execute(pool)
             .await
             .expect("insert request");
@@ -61451,7 +61957,8 @@ mod db_lifecycle_tests {
                 .await
                 .expect("session-only resolution must yield a session");
         assert!(session.token_valid);
-        assert_eq!(session.user_id, "user-fallthrough");
+        assert_eq!(session.principal_id, Some(seeded.principal_id));
+        assert_eq!(session.display_user_id, seeded.principal_id.to_string());
         assert_eq!(source, crate::SessionIdSource::Header);
 
         sqlx::query("DELETE FROM sessions WHERE session_record_id = $1")
@@ -61468,7 +61975,7 @@ mod db_lifecycle_tests {
     /// `get_db()` pool. provider_mode=local so the audit/DB path is exercised.
     fn admin_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.token_valid = true;
@@ -61747,33 +62254,18 @@ mod db_lifecycle_tests {
                 ..Default::default()
             },
         );
-        let admin = admin_session("dbtest-admin-tok-4d2");
-        let (issuer, identity_epoch, _) =
-            seed_test_identity_authority(pool, "local", &admin.user_id).await;
-        crate::human_authority::persist_governed_assignment(
-            pool,
-            "local",
-            &issuer,
-            &admin.user_id,
-            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&admin.roles),
-        )
-        .await
-        .expect("seed token issuer authority");
-        let assignment_version: i64 = sqlx::query_scalar(
-            "SELECT assignment_version FROM human_authority_assignments \
-             WHERE provider = 'local' AND issuer = $1 AND subject = $2",
-        )
-        .bind(&issuer)
-        .bind(&admin.user_id)
-        .fetch_one(pool)
-        .await
-        .expect("read token issuer authority version");
+        let mut admin = admin_session("dbtest-admin-tok-4d2");
+        let subject = "dbtest-admin-tok-4d2";
+        let (issuer, principal_binding) =
+            seed_test_principal_binding(pool, "local", subject, &admin.roles).await;
+        admin.principal_id = Some(principal_binding.principal_id);
         let issuing_authority = crate::human_authority::InteractiveHumanAuthorityContext {
+            principal_binding,
             provider: "local".into(),
             issuer,
-            subject: admin.user_id.clone(),
-            identity_epoch,
-            assignment_version,
+            subject: subject.into(),
+            identity_epoch: principal_binding.principal_lifecycle_version,
+            assignment_version: principal_binding.principal_authority_version,
             roles: canonical_token_roles(&admin.roles).unwrap(),
             site_mode: crate::human_authority::HumanAuthorityMode::Global,
             site_scope: vec![],
@@ -61785,7 +62277,6 @@ mod db_lifecycle_tests {
             InteractiveHumanAuthorityExtractor(Some(issuing_authority)),
             Json(CreateTokenRequest {
                 name: "dbtest-audit-token".into(),
-                owner_principal: admin.user_id.clone(),
                 roles: admin.roles.clone(),
                 site_scope: None,
                 environment_scope: None,
@@ -61822,7 +62313,11 @@ mod db_lifecycle_tests {
         .expect("query create audit")
         .expect("a durable create audit row must exist");
         assert_eq!(c_action, "api-token-create");
-        assert_eq!(c_actor, "dbtest-admin-tok-4d2", "actor must be the admin");
+        assert_eq!(
+            c_actor,
+            principal_binding.principal_id.to_string(),
+            "actor must be the opaque issuing principal"
+        );
         assert!(c_detail.contains("dbtest-audit-token"), "names the token");
         assert!(
             !c_detail.contains("ryk_"),
@@ -61857,28 +62352,32 @@ mod db_lifecycle_tests {
         };
         let sid = Uuid::new_v4();
         let subject = "dbtest-victim-sess-8a1";
-        let (issuer, epoch, authority_version) =
-            seed_test_identity_authority(pool, "local", subject).await;
+        let roles = vec!["Auditor".to_string()];
+        let (issuer, binding) = seed_test_principal_binding(pool, "local", subject, &roles).await;
         let mut session_tx = pool.begin().await.expect("begin audit session seed");
         crate::human_authority::prepare_writer_tx(&mut session_tx, "local", &issuer, subject)
             .await
             .expect("prepare audit session writer");
         sqlx::query(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, user_id, display_name, roles, provider, \
-              identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
+             (session_record_id, bearer_verifier, principal_id, principal_lifecycle_version, \
+              principal_authority_version, principal_key_id, principal_key_version, \
+              principal_link_id, principal_link_version, display_name, roles, \
               site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, 'local', $6, $3, $7, $8, \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], now() + interval '1 hour')",
         )
         .bind(sid)
         .bind(Sha256::digest(sid.as_bytes()).to_vec())
-        .bind(subject)
+        .bind(binding.principal_id.into_uuid())
+        .bind(binding.principal_lifecycle_version)
+        .bind(binding.principal_authority_version)
+        .bind(binding.principal_key_id)
+        .bind(binding.principal_key_version)
+        .bind(binding.principal_link_id)
+        .bind(binding.principal_link_version)
         .bind(format!("{subject} (test)"))
-        .bind(vec!["Auditor".to_string()])
-        .bind(issuer)
-        .bind(epoch)
-        .bind(authority_version)
+        .bind(&roles)
         .execute(&mut *session_tx)
         .await
         .expect("seed session");
@@ -61888,6 +62387,10 @@ mod db_lifecycle_tests {
             .expect("commit audit session seed");
 
         let admin = admin_session("dbtest-admin-sess-2c7");
+        let admin_principal = admin
+            .principal_id
+            .expect("admin test principal")
+            .to_string();
         let revoked = admin_sessions_revoke(AuthExtractor(admin), Path(sid)).await;
         assert!(revoked.is_ok(), "revoke must succeed: {revoked:?}");
 
@@ -61903,10 +62406,13 @@ mod db_lifecycle_tests {
         .expect("a durable session-revoke audit row must exist");
 
         assert_eq!(action, "session-revoke");
-        assert_eq!(actor, "dbtest-admin-sess-2c7", "actor must be the admin");
+        assert_eq!(
+            actor, admin_principal,
+            "actor must be the opaque admin principal"
+        );
         assert!(
-            detail.contains(subject),
-            "audit detail must name the subject whose session was revoked"
+            detail.contains(&binding.principal_id.to_string()),
+            "audit detail must name the opaque principal whose session was revoked"
         );
     }
 
@@ -61921,28 +62427,32 @@ mod db_lifecycle_tests {
         };
         let sid = Uuid::new_v4();
         let subject = "dbtest-getsess-9f2";
-        let (issuer, epoch, authority_version) =
-            seed_test_identity_authority(pool, "local", subject).await;
+        let roles = vec!["Auditor".to_string()];
+        let (issuer, binding) = seed_test_principal_binding(pool, "local", subject, &roles).await;
         let mut session_tx = pool.begin().await.expect("begin get-session seed");
         crate::human_authority::prepare_writer_tx(&mut session_tx, "local", &issuer, subject)
             .await
             .expect("prepare get-session writer");
         sqlx::query(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, user_id, display_name, roles, provider, \
-              identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
+             (session_record_id, bearer_verifier, principal_id, principal_lifecycle_version, \
+              principal_authority_version, principal_key_id, principal_key_version, \
+              principal_link_id, principal_link_version, display_name, roles, \
               site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, 'local', $6, $3, $7, $8, \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], now() + interval '1 hour')",
         )
         .bind(sid)
         .bind(Sha256::digest(sid.as_bytes()).to_vec())
-        .bind(subject)
+        .bind(binding.principal_id.into_uuid())
+        .bind(binding.principal_lifecycle_version)
+        .bind(binding.principal_authority_version)
+        .bind(binding.principal_key_id)
+        .bind(binding.principal_key_version)
+        .bind(binding.principal_link_id)
+        .bind(binding.principal_link_version)
         .bind(format!("{subject} (test)"))
-        .bind(vec!["Auditor".to_string()])
-        .bind(issuer)
-        .bind(epoch)
-        .bind(authority_version)
+        .bind(&roles)
         .execute(&mut *session_tx)
         .await
         .expect("seed session");
@@ -61955,8 +62465,8 @@ mod db_lifecycle_tests {
         .await
         .expect("an existing session must be returned");
         assert_eq!(got.0["id"], json!(sid));
-        assert_eq!(got.0["user_id"], json!(subject));
-        assert_eq!(got.0["provider"], json!("local"));
+        assert_eq!(got.0["principal_id"], json!(binding.principal_id));
+        assert_eq!(got.0["provider_id"], json!("local"));
         assert!(got.0.get("bearer_verifier").is_none());
         assert!(got.0.get("session_token").is_none());
 
@@ -64035,7 +64545,7 @@ mod db_lifecycle_tests {
             ryuki_engine::auth::APP_ROLE_REQUESTER,
         ] {
             let mut session = AuthSession::static_dry_run();
-            session.user_id = "network-low-privilege".into();
+            bind_test_principal(&mut session, "network-low-privilege");
             session.roles = vec![role.to_string()];
             let readiness = network_readiness_check(
                 AuthExtractor(session.clone()),
@@ -65029,20 +65539,24 @@ mod db_lifecycle_tests {
             return;
         };
         let actor = "prefs-audit-test-user";
-        let count = |p: &'static PgPool| async move {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM audit_log \
-                 WHERE action = 'user.preferences.update' AND actor_principal = $1",
-            )
-            .bind(actor)
-            .fetch_one(p)
-            .await
-            .expect("count audit rows")
+        let actor_principal = test_principal_id(actor).to_string();
+        let count = |p: &'static PgPool| {
+            let actor_principal = actor_principal.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM audit_log \
+                     WHERE action = 'user.preferences.update' AND actor_principal = $1",
+                )
+                .bind(actor_principal)
+                .fetch_one(p)
+                .await
+                .expect("count audit rows")
+            }
         };
         let before = count(pool).await;
 
         let mut session = AuthSession::static_dry_run();
-        session.user_id = actor.into();
+        bind_test_principal(&mut session, actor);
         let resp = user_preferences_put(
             AuthExtractor(session),
             Json(UserPreferencesRequest {
@@ -65142,7 +65656,7 @@ mod db_lifecycle_tests {
         .expect("place fixture in quarantine");
 
         let mut maker = AuthSession::static_dry_run();
-        maker.user_id = "quarantine-recovery-maker".into();
+        bind_test_principal(&mut maker, "quarantine-recovery-maker");
         maker.token_valid = true;
         maker.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         maker.provider_mode = "test-verified-human".into();
@@ -65182,7 +65696,7 @@ mod db_lifecycle_tests {
         );
 
         let mut checker = AuthSession::static_dry_run();
-        checker.user_id = "quarantine-recovery-checker".into();
+        bind_test_principal(&mut checker, "quarantine-recovery-checker");
         checker.token_valid = true;
         checker.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         checker.provider_mode = "test-verified-human".into();
@@ -66924,25 +67438,32 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let request_binding = seed_request_principal(pool, "alert-owner").await;
         let spec_request_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO requests \
-             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+              principal_binding_state, created_by_principal_id, requester_principal_id, \
+              owner_principal_id) \
              VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', \
-                     'production', 'agent-alert-scope-test', 2, 4, 'alert-owner')",
+                     'production', 'agent-alert-scope-test', 2, 4, 'exact-v1', $2, $2, $2)",
         )
         .bind(spec_request_id)
+        .bind(request_binding.principal_id.into_uuid())
         .execute(pool)
         .await
         .expect("seed authoritative request");
         let scalar_request_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO requests \
-             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+              principal_binding_state, created_by_principal_id, requester_principal_id, \
+              owner_principal_id) \
              VALUES ($1, 'server-deployment', 'intake', 'intake', 'GBLON', \
-                     'test', 'agent-alert-scalar-scope-test', 2, 4, 'alert-owner')",
+                     'test', 'agent-alert-scalar-scope-test', 2, 4, 'exact-v1', $2, $2, $2)",
         )
         .bind(scalar_request_id)
+        .bind(request_binding.principal_id.into_uuid())
         .execute(pool)
         .await
         .expect("seed divergent scalar request");
@@ -67029,7 +67550,7 @@ mod db_lifecycle_tests {
 
         let scoped = |site: &str, environment: &str, user_id: &str| {
             let mut session = AuthSession::static_dry_run();
-            session.user_id = user_id.to_string();
+            bind_test_principal(&mut session, user_id);
             session.site_scope = vec![site.to_string()];
             session.environment_scope = vec![environment.to_string()];
             session
@@ -68774,7 +69295,7 @@ mod db_lifecycle_tests {
         let id = seed_request(pool, "planned", "approve").await;
         let actor = "batch-reject-auditor-p2";
         let mut auditor = AuthSession::static_dry_run();
-        auditor.user_id = actor.into();
+        bind_test_principal(&mut auditor, actor);
         auditor.provider_mode = "local".into();
         auditor.roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
 
@@ -68885,7 +69406,7 @@ mod db_lifecycle_tests {
     /// `approver_session` but holding `execute` (VMwareOperator) instead of `approve`.
     fn operator_session() -> AuthSession {
         let mut s = approver_session();
-        s.user_id = "operator-db".into();
+        bind_test_principal(&mut s, "operator-db");
         s.roles = vec![ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string()];
         s
     }
@@ -69215,7 +69736,7 @@ mod db_lifecycle_tests {
         let id2 = seed_request(pool, "planned", "approve").await;
         let actor = "batch-fail-approver-p2";
         let mut approver = approver_session();
-        approver.user_id = actor.into();
+        bind_test_principal(&mut approver, actor);
 
         let denied_count = |actor: &'static str| async move {
             sqlx::query_scalar::<_, i64>(
@@ -69315,7 +69836,7 @@ mod db_lifecycle_tests {
 
     fn dc_approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
@@ -69676,7 +70197,7 @@ mod db_lifecycle_tests {
     }
 
     /// #59: a user's scope preferences round-trip (set → read → clear), keyed on
-    /// the verified session.user_id (a unique user so it never collides).
+    /// the verified opaque principal id (a unique principal so it never collides).
     #[tokio::test]
     async fn user_preferences_set_get_clear_roundtrip() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -69686,7 +70207,7 @@ mod db_lifecycle_tests {
         };
         let uid = format!("pref-user-{}", Uuid::new_v4());
         let mut session = AuthSession::static_dry_run();
-        session.user_id = uid.clone();
+        let principal = bind_test_principal(&mut session, &uid).to_string();
 
         // Set both.
         let Ok(Json(set)) = user_preferences_put(
@@ -69699,7 +70220,7 @@ mod db_lifecycle_tests {
         .await
         else {
             sqlx::query("DELETE FROM user_preferences WHERE user_id = $1")
-                .bind(&uid)
+                .bind(&principal)
                 .execute(pool)
                 .await
                 .ok();
@@ -69735,7 +70256,7 @@ mod db_lifecycle_tests {
         assert_eq!(cleared["preferred_environment"], serde_json::Value::Null);
 
         sqlx::query("DELETE FROM user_preferences WHERE user_id = $1")
-            .bind(&uid)
+            .bind(&principal)
             .execute(pool)
             .await
             .ok();
@@ -69871,10 +70392,10 @@ mod quorum_enforcement_db_tests {
     }
 
     /// A verified approver session with an explicit principal AND approval role,
-    /// so distinct (user_id, role) pairs can form (or fail to form) a quorum.
+    /// so distinct (principal id, role) pairs can form (or fail to form) a quorum.
     fn approver(user_id: &str, role: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.roles = vec![role.to_string()];
@@ -71649,13 +72170,17 @@ mod quorum_enforcement_db_tests {
     #[tokio::test]
     async fn sod_blocks_self_approval_on_quorum_request() {
         let creator = approver("self-q", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let creator_principal = creator
+            .principal_id
+            .expect("creator test principal")
+            .to_string();
         // Creator == approver under live identity -> Block (403 in the handler).
         assert_eq!(
-            sod_decision(&creator, Some("self-q"), &AuthMode::Local),
+            sod_decision(&creator, Some(&creator_principal), &AuthMode::Local),
             SodDecision::Block
         );
         assert_eq!(
-            sod_decision(&creator, Some("self-q"), &AuthMode::EntraId),
+            sod_decision(&creator, Some(&creator_principal), &AuthMode::EntraId),
             SodDecision::Block
         );
         // A distinct approver is always allowed.
@@ -71843,7 +72368,7 @@ mod dns_records_db_tests {
 
     fn audit_actor(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s
     }
 
@@ -71857,8 +72382,13 @@ mod dns_records_db_tests {
             return;
         };
         let actor = "dns-audit-7c2";
+        let actor_session = audit_actor(actor);
+        let actor_principal = actor_session
+            .principal_id
+            .expect("DNS audit actor has a typed principal")
+            .to_string();
         let Json(created) = dns_record_create(
-            AuthExtractor(audit_actor(actor)),
+            AuthExtractor(actor_session),
             Json(DnsCreateRequest {
                 name: "audit".into(),
                 record_type: "A".into(),
@@ -71883,7 +72413,7 @@ mod dns_records_db_tests {
         .expect("query create audit")
         .expect("a dns-record-create audit row must exist");
         assert_eq!(
-            c_actor, actor,
+            c_actor, actor_principal,
             "audit actor must be the authenticated caller"
         );
         assert!(c_detail.contains("DEFRA"), "detail must name the site");
@@ -72232,7 +72762,7 @@ mod maint_calendar_db_tests {
 
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.provider_mode = "local".into();
         s
     }
@@ -74015,7 +74545,8 @@ mod shift_queue_db_tests {
         environments: &[&str],
     ) -> AuthSession {
         AuthSession {
-            user_id: user_id.into(),
+            display_user_id: user_id.into(),
+            principal_id: Some(test_principal_id(user_id)),
             display_name: format!("{user_id} (verified test human)"),
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             token_valid: true,
@@ -76388,7 +76919,7 @@ mod shift_queue_db_tests {
         };
         let role_session = |role: &str| {
             let mut s = AuthSession::static_dry_run();
-            s.user_id = "shift-reader".into();
+            bind_test_principal(&mut s, "shift-reader");
             s.provider_mode = "local".into();
             s.roles = vec![role.to_string()];
             s
@@ -76427,7 +76958,7 @@ mod emergency_change_unit_tests {
 
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.token_valid = true;
         s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         s.provider_mode = "test-verified-human".into();
@@ -76560,10 +77091,10 @@ mod secrets_rotation_db_tests {
     use sqlx::PgPool;
 
     /// Authenticated rotating session — secrets_rotate stamps `rotated_by` from
-    /// `session.user_id`, so the persisted run must carry exactly this id.
+    /// the typed principal, so the persisted run must carry exactly this id.
     fn caller_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s
@@ -76962,7 +77493,7 @@ mod secrets_rotation_db_tests {
     // ── SECURITY: rotate stamps rotated_by from the session, not a client field ──
 
     #[tokio::test]
-    async fn test_rotate_records_session_user_as_rotated_by() {
+    async fn test_rotate_records_session_principal_as_rotated_by() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -76972,15 +77503,16 @@ mod secrets_rotation_db_tests {
         // A distinctive session principal: if attribution leaked from anywhere
         // other than THIS session, the assertion below would not match.
         let session_user = "dbtest-principal-rotate-7f3a";
+        let session = caller_session(session_user);
+        let session_principal = session
+            .principal_id
+            .expect("rotation caller has a typed principal")
+            .to_string();
         seed_secret(pool, id, "DBTEST-RA", "2026-12-31T00:00:00+00:00").await;
         // Freshly seeded → zero runs; rotate must create exactly one for it.
         assert_eq!(run_count_for(pool, id).await, 0, "fixture must start clean");
 
-        let result = secrets_rotate(
-            Path(id.to_string()),
-            Extension(caller_session(session_user)),
-        )
-        .await;
+        let result = secrets_rotate(Path(id.to_string()), Extension(session)).await;
 
         let Ok(Json(body)) = &result else {
             cleanup_secret(pool, id).await;
@@ -77014,8 +77546,8 @@ mod secrets_rotation_db_tests {
             "the run must belong to the rotated secret"
         );
         assert_eq!(
-            persisted_actor, session_user,
-            "rotated_by MUST be the session user_id, never a client value"
+            persisted_actor, session_principal,
+            "rotated_by MUST be the typed session principal, never a client value"
         );
     }
 
@@ -77031,13 +77563,14 @@ mod secrets_rotation_db_tests {
         };
         let id = "sr-dbtest-audit-9c1";
         let session_user = "dbtest-principal-audit-3b8e";
+        let session = caller_session(session_user);
+        let session_principal = session
+            .principal_id
+            .expect("rotation caller has a typed principal")
+            .to_string();
         seed_secret(pool, id, "DBTEST-AUD", "2026-12-31T00:00:00+00:00").await;
 
-        let result = secrets_rotate(
-            Path(id.to_string()),
-            Extension(caller_session(session_user)),
-        )
-        .await;
+        let result = secrets_rotate(Path(id.to_string()), Extension(session)).await;
         assert!(result.is_ok(), "rotate must succeed: {result:?}");
 
         // The durable audit_log row, read back from the DB (not the response).
@@ -77057,7 +77590,7 @@ mod secrets_rotation_db_tests {
             row.expect("a durable audit_log row must exist for the rotation");
         assert_eq!(action, "secret-rotate");
         assert_eq!(
-            actor, session_user,
+            actor, session_principal,
             "audit actor MUST be the authenticated caller"
         );
         assert_eq!(to_status, "rotated");
@@ -77423,7 +77956,7 @@ mod secrets_rotation_db_tests {
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api access_recertification_db_tests
 //
 // The headline property is SECURITY: start assigns `reviewer` from the
-// AUTHENTICATED session.user_id (Extension<AuthSession>), never a client field;
+// AUTHENTICATED typed principal (Extension<AuthSession>), never a client field;
 // approve/revoke/exempt then require and preserve that exact designation. A
 // second approve-tier principal cannot claim the object by submitting a
 // verdict. Repo tests cover the SQL CAS, while these tests prove the
@@ -77435,15 +77968,19 @@ mod access_recertification_db_tests {
     use sqlx::PgPool;
 
     /// Authenticated reviewing session — the decision handlers stamp `reviewer`
-    /// from `session.user_id`, so the persisted row must carry exactly this id.
+    /// from `session.principal_id`, so the persisted row must carry exactly this id.
     fn caller_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.token_valid = true;
         s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         s
+    }
+
+    fn caller_principal(user_id: &str) -> String {
+        test_principal_id(user_id).to_string()
     }
 
     #[tokio::test]
@@ -77599,7 +78136,7 @@ mod access_recertification_db_tests {
         assert_eq!(rows.len(), 1, "one successful decision must emit one event");
         let row = rows.into_iter().next().expect("one audit row");
         let expected_session = caller_session(actor);
-        assert_eq!(row.actor_principal, actor);
+        assert_eq!(row.actor_principal, caller_principal(actor));
         assert_eq!(row.actor_display, expected_session.display_name);
         assert_eq!(row.actor_roles, expected_session.roles);
         assert_eq!(row.provider_mode, expected_session.provider_mode);
@@ -77637,7 +78174,7 @@ mod access_recertification_db_tests {
             "CREATE FUNCTION ryuki_test_reject_audit_insert() RETURNS trigger \
              LANGUAGE plpgsql AS $$ \
              BEGIN \
-               IF NEW.actor_principal LIKE 'dbtest-audit-failure-%' THEN \
+               IF NEW.action LIKE 'access-review-%' THEN \
                  RAISE EXCEPTION 'injected audit failure' USING ERRCODE = '23514'; \
                END IF; \
                RETURN NEW; \
@@ -77670,7 +78207,7 @@ mod access_recertification_db_tests {
     // ── SECURITY: start stamps `reviewer` from the session, not a client field ──
 
     #[tokio::test]
-    async fn test_start_records_session_user_as_reviewer() {
+    async fn test_start_records_session_principal_as_reviewer() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -77678,6 +78215,7 @@ mod access_recertification_db_tests {
         };
         let id = Uuid::new_v4().to_string();
         let session_user = "dbtest-reviewer-start-3a7";
+        let session_principal = caller_principal(session_user);
         seed_review(pool, &id, "Pending", None).await;
 
         let result =
@@ -77689,8 +78227,8 @@ mod access_recertification_db_tests {
         let (reviewer, status) = row.expect("row must exist");
         assert_eq!(
             reviewer.as_deref(),
-            Some(session_user),
-            "reviewer MUST be the session user_id, never a client value"
+            Some(session_principal.as_str()),
+            "reviewer MUST be the typed session principal, never a client value"
         );
         assert_eq!(status, "InProgress", "start must flip status to InProgress");
         assert_decision_audit(
@@ -77716,7 +78254,8 @@ mod access_recertification_db_tests {
         };
         let id = Uuid::new_v4().to_string();
         let session_user = "dbtest-approver-9d4";
-        seed_review(pool, &id, "InProgress", Some(session_user)).await;
+        let session_principal = caller_principal(session_user);
+        seed_review(pool, &id, "InProgress", Some(&session_principal)).await;
         let before_due = next_review_due(pool, &id).await;
 
         let result = access_review_approve(
@@ -77736,7 +78275,7 @@ mod access_recertification_db_tests {
         let (reviewer, status) = row.expect("row must exist");
         assert_eq!(
             reviewer.as_deref(),
-            Some(session_user),
+            Some(session_principal.as_str()),
             "approval must preserve the start-time reviewer designation"
         );
         assert_eq!(status, "Approved");
@@ -77766,7 +78305,9 @@ mod access_recertification_db_tests {
         let id = Uuid::new_v4().to_string();
         let designated = "dbtest-designated-reviewer";
         let other = "dbtest-nondesignated-approver";
-        seed_review(pool, &id, "InProgress", Some(designated)).await;
+        let designated_principal = caller_principal(designated);
+        let other_principal = caller_principal(other);
+        seed_review(pool, &id, "InProgress", Some(&designated_principal)).await;
         let before = review_snapshot(pool, &id).await;
 
         let result = access_review_approve(
@@ -77785,7 +78326,7 @@ mod access_recertification_db_tests {
             "SELECT COUNT(*) FROM audit_log \
              WHERE actor_principal = $1 AND action = 'access-review-approve'",
         )
-        .bind(other)
+        .bind(&other_principal)
         .fetch_one(pool)
         .await
         .expect("count denied reviewer audits");
@@ -77805,9 +78346,11 @@ mod access_recertification_db_tests {
         };
         let designated = "dbtest-designated-verdict-reviewer";
         let other = "dbtest-nondesignated-verdict-reviewer";
+        let designated_principal = caller_principal(designated);
+        let other_principal = caller_principal(other);
 
         let revoke_id = Uuid::new_v4().to_string();
-        seed_review(pool, &revoke_id, "InProgress", Some(designated)).await;
+        seed_review(pool, &revoke_id, "InProgress", Some(&designated_principal)).await;
         let revoke_before = review_snapshot(pool, &revoke_id).await;
         let revoke = access_review_revoke(
             Path(revoke_id.clone()),
@@ -77822,7 +78365,7 @@ mod access_recertification_db_tests {
         assert_eq!(review_snapshot(pool, &revoke_id).await, revoke_before);
 
         let exempt_id = Uuid::new_v4().to_string();
-        seed_review(pool, &exempt_id, "InProgress", Some(designated)).await;
+        seed_review(pool, &exempt_id, "InProgress", Some(&designated_principal)).await;
         let exempt_before = review_snapshot(pool, &exempt_id).await;
         let exempt = access_review_exempt(
             Path(exempt_id.clone()),
@@ -77842,7 +78385,7 @@ mod access_recertification_db_tests {
                AND action IN ('access-review-revoke', 'access-review-exempt') \
                AND detail->>'review_id' IN ($2, $3)",
         )
-        .bind(other)
+        .bind(&other_principal)
         .bind(&revoke_id)
         .bind(&exempt_id)
         .fetch_one(pool)
@@ -77865,6 +78408,7 @@ mod access_recertification_db_tests {
             return;
         };
         let actor = format!("dbtest-pending-verdict-{}", Uuid::new_v4());
+        let actor_principal = caller_principal(&actor);
         let approve_id = Uuid::new_v4().to_string();
         let revoke_id = Uuid::new_v4().to_string();
         let exempt_id = Uuid::new_v4().to_string();
@@ -77917,7 +78461,7 @@ mod access_recertification_db_tests {
                               'access-review-exempt') \
                AND detail->>'review_id' IN ($2, $3, $4)",
         )
-        .bind(&actor)
+        .bind(&actor_principal)
         .bind(&approve_id)
         .bind(&revoke_id)
         .bind(&exempt_id)
@@ -77943,7 +78487,8 @@ mod access_recertification_db_tests {
         };
         let id = Uuid::new_v4().to_string();
         let session_user = "dbtest-revoker-5f1";
-        seed_review(pool, &id, "InProgress", Some(session_user)).await;
+        let session_principal = caller_principal(session_user);
+        seed_review(pool, &id, "InProgress", Some(&session_principal)).await;
 
         let result = access_review_revoke(
             Path(id.clone()),
@@ -77959,7 +78504,7 @@ mod access_recertification_db_tests {
 
         assert!(result.is_ok(), "revoke must succeed: {result:?}");
         let (reviewer, status) = row.expect("row must exist");
-        assert_eq!(reviewer.as_deref(), Some(session_user));
+        assert_eq!(reviewer.as_deref(), Some(session_principal.as_str()));
         assert_eq!(status, "Revoked");
         assert_decision_audit(
             pool,
@@ -77982,7 +78527,8 @@ mod access_recertification_db_tests {
         };
         let id = Uuid::new_v4().to_string();
         let session_user = "dbtest-exemptor-6b2";
-        seed_review(pool, &id, "InProgress", Some(session_user)).await;
+        let session_principal = caller_principal(session_user);
+        seed_review(pool, &id, "InProgress", Some(&session_principal)).await;
         let expiry = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
 
         let result = access_review_exempt(
@@ -77997,7 +78543,7 @@ mod access_recertification_db_tests {
 
         assert!(result.is_ok(), "exempt must succeed: {result:?}");
         let (reviewer, status) = review_row(pool, &id).await.expect("row must exist");
-        assert_eq!(reviewer.as_deref(), Some(session_user));
+        assert_eq!(reviewer.as_deref(), Some(session_principal.as_str()));
         assert_eq!(status, "Exempted");
         let audit = assert_decision_audit(
             pool,
@@ -78021,6 +78567,7 @@ mod access_recertification_db_tests {
         };
         let id = Uuid::new_v4().to_string();
         let actor = format!("dbtest-audit-failure-{}", Uuid::new_v4());
+        let actor_principal = caller_principal(&actor);
         seed_review(pool, &id, "Pending", None).await;
         let before_updated_at: chrono::DateTime<chrono::Utc> =
             sqlx::query_scalar("SELECT updated_at FROM access_reviews WHERE id = $1::uuid")
@@ -78048,7 +78595,7 @@ mod access_recertification_db_tests {
             "SELECT COUNT(*) FROM audit_log \
              WHERE actor_principal = $1 AND action = 'access-review-start'",
         )
-        .bind(&actor)
+        .bind(&actor_principal)
         .fetch_one(pool)
         .await
         .expect("count rejected audit rows");
@@ -78081,9 +78628,12 @@ mod access_recertification_db_tests {
         let approve_actor = format!("dbtest-audit-failure-approve-{token}");
         let revoke_actor = format!("dbtest-audit-failure-revoke-{token}");
         let exempt_actor = format!("dbtest-audit-failure-exempt-{token}");
-        seed_review(pool, &approve_id, "InProgress", Some(&approve_actor)).await;
-        seed_review(pool, &revoke_id, "InProgress", Some(&revoke_actor)).await;
-        seed_review(pool, &exempt_id, "InProgress", Some(&exempt_actor)).await;
+        let approve_principal = caller_principal(&approve_actor);
+        let revoke_principal = caller_principal(&revoke_actor);
+        let exempt_principal = caller_principal(&exempt_actor);
+        seed_review(pool, &approve_id, "InProgress", Some(&approve_principal)).await;
+        seed_review(pool, &revoke_id, "InProgress", Some(&revoke_principal)).await;
+        seed_review(pool, &exempt_id, "InProgress", Some(&exempt_principal)).await;
         let approve_before = review_snapshot(pool, &approve_id).await;
         let revoke_before = review_snapshot(pool, &revoke_id).await;
         let exempt_before = review_snapshot(pool, &exempt_id).await;
@@ -78139,9 +78689,9 @@ mod access_recertification_db_tests {
                AND action IN ('access-review-approve', 'access-review-revoke', \
                               'access-review-exempt')",
         )
-        .bind(&approve_actor)
-        .bind(&revoke_actor)
-        .bind(&exempt_actor)
+        .bind(&approve_principal)
+        .bind(&revoke_principal)
+        .bind(&exempt_principal)
         .fetch_one(pool)
         .await
         .expect("count rejected access decision audits");
@@ -78181,7 +78731,8 @@ mod access_recertification_db_tests {
         };
         let id = "c0000200-d0d0-4000-8000-00000000a004";
         // Already Approved → start (Pending-only) must be rejected at the guard.
-        seed_review(pool, id, "Approved", Some("someone")).await;
+        let existing_reviewer = caller_principal("someone");
+        seed_review(pool, id, "Approved", Some(&existing_reviewer)).await;
 
         let result = access_review_start(
             Path(id.to_string()),
@@ -78282,12 +78833,13 @@ mod emergency_change_db_tests {
 
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.token_valid = true;
         s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         s.provider_mode = "test-verified-human".into();
         s
     }
+
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -78304,11 +78856,12 @@ mod emergency_change_db_tests {
     /// Seed a row directly in a chosen status so we can test transitions without
     /// traversing the full lifecycle each time.
     async fn seed_change(pool: &PgPool, id: &str, status: &str, site: &str) {
+        let seeded_principal = test_principal_id("seed.user").to_string();
         sqlx::query(
             "INSERT INTO emergency_changes \
              (id, change_description, affected_systems, initiated_by, reason_override, \
               status, audit_evidence, site) \
-             VALUES ($1::uuid, $2, ARRAY['host-a']::text[], 'seed.user', 'seed reason', \
+             VALUES ($1::uuid, $2, ARRAY['host-a']::text[], $5, 'seed reason', \
                     $3, '{}', $4) \
              ON CONFLICT (id) DO NOTHING",
         )
@@ -78316,6 +78869,7 @@ mod emergency_change_db_tests {
         .bind(format!("Test emergency {id}"))
         .bind(status)
         .bind(site)
+        .bind(seeded_principal)
         .execute(pool)
         .await
         .expect("seed emergency_change");
@@ -78344,7 +78898,7 @@ mod emergency_change_db_tests {
             "CREATE FUNCTION ryuki_test_reject_emergency_initiation_audit() RETURNS trigger \
              LANGUAGE plpgsql AS $$ \
              BEGIN \
-               IF NEW.actor_principal LIKE 'dbtest-emergency-audit-failure-%' THEN \
+               IF NEW.action = 'emergency-initiate' THEN \
                  RAISE EXCEPTION 'injected emergency initiation audit failure' \
                    USING ERRCODE = '23514'; \
                END IF; \
@@ -78388,6 +78942,10 @@ mod emergency_change_db_tests {
         };
 
         let initiating_session = approver_session("db.test.user");
+        let initiating_principal = initiating_session
+            .principal_id
+            .expect("initiator has a typed principal")
+            .to_string();
         let result = emergency_initiate(
             Extension(initiating_session.clone()),
             Json(EmergencyInitiateRequest {
@@ -78418,7 +78976,7 @@ mod emergency_change_db_tests {
         .expect("read back");
         let row = row.expect("row must exist after initiate");
         assert_eq!(row.status, "Initiated");
-        assert_eq!(row.initiated_by, "db.test.user");
+        assert_eq!(row.initiated_by, initiating_principal);
         assert_eq!(row.site, "DEFRA");
 
         type EmergencyInitiationAuditRow = (
@@ -78456,7 +79014,7 @@ mod emergency_change_db_tests {
             prev_hash,
             entry_hash,
         ) = &audits[0];
-        assert_eq!(actor, "db.test.user");
+        assert_eq!(actor, &initiating_principal);
         assert_eq!(actor_display, &initiating_session.display_name);
         assert_eq!(actor_roles, &initiating_session.roles);
         assert_eq!(provider_mode, &initiating_session.provider_mode);
@@ -78486,6 +79044,7 @@ mod emergency_change_db_tests {
             return;
         };
         let actor = format!("dbtest-emergency-audit-failure-{}", Uuid::new_v4());
+        let actor_principal = test_principal_id(&actor).to_string();
 
         install_initiation_audit_failure_trigger(pool).await;
         let result = emergency_initiate(
@@ -78502,7 +79061,7 @@ mod emergency_change_db_tests {
 
         let domain_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM emergency_changes WHERE initiated_by = $1")
-                .bind(&actor)
+                .bind(&actor_principal)
                 .fetch_one(pool)
                 .await
                 .expect("count rolled-back emergency rows");
@@ -78510,7 +79069,7 @@ mod emergency_change_db_tests {
             "SELECT COUNT(*) FROM audit_log WHERE actor_principal = $1 \
              AND action = 'emergency-initiate'",
         )
-        .bind(&actor)
+        .bind(&actor_principal)
         .fetch_one(pool)
         .await
         .expect("count rejected emergency audits");
@@ -78535,18 +79094,22 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000001";
         cleanup_change(pool, id).await;
         seed_change(pool, id, "Initiated", "DEFRA").await;
+        let approver = approver_session("test-approver");
+        let approver_principal = approver
+            .principal_id
+            .expect("approver has a typed principal")
+            .to_string();
 
-        let result = emergency_approve(
-            AuthExtractor(approver_session("test-approver")),
-            Path(id.into()),
-        )
-        .await;
+        let result = emergency_approve(AuthExtractor(approver), Path(id.into())).await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
         assert_eq!(body["source"], "database");
         assert_eq!(body["status"], "Approved");
-        assert_eq!(body["approved_by"].as_str(), Some("test-approver"));
+        assert_eq!(
+            body["approved_by"].as_str(),
+            Some(approver_principal.as_str())
+        );
 
         // #7 audit: the approve wrote a durable audit row attributing the
         // session principal (atomic with the CAS transition).
@@ -78561,7 +79124,7 @@ mod emergency_change_db_tests {
         .expect("query approve audit")
         .expect("an emergency-approve audit row must exist");
         assert_eq!(
-            audit_actor, "test-approver",
+            audit_actor, approver_principal,
             "audit actor must be the approver session principal"
         );
 
@@ -78574,11 +79137,13 @@ mod emergency_change_db_tests {
         .await
         .expect("read back");
         assert_eq!(row.status, "Approved");
-        assert_eq!(row.approved_by.as_deref(), Some("test-approver"));
-        assert!(row
-            .audit_evidence
-            .iter()
-            .any(|entry| { entry.contains("EMERGENCY human approval by test-approver") }));
+        assert_eq!(
+            row.approved_by.as_deref(),
+            Some(approver_principal.as_str())
+        );
+        assert!(row.audit_evidence.iter().any(|entry| {
+            entry.contains(&format!("EMERGENCY human approval by {approver_principal}"))
+        }));
 
         cleanup_change(pool, id).await;
     }
@@ -82996,7 +83561,7 @@ mod alert_routes_db_tests {
 
     fn scoped_admin(site: &str, environment: &str, user_id: &str) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = user_id.to_string();
+        bind_test_principal(&mut session, user_id);
         session.site_scope = vec![site.to_string()];
         session.environment_scope = vec![environment.to_string()];
         session
@@ -83744,7 +84309,7 @@ mod firewall_rules_db_tests {
 
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.provider_mode = "local".into();
         s
     }
@@ -83967,6 +84532,7 @@ mod firewall_rules_db_tests {
         };
         let suffix = uuid::Uuid::new_v4().to_string();
         let actor = format!("fw-audit-{}", &suffix[..8]);
+        let actor_principal = test_principal_id(&actor).to_string();
         let Ok(Json(created)) = firewall_rule_create(
             Extension(approver_session(&actor)),
             Json(create_body(&suffix)),
@@ -83988,7 +84554,7 @@ mod firewall_rules_db_tests {
         .expect("query create audit")
         .expect("a firewall-rule-create audit row must exist");
         assert_eq!(
-            c_actor, actor,
+            c_actor, actor_principal,
             "audit actor must be the authenticated caller"
         );
         assert!(c_detail.contains("DEFRA"), "detail must name the site");
@@ -84269,11 +84835,15 @@ mod legal_hold_db_tests {
 
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.provider_mode = "local".into();
         s.token_valid = true;
         s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         s
+    }
+
+    fn caller_principal(user_id: &str) -> String {
+        test_principal_id(user_id).to_string()
     }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
@@ -84313,6 +84883,7 @@ mod legal_hold_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let test_user_principal = caller_principal("test-user");
         let Ok(Json(placed)) = legal_hold_place(
             AuthExtractor(approver_session("test-user")),
             Json(place_body(&suffix)),
@@ -84374,7 +84945,7 @@ mod legal_hold_db_tests {
         .expect("query extend audit")
         .expect("a legal-hold-extend audit_log row must exist");
         assert_eq!(
-            audit_actor, "test-user",
+            audit_actor, test_user_principal,
             "audit actor must be the session principal"
         );
 
@@ -84409,6 +84980,7 @@ mod legal_hold_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let releaser_principal = caller_principal("test-releaser");
         let Ok(Json(placed)) = legal_hold_place(
             AuthExtractor(approver_session("test-user")),
             Json(place_body(&suffix)),
@@ -84432,7 +85004,7 @@ mod legal_hold_db_tests {
             released["status"], "Released",
             "status after release must be Released"
         );
-        assert_eq!(released["released_by"], "test-releaser");
+        assert_eq!(released["released_by"], releaser_principal);
 
         // Active query must NOT include the released hold.
         let Ok(Json(active)) = legal_hold_active(
@@ -84557,15 +85129,17 @@ mod legal_hold_db_tests {
         };
 
         let id = format!("lh-direct-{}", uuid::Uuid::new_v4());
+        let seeded_principal = caller_principal("test-user");
         sqlx::query(
             "INSERT INTO legal_holds \
              (id, server_or_app_name, hold_type, reason, initiated_by, \
               initiated_date, expiry_date, status, affected_backups, site, audit_trail) \
              VALUES ($1, 'db-test-srv.example.local', 'Litigation', 'Direct SQL test', \
-                     'test-user', NOW(), NOW() + INTERVAL '90 days', 'Active', \
+                     $2, NOW(), NOW() + INTERVAL '90 days', 'Active', \
                      '[\"bkp-001\"]'::jsonb, 'DEFRA', '[]'::jsonb)",
         )
         .bind(&id)
+        .bind(&seeded_principal)
         .execute(pool)
         .await
         .expect("direct SQL insert");
@@ -84592,6 +85166,7 @@ mod legal_hold_db_tests {
         );
 
         // Release via handler.
+        let releaser_principal = caller_principal("direct-test-releaser");
         let Ok(Json(released)) = legal_hold_release(
             AuthExtractor(approver_session("direct-test-releaser")),
             Path(id.clone()),
@@ -84602,7 +85177,7 @@ mod legal_hold_db_tests {
             panic!("release on direct-insert hold must succeed");
         };
         assert_eq!(released["status"], "Released");
-        assert_eq!(released["released_by"], "direct-test-releaser");
+        assert_eq!(released["released_by"], releaser_principal);
 
         cleanup_hold(pool, &id).await;
     }
@@ -84802,11 +85377,11 @@ mod software_deployment_db_tests {
         }
     }
 
-    /// An authenticated approver session — software_approve records the approver
-    /// from `session.user_id`, so the recorded `approved_by` is this id.
+    /// An authenticated approver session — software_approve records the typed
+    /// principal, so the recorded `approved_by` is its opaque UUID.
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.token_valid = true;
@@ -84839,13 +85414,14 @@ mod software_deployment_db_tests {
             .expect("plan approval-audit fixture");
         let deployment_id = planned["id"].as_str().expect("deployment id").to_string();
         let checker = approver_session("software-approval-audit-checker");
+        let checker_principal = checker.principal_id.expect("checker principal").to_string();
 
         let Json(approved) =
             software_approve(Path(deployment_id.clone()), AuthExtractor(checker.clone()))
                 .await
                 .expect("distinct checker approves deployment");
         assert_eq!(approved["status"], "Approved");
-        assert_eq!(approved["approved_by"], checker.user_id);
+        assert_eq!(approved["approved_by"], checker_principal);
 
         let (actor, from_status, to_status, detail_json, prev_hash, entry_hash): (
             String,
@@ -84863,13 +85439,13 @@ mod software_deployment_db_tests {
                AND detail ->> 'deployment_id' = $2 \
              ORDER BY id DESC LIMIT 1",
         )
-        .bind(&checker.user_id)
+        .bind(&checker_principal)
         .bind(&deployment_id)
         .fetch_one(pool)
         .await
         .expect("software approval audit row");
         let detail: Value = serde_json::from_str(&detail_json).expect("approval audit detail");
-        assert_eq!(actor, checker.user_id);
+        assert_eq!(actor, checker_principal);
         assert_eq!(from_status.as_deref(), Some("Planned"));
         assert_eq!(to_status, "approved");
         assert_eq!(detail["deployment_id"], deployment_id);
@@ -84877,7 +85453,7 @@ mod software_deployment_db_tests {
             detail["configuration_item_id"],
             configuration_item_id.to_string()
         );
-        assert_eq!(detail["approved_by"], "software-approval-audit-checker");
+        assert_eq!(detail["approved_by"], checker_principal);
         assert!(prev_hash.as_deref().is_some_and(|hash| !hash.is_empty()));
         assert!(entry_hash.as_deref().is_some_and(|hash| !hash.is_empty()));
 
@@ -84904,6 +85480,7 @@ mod software_deployment_db_tests {
         .expect("plan approval rollback fixture");
         let deployment_id = planned["id"].as_str().expect("deployment id").to_string();
         let checker = approver_session("software-approval-rollback-checker");
+        let checker_principal = checker.principal_id.expect("checker principal").to_string();
 
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("reject_software_audit_{suffix}");
@@ -84912,7 +85489,7 @@ mod software_deployment_db_tests {
             "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
              BEGIN \
                IF NEW.action = 'software-approve' \
-                  AND NEW.actor_principal = 'software-approval-rollback-checker' THEN \
+                  AND NEW.actor_principal = '{checker_principal}' THEN \
                  RAISE EXCEPTION 'injected software approval audit failure' \
                    USING ERRCODE = '23514'; \
                END IF; \
@@ -84959,7 +85536,7 @@ mod software_deployment_db_tests {
                AND actor_principal = $1 \
                AND detail ->> 'deployment_id' = $2",
         )
-        .bind(&checker.user_id)
+        .bind(&checker_principal)
         .bind(&deployment_id)
         .fetch_one(pool)
         .await
@@ -85925,10 +86502,10 @@ mod server_decommission_db_tests {
     use sqlx::PgPool;
 
     /// An authenticated approver session — decommission_approve records the
-    /// approver from `session.user_id`, so the recorded approver is this id.
+    /// session's opaque typed principal as the approver.
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.token_valid = true;
@@ -86776,9 +87353,9 @@ mod server_decommission_db_tests {
         );
     }
 
-    /// approve with empty approver must return 409 (engine error propagated as 409).
+    /// Approval without an admitted typed principal must fail closed.
     #[tokio::test]
-    async fn test_approve_empty_approver_returns_409() {
+    async fn test_approve_missing_principal_returns_403() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
@@ -86797,15 +87374,17 @@ mod server_decommission_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
+        let mut missing_principal = approver_session("missing-principal");
+        missing_principal.principal_id = None;
         let Err((status, _)) =
-            decommission_approve(Path(id.clone()), Extension(approver_session(""))).await
+            decommission_approve(Path(id.clone()), Extension(missing_principal)).await
         else {
             cleanup(pool, &id).await;
-            panic!("expected error for empty approver but got Ok");
+            panic!("expected missing principal to fail closed but got Ok");
         };
 
         cleanup(pool, &id).await;
-        assert_eq!(status, StatusCode::CONFLICT, "empty approver must be 409");
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// approve from wrong state (already Approved) must return 409.
@@ -86984,7 +87563,7 @@ mod patch_waves_db_tests {
 
         // 3. approve — the session principal must land in the approval trail.
         let mut approver = AuthSession::static_dry_run();
-        approver.user_id = "patch-approver".into();
+        let approver_principal = bind_test_principal(&mut approver, "patch-approver").to_string();
         approver.token_valid = true;
         approver.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         approver.provider_mode = "test-verified-human".into();
@@ -87001,7 +87580,7 @@ mod patch_waves_db_tests {
         };
         assert_eq!(approved["status"], "Approved");
         assert_eq!(
-            approved["metadata"]["approver"], "patch-approver",
+            approved["metadata"]["approver"], approver_principal,
             "the persisted approver must be the session principal, not a hardcoded string"
         );
 
@@ -87018,7 +87597,7 @@ mod patch_waves_db_tests {
         .expect("query approve audit")
         .expect("a patch-approve audit row must exist");
         assert_eq!(
-            audit_actor, "patch-approver",
+            audit_actor, approver_principal,
             "audit actor must be the approver session principal"
         );
 
@@ -87377,7 +87956,7 @@ mod snapshots_db_tests {
 
     fn scoped_session(user: &str, sites: &[&str], environments: &[&str]) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = user.to_string();
+        bind_test_principal(&mut session, user);
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         session.provider_mode = "test-verified-human".into();
@@ -87501,7 +88080,7 @@ mod snapshots_db_tests {
     #[tokio::test]
     async fn snapshot_record_reads_require_audit_not_requester() {
         let mut requester = AuthSession::static_dry_run();
-        requester.user_id = "snapshot-requester".into();
+        bind_test_principal(&mut requester, "snapshot-requester");
         requester.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
 
         let list_error = snapshot_records_list(
@@ -88736,10 +89315,10 @@ mod backup_restore_db_tests {
     use sqlx::PgPool;
 
     /// An authenticated approver session — backup_restore_approve records the
-    /// approver from `session.user_id`, so the recorded approver is this id.
+    /// session's opaque typed principal as the approver.
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
+        bind_test_principal(&mut s, user_id);
         s.display_name = format!("{user_id} (test)");
         s.provider_mode = "local".into();
         s.token_valid = true;
@@ -92975,8 +93554,11 @@ mod file_share_ntfs_db_tests {
             .await
             .expect("insert failed");
 
+        let reviewer = format!("reviewer-{suffix}");
+        let reviewer_principal = super::test_principal_id(&reviewer);
         let session = ryuki_engine::auth::AuthSession {
-            user_id: format!("reviewer-{suffix}"),
+            display_user_id: reviewer,
+            principal_id: Some(reviewer_principal),
             display_name: "File-share reviewer".to_string(),
             roles: vec!["PlatformAdmin".to_string()],
             token_valid: true,
@@ -93019,7 +93601,7 @@ mod file_share_ntfs_db_tests {
         .bind(now - chrono::Duration::minutes(5))
         .bind(now + chrono::Duration::hours(1))
         .bind(&share.owner)
-        .bind(&session.user_id)
+        .bind(reviewer_principal.to_string())
         .bind(format!("approver-{suffix}"))
         .bind(format!("evidence://owner/{evidence_id}"))
         .bind(format!("evidence://acl/{evidence_id}"))
@@ -93052,7 +93634,7 @@ mod file_share_ntfs_db_tests {
         assert_eq!(first["status"], "Compliant");
         assert_eq!(first["shareVersion"], share_version);
         assert_eq!(first["site"], "DEFRA");
-        assert_eq!(first["reviewer"], session.user_id);
+        assert_eq!(first["reviewer"], reviewer_principal.to_string());
         assert_eq!(first["evidenceSource"], "AuthoritativeProviderSnapshot");
         assert_eq!(first["aclSnapshotVersion"], "provider-acl-version-42");
         assert_eq!(
@@ -93133,7 +93715,7 @@ mod file_share_ntfs_db_tests {
             )
             .bind(Uuid::new_v4())
             .bind(direct_evidence_id)
-            .bind(&session.user_id)
+            .bind(reviewer_principal.to_string())
             .bind(forged_reviewed_at)
             .bind(forged_due)
             .fetch_one(&mut *tx)
@@ -93195,7 +93777,7 @@ mod file_share_ntfs_db_tests {
         )
         .bind(Uuid::new_v4())
         .bind(static_evidence_id)
-        .bind(&session.user_id)
+        .bind(reviewer_principal.to_string())
         .execute(&mut *tx)
         .await;
         assert!(
@@ -94037,9 +94619,13 @@ mod datacenter_readiness_db_tests {
 /// reflects whether the DB was actually consulted (an empty live result is
 /// still "db", never "no-db").
 async fn notifications_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let recipient = principal_id.to_string();
     let (items, source) = match get_db() {
         Some(pool) => (
-            crate::repos::notifications::list_for_recipient(pool, &session.user_id, &session.roles)
+            crate::repos::notifications::list_for_recipient(pool, &recipient, &session.roles)
                 .await
                 .map_err(db_error)?,
             "db",
@@ -94053,9 +94639,13 @@ async fn notifications_list(AuthExtractor(session): AuthExtractor) -> ApiResult 
 /// Returns the count of unread notifications for the authenticated user.
 /// Degrades to {"source":"no-db","unread":0} when no DB is configured.
 async fn notifications_unread_count(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let recipient = principal_id.to_string();
     let (unread, source) = match get_db() {
         Some(pool) => (
-            crate::repos::notifications::unread_count(pool, &session.user_id, &session.roles)
+            crate::repos::notifications::unread_count(pool, &recipient, &session.roles)
                 .await
                 .map_err(db_error)?,
             "db",
@@ -94072,9 +94662,13 @@ async fn notifications_mark_read(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let recipient = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     use crate::repos::notifications::MarkOutcome;
-    match crate::repos::notifications::mark_read(pool, &id, &session.user_id, &session.roles)
+    match crate::repos::notifications::mark_read(pool, &id, &recipient, &session.roles)
         .await
         .map_err(db_error)?
     {
@@ -94087,8 +94681,12 @@ async fn notifications_mark_read(
 /// Marks all unread notifications for the authenticated user as read.
 /// Returns 503 without a DB.
 async fn notifications_mark_all_read(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let Some(principal_id) = session.principal_id else {
+        return Err(status_403());
+    };
+    let recipient = principal_id.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let marked = crate::repos::notifications::mark_all_read(pool, &session.user_id, &session.roles)
+    let marked = crate::repos::notifications::mark_all_read(pool, &recipient, &session.roles)
         .await
         .map_err(db_error)?;
     Ok(Json(json!({ "source": "db", "marked": marked })))
@@ -94147,6 +94745,15 @@ mod vm_day2_no_db_tests {
     use super::*;
     use axum::http::StatusCode;
 
+    fn verified_operator() -> AuthSession {
+        let mut session = AuthSession::static_dry_run();
+        bind_test_principal(&mut session, "vm-day2-no-db-operator");
+        session.token_valid = true;
+        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
+        session.provider_mode = "test-verified-human".into();
+        session
+    }
+
     #[tokio::test]
     async fn test_plan_returns_503_without_db() {
         let body = VmDay2PlanRequest {
@@ -94158,7 +94765,7 @@ mod vm_day2_no_db_tests {
             owner: "test-owner".into(),
             maintenance_window: "EU-Overnight".into(),
         };
-        let result = vm_day2_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
+        let result = vm_day2_plan(AuthExtractor(verified_operator()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -94168,8 +94775,7 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result =
-            vm_day2_validate(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
+        let result = vm_day2_validate(AuthExtractor(verified_operator()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -94186,7 +94792,7 @@ mod vm_day2_no_db_tests {
         assert_eq!(denied.unwrap_err().0, StatusCode::FORBIDDEN);
 
         let mut checker = AuthSession::static_dry_run();
-        checker.user_id = "distinct.vm.checker".into();
+        bind_test_principal(&mut checker, "distinct.vm.checker");
         checker.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
         checker.token_valid = true;
         checker.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
@@ -94201,7 +94807,7 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = vm_day2_lock(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
+        let result = vm_day2_lock(AuthExtractor(verified_operator()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -94211,8 +94817,7 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result =
-            vm_day2_execute(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
+        let result = vm_day2_execute(AuthExtractor(verified_operator()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -94222,7 +94827,7 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = vm_day2_verify(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
+        let result = vm_day2_verify(AuthExtractor(verified_operator()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -94260,7 +94865,7 @@ mod vm_day2_operations_db_tests {
 
     fn checker_session(suffix: &str) -> AuthSession {
         let mut session = AuthSession::static_dry_run();
-        session.user_id = format!("vm-checker-{suffix}");
+        bind_test_principal(&mut session, &format!("vm-checker-{suffix}"));
         session.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
         session.token_valid = true;
         session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
@@ -95566,6 +96171,7 @@ mod linux_deployment_requests_db_tests {
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins runbook_executions_db_tests -- --test-threads=1
 #[cfg(test)]
 mod runbook_executions_db_tests {
+    use super::bind_test_principal;
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -95601,7 +96207,7 @@ mod runbook_executions_db_tests {
             "CREATE FUNCTION ryuki_test_reject_runbook_step_audit() RETURNS trigger \
              LANGUAGE plpgsql AS $$ \
              BEGIN \
-               IF NEW.actor_principal LIKE 'dbtest-runbook-audit-failure-%' THEN \
+               IF NEW.action = 'runbook-step-execute' THEN \
                  RAISE EXCEPTION 'injected runbook step audit failure' USING ERRCODE = '23514'; \
                END IF; \
                RETURN NEW; \
@@ -95652,16 +96258,18 @@ mod runbook_executions_db_tests {
             return;
         };
         let suffix = uuid::Uuid::new_v4().to_string();
-        let exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
+        let mut initiator = ryuki_engine::auth::AuthSession::static_dry_run();
+        let initiator_principal =
+            bind_test_principal(&mut initiator, &format!("test.engineer-{suffix}"));
+        initiator.token_valid = true;
+        initiator.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
+        initiator.provider_mode = "test-verified-human".into();
+        let mut exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
+        exec.started_by = initiator_principal.to_string();
         let id = exec.id.clone();
         crate::repos::runbook_executions::insert(pool, &exec)
             .await
             .expect("insert maker/checker fixture");
-        let mut initiator = ryuki_engine::auth::AuthSession::static_dry_run();
-        initiator.user_id = exec.started_by.clone();
-        initiator.token_valid = true;
-        initiator.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        initiator.provider_mode = "test-verified-human".into();
 
         let result =
             super::runbook_approve(super::Path(id.clone()), super::Extension(initiator.clone()))
@@ -95683,7 +96291,7 @@ mod runbook_executions_db_tests {
              WHERE actor_principal = $1 AND action = 'runbook-approve' \
                AND detail->>'execution_id' = $2",
         )
-        .bind(&initiator.user_id)
+        .bind(initiator_principal.to_string())
         .bind(&id)
         .fetch_one(pool)
         .await
@@ -95714,7 +96322,7 @@ mod runbook_executions_db_tests {
             .await
             .expect("insert approved execution");
         let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
-        session.user_id = "step.executor.bob".to_string();
+        let session_principal = bind_test_principal(&mut session, "step.executor.bob");
         session.display_name = "Step Executor Bob".to_string();
 
         let result = super::runbook_execute_step(
@@ -95773,7 +96381,7 @@ mod runbook_executions_db_tests {
             prev_hash,
             entry_hash,
         ) = &rows[0];
-        assert_eq!(actor, &session.user_id);
+        assert_eq!(actor, &session_principal.to_string());
         assert_eq!(actor_display, &session.display_name);
         assert_eq!(actor_roles, &session.roles);
         assert_eq!(provider_mode, &session.provider_mode);
@@ -95822,7 +96430,7 @@ mod runbook_executions_db_tests {
             .expect("insert approved execution");
         let actor = format!("dbtest-runbook-audit-failure-{}", uuid::Uuid::new_v4());
         let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
-        session.user_id = actor.clone();
+        let actor_principal = bind_test_principal(&mut session, &actor);
 
         install_step_audit_failure_trigger(pool).await;
         let result = super::runbook_execute_step(
@@ -95840,7 +96448,7 @@ mod runbook_executions_db_tests {
             "SELECT COUNT(*) FROM audit_log WHERE actor_principal = $1 \
              AND action = 'runbook-step-execute'",
         )
-        .bind(&actor)
+        .bind(actor_principal.to_string())
         .fetch_one(pool)
         .await
         .expect("count rejected step audits");
@@ -99281,12 +99889,14 @@ mod admin_tokens_sessions_pagination_db_tests {
     /// `PlatformAdmin`, which holds the `admin` permission (see
     /// `check_permission`), so it satisfies `require_admin_permission` as-is.
     fn admin_session() -> AuthSession {
-        AuthSession {
+        let mut session = AuthSession {
             token_valid: true,
             actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
             provider_mode: "local".to_string(),
             ..AuthSession::static_dry_run()
-        }
+        };
+        bind_test_principal(&mut session, "pagination-admin");
+        session
     }
 
     fn page_params(limit: i64, offset: i64) -> Query<AdminListPage> {
@@ -99296,58 +99906,34 @@ mod admin_tokens_sessions_pagination_db_tests {
         })
     }
 
-    async fn seed_session_authority(pool: &PgPool, subject: &str) -> (String, i64, i64) {
+    async fn seed_session_authority(
+        pool: &PgPool,
+        subject: &str,
+    ) -> (String, crate::principal_registry::PrincipalBinding) {
         let provider = "static-dry-run";
         let issuer = "urn:ryuki:test:session-pagination";
-        let digest = Sha256::digest(format!("pagination-authority\0{subject}"));
-        let mut identity_tx = pool.begin().await.expect("begin pagination identity seed");
-        crate::human_authority::prepare_writer_tx(&mut identity_tx, provider, issuer, subject)
-            .await
-            .expect("prepare pagination identity writer");
-        crate::human_authority::mark_governed_identity_reactivation_tx(&mut identity_tx)
-            .await
-            .expect("mark pagination identity reactivation");
-        let epoch = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO identity_authorities \
-             (provider, issuer, subject, authority_epoch, authority_digest, authority_status) \
-             VALUES ($1, $2, $3, 1, $4, 'active-scoped-v2') \
-             ON CONFLICT (provider, issuer, subject) DO UPDATE SET \
-               authority_status = 'active-scoped-v2' \
-             RETURNING authority_epoch",
-        )
-        .bind(provider)
-        .bind(issuer)
-        .bind(subject)
-        .bind(digest.as_slice())
-        .fetch_one(&mut *identity_tx)
-        .await
-        .expect("seed session authority");
-        identity_tx
-            .commit()
-            .await
-            .expect("commit pagination identity seed");
-        crate::human_authority::persist_governed_assignment(
-            pool,
+        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+        let roles = vec!["PlatformAdmin".to_string()];
+        let mut tx = pool.begin().await.expect("begin pagination principal seed");
+        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+            &mut tx,
             provider,
             issuer,
             subject,
-            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&[
-                "PlatformAdmin".to_string()
-            ]),
+            &crate::principal_registry::InitialHumanAuthority {
+                authority_digest: &authority_digest,
+                roles: &roles,
+                site_mode: "global",
+                site_scope: &[],
+                environment_mode: "global",
+                environment_scope: &[],
+                created_by: "contracts-pagination-test",
+            },
         )
         .await
-        .expect("seed pagination human authority");
-        let version: i64 = sqlx::query_scalar(
-            "SELECT assignment_version FROM human_authority_assignments \
-             WHERE provider = $1 AND issuer = $2 AND subject = $3",
-        )
-        .bind(provider)
-        .bind(issuer)
-        .bind(subject)
-        .fetch_one(pool)
-        .await
-        .expect("read pagination authority version");
-        (issuer.to_string(), epoch, version)
+        .expect("seed exact pagination principal binding");
+        tx.commit().await.expect("commit pagination principal seed");
+        (issuer.to_string(), binding)
     }
 
     /// #14 (batch 2): admin_tokens_list is bounded by limit/offset and reports
@@ -99552,7 +100138,7 @@ mod admin_tokens_sessions_pagination_db_tests {
         for i in 0..5 {
             let user_id = format!("pg-session-user-{suffix}-{i}");
             let record_id = Uuid::new_v4();
-            let (issuer, epoch, authority_version) = seed_session_authority(pool, &user_id).await;
+            let (issuer, binding) = seed_session_authority(pool, &user_id).await;
             let mut session_tx = pool.begin().await.expect("begin pagination session seed");
             crate::human_authority::prepare_writer_tx(
                 &mut session_tx,
@@ -99564,22 +100150,27 @@ mod admin_tokens_sessions_pagination_db_tests {
             .expect("prepare pagination session writer");
             let id: Uuid = sqlx::query_scalar(
                 "INSERT INTO sessions \
-                 (session_record_id, bearer_verifier, user_id, display_name, roles, provider, \
-                  identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
-                  site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
-                 VALUES ($1, $2, $3, $4, $5, 'static-dry-run', $6, $3, $7, $8, \
+                 (session_record_id, bearer_verifier, principal_id, \
+                  principal_lifecycle_version, principal_authority_version, \
+                  principal_key_id, principal_key_version, principal_link_id, \
+                  principal_link_version, display_name, roles, site_authority_mode, \
+                  site_scope, environment_authority_mode, environment_scope, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                          'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], \
                          NOW() + INTERVAL '1 hour') \
                  RETURNING session_record_id",
             )
             .bind(record_id)
             .bind(Sha256::digest(record_id.as_bytes()).to_vec())
-            .bind(&user_id)
+            .bind(binding.principal_id.into_uuid())
+            .bind(binding.principal_lifecycle_version)
+            .bind(binding.principal_authority_version)
+            .bind(binding.principal_key_id)
+            .bind(binding.principal_key_version)
+            .bind(binding.principal_link_id)
+            .bind(binding.principal_link_version)
             .bind(format!("PG Test User {i}"))
             .bind(vec!["PlatformAdmin".to_string()])
-            .bind(issuer)
-            .bind(epoch)
-            .bind(authority_version)
             .fetch_one(&mut *session_tx)
             .await
             .expect("seed session");
@@ -99593,8 +100184,7 @@ mod admin_tokens_sessions_pagination_db_tests {
         // `expires_at > NOW()`).
         let expired_user = format!("pg-session-expired-{suffix}");
         let expired_record_id = Uuid::new_v4();
-        let (expired_issuer, expired_epoch, expired_authority_version) =
-            seed_session_authority(pool, &expired_user).await;
+        let (expired_issuer, expired_binding) = seed_session_authority(pool, &expired_user).await;
         let mut expired_tx = pool.begin().await.expect("begin expired session seed");
         crate::human_authority::prepare_writer_tx(
             &mut expired_tx,
@@ -99606,22 +100196,27 @@ mod admin_tokens_sessions_pagination_db_tests {
         .expect("prepare expired session writer");
         let expired_id: Uuid = sqlx::query_scalar(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, user_id, display_name, roles, provider, \
-              identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
-              site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, 'static-dry-run', $6, $3, $7, $8, \
+             (session_record_id, bearer_verifier, principal_id, \
+              principal_lifecycle_version, principal_authority_version, \
+              principal_key_id, principal_key_version, principal_link_id, \
+              principal_link_version, display_name, roles, site_authority_mode, \
+              site_scope, environment_authority_mode, environment_scope, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], \
                      NOW() - INTERVAL '1 hour') \
              RETURNING session_record_id",
         )
         .bind(expired_record_id)
         .bind(Sha256::digest(expired_record_id.as_bytes()).to_vec())
-        .bind(&expired_user)
+        .bind(expired_binding.principal_id.into_uuid())
+        .bind(expired_binding.principal_lifecycle_version)
+        .bind(expired_binding.principal_authority_version)
+        .bind(expired_binding.principal_key_id)
+        .bind(expired_binding.principal_key_version)
+        .bind(expired_binding.principal_link_id)
+        .bind(expired_binding.principal_link_version)
         .bind("PG Test Expired User")
         .bind(vec!["PlatformAdmin".to_string()])
-        .bind(expired_issuer)
-        .bind(expired_epoch)
-        .bind(expired_authority_version)
         .fetch_one(&mut *expired_tx)
         .await
         .expect("seed expired session");

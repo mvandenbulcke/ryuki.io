@@ -143,7 +143,19 @@ pub fn new_connection_id(vendor_type: &str) -> String {
 // Engine-level CRUD (in-memory fallback, no credentials)
 // ---------------------------------------------------------------------------
 
-pub fn create_connection(
+/// Validated connection state that has not yet been published to the process
+/// store. Keeping the inner value private lets an API adapter reserve mandatory
+/// audit evidence before the mutation without exposing an unchecked insertion
+/// primitive.
+pub struct PreparedIntegrationConnection(IntegrationConnection);
+
+impl PreparedIntegrationConnection {
+    pub fn connection(&self) -> &IntegrationConnection {
+        &self.0
+    }
+}
+
+pub fn prepare_connection(
     vendor_type: &str,
     name: &str,
     endpoint_url: &str,
@@ -151,7 +163,7 @@ pub fn create_connection(
     credential_source: CredentialSource,
     credential_ref: &str,
     created_by: &str,
-) -> Result<IntegrationConnection, String> {
+) -> Result<PreparedIntegrationConnection, String> {
     if vendor_type.is_empty() {
         return Err("vendor_type is required".into());
     }
@@ -162,7 +174,7 @@ pub fn create_connection(
         return Err("endpoint_url is required".into());
     }
     let now = now_iso();
-    let conn = IntegrationConnection {
+    Ok(PreparedIntegrationConnection(IntegrationConnection {
         id: new_connection_id(vendor_type),
         vendor_type: vendor_type.to_string(),
         name: name.to_string(),
@@ -178,10 +190,43 @@ pub fn create_connection(
         created_by: created_by.to_string(),
         created_at: now.clone(),
         updated_at: now,
-    };
+    }))
+}
+
+/// Publish one engine-validated connection. The prepared value is consumed, so
+/// a caller cannot accidentally insert it twice after committing one audit
+/// reservation.
+pub fn insert_prepared_connection(
+    prepared: PreparedIntegrationConnection,
+) -> Result<IntegrationConnection, String> {
+    let conn = prepared.0;
     let mut store = connection_store().lock().unwrap();
+    if store.iter().any(|existing| existing.id == conn.id) {
+        return Err("connection id already exists".to_string());
+    }
     store.push(conn.clone());
     Ok(conn)
+}
+
+pub fn create_connection(
+    vendor_type: &str,
+    name: &str,
+    endpoint_url: &str,
+    site_scope: Option<String>,
+    credential_source: CredentialSource,
+    credential_ref: &str,
+    created_by: &str,
+) -> Result<IntegrationConnection, String> {
+    let prepared = prepare_connection(
+        vendor_type,
+        name,
+        endpoint_url,
+        site_scope,
+        credential_source,
+        credential_ref,
+        created_by,
+    )?;
+    insert_prepared_connection(prepared)
 }
 
 pub fn list_connections(
@@ -338,6 +383,31 @@ mod unit_tests {
             err.contains("vendor_type"),
             "error should mention vendor_type: {err}"
         );
+    }
+
+    #[test]
+    fn prepared_connection_is_not_visible_until_inserted() {
+        let prepared = prepare_connection(
+            "vmware",
+            "prepared-test",
+            "https://example.com",
+            None,
+            CredentialSource::EnvVar,
+            "MY_API_KEY",
+            "opaque-principal-test",
+        )
+        .expect("prepare connection");
+        let id = prepared.connection().id.clone();
+
+        assert!(
+            get_connection(&id).is_none(),
+            "preparation must not publish the connection"
+        );
+
+        let inserted = insert_prepared_connection(prepared).expect("insert prepared connection");
+        assert_eq!(inserted.id, id);
+        assert!(get_connection(&id).is_some());
+        assert!(delete_connection(&id));
     }
 
     #[test]
