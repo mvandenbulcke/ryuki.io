@@ -22,6 +22,8 @@ pub const AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-runtime-binding-v2";
 pub const AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-provider-policy-binding-v1";
+pub const AUTHENTICATOR_ORIGIN_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-origin-binding-v1";
 pub const AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-cache-partition-v1";
 pub const AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT: &str =
@@ -821,6 +823,70 @@ pub struct AuthenticatorRuntimeBindingDocumentReference {
     pub artifact_locator: String,
 }
 
+/// Canonical provenance retained by credentials and sessions issued through
+/// one exact authenticator path.
+///
+/// D, P, Q, and R remain independent inputs. The digest of this projection is
+/// a fifth binding and must not alias any of them.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorOriginProjection {
+    pub deployment_id: String,
+    pub trust_domain_id: String,
+    pub tenant_id: Option<String>,
+    pub provider_id: String,
+    pub provider_configuration_version: u64,
+    /// P: digest of the exact active provider configuration payload.
+    pub provider_configuration_payload_digest: String,
+    pub provider_lifecycle_record_version: u64,
+    pub provider_lifecycle_state: ProviderLifecycleState,
+    /// D: reference to the exact raw, value-free runtime-binding document.
+    pub binding_document_reference: AuthenticatorRuntimeBindingDocumentReference,
+    /// Q: digest of the provider policy after excluding only its D reference.
+    pub provider_policy_binding_digest: String,
+    /// R: digest of the retained authenticator runtime allocation.
+    pub runtime_binding_digest: String,
+    pub path_id: String,
+    pub path_version: u64,
+}
+
+#[derive(Serialize)]
+struct AuthenticatorOriginBindingDigestProjection<'a> {
+    digest_contract: &'static str,
+    origin: &'a AuthenticatorOriginProjection,
+}
+
+/// Encode one validated authenticator origin with `ryuki-canonical-json-v1`.
+pub fn authenticator_origin_binding_canonical_bytes(
+    origin: &AuthenticatorOriginProjection,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_authenticator_origin_projection(origin)?;
+    canonical_projection_bytes(AuthenticatorOriginBindingDigestProjection {
+        digest_contract: AUTHENTICATOR_ORIGIN_BINDING_DIGEST_CONTRACT,
+        origin,
+    })
+}
+
+/// Digest one canonical authenticator origin, preserving D/P/Q/R separation.
+pub fn authenticator_origin_binding_digest(
+    origin: &AuthenticatorOriginProjection,
+) -> Result<String, RuntimeGuardDigestError> {
+    let digest = digest_canonical_bytes(authenticator_origin_binding_canonical_bytes(origin)?)?;
+    if [
+        &origin.binding_document_reference.content_digest,
+        &origin.provider_configuration_payload_digest,
+        &origin.provider_policy_binding_digest,
+        &origin.runtime_binding_digest,
+    ]
+    .contains(&&digest)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator origin/D/P/Q/R digest separation",
+        ));
+    }
+    Ok(digest)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthenticatorRuntimeOwnership {
@@ -1549,6 +1615,47 @@ fn validate_authenticator_runtime_binding_projection(
                 "authenticator runtime binding path",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_authenticator_origin_projection(
+    origin: &AuthenticatorOriginProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    let document = &origin.binding_document_reference;
+    let digests = [
+        origin.provider_configuration_payload_digest.as_str(),
+        document.content_digest.as_str(),
+        origin.provider_policy_binding_digest.as_str(),
+        origin.runtime_binding_digest.as_str(),
+    ];
+    let distinct_digests = digests.iter().copied().collect::<HashSet<_>>().len() == digests.len();
+    let tenant_id_is_valid = origin
+        .tenant_id
+        .as_deref()
+        .is_none_or(|tenant_id| valid_canonical_scoped_id(tenant_id, "tenant:"));
+
+    if !valid_canonical_scoped_id(&origin.deployment_id, "deployment:")
+        || !valid_canonical_scoped_id(&origin.trust_domain_id, "trust-domain:")
+        || !tenant_id_is_valid
+        || !valid_canonical_scoped_id(&origin.provider_id, "provider:")
+        || origin.provider_configuration_version == 0
+        || !valid_sha256_digest(&origin.provider_configuration_payload_digest)
+        || origin.provider_lifecycle_record_version == 0
+        || origin.provider_lifecycle_state != ProviderLifecycleState::Active
+        || !valid_canonical_scoped_id(&document.document_id, "authenticator-runtime-binding:")
+        || document.document_version == 0
+        || !valid_sha256_digest(&document.content_digest)
+        || !valid_authenticator_binding_locator(&document.artifact_locator)
+        || !valid_sha256_digest(&origin.provider_policy_binding_digest)
+        || !valid_sha256_digest(&origin.runtime_binding_digest)
+        || !distinct_digests
+        || !valid_canonical_scoped_id(&origin.path_id, "authenticator-path:")
+        || origin.path_version == 0
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator origin binding",
+        ));
     }
     Ok(())
 }
@@ -3074,6 +3181,31 @@ mod tests {
         }
     }
 
+    fn authenticator_origin_projection() -> AuthenticatorOriginProjection {
+        AuthenticatorOriginProjection {
+            deployment_id: "deployment:fixture".into(),
+            trust_domain_id: "trust-domain:fixture".into(),
+            tenant_id: Some("tenant:fixture".into()),
+            provider_id: "provider:fixture-oidc".into(),
+            provider_configuration_version: 7,
+            provider_configuration_payload_digest: fixture_digest('1'),
+            provider_lifecycle_record_version: 9,
+            provider_lifecycle_state: ProviderLifecycleState::Active,
+            binding_document_reference: AuthenticatorRuntimeBindingDocumentReference {
+                document_id: "authenticator-runtime-binding:fixture-oidc".into(),
+                document_version: 3,
+                content_digest: fixture_digest('2'),
+                artifact_locator:
+                    "catalog/security-contracts/v1/authenticator-runtime-binding.fixture.json"
+                        .into(),
+            },
+            provider_policy_binding_digest: fixture_digest('3'),
+            runtime_binding_digest: fixture_digest('4'),
+            path_id: "authenticator-path:browser-sso".into(),
+            path_version: 5,
+        }
+    }
+
     fn all_authenticator_classes() -> Vec<ExpectedAuthenticatorBinding> {
         [
             (
@@ -3863,6 +3995,208 @@ mod tests {
         );
         drifted_migrations.swap(0, 1);
         assert!(postgresql_migration_inventory_digest(&drifted_migrations).is_err());
+    }
+
+    #[test]
+    fn authenticator_origin_binding_has_an_independent_canonical_golden() {
+        let origin = authenticator_origin_projection();
+        assert_independent_canonical_golden(
+            authenticator_origin_binding_canonical_bytes(&origin).unwrap(),
+            json!({
+                "digest_contract": "ryuki-authenticator-origin-binding-v1",
+                "origin": {
+                    "deployment_id": "deployment:fixture",
+                    "trust_domain_id": "trust-domain:fixture",
+                    "tenant_id": "tenant:fixture",
+                    "provider_id": "provider:fixture-oidc",
+                    "provider_configuration_version": 7,
+                    "provider_configuration_payload_digest": fixture_digest('1'),
+                    "provider_lifecycle_record_version": 9,
+                    "provider_lifecycle_state": "active",
+                    "binding_document_reference": {
+                        "document_id": "authenticator-runtime-binding:fixture-oidc",
+                        "document_version": 3,
+                        "content_digest": fixture_digest('2'),
+                        "artifact_locator": "catalog/security-contracts/v1/authenticator-runtime-binding.fixture.json"
+                    },
+                    "provider_policy_binding_digest": fixture_digest('3'),
+                    "runtime_binding_digest": fixture_digest('4'),
+                    "path_id": "authenticator-path:browser-sso",
+                    "path_version": 5
+                }
+            }),
+        );
+
+        let digest = authenticator_origin_binding_digest(&origin).unwrap();
+        for separated_digest in [
+            &origin.binding_document_reference.content_digest,
+            &origin.provider_configuration_payload_digest,
+            &origin.provider_policy_binding_digest,
+            &origin.runtime_binding_digest,
+        ] {
+            assert_ne!(&digest, separated_digest);
+        }
+    }
+
+    #[test]
+    fn authenticator_origin_binding_changes_for_each_independent_leaf_mutation() {
+        let origin = authenticator_origin_projection();
+        let digest = authenticator_origin_binding_digest(&origin).unwrap();
+        let mut mutations = Vec::new();
+
+        let mut drifted = origin.clone();
+        drifted.deployment_id = "deployment:fixture-next".into();
+        mutations.push(("deployment_id", drifted));
+        let mut drifted = origin.clone();
+        drifted.trust_domain_id = "trust-domain:fixture-next".into();
+        mutations.push(("trust_domain_id", drifted));
+        let mut drifted = origin.clone();
+        drifted.tenant_id = None;
+        mutations.push(("tenant_id", drifted));
+        let mut drifted = origin.clone();
+        drifted.provider_id = "provider:fixture-oidc-next".into();
+        mutations.push(("provider_id", drifted));
+        let mut drifted = origin.clone();
+        drifted.provider_configuration_version += 1;
+        mutations.push(("provider_configuration_version", drifted));
+        let mut drifted = origin.clone();
+        drifted.provider_configuration_payload_digest = fixture_digest('5');
+        mutations.push(("provider_configuration_payload_digest", drifted));
+        let mut drifted = origin.clone();
+        drifted.provider_lifecycle_record_version += 1;
+        mutations.push(("provider_lifecycle_record_version", drifted));
+        let mut drifted = origin.clone();
+        drifted.binding_document_reference.document_id =
+            "authenticator-runtime-binding:fixture-oidc-next".into();
+        mutations.push(("binding_document_reference.document_id", drifted));
+        let mut drifted = origin.clone();
+        drifted.binding_document_reference.document_version += 1;
+        mutations.push(("binding_document_reference.document_version", drifted));
+        let mut drifted = origin.clone();
+        drifted.binding_document_reference.content_digest = fixture_digest('6');
+        mutations.push(("binding_document_reference.content_digest", drifted));
+        let mut drifted = origin.clone();
+        drifted.binding_document_reference.artifact_locator =
+            "catalog/security-contracts/v1/authenticator-runtime-binding.fixture-next.json".into();
+        mutations.push(("binding_document_reference.artifact_locator", drifted));
+        let mut drifted = origin.clone();
+        drifted.provider_policy_binding_digest = fixture_digest('7');
+        mutations.push(("provider_policy_binding_digest", drifted));
+        let mut drifted = origin.clone();
+        drifted.runtime_binding_digest = fixture_digest('8');
+        mutations.push(("runtime_binding_digest", drifted));
+        let mut drifted = origin.clone();
+        drifted.path_id = "authenticator-path:browser-sso-next".into();
+        mutations.push(("path_id", drifted));
+        let mut drifted = origin.clone();
+        drifted.path_version += 1;
+        mutations.push(("path_version", drifted));
+
+        for (field, drifted) in mutations {
+            assert_ne!(
+                authenticator_origin_binding_digest(&drifted)
+                    .unwrap_or_else(|error| panic!("valid {field} drift rejected: {error}")),
+                digest,
+                "{field} drift must change the origin binding digest"
+            );
+        }
+
+        let mut inactive = origin;
+        inactive.provider_lifecycle_state = ProviderLifecycleState::Draining;
+        assert!(
+            authenticator_origin_binding_digest(&inactive).is_err(),
+            "provider_lifecycle_state drift must reject a non-active origin"
+        );
+    }
+
+    #[test]
+    fn authenticator_origin_binding_rejects_invalid_namespaces_versions_and_digests() {
+        let origin = authenticator_origin_projection();
+        let assert_rejected = |label: &str, candidate: &AuthenticatorOriginProjection| {
+            assert!(
+                authenticator_origin_binding_digest(candidate).is_err(),
+                "invalid {label} must be rejected"
+            );
+        };
+
+        let mut candidate = origin.clone();
+        candidate.deployment_id = "trust-domain:fixture".into();
+        assert_rejected("deployment namespace", &candidate);
+        let mut candidate = origin.clone();
+        candidate.trust_domain_id = "deployment:fixture".into();
+        assert_rejected("trust-domain namespace", &candidate);
+        let mut candidate = origin.clone();
+        candidate.tenant_id = Some("provider:fixture".into());
+        assert_rejected("tenant namespace", &candidate);
+        let mut candidate = origin.clone();
+        candidate.provider_id = "tenant:fixture".into();
+        assert_rejected("provider namespace", &candidate);
+        let mut candidate = origin.clone();
+        candidate.binding_document_reference.document_id = "document:fixture".into();
+        assert_rejected("binding-document namespace", &candidate);
+        let mut candidate = origin.clone();
+        candidate.path_id = "credential-profile:fixture".into();
+        assert_rejected("path namespace", &candidate);
+        let mut candidate = origin.clone();
+        candidate.binding_document_reference.artifact_locator = "../fixture.json".into();
+        assert_rejected("binding-document locator", &candidate);
+
+        let mut candidate = origin.clone();
+        candidate.provider_configuration_version = 0;
+        assert_rejected("provider configuration version", &candidate);
+        let mut candidate = origin.clone();
+        candidate.provider_lifecycle_record_version = 0;
+        assert_rejected("provider lifecycle record version", &candidate);
+        let mut candidate = origin.clone();
+        candidate.binding_document_reference.document_version = 0;
+        assert_rejected("binding-document version", &candidate);
+        let mut candidate = origin.clone();
+        candidate.path_version = 0;
+        assert_rejected("path version", &candidate);
+
+        let mut malformed_digests = Vec::new();
+        let mut candidate = origin.clone();
+        candidate.provider_configuration_payload_digest = "sha256:invalid".into();
+        malformed_digests.push(("P", candidate));
+        let mut candidate = origin.clone();
+        candidate.binding_document_reference.content_digest = "sha256:invalid".into();
+        malformed_digests.push(("D", candidate));
+        let mut candidate = origin.clone();
+        candidate.provider_policy_binding_digest = "sha256:invalid".into();
+        malformed_digests.push(("Q", candidate));
+        let mut candidate = origin.clone();
+        candidate.runtime_binding_digest = "sha256:invalid".into();
+        malformed_digests.push(("R", candidate));
+        for (label, candidate) in malformed_digests {
+            assert_rejected(label, &candidate);
+        }
+
+        let mut collisions = Vec::new();
+        let mut candidate = origin.clone();
+        candidate.provider_configuration_payload_digest =
+            candidate.binding_document_reference.content_digest.clone();
+        collisions.push(("P/D", candidate));
+        let mut candidate = origin.clone();
+        candidate.provider_configuration_payload_digest =
+            candidate.provider_policy_binding_digest.clone();
+        collisions.push(("P/Q", candidate));
+        let mut candidate = origin.clone();
+        candidate.provider_configuration_payload_digest = candidate.runtime_binding_digest.clone();
+        collisions.push(("P/R", candidate));
+        let mut candidate = origin.clone();
+        candidate.binding_document_reference.content_digest =
+            candidate.provider_policy_binding_digest.clone();
+        collisions.push(("D/Q", candidate));
+        let mut candidate = origin.clone();
+        candidate.binding_document_reference.content_digest =
+            candidate.runtime_binding_digest.clone();
+        collisions.push(("D/R", candidate));
+        let mut candidate = origin;
+        candidate.provider_policy_binding_digest = candidate.runtime_binding_digest.clone();
+        collisions.push(("Q/R", candidate));
+        for (label, candidate) in collisions {
+            assert_rejected(label, &candidate);
+        }
     }
 
     #[test]
