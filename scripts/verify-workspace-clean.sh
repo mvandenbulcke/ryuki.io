@@ -7,15 +7,34 @@ set -Eeuo pipefail
 # automatic eviction policy. That is useful during interactive development,
 # but a full workspace/SSR/WASM verification wave can retain many toolchain and
 # feature combinations. This wrapper isolates those objects, disables the two
-# largest one-shot cache multipliers, checks disk headroom between gates, and
-# removes its target on success, failure, or interruption.
+# largest one-shot cache multipliers, serializes verification across worktrees,
+# checks disk headroom between gates, and removes its target on success, failure,
+# interruption, or the next run after an untrappable process death.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${RYUKI_VERIFY_STATE_BASE:-}" && "${RYUKI_VERIFY_TEST_MODE:-0}" != "1" ]]; then
+  echo "error: RYUKI_VERIFY_STATE_BASE is reserved for verify-clean regression tests" >&2
+  exit 64
+fi
+STATE_BASE_ROOT="$(cd "${RYUKI_VERIFY_STATE_BASE:-/tmp}" && pwd -P)"
+GIT_COMMON_DIR_RAW="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir)"
+GIT_COMMON_DIR="$(cd "$GIT_COMMON_DIR_RAW" && pwd -P)"
+REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object --stdin)"
 MIN_FREE_GIB="${RYUKI_VERIFY_MIN_FREE_GIB:-30}"
 MAX_TARGET_GIB="${RYUKI_VERIFY_MAX_TARGET_GIB:-64}"
 KEEP_TARGET="${RYUKI_VERIFY_KEEP_TARGET:-0}"
 WATCH_INTERVAL_SECONDS="${RYUKI_VERIFY_WATCH_INTERVAL_SECONDS:-5}"
 ACTIVE_GATE_PID=""
+VERIFY_NAMESPACE="${STATE_BASE_ROOT}/ryuki-verify-$(id -u)"
+VERIFY_TARGET_ROOT="${VERIFY_NAMESPACE}/${REPOSITORY_ID}"
+VERIFY_LOCK_FILE="${VERIFY_NAMESPACE}/${REPOSITORY_ID}.lock"
+RUN_ID="$$.$RANDOM.$RANDOM"
+VERIFY_DIR="${VERIFY_TARGET_ROOT}/run.${RUN_ID}"
+VERIFY_DIR_CREATED=0
+SENTINEL_TMP="${VERIFY_TARGET_ROOT}/.run.${RUN_ID}.owner.tmp"
+SENTINEL_TMP_CREATED=0
+SENTINEL_PUBLISHED=0
+export CARGO_TARGET_DIR="${VERIFY_DIR}/target"
 
 require_positive_integer() {
   local name="$1"
@@ -32,9 +51,146 @@ require_positive_integer RYUKI_VERIFY_MIN_FREE_GIB "$MIN_FREE_GIB"
 require_positive_integer RYUKI_VERIFY_MAX_TARGET_GIB "$MAX_TARGET_GIB"
 require_positive_integer RYUKI_VERIFY_WATCH_INTERVAL_SECONDS "$WATCH_INTERVAL_SECONDS"
 
-VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-verify.XXXXXX")"
-export CARGO_TARGET_DIR="${VERIFY_DIR}/target"
-mkdir -p "$CARGO_TARGET_DIR"
+case "$KEEP_TARGET" in
+  0|1) ;;
+  *)
+    echo "error: RYUKI_VERIFY_KEEP_TARGET must be 0 or 1 (got '${KEEP_TARGET}')" >&2
+    exit 64
+    ;;
+esac
+
+sentinel_value() {
+  local state_file="$1"
+  local key="$2"
+  awk -F= -v key="$key" '
+    $1 == key {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "$state_file"
+}
+
+is_managed_verify_dir() {
+  local candidate="${1:-}"
+  local parent base
+  [[ -n "$candidate" ]] || return 1
+  parent="$(dirname "$candidate")"
+  base="$(basename "$candidate")"
+  [[ "$parent" == "$VERIFY_TARGET_ROOT" && "$base" == run.* ]]
+}
+
+write_verify_sentinel_temp() {
+  {
+    printf 'version=1\n'
+    printf 'repository_id=%s\n' "$REPOSITORY_ID"
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'workspace=%s\n' "$ROOT_DIR"
+    printf 'keep_target=%s\n' "$KEEP_TARGET"
+  } > "$SENTINEL_TMP"
+  SENTINEL_TMP_CREATED=1
+}
+
+prepare_verify_namespace() {
+  if [[ -L "$VERIFY_NAMESPACE" ]]; then
+    echo "error: verification namespace must not be a symlink: ${VERIFY_NAMESPACE}" >&2
+    return 75
+  fi
+  if [[ ! -d "$VERIFY_NAMESPACE" ]]; then
+    if ! mkdir -m 700 "$VERIFY_NAMESPACE" 2>/dev/null; then
+      echo "error: unable to create verification namespace: ${VERIFY_NAMESPACE}" >&2
+      return 75
+    fi
+  fi
+  if [[ ! -d "$VERIFY_NAMESPACE" || -L "$VERIFY_NAMESPACE" || ! -w "$VERIFY_NAMESPACE" ]]; then
+    echo "error: verification namespace is not a private writable directory: ${VERIFY_NAMESPACE}" >&2
+    return 75
+  fi
+  chmod 700 "$VERIFY_NAMESPACE"
+  if [[ -L "$VERIFY_LOCK_FILE" ]]; then
+    echo "error: verification lock file must not be a symlink: ${VERIFY_LOCK_FILE}" >&2
+    return 75
+  fi
+}
+
+acquire_verify_lock() {
+  prepare_verify_namespace
+  exec 9>>"$VERIFY_LOCK_FILE"
+  if command -v flock >/dev/null 2>&1; then
+    if ! flock -n 9; then
+      echo "error: verification is already running for this repository" >&2
+      return 75
+    fi
+  elif command -v lockf >/dev/null 2>&1; then
+    if ! lockf -s -t 0 9; then
+      echo "error: verification is already running for this repository" >&2
+      return 75
+    fi
+  else
+    echo "error: verify-clean requires flock or lockf for repository-wide serialization" >&2
+    return 69
+  fi
+}
+
+reclaim_stale_verify_dirs() {
+  local candidate sentinel version repository_id run_id keep_target expected_run_id sentinel_tmp
+
+  [[ -d "$VERIFY_TARGET_ROOT" ]] || return 0
+  if [[ -L "$VERIFY_TARGET_ROOT" ]]; then
+    echo "error: verification target root must not be a symlink: ${VERIFY_TARGET_ROOT}" >&2
+    return 75
+  fi
+
+  for sentinel_tmp in "${VERIFY_TARGET_ROOT}"/.run.*.owner.tmp; do
+    [[ -e "$sentinel_tmp" || -L "$sentinel_tmp" ]] || continue
+    if [[ ! -f "$sentinel_tmp" || -L "$sentinel_tmp" ]]; then
+      echo "error: refusing malformed verification setup sentinel: ${sentinel_tmp}" >&2
+      return 75
+    fi
+    rm -f -- "$sentinel_tmp"
+  done
+
+  for candidate in "${VERIFY_TARGET_ROOT}"/run.*; do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    if [[ ! -d "$candidate" || -L "$candidate" ]] || ! is_managed_verify_dir "$candidate"; then
+      echo "error: refusing malformed verification target entry: ${candidate}" >&2
+      return 75
+    fi
+
+    sentinel="${candidate}/.ryuki-verify-owner"
+    if [[ ! -e "$sentinel" ]]; then
+      if [[ -z "$(find "$candidate" -mindepth 1 -print -quit)" ]]; then
+        rmdir "$candidate"
+        continue
+      fi
+      echo "error: refusing non-empty unmarked verification target: ${candidate}" >&2
+      return 75
+    fi
+    if [[ ! -f "$sentinel" || -L "$sentinel" ]]; then
+      echo "error: refusing malformed verification target sentinel: ${sentinel}" >&2
+      return 75
+    fi
+
+    version="$(sentinel_value "$sentinel" version)"
+    repository_id="$(sentinel_value "$sentinel" repository_id)"
+    run_id="$(sentinel_value "$sentinel" run_id)"
+    keep_target="$(sentinel_value "$sentinel" keep_target)"
+    expected_run_id="${candidate##*/run.}"
+    if [[ "$version" != "1" || "$repository_id" != "$REPOSITORY_ID" \
+      || "$run_id" != "$expected_run_id" || ! "$keep_target" =~ ^[01]$ ]]; then
+      echo "error: refusing verification target with invalid sentinel: ${candidate}" >&2
+      return 75
+    fi
+
+    if [[ "$keep_target" == "1" ]]; then
+      echo "preserving explicitly retained verification target: ${candidate}" >&2
+      continue
+    fi
+    echo "removing stale verification target from interrupted run: ${candidate}" >&2
+    rm -rf -- "$candidate"
+  done
+}
+
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
@@ -49,12 +205,22 @@ cleanup() {
   trap - EXIT
   trap '' INT TERM
   stop_active_gate
-  if [[ "$KEEP_TARGET" == "1" ]]; then
+  if [[ "$SENTINEL_TMP_CREATED" == "1" && -f "$SENTINEL_TMP" && ! -L "$SENTINEL_TMP" ]]; then
+    rm -f -- "$SENTINEL_TMP" || status=75
+  fi
+  if [[ "$VERIFY_DIR_CREATED" == "1" && "$SENTINEL_PUBLISHED" == "1" \
+    && "$KEEP_TARGET" == "1" ]]; then
     echo "verification target retained at ${CARGO_TARGET_DIR}" >&2
-  else
-    cargo clean --target-dir "$CARGO_TARGET_DIR" >/dev/null 2>&1 \
-      || rm -rf -- "$CARGO_TARGET_DIR"
-    rmdir "$VERIFY_DIR" 2>/dev/null || true
+  elif [[ "$VERIFY_DIR_CREATED" == "1" && -e "$VERIFY_DIR" ]]; then
+    if is_managed_verify_dir "$VERIFY_DIR"; then
+      if ! rm -rf -- "$VERIFY_DIR"; then
+        echo "error: unable to remove disposable verification target: ${VERIFY_DIR}" >&2
+        status=75
+      fi
+    else
+      echo "error: refusing to remove unmanaged verification path: ${VERIFY_DIR}" >&2
+      status=75
+    fi
   fi
   exit "$status"
 }
@@ -150,6 +316,32 @@ trap cleanup EXIT
 trap 'handle_signal 130' INT
 trap 'handle_signal 143' TERM
 
+acquire_verify_lock
+reclaim_stale_verify_dirs
+if [[ -L "$VERIFY_TARGET_ROOT" ]]; then
+  echo "error: verification target root must not be a symlink: ${VERIFY_TARGET_ROOT}" >&2
+  exit 75
+fi
+if [[ ! -d "$VERIFY_TARGET_ROOT" ]]; then
+  mkdir -m 700 "$VERIFY_TARGET_ROOT"
+fi
+chmod 700 "$VERIFY_TARGET_ROOT"
+write_verify_sentinel_temp
+mkdir -m 700 "$VERIFY_DIR"
+VERIFY_DIR_CREATED=1
+mv -f -- "$SENTINEL_TMP" "${VERIFY_DIR}/.ryuki-verify-owner"
+SENTINEL_TMP_CREATED=0
+SENTINEL_PUBLISHED=1
+mkdir -p "$CARGO_TARGET_DIR"
+
+run_gate_command() {
+  # Keep the advisory-lock descriptor alive in a supervisor process even if
+  # the gate executable closes inherited descriptors and the wrapper is killed.
+  # The supervisor must not inherit the wrapper's EXIT cleanup trap.
+  trap - EXIT INT TERM
+  "$@"
+}
+
 run_gate() {
   local label="$1"
   local command_pid command_status guard_status
@@ -157,7 +349,7 @@ run_gate() {
   disk_guard
   echo "==> ${label}"
 
-  "$@" &
+  run_gate_command "$@" &
   command_pid=$!
   ACTIVE_GATE_PID="$command_pid"
   while kill -0 "$command_pid" 2>/dev/null; do
@@ -195,6 +387,7 @@ if [[ "${RYUKI_VERIFY_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
+run_gate "verification cleanup regression" ./scripts/regressions/verify-workspace-clean.sh
 run_gate "format" cargo fmt --check --all
 run_gate "workspace build" cargo build --workspace
 run_gate "workspace tests" cargo test --workspace
