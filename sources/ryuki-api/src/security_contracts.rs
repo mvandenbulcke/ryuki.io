@@ -3626,6 +3626,16 @@ impl SecurityContractContext {
         legacy_auth_selector_present: bool,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
+        // Production authority always comes from the authenticated provider
+        // registry. Reject the legacy selector before any guard-specific
+        // branch can return early and accidentally leave two authority
+        // sources configured for a future fully-admitted production startup.
+        if self.profile.security_profile.is_production() && legacy_auth_selector_present {
+            return Err(
+                "RYUKI_AUTH_MODE and the provider registry cannot both select authority without migration_overlay"
+                    .into(),
+            );
+        }
         if self.profile.security_profile.is_production() {
             let ConformanceState::Production(boundary) = &self.conformance_state else {
                 return Err("production startup has no sealed production-boundary proof".into());
@@ -13627,6 +13637,24 @@ mod tests {
             .validate_runtime_bindings(&config, false, fixed_now())
             .unwrap_err()
             .contains("loopback"));
+    }
+
+    #[test]
+    fn production_rejects_the_legacy_auth_selector_before_guard_admission() {
+        let fixture = ActiveFixture::build();
+        let mut context = fixture.load().unwrap();
+        context.profile.security_profile = SecurityProfile::Production;
+        let config = RyukiConfig {
+            auth_mode: AuthMode::StaticDryRun,
+            ..RyukiConfig::default()
+        };
+
+        let error = context
+            .validate_runtime_bindings(&config, true, fixed_now())
+            .unwrap_err();
+
+        assert!(error.contains("cannot both select authority"));
+        assert!(!error.contains("sealed production-boundary proof"));
     }
 
     #[test]

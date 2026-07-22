@@ -283,6 +283,8 @@ pub(crate) enum AuthenticatorRuntimePostureError {
     CredentialFree,
     #[error("password-based local authentication cannot satisfy production admission")]
     PasswordLocal,
+    #[error("an additional unbound authenticator cannot satisfy production admission")]
+    UnboundAuthenticator,
 }
 
 fn normalized_identity_url(raw: &str, label: &'static str) -> Result<String, String> {
@@ -432,6 +434,9 @@ impl ApiAuthenticatorRuntime {
         &self,
     ) -> Result<&AuthenticatorRuntimeObservation, AuthenticatorRuntimePostureError> {
         match self.operational_observation.posture() {
+            ProductionAuthenticatorPosture::EntraOidc if self.generic_oidc_enabled => {
+                Err(AuthenticatorRuntimePostureError::UnboundAuthenticator)
+            }
             ProductionAuthenticatorPosture::EntraOidc => Ok(&self.operational_observation),
             ProductionAuthenticatorPosture::CredentialFreeMockDryRun
             | ProductionAuthenticatorPosture::CredentialFreeStaticDryRun => {
@@ -768,6 +773,37 @@ mod tests {
             runtime.operational_observation().consumers(),
             &[
                 AuthenticatorRuntimeConsumer::LocalPasswordLogin,
+                AuthenticatorRuntimeConsumer::GenericOidcBrowserCallback,
+            ]
+        );
+    }
+
+    #[test]
+    fn entra_oidc_rejects_an_unbound_generic_oidc_sidecar() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        config.entra_tenant_id = "tenant-sidecar-fixture".to_string();
+        config.entra_client_id = "entra-sidecar-fixture".to_string();
+        config.entra_redirect_uri = "https://portal.example.test/entra/callback".to_string();
+        config.oidc.enabled = true;
+        config.oidc.token_endpoint = "https://identity.example.test/token".to_string();
+        config.oidc.jwks_uri = "https://identity.example.test/jwks".to_string();
+        config.oidc.issuer = "https://identity.example.test/issuer".to_string();
+        config.oidc.client_id = "generic-sidecar-client".to_string();
+
+        let (_, runtime) = build_runtime(&config);
+
+        assert_eq!(
+            runtime.validate_production_posture(),
+            Err(AuthenticatorRuntimePostureError::UnboundAuthenticator)
+        );
+        assert_eq!(
+            runtime.operational_observation().consumers(),
+            &[
+                AuthenticatorRuntimeConsumer::EntraBearerRequestAdmission,
+                AuthenticatorRuntimeConsumer::EntraBrowserSso,
                 AuthenticatorRuntimeConsumer::GenericOidcBrowserCallback,
             ]
         );
