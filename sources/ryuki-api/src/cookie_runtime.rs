@@ -10,9 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::http::header::SET_COOKIE;
-use axum::http::{header::InvalidHeaderValue, HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, header::InvalidHeaderValue};
 use axum::response::Response;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::cookie_policy::{
     CookiePolicyConsumer, CookiePolicyError, ProductionApiCookiePolicyConfig, RetainedCookiePolicy,
@@ -363,6 +363,140 @@ enum ApiCookieRuntimeMode {
     },
 }
 
+/// Closed, value-free classification of the cookie authority measured for an
+/// authenticator runtime. `SecureProduction` identifies the production-grade
+/// retained policy factory; the independent `production` bit records whether
+/// startup admitted this process under the authenticated production profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiCookieRuntimeObservationMode {
+    SecureProduction,
+    LoopbackDevelopment,
+}
+
+/// Non-forgeable live observation of the exact retained cookie authority.
+///
+/// The observation exposes only closed classifications and the canonical
+/// policy-inventory digest. It privately retains both the runtime allocation
+/// and, in secure mode, the exact core policy allocation so a production guard
+/// can reject an independently reconstructed but equal-looking substitute.
+pub(crate) struct ApiCookieRuntimeObservation {
+    mode: ApiCookieRuntimeObservationMode,
+    production: bool,
+    policy_inventory_digest: Option<String>,
+    runtime: Arc<ApiCookieRuntime>,
+    secure_policies: Option<Arc<RetainedCookiePolicySet>>,
+}
+
+impl fmt::Debug for ApiCookieRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiCookieRuntimeObservation")
+            .field("mode", &self.mode)
+            .field("production", &self.production)
+            .field(
+                "policy_inventory_digest",
+                &self.policy_inventory_digest.as_ref().map(|_| "[RETAINED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApiCookieRuntimeObservation {
+    fn measure(runtime: &Arc<ApiCookieRuntime>) -> Result<Self, ApiCookieRuntimeError> {
+        let (mode, secure_policies, policy_inventory_digest) = match &runtime.mode {
+            ApiCookieRuntimeMode::Secure { policies } => {
+                policies.verify_integrity()?;
+                (
+                    ApiCookieRuntimeObservationMode::SecureProduction,
+                    Some(Arc::clone(policies)),
+                    Some(policies.policy_inventory_digest().to_owned()),
+                )
+            }
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => (
+                ApiCookieRuntimeObservationMode::LoopbackDevelopment,
+                None,
+                None,
+            ),
+        };
+        let observation = Self {
+            mode,
+            production: runtime.production,
+            policy_inventory_digest,
+            runtime: Arc::clone(runtime),
+            secure_policies,
+        };
+        observation.verify_retained_runtime(runtime)?;
+        Ok(observation)
+    }
+
+    pub(crate) fn mode(&self) -> ApiCookieRuntimeObservationMode {
+        self.mode
+    }
+
+    pub(crate) fn production(&self) -> bool {
+        self.production
+    }
+
+    /// Canonical digest of the complete secure cookie inventory. Session
+    /// lifetime, SameSite, Secure, HttpOnly, path, names, value profiles, and
+    /// issuer/parser inventories are all already bound by this digest.
+    pub(crate) fn policy_inventory_digest(&self) -> Option<&str> {
+        self.policy_inventory_digest.as_deref()
+    }
+
+    /// Re-measure the candidate and prove it is the exact process-lifetime
+    /// runtime and policy allocation retained when this observation was made.
+    pub(crate) fn verify_retained_runtime(
+        &self,
+        candidate: &Arc<ApiCookieRuntime>,
+    ) -> Result<(), ApiCookieRuntimeError> {
+        if !Arc::ptr_eq(&self.runtime, candidate)
+            || self.production != candidate.production
+            || self.mode
+                != match &candidate.mode {
+                    ApiCookieRuntimeMode::Secure { .. } => {
+                        ApiCookieRuntimeObservationMode::SecureProduction
+                    }
+                    ApiCookieRuntimeMode::LoopbackDevelopment { .. } => {
+                        ApiCookieRuntimeObservationMode::LoopbackDevelopment
+                    }
+                }
+        {
+            return Err(ApiCookieRuntimeError::Invalid(
+                "cookie observation does not retain the exact runtime allocation",
+            ));
+        }
+
+        match (&self.secure_policies, candidate.secure_policy_set()) {
+            (Some(retained), Some(measured)) => {
+                if !Arc::ptr_eq(retained, measured) {
+                    return Err(ApiCookieRuntimeError::Invalid(
+                        "cookie observation does not retain the exact policy allocation",
+                    ));
+                }
+                retained.verify_integrity()?;
+                if self.policy_inventory_digest.as_deref()
+                    != Some(retained.policy_inventory_digest())
+                {
+                    return Err(ApiCookieRuntimeError::Invalid(
+                        "cookie observation differs from the retained policy inventory",
+                    ));
+                }
+            }
+            (None, None)
+                if self.mode == ApiCookieRuntimeObservationMode::LoopbackDevelopment
+                    && !self.production
+                    && self.policy_inventory_digest.is_none() => {}
+            _ => {
+                return Err(ApiCookieRuntimeError::Invalid(
+                    "cookie observation has inconsistent secure-policy retention",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One immutable process-lifetime cookie authority. The value is intentionally
 /// not `Clone`; consumers receive typed handles that share its outer `Arc`.
 pub(crate) struct ApiCookieRuntime {
@@ -491,6 +625,14 @@ impl ApiCookieRuntime {
 
     pub(crate) fn oidc_binding_parser(self: &Arc<Self>) -> ApiOidcBindingParser {
         BindingCookieParser::new(Arc::clone(self))
+    }
+
+    /// Measure the exact retained authority without exposing raw cookie
+    /// configuration or individual policy values.
+    pub(crate) fn live_observation(
+        self: &Arc<Self>,
+    ) -> Result<ApiCookieRuntimeObservation, ApiCookieRuntimeError> {
+        ApiCookieRuntimeObservation::measure(self)
     }
 
     /// The exact retained allocation to move into the secure-cookie witness.
@@ -951,6 +1093,70 @@ mod tests {
     }
 
     #[test]
+    fn live_observation_remeasures_the_exact_secure_runtime_and_policy_arcs() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let observation = runtime.live_observation().unwrap();
+        let retained_policies = observation
+            .secure_policies
+            .as_ref()
+            .expect("secure observation must retain the policy allocation");
+
+        assert_eq!(
+            observation.mode(),
+            ApiCookieRuntimeObservationMode::SecureProduction
+        );
+        assert!(observation.production());
+        assert_eq!(
+            observation.policy_inventory_digest(),
+            Some(retained_policies.policy_inventory_digest())
+        );
+        assert!(Arc::ptr_eq(&observation.runtime, &runtime));
+        assert!(Arc::ptr_eq(
+            retained_policies,
+            runtime.secure_policy_set().unwrap()
+        ));
+        observation.verify_retained_runtime(&runtime).unwrap();
+
+        let equal_looking = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let equal_looking_observation = equal_looking.live_observation().unwrap();
+        assert_eq!(
+            observation.policy_inventory_digest(),
+            equal_looking_observation.policy_inventory_digest()
+        );
+        assert!(observation.verify_retained_runtime(&equal_looking).is_err());
+    }
+
+    #[test]
+    fn live_observation_inventory_digest_changes_with_closed_policy_semantics() {
+        let baseline = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let baseline_observation = baseline.live_observation().unwrap();
+
+        let mut lifetime_mutation = secure_config();
+        lifetime_mutation.session.cookie_max_age_secs += 1;
+        let lifetime_runtime =
+            ApiCookieRuntime::from_admitted_config(&lifetime_mutation, true).unwrap();
+        let lifetime_observation = lifetime_runtime.live_observation().unwrap();
+        assert_ne!(
+            baseline_observation.policy_inventory_digest(),
+            lifetime_observation.policy_inventory_digest()
+        );
+
+        let mut same_site_mutation = secure_config();
+        same_site_mutation.session.cookie_same_site = "strict".into();
+        let same_site_runtime =
+            ApiCookieRuntime::from_admitted_config(&same_site_mutation, true).unwrap();
+        let same_site_observation = same_site_runtime.live_observation().unwrap();
+        assert_ne!(
+            baseline_observation.policy_inventory_digest(),
+            same_site_observation.policy_inventory_digest()
+        );
+        assert_ne!(
+            lifetime_observation.policy_inventory_digest(),
+            same_site_observation.policy_inventory_digest()
+        );
+    }
+
+    #[test]
     fn production_rejects_insecure_non_http_only_and_none_policies() {
         let mut config = secure_config();
         config.session.cookie_secure = false;
@@ -976,6 +1182,14 @@ mod tests {
         assert!(runtime.measured_production_value().is_err());
         assert_eq!(runtime.session_max_age_secs(), 86_400);
         assert_eq!(runtime.session_same_site(), CookieSameSitePolicy::Lax);
+        let observation = runtime.live_observation().unwrap();
+        assert_eq!(
+            observation.mode(),
+            ApiCookieRuntimeObservationMode::LoopbackDevelopment
+        );
+        assert!(!observation.production());
+        assert_eq!(observation.policy_inventory_digest(), None);
+        observation.verify_retained_runtime(&runtime).unwrap();
 
         config.server.bind_address = "0.0.0.0:8080".into();
         assert!(ApiCookieRuntime::from_admitted_config(&config, false).is_err());
@@ -988,9 +1202,11 @@ mod tests {
             ApiCookieRuntime::from_admitted_config(&production_config, true).unwrap();
         let mut non_http_only = production_config;
         non_http_only.session.cookie_http_only = false;
-        assert!(production_runtime
-            .validate_config_binding(&non_http_only, true)
-            .is_err());
+        assert!(
+            production_runtime
+                .validate_config_binding(&non_http_only, true)
+                .is_err()
+        );
 
         let mut loopback_config = secure_config();
         loopback_config.session.cookie_secure = false;
@@ -999,13 +1215,17 @@ mod tests {
             ApiCookieRuntime::from_admitted_config(&loopback_config, false).unwrap();
 
         loopback_config.server.bind_address = "127.0.0.1:8081".into();
-        assert!(loopback_runtime
-            .validate_config_binding(&loopback_config, false)
-            .is_err());
+        assert!(
+            loopback_runtime
+                .validate_config_binding(&loopback_config, false)
+                .is_err()
+        );
         loopback_config.server.bind_address = "0.0.0.0:8080".into();
-        assert!(loopback_runtime
-            .validate_config_binding(&loopback_config, false)
-            .is_err());
+        assert!(
+            loopback_runtime
+                .validate_config_binding(&loopback_config, false)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1329,5 +1549,19 @@ mod tests {
         assert!(debug.contains("policy_inventory_digest"));
         assert!(!debug.contains("must-not-appear"));
         assert!(!debug.contains("__Host-"));
+
+        let observation_debug = format!("{:?}", runtime.live_observation().unwrap());
+        assert!(observation_debug.contains("SecureProduction"));
+        assert!(observation_debug.contains("[RETAINED]"));
+        assert!(!observation_debug.contains("must-not-appear"));
+        assert!(!observation_debug.contains("__Host-"));
+        assert!(
+            !observation_debug.contains(
+                runtime
+                    .secure_policy_set()
+                    .unwrap()
+                    .policy_inventory_digest()
+            )
+        );
     }
 }
