@@ -207,6 +207,25 @@ pub fn get_api_cookie_runtime() -> Arc<crate::cookie_runtime::ApiCookieRuntime> 
 }
 
 #[cfg(not(test))]
+pub(crate) fn get_derived_session_credentials(
+) -> Arc<crate::session_credentials::DerivedSessionCredentialRuntime> {
+    get_api_authenticator_runtime().derived_session_credentials()
+}
+
+#[cfg(test)]
+pub(crate) fn get_derived_session_credentials(
+) -> Arc<crate::session_credentials::DerivedSessionCredentialRuntime> {
+    let startup = startup_config_if_initialized().expect("startup config not initialized");
+    if let Some(runtime) = startup.api_authenticator_runtime.as_ref() {
+        return runtime.derived_session_credentials();
+    }
+    crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
+        &startup.app_config.session,
+    )
+    .expect("test config must construct session credential runtime")
+}
+
+#[cfg(not(test))]
 pub fn get_api_authenticator_runtime() -> Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>
 {
     Arc::clone(

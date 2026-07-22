@@ -23,6 +23,9 @@ use crate::entra_sso::EntraSsoDeps;
 use crate::oidc_callback::{
     OidcCallbackDeps, OidcIdTokenValidator, ReqwestTokenExchanger, TokenExchanger,
 };
+use crate::session_credentials::{
+    DerivedSessionCredentialRuntime, DerivedSessionRuntimeObservation,
+};
 
 const DISABLED_OIDC_TOKEN_ENDPOINT: &str = "https://disabled.invalid/token";
 const DISABLED_OIDC_JWKS_ENDPOINT: &str = "https://disabled.invalid/jwks";
@@ -90,6 +93,7 @@ pub(crate) struct AuthenticatorRuntimeObservation {
     posture: ProductionAuthenticatorPosture,
     consumers: Box<[AuthenticatorRuntimeConsumer]>,
     entra_validator_observation: Option<Arc<EntraBearerRuntimeObservation>>,
+    derived_session_observation: Arc<DerivedSessionRuntimeObservation>,
     generic_oidc_enabled: bool,
     generic_oidc_issuer_authority_binding_digest: Option<String>,
     generic_oidc_audience_client_binding_digest: Option<String>,
@@ -114,6 +118,7 @@ impl AuthenticatorRuntimeObservation {
     fn measure(
         config: &RyukiConfig,
         entra_validator_observation: Arc<EntraBearerRuntimeObservation>,
+        derived_session_observation: Arc<DerivedSessionRuntimeObservation>,
     ) -> Result<Self, String> {
         let posture = match &config.auth_mode {
             AuthMode::EntraId => ProductionAuthenticatorPosture::EntraOidc,
@@ -121,6 +126,31 @@ impl AuthenticatorRuntimeObservation {
             AuthMode::StaticDryRun => ProductionAuthenticatorPosture::CredentialFreeStaticDryRun,
             AuthMode::Local => ProductionAuthenticatorPosture::PasswordLocal,
         };
+
+        let exact_session_policy = derived_session_observation.as_ref();
+        let configured_session_credential = !config.session.credential_hmac_key.is_empty();
+        if exact_session_policy.enabled() != configured_session_credential
+            || exact_session_policy.maximum_session_age_seconds()
+                != config.session.cookie_max_age_secs
+            || exact_session_policy.federated_authority_max_staleness_seconds()
+                != config.session.federated_authority_max_staleness_secs
+            || exact_session_policy.credential_format_id() != "session-credential:opaque-random-v1"
+            || exact_session_policy.verifier_algorithm_id() != "hmac-sha256"
+            || exact_session_policy.credential_random_bytes() != 32
+            || exact_session_policy.database_representation_id()
+                != "session-verifier:keyed-digest-only-v1"
+            || (exact_session_policy.enabled()
+                && !exact_session_policy
+                    .key_identity_binding_digest()
+                    .is_some_and(|digest| digest.starts_with("sha256:")))
+            || (!exact_session_policy.enabled()
+                && exact_session_policy.key_identity_binding_digest().is_some())
+        {
+            return Err(
+                "retained derived-session authority does not implement the closed runtime policy"
+                    .to_string(),
+            );
+        }
 
         if posture == ProductionAuthenticatorPosture::EntraOidc {
             let exact_policy = entra_validator_observation.as_ref();
@@ -205,6 +235,7 @@ impl AuthenticatorRuntimeObservation {
             consumers: consumers.into_boxed_slice(),
             entra_validator_observation: (posture == ProductionAuthenticatorPosture::EntraOidc)
                 .then_some(entra_validator_observation),
+            derived_session_observation,
             generic_oidc_enabled: config.oidc.enabled,
             generic_oidc_issuer_authority_binding_digest,
             generic_oidc_audience_client_binding_digest,
@@ -219,6 +250,10 @@ impl AuthenticatorRuntimeObservation {
 
     pub(crate) fn posture(&self) -> ProductionAuthenticatorPosture {
         self.posture
+    }
+
+    pub(crate) fn derived_session_observation(&self) -> &Arc<DerivedSessionRuntimeObservation> {
+        &self.derived_session_observation
     }
 
     #[cfg(test)]
@@ -321,6 +356,8 @@ pub(crate) enum AuthenticatorRuntimePostureError {
     PasswordLocal,
     #[error("an additional unbound authenticator cannot satisfy production admission")]
     UnboundAuthenticator,
+    #[error("the retained derived-session credential authority is unavailable")]
+    DerivedSessionCredentialUnavailable,
 }
 
 fn normalized_identity_url(raw: &str, label: &'static str) -> Result<String, String> {
@@ -363,6 +400,8 @@ pub(crate) struct ApiAuthenticatorRuntime {
     api_cookie_runtime: Arc<ApiCookieRuntime>,
     entra_bearer_validator: Arc<EntraTokenValidator>,
     entra_bearer_observation: Arc<EntraBearerRuntimeObservation>,
+    derived_session_credentials: Arc<DerivedSessionCredentialRuntime>,
+    derived_session_observation: Arc<DerivedSessionRuntimeObservation>,
     oidc_callback_dependencies: Arc<OidcCallbackDeps>,
     entra_sso_dependencies: Arc<EntraSsoDeps>,
     local_login_throttle: Arc<LocalLoginThrottle>,
@@ -387,9 +426,15 @@ impl ApiAuthenticatorRuntime {
             config.entra_leeway_secs,
         ));
         let entra_bearer_observation = Arc::new(entra_bearer_validator.runtime_observation());
+        let derived_session_credentials =
+            DerivedSessionCredentialRuntime::from_admitted_config(&config.session)
+                .map_err(|error| error.to_string())?;
+        let derived_session_observation =
+            Arc::new(derived_session_credentials.runtime_observation());
         let operational_observation = Arc::new(AuthenticatorRuntimeObservation::measure(
             config,
             Arc::clone(&entra_bearer_observation),
+            Arc::clone(&derived_session_observation),
         )?);
 
         let (token_endpoint, jwks_endpoint, issuer, audience) = if config.oidc.enabled {
@@ -426,7 +471,14 @@ impl ApiAuthenticatorRuntime {
         let oidc_callback_dependencies = Arc::new(OidcCallbackDeps {
             exchanger,
             validator,
+            session_credentials: Arc::clone(&derived_session_credentials),
+            cookie_runtime: Arc::clone(&api_cookie_runtime),
         });
+        let entra_sso_dependencies = EntraSsoDeps::from_app_config(
+            config,
+            Arc::clone(&derived_session_credentials),
+            Arc::clone(&api_cookie_runtime),
+        );
 
         Ok(Arc::new(Self {
             auth_mode: config.auth_mode.clone(),
@@ -435,8 +487,10 @@ impl ApiAuthenticatorRuntime {
             api_cookie_runtime,
             entra_bearer_validator,
             entra_bearer_observation,
+            derived_session_credentials,
+            derived_session_observation,
             oidc_callback_dependencies,
-            entra_sso_dependencies: EntraSsoDeps::from_app_config(config),
+            entra_sso_dependencies,
             local_login_throttle: Arc::new(LocalLoginThrottle::default()),
         }))
     }
@@ -459,6 +513,11 @@ impl ApiAuthenticatorRuntime {
         &self,
     ) -> Result<&AuthenticatorRuntimeObservation, AuthenticatorRuntimePostureError> {
         match self.operational_observation.posture() {
+            ProductionAuthenticatorPosture::EntraOidc
+                if !self.derived_session_credentials.enabled() =>
+            {
+                Err(AuthenticatorRuntimePostureError::DerivedSessionCredentialUnavailable)
+            }
             ProductionAuthenticatorPosture::EntraOidc if self.generic_oidc_enabled => {
                 Err(AuthenticatorRuntimePostureError::UnboundAuthenticator)
             }
@@ -473,8 +532,7 @@ impl ApiAuthenticatorRuntime {
         }
     }
 
-    #[cfg(test)]
-    fn api_cookie_runtime(&self) -> Arc<ApiCookieRuntime> {
+    pub(crate) fn api_cookie_runtime(&self) -> Arc<ApiCookieRuntime> {
         Arc::clone(&self.api_cookie_runtime)
     }
 
@@ -484,6 +542,14 @@ impl ApiAuthenticatorRuntime {
 
     pub(crate) fn entra_bearer_observation(&self) -> Arc<EntraBearerRuntimeObservation> {
         Arc::clone(&self.entra_bearer_observation)
+    }
+
+    pub(crate) fn derived_session_credentials(&self) -> Arc<DerivedSessionCredentialRuntime> {
+        Arc::clone(&self.derived_session_credentials)
+    }
+
+    pub(crate) fn derived_session_observation(&self) -> Arc<DerivedSessionRuntimeObservation> {
+        Arc::clone(&self.derived_session_observation)
     }
 
     pub(crate) fn oidc_callback_dependencies(&self) -> Arc<OidcCallbackDeps> {
@@ -527,6 +593,28 @@ impl ApiAuthenticatorRuntime {
         *self.entra_bearer_observation == self.entra_bearer_validator.runtime_observation()
     }
 
+    pub(crate) fn retains_derived_session_credentials(
+        &self,
+        runtime: &Arc<DerivedSessionCredentialRuntime>,
+    ) -> bool {
+        Arc::ptr_eq(&self.derived_session_credentials, runtime)
+    }
+
+    pub(crate) fn retains_derived_session_observation(
+        &self,
+        observation: &Arc<DerivedSessionRuntimeObservation>,
+    ) -> bool {
+        Arc::ptr_eq(&self.derived_session_observation, observation)
+            && Arc::ptr_eq(
+                self.operational_observation.derived_session_observation(),
+                observation,
+            )
+    }
+
+    pub(crate) fn remeasures_derived_session_observation(&self) -> bool {
+        *self.derived_session_observation == self.derived_session_credentials.runtime_observation()
+    }
+
     pub(crate) fn retains_oidc_callback_dependencies(
         &self,
         dependencies: &Arc<OidcCallbackDeps>,
@@ -553,6 +641,8 @@ impl fmt::Debug for ApiAuthenticatorRuntime {
             .field("api_cookie_runtime", &"[RETAINED]")
             .field("entra_bearer_validator", &"[RETAINED]")
             .field("entra_bearer_observation", &"[RETAINED]")
+            .field("derived_session_credentials", &"[RETAINED]")
+            .field("derived_session_observation", &"[RETAINED]")
             .field("oidc_callback_dependencies", &"[RETAINED]")
             .field("entra_sso_dependencies", &"[RETAINED]")
             .field("local_login_throttle", &"[RETAINED]")
@@ -585,6 +675,8 @@ mod tests {
         let observation = Arc::clone(runtime.operational_observation());
         let entra_bearer_validator = runtime.entra_bearer_validator();
         let entra_bearer_observation = runtime.entra_bearer_observation();
+        let derived_session_credentials = runtime.derived_session_credentials();
+        let derived_session_observation = runtime.derived_session_observation();
         let oidc_callback_dependencies = runtime.oidc_callback_dependencies();
         let entra_sso_dependencies = runtime.entra_sso_dependencies();
         let local_login_throttle = runtime.local_login_throttle();
@@ -594,9 +686,18 @@ mod tests {
         assert!(runtime.retains_entra_bearer_validator(&entra_bearer_validator));
         assert!(runtime.retains_entra_bearer_observation(&entra_bearer_observation));
         assert!(runtime.remeasures_entra_bearer_observation());
+        assert!(runtime.retains_derived_session_credentials(&derived_session_credentials));
+        assert!(runtime.retains_derived_session_observation(&derived_session_observation));
+        assert!(runtime.remeasures_derived_session_observation());
         assert!(runtime.retains_oidc_callback_dependencies(&oidc_callback_dependencies));
         assert!(runtime.retains_entra_sso_dependencies(&entra_sso_dependencies));
         assert!(runtime.retains_local_login_throttle(&local_login_throttle));
+        assert!(
+            oidc_callback_dependencies.retains_session_credentials(&derived_session_credentials)
+        );
+        assert!(oidc_callback_dependencies.retains_cookie_runtime(&cookie_runtime));
+        assert!(entra_sso_dependencies.retains_session_credentials(&derived_session_credentials));
+        assert!(entra_sso_dependencies.retains_cookie_runtime(&cookie_runtime));
         assert!(Arc::ptr_eq(
             &runtime.api_cookie_runtime(),
             &runtime.api_cookie_runtime()
@@ -608,6 +709,14 @@ mod tests {
         assert!(Arc::ptr_eq(
             &runtime.entra_bearer_observation(),
             &runtime.entra_bearer_observation()
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.derived_session_credentials(),
+            &runtime.derived_session_credentials()
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.derived_session_observation(),
+            &runtime.derived_session_observation()
         ));
         assert!(Arc::ptr_eq(
             &runtime.oidc_callback_dependencies(),
@@ -629,6 +738,10 @@ mod tests {
         assert!(
             !runtime.retains_entra_bearer_observation(&other_runtime.entra_bearer_observation())
         );
+        assert!(!runtime
+            .retains_derived_session_credentials(&other_runtime.derived_session_credentials()));
+        assert!(!runtime
+            .retains_derived_session_observation(&other_runtime.derived_session_observation()));
         assert!(!runtime
             .retains_oidc_callback_dependencies(&other_runtime.oidc_callback_dependencies()));
         assert!(!runtime.retains_entra_sso_dependencies(&other_runtime.entra_sso_dependencies()));
@@ -765,6 +878,7 @@ mod tests {
         config.entra_tenant_id = "tenant-posture-fixture".to_string();
         config.entra_client_id = "client-posture-fixture".to_string();
         config.entra_redirect_uri = "https://portal.example.test/entra/callback".to_string();
+        config.session.credential_hmac_key = "k".repeat(32);
 
         let (_, runtime) = build_runtime(&config);
         let observation = runtime
@@ -806,6 +920,24 @@ mod tests {
         assert_eq!(
             observation.entra_validation_leeway_seconds(),
             config.entra_leeway_secs
+        );
+        assert!(observation.derived_session_observation().enabled());
+    }
+
+    #[test]
+    fn entra_production_posture_rejects_a_disabled_session_authority() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        config.entra_tenant_id = "tenant-posture-fixture".to_string();
+        config.entra_client_id = "client-posture-fixture".to_string();
+        config.entra_redirect_uri = "https://portal.example.test/entra/callback".to_string();
+
+        let (_, runtime) = build_runtime(&config);
+        assert_eq!(
+            runtime.validate_production_posture(),
+            Err(AuthenticatorRuntimePostureError::DerivedSessionCredentialUnavailable)
         );
     }
 
@@ -850,6 +982,7 @@ mod tests {
         config.oidc.jwks_uri = "https://identity.example.test/jwks".to_string();
         config.oidc.issuer = "https://identity.example.test/issuer".to_string();
         config.oidc.client_id = "generic-sidecar-client".to_string();
+        config.session.credential_hmac_key = "k".repeat(32);
 
         let (_, runtime) = build_runtime(&config);
 

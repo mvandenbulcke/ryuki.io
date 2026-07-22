@@ -12,7 +12,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
 
 use ryuki_core::config::{LocalAuthUser, SessionConfig};
@@ -23,6 +25,8 @@ const SESSION_BEARER_PAYLOAD_LEN: usize = 43;
 pub const SESSION_BEARER_LEN: usize = SESSION_BEARER_PREFIX.len() + SESSION_BEARER_PAYLOAD_LEN;
 const SESSION_VERIFIER_DOMAIN: &[u8] = b"ryuki/session-bearer/verifier/v1\0";
 const IDENTITY_AUTHORITY_DOMAIN: &[u8] = b"ryuki/identity-authority/v1\0";
+const SESSION_RUNTIME_KEY_IDENTITY_DOMAIN: &[u8] =
+    b"ryuki/derived-session-runtime/key-identity/v1\0";
 pub const SESSION_VERIFIER_LEN: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -33,6 +37,8 @@ pub enum SessionCredentialError {
     VerifierKeyTooShort,
     MalformedVerifierKey,
     MalformedBearer,
+    InvalidMaximumAge,
+    InvalidFederatedAuthorityStaleness,
 }
 
 impl std::fmt::Display for SessionCredentialError {
@@ -42,6 +48,10 @@ impl std::fmt::Display for SessionCredentialError {
             Self::VerifierKeyTooShort => "session credential verifier key is too short",
             Self::MalformedVerifierKey => "session credential verifier key is malformed",
             Self::MalformedBearer => "session bearer is malformed",
+            Self::InvalidMaximumAge => "session credential maximum age must be positive",
+            Self::InvalidFederatedAuthorityStaleness => {
+                "federated session authority staleness must be positive"
+            }
         })
     }
 }
@@ -76,6 +86,283 @@ impl IssuedSessionCredential {
     /// returned, or logged.
     pub fn verifier(&self) -> &[u8; SESSION_VERIFIER_LEN] {
         &self.verifier
+    }
+}
+
+/// Value-free measurement of the exact derived-session credential authority.
+/// The key itself is never exposed; its identity is a domain-separated keyed
+/// digest suitable only for equality and substitution detection.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DerivedSessionRuntimeObservation {
+    enabled: bool,
+    key_identity_binding_digest: Option<String>,
+    maximum_session_age_seconds: u64,
+    federated_authority_max_staleness_seconds: u64,
+    credential_format_id: &'static str,
+    verifier_algorithm_id: &'static str,
+    credential_random_bytes: u32,
+    database_representation_id: &'static str,
+}
+
+impl fmt::Debug for DerivedSessionRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DerivedSessionRuntimeObservation")
+            .field("enabled", &self.enabled)
+            .field("key_identity_binding", &"[REDACTED]")
+            .field(
+                "maximum_session_age_seconds",
+                &self.maximum_session_age_seconds,
+            )
+            .field(
+                "federated_authority_max_staleness_seconds",
+                &self.federated_authority_max_staleness_seconds,
+            )
+            .field("credential_policy", &"[RETAINED]")
+            .finish()
+    }
+}
+
+impl DerivedSessionRuntimeObservation {
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn key_identity_binding_digest(&self) -> Option<&str> {
+        self.key_identity_binding_digest.as_deref()
+    }
+
+    pub(crate) fn maximum_session_age_seconds(&self) -> u64 {
+        self.maximum_session_age_seconds
+    }
+
+    pub(crate) fn federated_authority_max_staleness_seconds(&self) -> u64 {
+        self.federated_authority_max_staleness_seconds
+    }
+
+    pub(crate) fn credential_format_id(&self) -> &str {
+        self.credential_format_id
+    }
+
+    pub(crate) fn verifier_algorithm_id(&self) -> &str {
+        self.verifier_algorithm_id
+    }
+
+    pub(crate) fn credential_random_bytes(&self) -> u32 {
+        self.credential_random_bytes
+    }
+
+    pub(crate) fn database_representation_id(&self) -> &str {
+        self.database_representation_id
+    }
+}
+
+/// One immutable owner for browser/local session credential issuance,
+/// verification, and identity-authority derivation.
+///
+/// Production retains one instance under `ApiAuthenticatorRuntime` and every
+/// credential-bearing consumer receives an `Arc` cloned from that owner. An
+/// empty key is representable only so credential-free development modes can
+/// construct the complete runtime graph; all credential operations then fail
+/// closed with `MissingVerifierKey`.
+pub(crate) struct DerivedSessionCredentialRuntime {
+    credential_hmac_key: Option<Zeroizing<String>>,
+    maximum_session_age_seconds: u64,
+    federated_authority_max_staleness_seconds: u64,
+}
+
+impl DerivedSessionCredentialRuntime {
+    pub(crate) fn from_admitted_config(
+        session: &SessionConfig,
+    ) -> Result<Arc<Self>, SessionCredentialError> {
+        if session.cookie_max_age_secs == 0 {
+            return Err(SessionCredentialError::InvalidMaximumAge);
+        }
+        if session.federated_authority_max_staleness_secs == 0 {
+            return Err(SessionCredentialError::InvalidFederatedAuthorityStaleness);
+        }
+        let credential_hmac_key = if session.credential_hmac_key.is_empty() {
+            None
+        } else {
+            verifier_key(session)?;
+            Some(Zeroizing::new(session.credential_hmac_key.clone()))
+        };
+        Ok(Arc::new(Self {
+            credential_hmac_key,
+            maximum_session_age_seconds: session.cookie_max_age_secs,
+            federated_authority_max_staleness_seconds: session
+                .federated_authority_max_staleness_secs,
+        }))
+    }
+
+    fn key(&self) -> Result<&[u8], SessionCredentialError> {
+        self.credential_hmac_key
+            .as_deref()
+            .map(|key| key.as_bytes())
+            .ok_or(SessionCredentialError::MissingVerifierKey)
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.credential_hmac_key.is_some()
+    }
+
+    pub(crate) fn maximum_session_age_seconds(&self) -> u64 {
+        self.maximum_session_age_seconds
+    }
+
+    pub(crate) fn federated_authority_max_staleness_seconds(&self) -> u64 {
+        self.federated_authority_max_staleness_seconds
+    }
+
+    pub(crate) fn issue(&self) -> Result<IssuedSessionCredential, SessionCredentialError> {
+        let plaintext = generate_session_bearer();
+        let verifier = session_bearer_verifier_with_key(plaintext.as_str(), self.key()?)?;
+        Ok(IssuedSessionCredential {
+            plaintext,
+            verifier,
+        })
+    }
+
+    pub(crate) fn verifier(
+        &self,
+        session_token: &str,
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        session_bearer_verifier_with_key(session_token, self.key()?)
+    }
+
+    pub(crate) fn local_identity_authority_digest(
+        &self,
+        user: &LocalAuthUser,
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        Ok(user.session_authority_digest(self.key()?))
+    }
+
+    pub(crate) fn identity_authority_digest(
+        &self,
+        provider: &str,
+        issuer: &str,
+        subject: &str,
+        roles: &[String],
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        identity_authority_digest_with_key(provider, issuer, subject, roles, self.key()?)
+    }
+
+    pub(crate) fn runtime_observation(&self) -> DerivedSessionRuntimeObservation {
+        let key_identity_binding_digest = self.credential_hmac_key.as_ref().map(|key| {
+            let mut mac =
+                HmacSha256::new_from_slice(key.as_bytes()).expect("validated HMAC-SHA256 key");
+            mac.update(SESSION_RUNTIME_KEY_IDENTITY_DOMAIN);
+            let keyed_identity = mac.finalize().into_bytes();
+            let mut digest = Sha256::new();
+            digest.update((SESSION_RUNTIME_KEY_IDENTITY_DOMAIN.len() as u64).to_be_bytes());
+            digest.update(SESSION_RUNTIME_KEY_IDENTITY_DOMAIN);
+            digest.update((keyed_identity.len() as u64).to_be_bytes());
+            digest.update(keyed_identity);
+            format!("sha256:{:x}", digest.finalize())
+        });
+        DerivedSessionRuntimeObservation {
+            enabled: self.enabled(),
+            key_identity_binding_digest,
+            maximum_session_age_seconds: self.maximum_session_age_seconds,
+            federated_authority_max_staleness_seconds: self
+                .federated_authority_max_staleness_seconds,
+            credential_format_id: "session-credential:opaque-random-v1",
+            verifier_algorithm_id: "hmac-sha256",
+            credential_random_bytes: SESSION_BEARER_RANDOM_BYTES as u32,
+            database_representation_id: "session-verifier:keyed-digest-only-v1",
+        }
+    }
+}
+
+impl fmt::Debug for DerivedSessionCredentialRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DerivedSessionCredentialRuntime")
+            .field("credential_hmac_key", &"[REDACTED]")
+            .field(
+                "maximum_session_age_seconds",
+                &self.maximum_session_age_seconds,
+            )
+            .field(
+                "federated_authority_max_staleness_seconds",
+                &self.federated_authority_max_staleness_seconds,
+            )
+            .finish()
+    }
+}
+
+/// Common authority surface accepted by identity persistence. Tests may use a
+/// `SessionConfig` directly; production passes the exact retained runtime.
+mod sealed {
+    pub trait Sealed {}
+
+    impl Sealed for super::DerivedSessionCredentialRuntime {}
+
+    #[cfg(test)]
+    impl Sealed for ryuki_core::config::SessionConfig {}
+}
+
+pub(crate) trait SessionCredentialAuthority: sealed::Sealed {
+    fn maximum_session_age_seconds(&self) -> u64;
+
+    fn local_authority_digest(
+        &self,
+        user: &LocalAuthUser,
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError>;
+
+    fn federated_authority_digest(
+        &self,
+        provider: &str,
+        issuer: &str,
+        subject: &str,
+        roles: &[String],
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError>;
+}
+
+impl SessionCredentialAuthority for DerivedSessionCredentialRuntime {
+    fn maximum_session_age_seconds(&self) -> u64 {
+        self.maximum_session_age_seconds()
+    }
+
+    fn local_authority_digest(
+        &self,
+        user: &LocalAuthUser,
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        self.local_identity_authority_digest(user)
+    }
+
+    fn federated_authority_digest(
+        &self,
+        provider: &str,
+        issuer: &str,
+        subject: &str,
+        roles: &[String],
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        self.identity_authority_digest(provider, issuer, subject, roles)
+    }
+}
+
+#[cfg(test)]
+impl SessionCredentialAuthority for SessionConfig {
+    fn maximum_session_age_seconds(&self) -> u64 {
+        self.cookie_max_age_secs
+    }
+
+    fn local_authority_digest(
+        &self,
+        user: &LocalAuthUser,
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        local_identity_authority_digest(user, self)
+    }
+
+    fn federated_authority_digest(
+        &self,
+        provider: &str,
+        issuer: &str,
+        subject: &str,
+        roles: &[String],
+    ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+        identity_authority_digest(provider, issuer, subject, roles, self)
     }
 }
 
@@ -135,14 +422,22 @@ pub fn generate_session_bearer() -> Zeroizing<String> {
 }
 
 /// Compute the keyed verifier for a canonical plaintext bearer.
+#[cfg(test)]
 pub fn session_bearer_verifier(
     session_token: &str,
     session: &SessionConfig,
 ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
+    let key = verifier_key(session)?;
+    session_bearer_verifier_with_key(session_token, key)
+}
+
+fn session_bearer_verifier_with_key(
+    session_token: &str,
+    key: &[u8],
+) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
     if !is_well_formed_session_bearer(session_token) {
         return Err(SessionCredentialError::MalformedBearer);
     }
-    let key = verifier_key(session)?;
     let mut mac =
         HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of every length");
     mac.update(SESSION_VERIFIER_DOMAIN);
@@ -153,6 +448,7 @@ pub fn session_bearer_verifier(
     Ok(verifier)
 }
 
+#[cfg(test)]
 pub fn issue_session_credential(
     session: &SessionConfig,
 ) -> Result<IssuedSessionCredential, SessionCredentialError> {
@@ -171,6 +467,7 @@ fn update_length_prefixed(mac: &mut HmacSha256, value: &[u8]) {
 
 /// Computes the keyed authorization digest for a configured local account
 /// without exposing its password outside `ryuki-core`.
+#[cfg(test)]
 pub fn local_identity_authority_digest(
     user: &LocalAuthUser,
     session: &SessionConfig,
@@ -183,6 +480,7 @@ pub fn local_identity_authority_digest(
 /// identity assertion. The digest binds the provider namespace, canonical
 /// issuer, stable subject, and effective role set; display names and email
 /// addresses are deliberately excluded because they are not identity keys.
+#[cfg(test)]
 pub fn identity_authority_digest(
     provider: &str,
     issuer: &str,
@@ -190,7 +488,16 @@ pub fn identity_authority_digest(
     roles: &[String],
     session: &SessionConfig,
 ) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
-    let key = verifier_key(session)?;
+    identity_authority_digest_with_key(provider, issuer, subject, roles, verifier_key(session)?)
+}
+
+fn identity_authority_digest_with_key(
+    provider: &str,
+    issuer: &str,
+    subject: &str,
+    roles: &[String],
+    key: &[u8],
+) -> Result<[u8; SESSION_VERIFIER_LEN], SessionCredentialError> {
     let mut mac =
         HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of every length");
     mac.update(IDENTITY_AUTHORITY_DOMAIN);
@@ -291,6 +598,90 @@ mod tests {
         let rendered = format!("{credential:?}");
         assert!(!rendered.contains(credential.bearer()));
         assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn retained_runtime_issues_verifies_and_measures_exact_policy() {
+        let mut session = config(b'k');
+        session.cookie_max_age_secs = 600;
+        session.federated_authority_max_staleness_secs = 300;
+        let runtime = DerivedSessionCredentialRuntime::from_admitted_config(&session).unwrap();
+        let credential = runtime.issue().unwrap();
+
+        assert_eq!(
+            runtime.verifier(credential.bearer()).unwrap(),
+            *credential.verifier()
+        );
+        assert_eq!(runtime.maximum_session_age_seconds(), 600);
+        assert_eq!(runtime.federated_authority_max_staleness_seconds(), 300);
+
+        let observation = runtime.runtime_observation();
+        assert!(observation.enabled());
+        assert_eq!(observation.maximum_session_age_seconds(), 600);
+        assert_eq!(observation.federated_authority_max_staleness_seconds(), 300);
+        assert!(observation
+            .key_identity_binding_digest()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert_eq!(
+            observation.credential_format_id(),
+            "session-credential:opaque-random-v1"
+        );
+        assert_eq!(observation.verifier_algorithm_id(), "hmac-sha256");
+        assert_eq!(observation.credential_random_bytes(), 32);
+        assert_eq!(
+            observation.database_representation_id(),
+            "session-verifier:keyed-digest-only-v1"
+        );
+    }
+
+    #[test]
+    fn retained_runtime_rejects_disabled_credential_operations_and_substitution() {
+        let disabled =
+            DerivedSessionCredentialRuntime::from_admitted_config(&SessionConfig::default())
+                .unwrap();
+        assert!(!disabled.enabled());
+        assert_eq!(
+            disabled.issue().unwrap_err(),
+            SessionCredentialError::MissingVerifierKey
+        );
+        assert!(disabled
+            .runtime_observation()
+            .key_identity_binding_digest()
+            .is_none());
+
+        let first = DerivedSessionCredentialRuntime::from_admitted_config(&config(b'a')).unwrap();
+        let second = DerivedSessionCredentialRuntime::from_admitted_config(&config(b'b')).unwrap();
+        let issued = first.issue().unwrap();
+        assert_ne!(
+            first.runtime_observation(),
+            second.runtime_observation(),
+            "a lookalike runtime with another key must measure differently"
+        );
+        assert_ne!(
+            first.verifier(issued.bearer()).unwrap(),
+            second.verifier(issued.bearer()).unwrap()
+        );
+
+        let rendered = format!("{first:?}");
+        assert!(!rendered.contains(&"a".repeat(32)));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn retained_runtime_rejects_invalid_lifetimes() {
+        let mut invalid = config(b'k');
+        invalid.cookie_max_age_secs = 0;
+        assert!(matches!(
+            DerivedSessionCredentialRuntime::from_admitted_config(&invalid),
+            Err(SessionCredentialError::InvalidMaximumAge)
+        ));
+
+        let mut invalid = config(b'k');
+        invalid.federated_authority_max_staleness_secs = 0;
+        assert!(matches!(
+            DerivedSessionCredentialRuntime::from_admitted_config(&invalid),
+            Err(SessionCredentialError::InvalidFederatedAuthorityStaleness)
+        ));
     }
 
     #[test]

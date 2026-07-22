@@ -730,6 +730,25 @@ impl OidcIdTokenValidator {
 pub struct OidcCallbackDeps {
     pub exchanger: Arc<dyn TokenExchanger + Send + Sync>,
     pub validator: Arc<OidcIdTokenValidator>,
+    pub(crate) session_credentials:
+        Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+    pub(crate) cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+}
+
+impl OidcCallbackDeps {
+    pub(crate) fn retains_session_credentials(
+        &self,
+        runtime: &Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+    ) -> bool {
+        Arc::ptr_eq(&self.session_credentials, runtime)
+    }
+
+    pub(crate) fn retains_cookie_runtime(
+        &self,
+        runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    ) -> bool {
+        Arc::ptr_eq(&self.cookie_runtime, runtime)
+    }
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -840,7 +859,7 @@ pub(crate) async fn oidc_callback(
     // obtained from an attacker's own flow carries a different binding, so a
     // victim's browser cannot redeem it. Constant-time compare is unnecessary:
     // both values are single-use, server-generated 256-bit values.
-    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookie_runtime = Arc::clone(&deps.cookie_runtime);
     let cookie_binding = match cookie_runtime.oidc_binding_parser().parse(&headers) {
         crate::cookie_runtime::CookieEvidence::Value(value) => value,
         crate::cookie_runtime::CookieEvidence::Absent
@@ -890,14 +909,13 @@ pub(crate) async fn oidc_callback(
     // Step 8: mint unrelated management and authentication values. Only the
     // keyed verifier is persisted; the plaintext bearer is cookie-only.
     let session_record_id = Uuid::new_v4();
-    let credential =
-        crate::session_credentials::issue_session_credential(&cfg.session).map_err(|error| {
-            tracing::error!(reason = %error, "oidc session credential issuance failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})),
-            )
-        })?;
+    let credential = deps.session_credentials.issue().map_err(|error| {
+        tracing::error!(reason = %error, "oidc session credential issuance failed");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})),
+        )
+    })?;
     crate::contracts::map_auth_session_persistence_result(
         crate::identity_authority::create_federated_session(
             pool,
@@ -909,8 +927,8 @@ pub(crate) async fn oidc_callback(
             &claims.roles,
             session_record_id,
             credential.verifier().as_slice(),
-            cfg.session.cookie_max_age_secs,
-            &cfg.session,
+            deps.session_credentials.maximum_session_age_seconds(),
+            deps.session_credentials.as_ref(),
         )
         .await,
         "create",
@@ -1667,9 +1685,16 @@ mod oidc_callback_db_tests {
         validator: Arc<OidcIdTokenValidator>,
     ) -> axum::Router {
         ensure_config();
+        let cfg = crate::config_store::get_app_config();
         let deps = Arc::new(OidcCallbackDeps {
             exchanger,
             validator,
+            session_credentials:
+                crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
+                    &cfg.session,
+                )
+                .expect("test config must construct session credential runtime"),
+            cookie_runtime: crate::config_store::get_api_cookie_runtime(),
         });
         axum::Router::new()
             .route("/api/auth/oidc/callback", axum::routing::get(oidc_callback))

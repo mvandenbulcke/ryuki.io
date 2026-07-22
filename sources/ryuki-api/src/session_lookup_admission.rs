@@ -1091,8 +1091,36 @@ fn lookup_capacity_response() -> Response {
 /// Path-aware outer admission. `main` mounts this after (therefore outside)
 /// the whole-app concurrency admission. `try_acquire_owned` never waits, so
 /// random well-formed verifiers cannot occupy that budget.
+pub(crate) struct SessionLookupAdmissionMiddlewareState {
+    admission: Arc<SessionLookupAdmission>,
+    authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+}
+
+impl SessionLookupAdmissionMiddlewareState {
+    pub(crate) fn new(
+        admission: Arc<SessionLookupAdmission>,
+        authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            admission,
+            authenticator_runtime,
+        })
+    }
+
+    pub(crate) fn retains_admission(&self, admission: &Arc<SessionLookupAdmission>) -> bool {
+        Arc::ptr_eq(&self.admission, admission)
+    }
+
+    pub(crate) fn retains_authenticator_runtime(
+        &self,
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> bool {
+        Arc::ptr_eq(&self.authenticator_runtime, runtime)
+    }
+}
+
 pub(crate) async fn session_lookup_admission_middleware(
-    State(admission): State<Arc<SessionLookupAdmission>>,
+    State(state): State<Arc<SessionLookupAdmissionMiddlewareState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -1100,9 +1128,8 @@ pub(crate) async fn session_lookup_admission_middleware(
         return next.run(request).await;
     }
 
-    let config = crate::config_store::get_app_config();
     if matches!(
-        &config.auth_mode,
+        state.authenticator_runtime.auth_mode(),
         AuthMode::MockDryRun | AuthMode::StaticDryRun
     ) {
         return next.run(request).await;
@@ -1111,7 +1138,7 @@ pub(crate) async fn session_lookup_admission_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookie_runtime = state.authenticator_runtime.api_cookie_runtime();
     let session_parser = cookie_runtime.session_lookup_admission_parser();
     let Some((Ok(bearer), _source)) =
         crate::session_credential_from_headers(request.headers(), auth_header, &session_parser)
@@ -1120,17 +1147,17 @@ pub(crate) async fn session_lookup_admission_middleware(
         // reach the persisted-session SQL lookup from this branch.
         return next.run(request).await;
     };
-    let verifier =
-        match crate::session_credentials::session_bearer_verifier(bearer, &config.session) {
-            Ok(verifier) => verifier,
-            Err(_) => return next.run(request).await,
-        };
+    let session_credentials = state.authenticator_runtime.derived_session_credentials();
+    let verifier = match session_credentials.verifier(bearer) {
+        Ok(verifier) => verifier,
+        Err(_) => return next.run(request).await,
+    };
 
     let logout = is_logout_path(request.uri().path());
     let decision = if logout {
-        admission.try_admit_revocation(verifier)
+        state.admission.try_admit_revocation(verifier)
     } else {
-        admission.try_admit(verifier)
+        state.admission.try_admit(verifier)
     };
     match decision {
         SessionLookupDecision::KnownPositive(authority) => {

@@ -16414,19 +16414,19 @@ async fn auth_local_login(
     // and 256-bit bearer are independently generated server-side. PostgreSQL
     // receives only the keyed verifier.
     let session_record_id = Uuid::new_v4();
-    let credential = crate::session_credentials::issue_session_credential(&app_cfg.session)
-        .map_err(|error| {
-            tracing::error!(reason = %error, "local session credential issuance failed");
-            auth_session_persistence_problem()
-        })?;
+    let session_credentials = crate::config_store::get_derived_session_credentials();
+    let credential = session_credentials.issue().map_err(|error| {
+        tracing::error!(reason = %error, "local session credential issuance failed");
+        auth_session_persistence_problem()
+    })?;
     let created = map_auth_session_persistence_result(
         crate::identity_authority::create_local_session(
             pool,
             user,
             session_record_id,
             credential.verifier().as_slice(),
-            app_cfg.session.cookie_max_age_secs,
-            &app_cfg.session,
+            session_credentials.maximum_session_age_seconds(),
+            session_credentials.as_ref(),
         )
         .await,
         "create",
@@ -16497,8 +16497,8 @@ enum LogoutFailure {
 /// is returned to the caller and must never be projected as successful logout.
 async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure> {
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
-    let app_cfg = crate::config_store::get_app_config();
     let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let session_credentials = crate::config_store::get_derived_session_credentials();
     let session_parser = cookie_runtime.session_logout_parser();
     let session_bearer =
         match crate::session_credential_from_headers(headers, auth_header, &session_parser) {
@@ -16506,9 +16506,9 @@ async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure>
             Some((Ok(session_bearer), _source)) => session_bearer,
             Some((Err(()), _source)) => return Err(LogoutFailure::CredentialRejected),
         };
-    let verifier =
-        crate::session_credentials::session_bearer_verifier(session_bearer, &app_cfg.session)
-            .map_err(|_| LogoutFailure::VerifierUnavailable)?;
+    let verifier = session_credentials
+        .verifier(session_bearer)
+        .map_err(|_| LogoutFailure::VerifierUnavailable)?;
     let pool = get_db().ok_or(LogoutFailure::DatabaseUnavailable)?;
 
     let mut tx = pool.begin().await.map_err(LogoutFailure::Database)?;

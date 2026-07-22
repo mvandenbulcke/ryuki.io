@@ -6,7 +6,9 @@
 //! revocation tombstones that key instead of deriving or relinking an identity.
 
 use chrono::{DateTime, Utc};
-use ryuki_core::config::{AuthMode, LocalAuthConfig, LocalAuthUser, RyukiConfig, SessionConfig};
+#[cfg(test)]
+use ryuki_core::config::SessionConfig;
+use ryuki_core::config::{AuthMode, LocalAuthConfig, LocalAuthUser, RyukiConfig};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -91,18 +93,21 @@ fn validate_identity_key(
 /// Reconciles the complete immutable startup local-account configuration with
 /// opaque principals. Removed accounts are terminally tombstoned under the
 /// same provider/key lock order used by session admission.
-pub async fn reconcile_local_authorities(
+pub(crate) async fn reconcile_local_authorities<A>(
     pool: &PgPool,
     local_auth: &LocalAuthConfig,
-    session: &SessionConfig,
-) -> Result<(), IdentityAuthorityError> {
+    credential_authority: &A,
+) -> Result<(), IdentityAuthorityError>
+where
+    A: crate::session_credentials::SessionCredentialAuthority + ?Sized,
+{
     let mut assignments = Vec::with_capacity(local_auth.users.len());
     for user in local_auth.users.users() {
         validate_identity_key(LOCAL_PROVIDER, LOCAL_ISSUER, &user.username)?;
         // Validate the credential-key configuration before opening the
         // reconciliation transaction. Password material is never persisted in
         // or used to derive the opaque principal registry identifier.
-        let digest = crate::session_credentials::local_identity_authority_digest(user, session)?;
+        let digest = credential_authority.local_authority_digest(user)?;
         let assignment =
             crate::human_authority::HumanAuthorityAssignmentSpec::local(local_auth, &user.roles)?;
         assignments.push((user, digest, assignment));
@@ -224,16 +229,24 @@ pub async fn reconcile_session_provider_admission(
 
 /// Creates a local session only against an already reconciled, current account
 /// projection. The authority read and session insert share one transaction.
-pub async fn create_local_session(
+pub(crate) async fn create_local_session<A>(
     pool: &PgPool,
     user: &LocalAuthUser,
     session_record_id: Uuid,
     bearer_verifier: &[u8],
     max_age_secs: u64,
-    session: &SessionConfig,
-) -> Result<CreatedHumanSession, IdentityAuthorityError> {
+    credential_authority: &A,
+) -> Result<CreatedHumanSession, IdentityAuthorityError>
+where
+    A: crate::session_credentials::SessionCredentialAuthority + ?Sized,
+{
     validate_identity_key(LOCAL_PROVIDER, LOCAL_ISSUER, &user.username)?;
-    let digest = crate::session_credentials::local_identity_authority_digest(user, session)?;
+    if max_age_secs != credential_authority.maximum_session_age_seconds() {
+        return Err(IdentityAuthorityError::InvalidInput(
+            "session maximum age differs from retained credential authority",
+        ));
+    }
+    let digest = credential_authority.local_authority_digest(user)?;
     let mut tx = pool.begin().await?;
     crate::human_authority::prepare_writer_tx(
         &mut tx,
@@ -306,23 +319,25 @@ pub async fn create_local_session(
     })
 }
 
-pub(crate) async fn assert_federated_authority_tx(
+pub(crate) async fn assert_federated_authority_tx<A>(
     tx: &mut Transaction<'_, Postgres>,
     provider: &str,
     issuer: &str,
     subject: &str,
     roles: &[String],
-    session: &SessionConfig,
-) -> Result<[u8; 32], IdentityAuthorityError> {
+    credential_authority: &A,
+) -> Result<[u8; 32], IdentityAuthorityError>
+where
+    A: crate::session_credentials::SessionCredentialAuthority + ?Sized,
+{
     validate_identity_key(provider, issuer, subject)?;
     if provider == LOCAL_PROVIDER {
         return Err(IdentityAuthorityError::InvalidInput(
             "local authority is configuration-owned",
         ));
     }
-    let digest = crate::session_credentials::identity_authority_digest(
-        provider, issuer, subject, roles, session,
-    )?;
+    let digest =
+        credential_authority.federated_authority_digest(provider, issuer, subject, roles)?;
     crate::human_authority::prepare_writer_tx(tx, provider, issuer, subject).await?;
     crate::principal_registry::reconcile_authority_digest_tx(
         tx,
@@ -339,7 +354,7 @@ pub(crate) async fn assert_federated_authority_tx(
 /// Validates a federated assertion and creates a session against the exact
 /// active opaque binding while holding its registry writer contract.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_federated_session(
+pub(crate) async fn create_federated_session<A>(
     pool: &PgPool,
     provider: &str,
     issuer: &str,
@@ -350,10 +365,26 @@ pub async fn create_federated_session(
     session_record_id: Uuid,
     bearer_verifier: &[u8],
     max_age_secs: u64,
-    session: &SessionConfig,
-) -> Result<(), IdentityAuthorityError> {
+    credential_authority: &A,
+) -> Result<(), IdentityAuthorityError>
+where
+    A: crate::session_credentials::SessionCredentialAuthority + ?Sized,
+{
+    if max_age_secs != credential_authority.maximum_session_age_seconds() {
+        return Err(IdentityAuthorityError::InvalidInput(
+            "session maximum age differs from retained credential authority",
+        ));
+    }
     let mut tx = pool.begin().await?;
-    assert_federated_authority_tx(&mut tx, provider, issuer, subject, roles, session).await?;
+    assert_federated_authority_tx(
+        &mut tx,
+        provider,
+        issuer,
+        subject,
+        roles,
+        credential_authority,
+    )
+    .await?;
     let authority = crate::human_authority::resolve_assignment_tx(
         &mut tx,
         provider,
@@ -408,7 +439,7 @@ pub async fn create_federated_session(
 /// callbacks. Provider claims are only an upper bound; Unknown/Revoked/missing
 /// assignments and empty role/scope intersections fail closed.
 #[allow(clippy::too_many_arguments)]
-pub async fn admit_federated_bearer(
+pub(crate) async fn admit_federated_bearer<A>(
     pool: &PgPool,
     provider: &str,
     issuer: &str,
@@ -416,15 +447,24 @@ pub async fn admit_federated_bearer(
     display_name: &str,
     asserted_roles: &[String],
     actor_class: ryuki_engine::auth::ActorClass,
-    session: &SessionConfig,
-) -> Result<AdmittedFederatedBearer, IdentityAuthorityError> {
+    credential_authority: &A,
+) -> Result<AdmittedFederatedBearer, IdentityAuthorityError>
+where
+    A: crate::session_credentials::SessionCredentialAuthority + ?Sized,
+{
     if actor_class != ryuki_engine::auth::ActorClass::VerifiedHuman {
         return Err(IdentityAuthorityError::AssertionRejected);
     }
     let mut tx = pool.begin().await?;
-    let identity_authority_digest =
-        assert_federated_authority_tx(&mut tx, provider, issuer, subject, asserted_roles, session)
-            .await?;
+    let identity_authority_digest = assert_federated_authority_tx(
+        &mut tx,
+        provider,
+        issuer,
+        subject,
+        asserted_roles,
+        credential_authority,
+    )
+    .await?;
     let authority = crate::human_authority::resolve_assignment_tx(
         &mut tx,
         provider,
@@ -572,6 +612,7 @@ mod tests {
     fn session_config() -> SessionConfig {
         SessionConfig {
             credential_hmac_key: "placeholder-session-authority-key".repeat(2),
+            cookie_max_age_secs: 3_600,
             federated_authority_max_staleness_secs: 60,
             ..Default::default()
         }
@@ -595,6 +636,33 @@ mod tests {
             "environment_scope": environments
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_creation_rejects_a_lifetime_outside_the_retained_authority() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fixture:fixture@127.0.0.1/fixture")
+            .expect("lazy test pool URL must parse");
+        let local = local_config("lifetime-fixture:placeholder-pass-1:Auditor");
+        let user = local.users.users().first().expect("local fixture user");
+        let session = session_config();
+
+        let result = create_local_session(
+            &pool,
+            user,
+            Uuid::new_v4(),
+            &[0_u8; crate::session_credentials::SESSION_VERIFIER_LEN],
+            session.cookie_max_age_secs + 1,
+            &session,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(IdentityAuthorityError::InvalidInput(
+                "session maximum age differs from retained credential authority"
+            ))
+        ));
     }
 
     #[test]

@@ -121,7 +121,8 @@ pub struct EntraSsoDeps {
     redirect_uri: String,
     authorize_endpoint: String,
     issuer: String,
-    session: ryuki_core::config::SessionConfig,
+    session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+    cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
     exchanger: Arc<dyn TokenExchanger + Send + Sync>,
     validator: Arc<OidcIdTokenValidator>,
@@ -140,6 +141,21 @@ impl EntraSsoDeps {
         leeway_secs: u64,
         session: ryuki_core::config::SessionConfig,
     ) -> Arc<Self> {
+        let mut config = ryuki_core::config::RyukiConfig {
+            session,
+            ..ryuki_core::config::RyukiConfig::default()
+        };
+        if !config.session.cookie_secure {
+            config.server.bind_address = "127.0.0.1:0".to_string();
+        }
+        let session_credentials =
+            crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
+                &config.session,
+            )
+            .expect("test config must construct session credential runtime");
+        let cookie_runtime =
+            crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, false)
+                .expect("test config must construct cookie runtime");
         Self::build_with_trusted_proxies(
             mode_is_entra,
             tenant_id,
@@ -147,7 +163,8 @@ impl EntraSsoDeps {
             authority,
             redirect_uri,
             leeway_secs,
-            session,
+            session_credentials,
+            cookie_runtime,
             Vec::new(),
         )
     }
@@ -160,7 +177,8 @@ impl EntraSsoDeps {
         authority: &str,
         redirect_uri: &str,
         leeway_secs: u64,
-        session: ryuki_core::config::SessionConfig,
+        session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+        cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
         trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
     ) -> Arc<Self> {
         let endpoints = derive_entra_endpoints(authority, tenant_id);
@@ -181,7 +199,8 @@ impl EntraSsoDeps {
             redirect_uri: redirect_uri.to_string(),
             authorize_endpoint: endpoints.authorize,
             issuer: endpoints.issuer,
-            session,
+            session_credentials,
+            cookie_runtime,
             trusted_proxies,
             exchanger,
             validator,
@@ -192,7 +211,11 @@ impl EntraSsoDeps {
     /// not EntraId the handlers reject before touching the network deps, so
     /// the placeholder endpoints derived from a possibly-empty tenant are
     /// never dereferenced.
-    pub fn from_app_config(cfg: &ryuki_core::config::RyukiConfig) -> Arc<Self> {
+    pub fn from_app_config(
+        cfg: &ryuki_core::config::RyukiConfig,
+        session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+        cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    ) -> Arc<Self> {
         let trusted_proxies = cfg
             .rate_limit
             .parsed_trusted_proxies()
@@ -210,9 +233,24 @@ impl EntraSsoDeps {
             &cfg.entra_authority,
             &cfg.entra_redirect_uri,
             cfg.entra_leeway_secs,
-            cfg.session.clone(),
+            session_credentials,
+            cookie_runtime,
             trusted_proxies,
         )
+    }
+
+    pub(crate) fn retains_session_credentials(
+        &self,
+        runtime: &Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+    ) -> bool {
+        Arc::ptr_eq(&self.session_credentials, runtime)
+    }
+
+    pub(crate) fn retains_cookie_runtime(
+        &self,
+        runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    ) -> bool {
+        Arc::ptr_eq(&self.cookie_runtime, runtime)
     }
 
     fn configured(&self) -> bool {
@@ -338,7 +376,7 @@ pub(crate) async fn entra_authorize_url(
     // Only the retained Entra binding issuer can project this cookie policy.
     // The capability validates the generated 256-bit binding profile before
     // any credential-bearing response field is emitted.
-    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookie_runtime = Arc::clone(&deps.cookie_runtime);
     let binding_cookie = cookie_runtime
         .entra_binding_issuer()
         .issue(binding)
@@ -440,7 +478,7 @@ pub(crate) async fn entra_callback(
     // the browser that initiated the login (it holds the matching
     // mode-selected binding cookie). Both values are single-use,
     // server-generated 256-bit strings, so a simple compare suffices.
-    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookie_runtime = Arc::clone(&deps.cookie_runtime);
     let cookie_binding = match cookie_runtime.entra_binding_parser().parse(&headers) {
         crate::cookie_runtime::CookieEvidence::Value(value) => value,
         crate::cookie_runtime::CookieEvidence::Absent
@@ -487,14 +525,13 @@ pub(crate) async fn entra_callback(
     // Mint unrelated management and authentication values. Only the keyed
     // verifier crosses into PostgreSQL; the bearer crosses only into Set-Cookie.
     let session_record_id = Uuid::new_v4();
-    let credential =
-        crate::session_credentials::issue_session_credential(&deps.session).map_err(|error| {
-            tracing::error!(reason = %error, "entra session credential issuance failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})),
-            )
-        })?;
+    let credential = deps.session_credentials.issue().map_err(|error| {
+        tracing::error!(reason = %error, "entra session credential issuance failed");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})),
+        )
+    })?;
     crate::contracts::map_auth_session_persistence_result(
         crate::identity_authority::create_federated_session(
             pool,
@@ -506,8 +543,8 @@ pub(crate) async fn entra_callback(
             &claims.roles,
             session_record_id,
             credential.verifier().as_slice(),
-            deps.session.cookie_max_age_secs,
-            &deps.session,
+            deps.session_credentials.maximum_session_age_seconds(),
+            deps.session_credentials.as_ref(),
         )
         .await,
         "create",

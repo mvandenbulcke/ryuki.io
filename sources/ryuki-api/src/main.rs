@@ -267,6 +267,7 @@ fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
 fn persisted_request_read_authority(
     row: &DbAuthSessionRow,
     config: &RyukiConfig,
+    session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
     session: &AuthSession,
     authority: &crate::human_authority::InteractiveHumanAuthorityContext,
 ) -> Result<
@@ -315,8 +316,9 @@ fn persisted_request_read_authority(
         let last_asserted_at = identity_last_asserted_at.ok_or(
             RequestAuthorityError::InvalidBinding("federated assertion time is missing"),
         )?;
-        let staleness = i64::try_from(config.session.federated_authority_max_staleness_secs)
-            .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
+        let staleness =
+            i64::try_from(session_credentials.federated_authority_max_staleness_seconds())
+                .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
         Some(
             last_asserted_at
                 .checked_add_signed(chrono::Duration::seconds(staleness))
@@ -341,6 +343,12 @@ fn persisted_request_read_authority(
             tracing::warn!(reason, "request-read security namespace was not admitted");
             RequestAuthorityError::InvalidBinding("security-contract namespace")
         })?;
+    let session_runtime_observation = session_credentials.runtime_observation();
+    let key_identity_binding = session_runtime_observation
+        .key_identity_binding_digest()
+        .ok_or(RequestAuthorityError::InvalidBinding(
+            "derived-session credential authority is unavailable",
+        ))?;
     let digests = RequestReadCredentialDigests::new(
         bearer_verifier,
         request_read_digest(
@@ -353,7 +361,7 @@ fn persisted_request_read_authority(
         ),
         request_read_digest(
             b"ryuki-request-read-session-key-v1",
-            &[config.session.credential_hmac_key.as_bytes()],
+            &[key_identity_binding.as_bytes()],
         ),
     )?;
     let window = RequestReadCredentialWindow::new(
@@ -380,13 +388,14 @@ fn direct_request_read_authority(
     admitted: &crate::identity_authority::AdmittedFederatedBearer,
     credential: crate::request_authority::DirectFederatedCredential,
     config: &RyukiConfig,
+    session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
 ) -> Result<
     crate::request_authority::RequestReadAuthority,
     crate::request_authority::RequestAuthorityError,
 > {
     use crate::request_authority::{InteractiveRequestReadPrincipal, RequestAuthorityError};
 
-    let staleness = i64::try_from(config.session.federated_authority_max_staleness_secs)
+    let staleness = i64::try_from(session_credentials.federated_authority_max_staleness_seconds())
         .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
     let identity_fresh_until = admitted
         .identity_last_asserted_at
@@ -759,6 +768,11 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
 ) -> Option<(AuthSession, SessionIdSource)> {
     let cookie_runtime = test_cookie_runtime(config);
     let session_parser = cookie_runtime.session_auth_parser();
+    let session_credentials =
+        crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
+            &config.session,
+        )
+        .expect("test config must construct session credential runtime");
     auth_session_from_persisted_session_with_authority_admission(
         headers,
         auth_header,
@@ -766,6 +780,7 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
         admission,
         proof,
         &session_parser,
+        session_credentials.as_ref(),
     )
     .await
     .map(|(session, source, _authority, _request_read)| (session, source))
@@ -788,6 +803,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     admission: &Arc<crate::session_lookup_admission::SessionLookupAdmission>,
     proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
     session_parser: &cookie_runtime::ApiSessionAuthParser,
+    session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
 ) -> Option<(
     AuthSession,
     SessionIdSource,
@@ -795,7 +811,6 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     Option<crate::request_authority::RequestReadAuthority>,
 )> {
     let auth_mode = &config.auth_mode;
-    let session = &config.session;
     // Classify all credential evidence once. Any malformed session bearer or
     // simultaneous header/Authorization/cookie evidence fails closed before a
     // credential-specific resolver can fall through to another identity.
@@ -849,7 +864,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
         unreachable!("invalid session evidence returned above");
     };
     let pool = crate::database::get_db()?;
-    let verifier = match crate::session_credentials::session_bearer_verifier(bearer, session) {
+    let verifier = match session_credentials.verifier(bearer) {
         Ok(verifier) => verifier,
         Err(error) => {
             tracing::error!(reason = %error, "session verifier configuration rejected");
@@ -945,7 +960,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     let lookup_observation = admission.start_database_lookup();
     let lookup_result = sqlx::query_as::<_, DbAuthSessionRow>(query)
         .bind(verifier.as_slice())
-        .bind(session.federated_authority_max_staleness_secs as f64)
+        .bind(session_credentials.federated_authority_max_staleness_seconds() as f64)
         .bind(auth_mode.as_str())
         .bind(crate::identity_authority::LOCAL_ISSUER)
         .bind(entra_issuer)
@@ -1009,6 +1024,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                 let request_read = match persisted_request_read_authority(
                     &row,
                     config,
+                    session_credentials,
                     &admitted_session,
                     &authority,
                 ) {
@@ -2040,6 +2056,7 @@ async fn auth_middleware(
     let app_config = crate::config_store::get_app_config();
     let cookie_runtime = crate::config_store::get_api_cookie_runtime();
     let session_auth_parser = cookie_runtime.session_auth_parser();
+    let session_credentials = authenticator_runtime.derived_session_credentials();
     let auth_mode = authenticator_runtime.auth_mode().clone();
     let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
     let lookup_admission = crate::session_lookup_admission::global_admission();
@@ -2070,6 +2087,7 @@ async fn auth_middleware(
                 &lookup_admission,
                 lookup_proof,
                 &session_auth_parser,
+                session_credentials.as_ref(),
             )
             .await
             {
@@ -2114,7 +2132,7 @@ async fn auth_middleware(
                                 &validated.display_name,
                                 &validated.roles,
                                 validated.actor_class,
-                                &app_config.session,
+                                session_credentials.as_ref(),
                             )
                             .await
                         } else {
@@ -2127,6 +2145,7 @@ async fn auth_middleware(
                                     &admitted,
                                     credential,
                                     app_config,
+                                    session_credentials.as_ref(),
                                 ) {
                                     Ok(authority) => Some(authority),
                                     Err(error) => {
@@ -3587,6 +3606,10 @@ async fn main() {
         Arc::clone(api_authenticator_runtime.operational_observation());
     let entra_bearer_validator_identity = api_authenticator_runtime.entra_bearer_validator();
     let entra_bearer_observation_identity = api_authenticator_runtime.entra_bearer_observation();
+    let derived_session_credentials_identity =
+        api_authenticator_runtime.derived_session_credentials();
+    let derived_session_observation_identity =
+        api_authenticator_runtime.derived_session_observation();
     let oidc_callback_dependencies_identity =
         api_authenticator_runtime.oidc_callback_dependencies();
     let entra_sso_dependencies_identity = api_authenticator_runtime.entra_sso_dependencies();
@@ -3679,9 +3702,24 @@ async fn main() {
             .retains_entra_bearer_observation(&entra_bearer_observation_identity)
         || !api_authenticator_runtime_identity.remeasures_entra_bearer_observation()
         || !api_authenticator_runtime_identity
+            .retains_derived_session_credentials(&derived_session_credentials_identity)
+        || !api_authenticator_runtime_identity
+            .retains_derived_session_observation(&derived_session_observation_identity)
+        || !api_authenticator_runtime_identity.remeasures_derived_session_observation()
+        || !Arc::ptr_eq(
+            &derived_session_credentials_identity,
+            &config_store::get_derived_session_credentials(),
+        )
+        || !api_authenticator_runtime_identity
             .retains_oidc_callback_dependencies(&oidc_callback_dependencies_identity)
         || !api_authenticator_runtime_identity
             .retains_entra_sso_dependencies(&entra_sso_dependencies_identity)
+        || !oidc_callback_dependencies_identity
+            .retains_session_credentials(&derived_session_credentials_identity)
+        || !oidc_callback_dependencies_identity.retains_cookie_runtime(&api_cookie_runtime_identity)
+        || !entra_sso_dependencies_identity
+            .retains_session_credentials(&derived_session_credentials_identity)
+        || !entra_sso_dependencies_identity.retains_cookie_runtime(&api_cookie_runtime_identity)
         || !api_authenticator_runtime_identity
             .retains_local_login_throttle(&local_login_throttle_identity)
     {
@@ -3690,6 +3728,18 @@ async fn main() {
     }
     let session_lookup_admission =
         crate::session_lookup_admission::initialize_global(app_config.server.pool_max_connections);
+    let session_lookup_middleware_state =
+        crate::session_lookup_admission::SessionLookupAdmissionMiddlewareState::new(
+            Arc::clone(&session_lookup_admission),
+            Arc::clone(&api_authenticator_runtime),
+        );
+    if !session_lookup_middleware_state.retains_admission(&session_lookup_admission)
+        || !session_lookup_middleware_state
+            .retains_authenticator_runtime(&api_authenticator_runtime)
+    {
+        eprintln!("session lookup middleware state did not retain the admitted runtime graph");
+        std::process::exit(1);
+    }
 
     let level_filter = match app_config.logging.level {
         ryuki_core::config::LogLevel::Trace => LevelFilter::TRACE,
@@ -3849,7 +3899,7 @@ async fn main() {
             crate::identity_authority::reconcile_local_authorities(
                 pool,
                 &app_config.local_auth,
-                &app_config.session,
+                derived_session_credentials_identity.as_ref(),
             )
             .await
         } else {
@@ -3857,7 +3907,7 @@ async fn main() {
             crate::identity_authority::reconcile_local_authorities(
                 pool,
                 &disabled_local_auth,
-                &app_config.session,
+                derived_session_credentials_identity.as_ref(),
             )
             .await
         };
@@ -4229,7 +4279,7 @@ async fn main() {
         // confirmed live sessions bypass the miss budget but are still checked
         // against PostgreSQL and the current authority epoch on every request.
         .layer(middleware::from_fn_with_state(
-            session_lookup_admission,
+            session_lookup_middleware_state,
             session_lookup_admission::session_lookup_admission_middleware,
         ));
     // These two cheap wrappers remain outside every early-returning gate so
