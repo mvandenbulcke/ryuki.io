@@ -953,14 +953,15 @@ impl std::fmt::Debug for SessionConfig {
 }
 
 fn default_session_cookie_max_age() -> u64 {
-    86400
+    MAX_SESSION_COOKIE_AGE_SECS
 }
 
 fn default_federated_authority_max_staleness() -> u64 {
     900
 }
 
-const MAX_FEDERATED_AUTHORITY_STALENESS_SECS: u64 = 3600;
+pub const MAX_SESSION_COOKIE_AGE_SECS: u64 = 86_400;
+const MAX_FEDERATED_AUTHORITY_STALENESS_SECS: u64 = 3_600;
 
 fn default_true() -> bool {
     true
@@ -2152,6 +2153,10 @@ impl RyukiConfig {
         }
         if self.session.cookie_max_age_secs == 0 {
             errors.push("session.cookie_max_age_secs must be greater than 0".into());
+        } else if self.session.cookie_max_age_secs > MAX_SESSION_COOKIE_AGE_SECS {
+            errors.push(format!(
+                "session.cookie_max_age_secs must not exceed {MAX_SESSION_COOKIE_AGE_SECS}"
+            ));
         }
         if self.session.federated_authority_max_staleness_secs == 0 {
             errors.push(
@@ -2163,6 +2168,19 @@ impl RyukiConfig {
             errors.push(format!(
                 "session.federated_authority_max_staleness_secs must not exceed {MAX_FEDERATED_AUTHORITY_STALENESS_SECS}"
             ));
+        }
+        if self.session.cookie_max_age_secs > 0
+            && self.session.cookie_max_age_secs <= MAX_SESSION_COOKIE_AGE_SECS
+            && self.session.federated_authority_max_staleness_secs > 0
+            && self.session.federated_authority_max_staleness_secs
+                <= MAX_FEDERATED_AUTHORITY_STALENESS_SECS
+            && self.session.federated_authority_max_staleness_secs
+                > self.session.cookie_max_age_secs
+        {
+            errors.push(
+                "session.federated_authority_max_staleness_secs must not exceed session.cookie_max_age_secs"
+                    .into(),
+            );
         }
         let session_credentials_enabled =
             matches!(self.auth_mode, AuthMode::Local | AuthMode::EntraId) || self.oidc.enabled;
@@ -3416,24 +3434,73 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_federated_authority_staleness_is_rejected() {
+    fn test_session_cookie_max_age_boundaries_are_enforced() {
         let mut config = RyukiConfig::default();
-        config.session.federated_authority_max_staleness_secs = 0;
+        config.session.cookie_max_age_secs = 0;
         assert!(
             config
                 .validate()
                 .iter()
-                .any(|error| { error.contains("session.federated_authority_max_staleness_secs") })
+                .any(|error| { error == "session.cookie_max_age_secs must be greater than 0" })
         );
+
+        config.session.cookie_max_age_secs = MAX_SESSION_COOKIE_AGE_SECS;
+        assert!(
+            !config
+                .validate()
+                .iter()
+                .any(|error| { error.starts_with("session.cookie_max_age_secs must") })
+        );
+
+        config.session.cookie_max_age_secs = MAX_SESSION_COOKIE_AGE_SECS + 1;
+        assert!(config.validate().iter().any(|error| {
+            error
+                == &format!(
+                    "session.cookie_max_age_secs must not exceed {MAX_SESSION_COOKIE_AGE_SECS}"
+                )
+        }));
+    }
+
+    #[test]
+    fn test_federated_authority_staleness_boundaries_are_enforced() {
+        let mut config = RyukiConfig::default();
+        config.session.federated_authority_max_staleness_secs = 0;
+        assert!(config.validate().iter().any(|error| {
+            error == "session.federated_authority_max_staleness_secs must be greater than 0"
+        }));
+
+        config.session.federated_authority_max_staleness_secs =
+            MAX_FEDERATED_AUTHORITY_STALENESS_SECS;
+        assert!(!config.validate().iter().any(|error| {
+            error.starts_with("session.federated_authority_max_staleness_secs must")
+        }));
 
         config.session.federated_authority_max_staleness_secs =
             MAX_FEDERATED_AUTHORITY_STALENESS_SECS + 1;
-        assert!(
-            config
-                .validate()
-                .iter()
-                .any(|error| error.contains("must not exceed"))
-        );
+        assert!(config.validate().iter().any(|error| {
+            error
+                == &format!(
+                    "session.federated_authority_max_staleness_secs must not exceed {MAX_FEDERATED_AUTHORITY_STALENESS_SECS}"
+                )
+        }));
+    }
+
+    #[test]
+    fn test_federated_authority_staleness_must_not_outlive_session_cookie() {
+        let mut config = RyukiConfig::default();
+        config.session.cookie_max_age_secs = MAX_FEDERATED_AUTHORITY_STALENESS_SECS;
+        config.session.federated_authority_max_staleness_secs =
+            MAX_FEDERATED_AUTHORITY_STALENESS_SECS;
+        assert!(!config.validate().iter().any(|error| {
+            error
+                == "session.federated_authority_max_staleness_secs must not exceed session.cookie_max_age_secs"
+        }));
+
+        config.session.cookie_max_age_secs = MAX_FEDERATED_AUTHORITY_STALENESS_SECS - 1;
+        assert!(config.validate().iter().any(|error| {
+            error
+                == "session.federated_authority_max_staleness_secs must not exceed session.cookie_max_age_secs"
+        }));
     }
 
     #[test]

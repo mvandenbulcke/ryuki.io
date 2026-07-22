@@ -34,12 +34,18 @@ pub const AUTHENTICATOR_BROWSER_STATE_RELATION_V3: &str = "oidc_login_states_v3"
 pub const AUTHENTICATOR_BROWSER_STATE_CONTRACT_SETTING: &str = "ryuki.oidc_login_state_contract";
 pub const AUTHENTICATOR_BROWSER_STATE_CONTRACT_VERSION: u64 = 3;
 pub const AUTHENTICATOR_BROWSER_STATE_CONSUME_OPERATION: &str = "delete-returning";
+pub const AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID: &str =
+    "limit:authenticator.browser-state-lifetime";
 pub const AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS: u64 = 600;
 pub const AUTHENTICATOR_BROWSER_PKCE_METHOD_S256: &str = "s256";
 pub const AUTHENTICATOR_DERIVED_SESSION_RELATION: &str = "sessions";
 pub const AUTHENTICATOR_DERIVED_SESSION_CREDENTIAL_FORMAT: &str = "opaque-random-256-bit";
 pub const AUTHENTICATOR_DERIVED_SESSION_VERIFIER_ALGORITHM: &str = "hmac-sha256";
 pub const AUTHENTICATOR_DERIVED_SESSION_VERIFIER_COLUMN_V3: &str = "session_bearer_verifier_v3";
+pub const AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID: &str =
+    "limit:authenticator.browser-session-maximum-age";
+pub const AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID: &str =
+    "limit:authenticator.federated-authority-staleness";
 pub const POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT: &str =
     "ryuki-postgresql-database-identity-v1";
 pub const POSTGRESQL_PROVIDER_ROUTE_BINDING_DIGEST_CONTRACT: &str =
@@ -1936,7 +1942,7 @@ fn validate_authenticator_browser_state_authority_projection(
         && authority.writer_contract_setting == AUTHENTICATOR_BROWSER_STATE_CONTRACT_SETTING
         && authority.writer_contract_version == AUTHENTICATOR_BROWSER_STATE_CONTRACT_VERSION
         && authority.consume_operation == AUTHENTICATOR_BROWSER_STATE_CONSUME_OPERATION
-        && valid_canonical_scoped_id(&authority.state_lifetime_limit_id, "limit:")
+        && authority.state_lifetime_limit_id == AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID
         && authority.maximum_state_lifetime_seconds
             == AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS
         && authority.pkce_method == AUTHENTICATOR_BROWSER_PKCE_METHOD_S256
@@ -2006,11 +2012,11 @@ fn validate_authenticator_derived_session_authority_projection(
             == AUTHENTICATOR_DERIVED_SESSION_VERIFIER_ALGORITHM
         && valid_sha256_digest(&authority.credential_key_identity_digest)
         && authority.verifier_column_name == AUTHENTICATOR_DERIVED_SESSION_VERIFIER_COLUMN_V3
-        && valid_canonical_scoped_id(&authority.session_maximum_age_limit_id, "limit:")
-        && authority.maximum_session_age_seconds > 0
-        && valid_canonical_scoped_id(&authority.federated_authority_staleness_limit_id, "limit:")
         && authority.session_maximum_age_limit_id
-            != authority.federated_authority_staleness_limit_id
+            == AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID
+        && authority.maximum_session_age_seconds > 0
+        && authority.federated_authority_staleness_limit_id
+            == AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID
         && authority.maximum_federated_authority_staleness_seconds > 0
         && authority.maximum_federated_authority_staleness_seconds
             <= authority.maximum_session_age_seconds
@@ -5165,10 +5171,6 @@ mod tests {
         let mut candidate = authority.clone();
         candidate.state_authority_version += 1;
         mutable_leaf_changes.push(("state_authority_version", candidate));
-        let mut candidate = authority.clone();
-        candidate.state_lifetime_limit_id =
-            "limit:authenticator.browser-state-lifetime-next".into();
-        mutable_leaf_changes.push(("state_lifetime_limit_id", candidate));
         for (leaf, candidate) in mutable_leaf_changes {
             assert_ne!(
                 authenticator_browser_state_authority_binding_digest(&candidate)
@@ -5201,6 +5203,10 @@ mod tests {
         candidate.state_lifetime_limit_id = "runtime-limit:fixture".into();
         malformed.push(("state_lifetime_limit_id namespace", candidate));
         let mut candidate = authority.clone();
+        candidate.state_lifetime_limit_id =
+            "limit:authenticator.browser-state-lifetime-next".into();
+        malformed.push(("state_lifetime_limit_id identity", candidate));
+        let mut candidate = authority.clone();
         candidate.maximum_state_lifetime_seconds = 599;
         malformed.push(("maximum_state_lifetime_seconds", candidate));
         let mut candidate = authority.clone();
@@ -5230,6 +5236,89 @@ mod tests {
         assert!(
             serde_json::from_value::<AuthenticatorBrowserStateAuthorityProjection>(unknown)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn authenticator_browser_authorities_require_exact_limit_identities_and_bounds() {
+        assert_eq!(
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+            "limit:authenticator.browser-state-lifetime"
+        );
+        assert_eq!(
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+            "limit:authenticator.browser-session-maximum-age"
+        );
+        assert_eq!(
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+            "limit:authenticator.federated-authority-staleness"
+        );
+
+        let state_authority = authenticator_browser_state_authority();
+        for wrong_id in [
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+            "limit:authenticator.browser-state-lifetime-next",
+        ] {
+            let mut candidate = state_authority.clone();
+            candidate.state_lifetime_limit_id = wrong_id.into();
+            assert!(
+                authenticator_browser_state_authority_binding_digest(&candidate).is_err(),
+                "validly shaped but noncanonical browser-state limit {wrong_id} must fail closed"
+            );
+        }
+        let mut wrong_state_bound = state_authority;
+        wrong_state_bound.maximum_state_lifetime_seconds =
+            AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS + 1;
+        assert!(
+            authenticator_browser_state_authority_binding_digest(&wrong_state_bound).is_err(),
+            "browser-state lifetime must remain exactly 600 seconds"
+        );
+
+        let browser =
+            authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession);
+        for (field, wrong_id) in [
+            (
+                "session maximum age",
+                "limit:authenticator.browser-session-maximum-age-next",
+            ),
+            (
+                "federated authority staleness",
+                "limit:authenticator.federated-authority-staleness-next",
+            ),
+        ] {
+            let mut candidate = browser.clone();
+            let session = candidate.derived_session_authority.as_mut().unwrap();
+            match field {
+                "session maximum age" => session.session_maximum_age_limit_id = wrong_id.into(),
+                "federated authority staleness" => {
+                    session.federated_authority_staleness_limit_id = wrong_id.into();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticator_protocol_binding_digest(&candidate).is_err(),
+                "validly shaped but noncanonical {field} limit {wrong_id} must fail closed"
+            );
+        }
+
+        let mut boundary = browser.clone();
+        {
+            let session = boundary.derived_session_authority.as_mut().unwrap();
+            session.maximum_federated_authority_staleness_seconds =
+                session.maximum_session_age_seconds;
+        }
+        assert!(authenticator_protocol_binding_digest(&boundary).is_ok());
+        boundary
+            .derived_session_authority
+            .as_mut()
+            .unwrap()
+            .maximum_federated_authority_staleness_seconds += 1;
+        assert!(authenticator_protocol_binding_digest(&boundary).is_err());
+
+        let direct = authenticator_protocol_binding(AuthenticatorRuntimePathRole::DirectBearer);
+        assert!(
+            authenticator_protocol_binding_digest(&direct).is_ok(),
+            "browser limit identities must not narrow the direct-bearer protocol"
         );
     }
 
@@ -5700,17 +5789,6 @@ mod tests {
             }
         );
         assert_protocol_leaf_bound!(
-            "state_lifetime_limit_id",
-            |candidate: &mut AuthenticatorProtocolBindingProjection| {
-                candidate
-                    .browser_state_authority
-                    .as_mut()
-                    .unwrap()
-                    .state_lifetime_limit_id =
-                    "limit:authenticator.browser-state-lifetime-next".into();
-            }
-        );
-        assert_protocol_leaf_bound!(
             "session_authority_id",
             |candidate: &mut AuthenticatorProtocolBindingProjection| {
                 candidate
@@ -5742,17 +5820,6 @@ mod tests {
             }
         );
         assert_protocol_leaf_bound!(
-            "session_maximum_age_limit_id",
-            |candidate: &mut AuthenticatorProtocolBindingProjection| {
-                candidate
-                    .derived_session_authority
-                    .as_mut()
-                    .unwrap()
-                    .session_maximum_age_limit_id =
-                    "limit:authenticator.browser-session-maximum-age-next".into();
-            }
-        );
-        assert_protocol_leaf_bound!(
             "maximum_session_age_seconds",
             |candidate: &mut AuthenticatorProtocolBindingProjection| {
                 candidate
@@ -5760,17 +5827,6 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .maximum_session_age_seconds += 1;
-            }
-        );
-        assert_protocol_leaf_bound!(
-            "federated_authority_staleness_limit_id",
-            |candidate: &mut AuthenticatorProtocolBindingProjection| {
-                candidate
-                    .derived_session_authority
-                    .as_mut()
-                    .unwrap()
-                    .federated_authority_staleness_limit_id =
-                    "limit:authenticator.federated-authority-staleness-next".into();
             }
         );
         assert_protocol_leaf_bound!(
@@ -6076,6 +6132,10 @@ mod tests {
                 json!("runtime-limit:fixture"),
             ),
             (
+                "/browser_state_authority/state_lifetime_limit_id",
+                json!("limit:authenticator.browser-state-lifetime-next"),
+            ),
+            (
                 "/browser_state_authority/maximum_state_lifetime_seconds",
                 json!(599),
             ),
@@ -6126,12 +6186,20 @@ mod tests {
                 json!("runtime-limit:fixture"),
             ),
             (
+                "/derived_session_authority/session_maximum_age_limit_id",
+                json!("limit:authenticator.browser-session-maximum-age-next"),
+            ),
+            (
                 "/derived_session_authority/maximum_session_age_seconds",
                 json!(0),
             ),
             (
                 "/derived_session_authority/federated_authority_staleness_limit_id",
                 json!("limit:authenticator.browser-session-maximum-age"),
+            ),
+            (
+                "/derived_session_authority/federated_authority_staleness_limit_id",
+                json!("limit:authenticator.federated-authority-staleness-next"),
             ),
             (
                 "/derived_session_authority/maximum_federated_authority_staleness_seconds",
