@@ -5640,6 +5640,7 @@ fn validate_action_resource_registry(root: &Path, registry: &Value, errors: &mut
     }
 
     let mut mapping_ids = BTreeSet::new();
+    let mut route_keys = BTreeSet::new();
     for (collection, mapping) in [("route_mappings", "route"), ("worker_mappings", "worker")] {
         for (index, entry) in array(registry, collection).iter().enumerate() {
             let path =
@@ -5647,6 +5648,15 @@ fn validate_action_resource_registry(root: &Path, registry: &Value, errors: &mut
             let mapping_id = string_field(entry, "mapping_id").unwrap_or("");
             if !mapping_ids.insert(mapping_id.to_string()) {
                 errors.push(format!("{path}: duplicate mapping_id {mapping_id}"));
+            }
+            if collection == "route_mappings" {
+                let method = string_field(entry, "method").unwrap_or("");
+                let path_template = string_field(entry, "path_template").unwrap_or("");
+                if !route_keys.insert((method.to_string(), path_template.to_string())) {
+                    errors.push(format!(
+                        "{path}: duplicate route mapping for ({method}, {path_template})"
+                    ));
+                }
             }
             let action_id = string_field(entry, "action_id").unwrap_or("");
             let resource_kind = string_field(entry, "resource_kind").unwrap_or("");
@@ -5668,9 +5678,57 @@ fn validate_action_resource_registry(root: &Path, registry: &Value, errors: &mut
                 ));
                 continue;
             };
-            if string_field(resource, "resolver_id") != Some(resolver_id) {
+            let Some(resolver) = resolvers.get(resolver_id) else {
                 errors.push(format!(
-                    "{path}: mapping resolver {resolver_id} disagrees with resource {resource_kind}"
+                    "{path}: {mapping} mapping references unknown resolver {resolver_id}"
+                ));
+                continue;
+            };
+            if string_field(resolver, "resource_kind") != Some(resource_kind) {
+                errors.push(format!(
+                    "{path}: mapping resource {resource_kind} disagrees with resolver {resolver_id}"
+                ));
+            }
+            if entry.get("resolver_version") != resolver.get("resolver_version") {
+                errors.push(format!(
+                    "{path}: mapping and resolver {resolver_id} disagree on resolver_version"
+                ));
+            }
+            if entry.get("permit_kind") != resolver.get("permit_kind") {
+                errors.push(format!(
+                    "{path}: mapping and resolver {resolver_id} disagree on permit_kind"
+                ));
+            }
+            if entry.get("permitted_actor_kinds") != action.get("permitted_actor_kinds") {
+                errors.push(format!(
+                    "{path}: mapping actors disagree with action {action_id}"
+                ));
+            }
+            let semantics = string_field(action, "authorization_semantics").unwrap_or("");
+            let resolver_mode = string_field(resolver, "mode").unwrap_or("");
+            let permit_kind = string_field(entry, "permit_kind").unwrap_or("");
+            let valid_authorization_shape = matches!(
+                (semantics, resolver_mode, permit_kind),
+                ("query", "collection", "QueryPermit")
+                    | ("instance", "instance", "AuthorizationPermit")
+                    | ("global", "global", "AuthorizationPermit")
+            );
+            if !valid_authorization_shape {
+                errors.push(format!(
+                    "{path}: action semantics, resolver mode, and permit kind do not form a registered authorization shape"
+                ));
+            }
+            // A query action may select a registered collection resolver for a
+            // resource whose default resolver is an instance resolver. Every
+            // non-query mapping must remain pinned to that resource's declared
+            // canonical resolver; otherwise a second same-kind resolver could
+            // silently replace canonical instance/global resolution.
+            if !(semantics == "query" && resolver_mode == "collection")
+                && (string_field(resource, "resolver_id") != Some(resolver_id)
+                    || resource.get("resolver_version") != entry.get("resolver_version"))
+            {
+                errors.push(format!(
+                    "{path}: non-query mapping must use the resource's canonical resolver"
                 ));
             }
             if let Some(source) = string_field(entry, "source_file") {
@@ -6979,6 +7037,180 @@ mod tests {
                 errors.join("\n")
             );
         }
+    }
+
+    fn collection_mapping_registry(locator: &str, digest: &str) -> Value {
+        json!({
+            "actor_kinds": ["verified-human", "service"],
+            "actions": [{
+                "action_id": "request.list",
+                "resource_kind": "request",
+                "permitted_actor_kinds": ["verified-human", "service"],
+                "authorization_semantics": "query"
+            }],
+            "resources": [{
+                "resource_kind": "request",
+                "resolver_id": "resolver:request-instance-v1",
+                "resolver_version": 1
+            }],
+            "resolvers": [
+                {
+                    "resolver_id": "resolver:request-instance-v1",
+                    "resolver_version": 1,
+                    "resource_kind": "request",
+                    "mode": "instance",
+                    "permit_kind": "AuthorizationPermit"
+                },
+                {
+                    "resolver_id": "resolver:request-query-v1",
+                    "resolver_version": 1,
+                    "resource_kind": "request",
+                    "mode": "collection",
+                    "permit_kind": "QueryPermit"
+                }
+            ],
+            "route_mappings": [{
+                "mapping_id": "route:request-list-v1",
+                "method": "GET",
+                "path_template": "/api/requests",
+                "action_id": "request.list",
+                "resource_kind": "request",
+                "resolver_id": "resolver:request-query-v1",
+                "resolver_version": 1,
+                "permit_kind": "QueryPermit",
+                "permitted_actor_kinds": ["verified-human", "service"]
+            }],
+            "worker_mappings": [],
+            "inventory_closure": {
+                "inventory_sources": [{
+                    "document_id": "source:fixture-one",
+                    "document_version": 1,
+                    "content_digest": digest,
+                    "artifact_locator": locator
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn action_mapping_accepts_registered_collection_resolver_for_existing_resource() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let bytes = b"pub fn fixture() {}\n";
+        fs::write(temporary_root.path().join(locator), bytes).unwrap();
+        let registry = collection_mapping_registry(locator, &raw_sha256_digest(bytes));
+
+        let mut errors = Vec::new();
+        validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn action_mapping_rejects_resolver_and_authorization_shape_drift() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let bytes = b"pub fn fixture() {}\n";
+        fs::write(temporary_root.path().join(locator), bytes).unwrap();
+        let base = collection_mapping_registry(locator, &raw_sha256_digest(bytes));
+
+        for (pointer, replacement, expected) in [
+            (
+                "/route_mappings/0/resolver_id",
+                json!("resolver:missing"),
+                "unknown resolver",
+            ),
+            (
+                "/route_mappings/0/resolver_version",
+                json!(2),
+                "disagree on resolver_version",
+            ),
+            (
+                "/route_mappings/0/permit_kind",
+                json!("AuthorizationPermit"),
+                "disagree on permit_kind",
+            ),
+            (
+                "/route_mappings/0/permitted_actor_kinds/0",
+                json!("service"),
+                "mapping actors disagree",
+            ),
+            (
+                "/actions/0/authorization_semantics",
+                json!("instance"),
+                "do not form a registered authorization shape",
+            ),
+        ] {
+            let mut registry = base.clone();
+            *registry.pointer_mut(pointer).expect("mutation pointer") = replacement;
+            let mut errors = Vec::new();
+            validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} for {pointer}: {}",
+                errors.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn non_query_mapping_cannot_select_a_shadow_instance_resolver() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let bytes = b"pub fn fixture() {}\n";
+        fs::write(temporary_root.path().join(locator), bytes).unwrap();
+        let mut registry = collection_mapping_registry(locator, &raw_sha256_digest(bytes));
+        registry["actions"][0]["authorization_semantics"] = json!("instance");
+        registry["resolvers"]
+            .as_array_mut()
+            .expect("resolver array")
+            .push(json!({
+                "resolver_id": "resolver:request-instance-shadow-v1",
+                "resolver_version": 1,
+                "resource_kind": "request",
+                "mode": "instance",
+                "permit_kind": "AuthorizationPermit"
+            }));
+        registry["route_mappings"][0]["resolver_id"] = json!("resolver:request-instance-shadow-v1");
+        registry["route_mappings"][0]["permit_kind"] = json!("AuthorizationPermit");
+
+        let mut errors = Vec::new();
+        validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must use the resource's canonical resolver")),
+            "{}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn duplicate_route_method_and_path_are_rejected() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "sources/fixture.rs";
+        fs::create_dir_all(temporary_root.path().join("sources")).unwrap();
+        let bytes = b"pub fn fixture() {}\n";
+        fs::write(temporary_root.path().join(locator), bytes).unwrap();
+        let mut registry = collection_mapping_registry(locator, &raw_sha256_digest(bytes));
+        let mut duplicate = registry["route_mappings"][0].clone();
+        duplicate["mapping_id"] = json!("route:request-list-shadow-v1");
+        registry["route_mappings"]
+            .as_array_mut()
+            .expect("route array")
+            .push(duplicate);
+
+        let mut errors = Vec::new();
+        validate_action_resource_registry(temporary_root.path(), &registry, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate route mapping")),
+            "{}",
+            errors.join("\n")
+        );
     }
 
     #[test]

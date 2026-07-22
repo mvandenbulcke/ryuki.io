@@ -6319,6 +6319,30 @@ fn unique_registry_entry<'a>(
     Ok(entry)
 }
 
+fn unique_route_mapping<'a>(
+    document: &'a Value,
+    method: &str,
+    path_template: &str,
+) -> Result<&'a Value, String> {
+    let entries = document
+        .get("route_mappings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "action registry route_mappings is not an array".to_string())?;
+    let mut matches = entries.iter().filter(|entry| {
+        entry.get("method").and_then(Value::as_str) == Some(method)
+            && entry.get("path_template").and_then(Value::as_str) == Some(path_template)
+    });
+    let entry = matches.next().ok_or_else(|| {
+        format!("action registry omits route mapping ({method}, {path_template})")
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "action registry duplicates route mapping ({method}, {path_template})"
+        ));
+    }
+    Ok(entry)
+}
+
 fn request_read_registry_binding(
     document: &Value,
     profile: &DeploymentSecurityProfile,
@@ -6352,16 +6376,27 @@ fn request_read_registry_binding(
     }
 
     let actor_kinds = serde_json::json!(["verified-human", "service", "development-fixture"]);
-    let action = unique_registry_entry(document, "actions", "action_id", "request.read")?;
-    if action.get("resource_kind") != Some(&Value::String("request".into()))
-        || action.get("permitted_actor_kinds") != Some(&actor_kinds)
-        || action.get("authorization_semantics") != Some(&Value::String("instance".into()))
-        || action.get("obligations") != Some(&serde_json::json!(["audit"]))
-        || action.get("risk_class") != Some(&Value::String("ordinary".into()))
-        || action.get("lifecycle") != Some(&Value::String("active".into()))
-        || action.get("applicability_expression") != Some(&Value::String("always".into()))
+    let read_action = unique_registry_entry(document, "actions", "action_id", "request.read")?;
+    if read_action.get("resource_kind") != Some(&Value::String("request".into()))
+        || read_action.get("permitted_actor_kinds") != Some(&actor_kinds)
+        || read_action.get("authorization_semantics") != Some(&Value::String("instance".into()))
+        || read_action.get("obligations") != Some(&serde_json::json!(["audit"]))
+        || read_action.get("risk_class") != Some(&Value::String("ordinary".into()))
+        || read_action.get("lifecycle") != Some(&Value::String("active".into()))
+        || read_action.get("applicability_expression") != Some(&Value::String("always".into()))
     {
         return Err("request.read action semantics differ from the permit adapter".into());
+    }
+    let list_action = unique_registry_entry(document, "actions", "action_id", "request.list")?;
+    if list_action.get("resource_kind") != Some(&Value::String("request".into()))
+        || list_action.get("permitted_actor_kinds") != Some(&actor_kinds)
+        || list_action.get("authorization_semantics") != Some(&Value::String("query".into()))
+        || list_action.get("obligations") != Some(&serde_json::json!(["audit"]))
+        || list_action.get("risk_class") != Some(&Value::String("ordinary".into()))
+        || list_action.get("lifecycle") != Some(&Value::String("active".into()))
+        || list_action.get("applicability_expression") != Some(&Value::String("always".into()))
+    {
+        return Err("request.list action semantics differ from the permit adapter".into());
     }
 
     let resource = unique_registry_entry(document, "resources", "resource_kind", "request")?;
@@ -6379,13 +6414,24 @@ fn request_read_registry_binding(
         "sensitivity",
         "lifecycle_state"
     ]);
+    let scope_dimensions = serde_json::json!([
+        "deployment_id",
+        "trust_domain_id",
+        "tenant_id",
+        "site_id",
+        "environment_id",
+        "owner_principal_id"
+    ]);
     if resource.get("canonical_id_pattern") != Some(&Value::String("^request:[a-z0-9-]+$".into()))
         || resource.get("resolver_id")
             != Some(&Value::String("resolver:request-instance-v1".into()))
         || resource.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || resource.get("scope_dimensions") != Some(&scope_dimensions)
         || resource.get("requires_security_version") != Some(&Value::Bool(true))
         || resource.get("aliases_allowed") != Some(&Value::Bool(false))
         || resource.get("sensitivity") != Some(&Value::String("confidential".into()))
+        || resource.pointer("/canonical_resource_ref/schema_version")
+            != Some(&Value::Number(1_u64.into()))
         || resource.pointer("/canonical_resource_ref/required_fields") != Some(&required_fields)
         || resource.pointer("/canonical_resource_ref/security_version_field")
             != Some(&Value::String("resource_version".into()))
@@ -6397,56 +6443,89 @@ fn request_read_registry_binding(
         return Err("request resource semantics differ from the permit adapter".into());
     }
 
-    let resolver = unique_registry_entry(
+    let read_resolver = unique_registry_entry(
         document,
         "resolvers",
         "resolver_id",
         "resolver:request-instance-v1",
     )?;
-    if resolver.get("resolver_version") != Some(&Value::Number(1_u64.into()))
-        || resolver.get("resource_kind") != Some(&Value::String("request".into()))
-        || resolver.get("mode") != Some(&Value::String("instance".into()))
-        || resolver.get("canonical_id_source") != Some(&Value::String("requests.id".into()))
-        || resolver.get("security_version_source")
+    if read_resolver.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || read_resolver.get("resource_kind") != Some(&Value::String("request".into()))
+        || read_resolver.get("mode") != Some(&Value::String("instance".into()))
+        || read_resolver.get("canonical_id_source") != Some(&Value::String("requests.id".into()))
+        || read_resolver.get("security_version_source")
             != Some(&Value::String("requests.resource_version".into()))
-        || resolver.get("state_digest_source") != Some(&Value::String("job_steps.(id,xmin)".into()))
-        || resolver.get("permit_kind") != Some(&Value::String("AuthorizationPermit".into()))
-        || resolver.get("fail_closed") != Some(&Value::Bool(true))
-        || resolver.get("lifecycle") != Some(&Value::String("active".into()))
-        || resolver.get("applicability_expression") != Some(&Value::String("always".into()))
+        || read_resolver.get("state_digest_source")
+            != Some(&Value::String("job_steps.(id,xmin)".into()))
+        || read_resolver.get("permit_kind") != Some(&Value::String("AuthorizationPermit".into()))
+        || read_resolver.get("fail_closed") != Some(&Value::Bool(true))
+        || read_resolver.get("lifecycle") != Some(&Value::String("active".into()))
+        || read_resolver.get("applicability_expression") != Some(&Value::String("always".into()))
     {
         return Err("request resolver semantics differ from the permit adapter".into());
     }
-
-    let route = unique_registry_entry(
+    let list_resolver = unique_registry_entry(
         document,
-        "route_mappings",
-        "mapping_id",
-        "route:request-read-v1",
+        "resolvers",
+        "resolver_id",
+        "resolver:request-query-v1",
     )?;
-    if route.get("method") != Some(&Value::String("GET".into()))
-        || route.get("path_template") != Some(&Value::String("/api/requests/{id}".into()))
-        || route.get("action_id") != Some(&Value::String("request.read".into()))
-        || route.get("resource_kind") != Some(&Value::String("request".into()))
-        || route.get("resolver_id") != Some(&Value::String("resolver:request-instance-v1".into()))
-        || route.get("resolver_version") != Some(&Value::Number(1_u64.into()))
-        || route.get("permit_kind") != Some(&Value::String("AuthorizationPermit".into()))
-        || route.get("permitted_actor_kinds") != Some(&actor_kinds)
-        || route.get("lifecycle") != Some(&Value::String("active".into()))
-        || route.get("applicability_expression") != Some(&Value::String("always".into()))
-        || route.get("source_file")
+    if list_resolver.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || list_resolver.get("resource_kind") != Some(&Value::String("request".into()))
+        || list_resolver.get("mode") != Some(&Value::String("collection".into()))
+        || list_resolver.get("canonical_id_source")
+            != Some(&Value::String("constant:request:collection".into()))
+        || list_resolver.get("security_version_source")
+            != Some(&Value::String("maximum-authority-binding.version".into()))
+        || list_resolver.get("state_digest_source")
+            != Some(&Value::String("maximum-authority-binding.digest".into()))
+        || list_resolver.get("permit_kind") != Some(&Value::String("QueryPermit".into()))
+        || list_resolver.get("fail_closed") != Some(&Value::Bool(true))
+        || list_resolver.get("lifecycle") != Some(&Value::String("active".into()))
+        || list_resolver.get("applicability_expression") != Some(&Value::String("always".into()))
+    {
+        return Err("request-list resolver semantics differ from the permit adapter".into());
+    }
+
+    let read_route = unique_route_mapping(document, "GET", "/api/requests/{id}")?;
+    if read_route.get("mapping_id") != Some(&Value::String("route:request-read-v1".into()))
+        || read_route.get("action_id") != Some(&Value::String("request.read".into()))
+        || read_route.get("resource_kind") != Some(&Value::String("request".into()))
+        || read_route.get("resolver_id")
+            != Some(&Value::String("resolver:request-instance-v1".into()))
+        || read_route.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || read_route.get("permit_kind") != Some(&Value::String("AuthorizationPermit".into()))
+        || read_route.get("permitted_actor_kinds") != Some(&actor_kinds)
+        || read_route.get("lifecycle") != Some(&Value::String("active".into()))
+        || read_route.get("applicability_expression") != Some(&Value::String("always".into()))
+        || read_route.get("source_file")
             != Some(&Value::String("sources/ryuki-api/src/contracts.rs".into()))
     {
         return Err("request-read route semantics differ from the permit adapter".into());
+    }
+    let list_route = unique_route_mapping(document, "GET", "/api/requests")?;
+    if list_route.get("mapping_id") != Some(&Value::String("route:request-list-v1".into()))
+        || list_route.get("action_id") != Some(&Value::String("request.list".into()))
+        || list_route.get("resource_kind") != Some(&Value::String("request".into()))
+        || list_route.get("resolver_id") != Some(&Value::String("resolver:request-query-v1".into()))
+        || list_route.get("resolver_version") != Some(&Value::Number(1_u64.into()))
+        || list_route.get("permit_kind") != Some(&Value::String("QueryPermit".into()))
+        || list_route.get("permitted_actor_kinds") != Some(&actor_kinds)
+        || list_route.get("lifecycle") != Some(&Value::String("active".into()))
+        || list_route.get("applicability_expression") != Some(&Value::String("always".into()))
+        || list_route.get("source_file")
+            != Some(&Value::String("sources/ryuki-api/src/contracts.rs".into()))
+    {
+        return Err("request-list route semantics differ from the permit adapter".into());
     }
 
     let projection = serde_json::json!({
         "digest_contract": MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT,
         "registry_version": registry_version,
-        "action": action,
+        "actions": [list_action, read_action],
         "resource": resource,
-        "resolver": resolver,
-        "route": route,
+        "resolvers": [read_resolver, list_resolver],
+        "routes": [list_route, read_route],
     });
     Ok(RequestReadRegistryBinding {
         registry_version,
@@ -8547,23 +8626,120 @@ mod tests {
         json!({
             "digest_contract": MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT,
             "registry_version": 7,
-            "action": {
-                "action_id": "request.read",
-                "permitted_actor_kinds": ["service", "verified-human"]
-            },
+            "actions": [
+                {
+                    "action_id": "request.list",
+                    "permitted_actor_kinds": ["service", "verified-human"]
+                },
+                {
+                    "action_id": "request.read",
+                    "permitted_actor_kinds": ["service", "verified-human"]
+                }
+            ],
             "resource": {
                 "resource_kind": "request",
                 "required_fields": ["canonical_id", "resource_version"]
             },
-            "resolver": {
-                "resolver_id": "resolver:request-instance-v1",
-                "resolver_version": 1
-            },
-            "route": {
-                "method": "GET",
-                "path_template": "/api/requests/{id}"
-            }
+            "resolvers": [
+                {
+                    "resolver_id": "resolver:request-instance-v1",
+                    "resolver_version": 1
+                },
+                {
+                    "resolver_id": "resolver:request-query-v1",
+                    "resolver_version": 1
+                }
+            ],
+            "routes": [
+                {
+                    "method": "GET",
+                    "path_template": "/api/requests"
+                },
+                {
+                    "method": "GET",
+                    "path_template": "/api/requests/{id}"
+                }
+            ]
         })
+    }
+
+    fn checked_in_request_registry_fixture() -> (Value, DeploymentSecurityProfile) {
+        let registry = serde_json::from_str(include_str!(
+            "../../../catalog/security-contracts/v1/action-resource-registry.implementation.json"
+        ))
+        .expect("checked-in action registry parses");
+        let profile = serde_json::from_str(include_str!(
+            "../../../catalog/security-contracts/v1/deployment-security-profile.implementation.json"
+        ))
+        .expect("checked-in deployment profile parses");
+        (registry, profile)
+    }
+
+    #[test]
+    fn request_registry_binding_accepts_only_the_exact_collection_contract() {
+        let (registry, profile) = checked_in_request_registry_fixture();
+        request_read_registry_binding(&registry, &profile)
+            .expect("checked-in request registry must match the permit adapter");
+
+        for (pointer, replacement) in [
+            ("/actions/1/authorization_semantics", json!("instance")),
+            (
+                "/resources/0/scope_dimensions/5",
+                json!("requester_principal_id"),
+            ),
+            (
+                "/resources/0/canonical_resource_ref/schema_version",
+                json!(2),
+            ),
+            (
+                "/resolvers/1/canonical_id_source",
+                json!("request-query.scope"),
+            ),
+            (
+                "/resolvers/1/security_version_source",
+                json!("principal.authority_version"),
+            ),
+            (
+                "/resolvers/1/state_digest_source",
+                json!("request-query.digest"),
+            ),
+            (
+                "/route_mappings/1/permit_kind",
+                json!("AuthorizationPermit"),
+            ),
+        ] {
+            let mut changed = registry.clone();
+            *changed.pointer_mut(pointer).expect("mutation pointer") = replacement;
+            assert!(
+                request_read_registry_binding(&changed, &profile).is_err(),
+                "semantic drift at {pointer} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn request_registry_binding_rejects_duplicate_selected_route_keys() {
+        let (mut registry, profile) = checked_in_request_registry_fixture();
+        let list_route = registry["route_mappings"]
+            .as_array()
+            .expect("route array")
+            .iter()
+            .find(|route| {
+                route.get("method").and_then(Value::as_str) == Some("GET")
+                    && route.get("path_template").and_then(Value::as_str) == Some("/api/requests")
+            })
+            .expect("request-list route")
+            .clone();
+        let mut duplicate = list_route;
+        duplicate["mapping_id"] = json!("route:request-list-shadow-v1");
+        registry["route_mappings"]
+            .as_array_mut()
+            .expect("route array")
+            .push(duplicate);
+
+        assert!(request_read_registry_binding(&registry, &profile)
+            .unwrap_err()
+            .contains("duplicates route mapping"));
     }
 
     #[test]
@@ -8609,17 +8785,20 @@ mod tests {
                 json!("ryuki-maximum-authority-binding-v2"),
             ),
             ("/registry_version", json!(8)),
-            ("/action/action_id", json!("request.list")),
+            ("/actions/0/action_id", json!("request.search")),
             (
-                "/action/permitted_actor_kinds/0",
+                "/actions/1/permitted_actor_kinds/0",
                 json!("development-fixture"),
             ),
             ("/resource/resource_kind", json!("audit-log")),
             ("/resource/required_fields/0", json!("alias")),
-            ("/resolver/resolver_id", json!("resolver:request-list-v1")),
-            ("/resolver/resolver_version", json!(2)),
-            ("/route/method", json!("POST")),
-            ("/route/path_template", json!("/api/requests")),
+            (
+                "/resolvers/0/resolver_id",
+                json!("resolver:request-list-v1"),
+            ),
+            ("/resolvers/1/resolver_version", json!(2)),
+            ("/routes/0/method", json!("POST")),
+            ("/routes/1/path_template", json!("/api/requests")),
         ] {
             let mut mutated = projection.clone();
             *mutated

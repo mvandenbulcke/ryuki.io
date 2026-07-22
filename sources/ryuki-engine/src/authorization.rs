@@ -42,6 +42,7 @@ pub enum DeploymentProfile {
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
     RequestRead,
+    RequestList,
     RequestApprove,
     AuditRead,
     PlatformSettingsUpdate,
@@ -52,6 +53,7 @@ impl Action {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RequestRead => "request.read",
+            Self::RequestList => "request.list",
             Self::RequestApprove => "request.approve",
             Self::AuditRead => "audit.read",
             Self::PlatformSettingsUpdate => "platform.settings.update",
@@ -61,7 +63,7 @@ impl Action {
 
     const fn resource_kind(self) -> ResourceKind {
         match self {
-            Self::RequestRead | Self::RequestApprove => ResourceKind::Request,
+            Self::RequestRead | Self::RequestList | Self::RequestApprove => ResourceKind::Request,
             Self::AuditRead => ResourceKind::AuditLog,
             Self::PlatformSettingsUpdate => ResourceKind::PlatformConfig,
             Self::AgentHeartbeat => ResourceKind::Agent,
@@ -70,7 +72,7 @@ impl Action {
 
     const fn semantics(self) -> AuthorizationSemantics {
         match self {
-            Self::AuditRead => AuthorizationSemantics::Query,
+            Self::RequestList | Self::AuditRead => AuthorizationSemantics::Query,
             Self::PlatformSettingsUpdate => AuthorizationSemantics::Global,
             Self::RequestRead | Self::RequestApprove | Self::AgentHeartbeat => {
                 AuthorizationSemantics::Instance
@@ -85,7 +87,7 @@ impl Action {
                 ObligationKind::MakerChecker,
                 ObligationKind::StepUp,
             ]),
-            Self::RequestRead | Self::AuditRead | Self::AgentHeartbeat => {
+            Self::RequestRead | Self::RequestList | Self::AuditRead | Self::AgentHeartbeat => {
                 BTreeSet::from([ObligationKind::Audit])
             }
         }
@@ -93,7 +95,7 @@ impl Action {
 
     const fn actor_is_registered(self, actor: ActorKind) -> bool {
         match self {
-            Self::RequestRead => matches!(
+            Self::RequestRead | Self::RequestList => matches!(
                 actor,
                 ActorKind::VerifiedHuman | ActorKind::Service | ActorKind::DevelopmentFixture
             ),
@@ -812,11 +814,11 @@ impl RequestedQuery {
         limit: u32,
         offset: u64,
     ) -> Result<Self, AuthorizationError> {
-        if limit == 0
-            || filters.len() > 8
-            || filters.iter().any(|(key, value)| {
-                !matches!(key.as_str(), "site_id" | "environment_id") || !valid_identifier(value)
-            })
+        if filters.len() > 12
+            || filters
+                .iter()
+                .any(|(key, value)| !valid_query_filter(key, value))
+            || filters.contains_key("cursor_created_at") != filters.contains_key("cursor_id")
         {
             return Err(AuthorizationError::InvalidQuery);
         }
@@ -829,9 +831,17 @@ impl RequestedQuery {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
+pub enum CanonicalOwnerScope {
+    NotApplicable,
+    Any,
+    Principal(PrincipalId),
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct CanonicalQueryScope {
     site_scope: ExplicitScope,
     environment_scope: ExplicitScope,
+    owner_scope: CanonicalOwnerScope,
 }
 
 impl CanonicalQueryScope {
@@ -842,6 +852,13 @@ impl CanonicalQueryScope {
     pub const fn environment_scope(&self) -> &ExplicitScope {
         &self.environment_scope
     }
+
+    /// Mandatory object-owner predicate derived by policy. `None` means the
+    /// admitted principal has a registered read-any role; callers cannot set or
+    /// clear this value through query parameters.
+    pub const fn owner_scope(&self) -> &CanonicalOwnerScope {
+        &self.owner_scope
+    }
 }
 
 impl fmt::Debug for CanonicalQueryScope {
@@ -850,6 +867,7 @@ impl fmt::Debug for CanonicalQueryScope {
             .debug_struct("CanonicalQueryScope")
             .field("site_scope", &self.site_scope)
             .field("environment_scope", &self.environment_scope)
+            .field("owner_scope", &"<redacted>")
             .finish()
     }
 }
@@ -1021,7 +1039,7 @@ impl AuthorizationKernel {
         )
     }
 
-    /// Activate only the repository-integrated `request.read` action under the
+    /// Activate only the repository-integrated request read actions under the
     /// exact retained policy, action-registry, and maximum-authority roots.
     pub fn request_read_slice(
         evidence: RequestReadKernelEvidence,
@@ -1049,7 +1067,7 @@ impl AuthorizationKernel {
         }
         Ok(Self::new(
             evidence.profile,
-            BTreeSet::from([Action::RequestRead]),
+            BTreeSet::from([Action::RequestRead, Action::RequestList]),
             Some(evidence.expected_authority),
             evidence.policy_version,
             evidence.policy_digest,
@@ -1195,6 +1213,32 @@ impl AuthorizationKernel {
         })
     }
 
+    /// Resolve the closed request collection resource. Query scope and an
+    /// optional owner predicate are carried by the eventual [`QueryPermit`],
+    /// so no caller-supplied row axis participates in this resolver.
+    pub fn bind_request_list_resource(&self) -> Result<ResolvedResource, AuthorizationError> {
+        let expected =
+            self.request_read_authority
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidBinding(
+                    "request-list authority is not registered",
+                ))?;
+        Ok(ResolvedResource {
+            kind: ResourceKind::Request,
+            canonical_id: "request:collection".into(),
+            deployment_id: expected.deployment_id.clone(),
+            trust_domain_id: expected.trust_domain_id.clone(),
+            tenant_id: expected.tenant_id.clone(),
+            site_id: None,
+            environment_id: None,
+            owner_principal_id: None,
+            resource_version: self.authority.maximum_authority_version,
+            state_digest: Some(self.authority.maximum_authority_digest),
+            sensitivity: ResourceSensitivity::Confidential,
+            lifecycle_state: ResourceLifecycle::Active,
+        })
+    }
+
     /// Mint the transaction nonce owned by the repository unit of work. The
     /// context is non-cloneable and the repository retains it beside the live
     /// SQL transaction or local-store lock until the permit is consumed.
@@ -1207,6 +1251,24 @@ impl AuthorizationKernel {
         }
         Ok(TransactionContext(TransactionBinding {
             nonce: Uuid::new_v4(),
+            expires_at,
+        }))
+    }
+
+    /// Mint a query snapshot identity owned by the retained repository unit of
+    /// work. The authority version comes from the verified principal rather
+    /// than a handler-supplied scalar.
+    pub fn begin_query_snapshot(
+        &self,
+        resource: &ResolvedResource,
+        expires_at: DateTime<Utc>,
+    ) -> Result<SnapshotContext, AuthorizationError> {
+        if expires_at <= self.now() {
+            return Err(AuthorizationError::Expired);
+        }
+        Ok(SnapshotContext(SnapshotBinding {
+            nonce: Uuid::new_v4(),
+            authority_version: resource.resource_version,
             expires_at,
         }))
     }
@@ -1230,7 +1292,10 @@ impl AuthorizationKernel {
             return Err(AuthorizationError::InvalidDecision);
         }
         if decision.status != DecisionStatus::AllowPending
-            || decision.binding.action != Action::RequestRead
+            || !matches!(
+                decision.binding.action,
+                Action::RequestRead | Action::RequestList
+            )
             || !decision
                 .binding
                 .required_obligations
@@ -1377,10 +1442,11 @@ impl AuthorizationKernel {
             || principal.tenant_id != resource.tenant_id
         {
             Some(DenialReason::NamespaceMismatch)
-        } else if !principal.site_scope.permits(resource.site_id.as_deref())
-            || !principal
-                .environment_scope
-                .permits(resource.environment_id.as_deref())
+        } else if action.semantics() != AuthorizationSemantics::Query
+            && (!principal.site_scope.permits(resource.site_id.as_deref())
+                || !principal
+                    .environment_scope
+                    .permits(resource.environment_id.as_deref()))
         {
             Some(DenialReason::ScopeMismatch)
         } else if !resource_lifecycle_permits(action, resource.lifecycle_state) {
@@ -1596,9 +1662,23 @@ impl AuthorizationKernel {
         if decision.binding.semantics != AuthorizationSemantics::Query {
             return Err(AuthorizationError::WrongPermitKind);
         }
+        let Some(site_scope) = canonical_query_axis_scope(
+            &decision.binding.principal.site_scope,
+            decision.binding.resource.site_id.as_deref(),
+        ) else {
+            return Err(AuthorizationError::QueryWouldWidenAuthority);
+        };
+        let Some(environment_scope) = canonical_query_axis_scope(
+            &decision.binding.principal.environment_scope,
+            decision.binding.resource.environment_id.as_deref(),
+        ) else {
+            return Err(AuthorizationError::QueryWouldWidenAuthority);
+        };
         if requested.limit > self.query_maximum_limit
             || requested.offset > self.query_maximum_offset
-            || !query_filters_within_scope(&decision.binding.principal, &requested.filters)
+            || !query_filters_registered_for_action(decision.binding.action, &requested.filters)
+            || !query_filters_within_scope(&site_scope, &environment_scope, &requested.filters)
+            || snapshot.0.authority_version != decision.binding.resource.resource_version
         {
             return Err(AuthorizationError::QueryWouldWidenAuthority);
         }
@@ -1609,17 +1689,24 @@ impl AuthorizationKernel {
         if expires_at <= now {
             return Err(AuthorizationError::Expired);
         }
+        let owner_scope =
+            canonical_owner_scope(decision.binding.action, &decision.binding.principal);
         let predicate_digest = digest_serializable(
             QUERY_PREDICATE_DOMAIN,
             &(
-                &decision.binding.principal.site_scope,
-                &decision.binding.principal.environment_scope,
+                decision.binding.action,
+                &site_scope,
+                &environment_scope,
+                &owner_scope,
                 &requested.filters,
+                requested.limit,
+                requested.offset,
             ),
         );
         let scope = CanonicalQueryScope {
-            site_scope: decision.binding.principal.site_scope.clone(),
-            environment_scope: decision.binding.principal.environment_scope.clone(),
+            site_scope,
+            environment_scope,
+            owner_scope,
         };
         let plan = AuthorizedQueryPlan {
             predicate_digest,
@@ -1741,13 +1828,52 @@ impl AuthorizationKernel {
         {
             return Err(AuthorizationError::StaleBinding);
         }
+        let current_site_scope = canonical_query_axis_scope(
+            &current_principal.site_scope,
+            current_resource.site_id.as_deref(),
+        )
+        .ok_or(AuthorizationError::QueryWouldWidenAuthority)?;
+        let current_environment_scope = canonical_query_axis_scope(
+            &current_principal.environment_scope,
+            current_resource.environment_id.as_deref(),
+        )
+        .ok_or(AuthorizationError::QueryWouldWidenAuthority)?;
         if permit.plan.limit > permit.plan.maximum_limit
             || permit.plan.offset > permit.plan.maximum_offset
-            || permit.plan.scope.site_scope != current_principal.site_scope
-            || permit.plan.scope.environment_scope != current_principal.environment_scope
-            || !query_filters_within_scope(current_principal, &permit.plan.filters)
+            || permit.plan.scope.site_scope != current_site_scope
+            || permit.plan.scope.environment_scope != current_environment_scope
+            || permit.plan.scope.owner_scope
+                != canonical_owner_scope(permit.binding.decision.action, current_principal)
+            || permit.snapshot.authority_version != current_resource.resource_version
+            || !query_filters_registered_for_action(
+                permit.binding.decision.action,
+                &permit.plan.filters,
+            )
+            || !query_filters_within_scope(
+                &current_site_scope,
+                &current_environment_scope,
+                &permit.plan.filters,
+            )
         {
             return Err(AuthorizationError::QueryWouldWidenAuthority);
+        }
+        Ok(())
+    }
+
+    /// Verify currentness and the sink's exact registered query action.
+    pub fn ensure_query_current_for(
+        &self,
+        permit: &QueryPermit,
+        expected_action: Action,
+        current_principal: &VerifiedPrincipal,
+        current_resource: &ResolvedResource,
+        snapshot: &SnapshotContext,
+    ) -> Result<(), AuthorizationError> {
+        self.ensure_query_current(permit, current_principal, current_resource, snapshot)?;
+        if permit.binding.decision.action != expected_action
+            || permit.binding.decision.resource.kind != expected_action.resource_kind()
+        {
+            return Err(AuthorizationError::UnexpectedAction);
         }
         Ok(())
     }
@@ -1975,19 +2101,111 @@ fn obligation_evidence_is_valid(
 }
 
 fn query_filters_within_scope(
-    principal: &VerifiedPrincipal,
+    site_scope: &ExplicitScope,
+    environment_scope: &ExplicitScope,
     filters: &BTreeMap<String, String>,
 ) -> bool {
     filters.iter().all(|(key, value)| match key.as_str() {
-        "site_id" => principal.site_scope.permits(Some(value)),
-        "environment_id" => principal.environment_scope.permits(Some(value)),
+        "site_id" => site_scope.permits(Some(value)),
+        "environment_id" => environment_scope.permits(Some(value)),
+        "status"
+        | "request_type"
+        | "created_by_principal_id"
+        | "q"
+        | "sort"
+        | "direction"
+        | "include_total"
+        | "cursor_created_at"
+        | "cursor_id" => true,
         _ => false,
     })
 }
 
+fn query_filters_registered_for_action(action: Action, filters: &BTreeMap<String, String>) -> bool {
+    match action {
+        Action::AuditRead => filters
+            .keys()
+            .all(|key| matches!(key.as_str(), "site_id" | "environment_id")),
+        Action::RequestList => {
+            ["sort", "direction", "include_total"]
+                .into_iter()
+                .all(|key| filters.contains_key(key))
+                && filters.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "site_id"
+                            | "environment_id"
+                            | "status"
+                            | "request_type"
+                            | "created_by_principal_id"
+                            | "q"
+                            | "sort"
+                            | "direction"
+                            | "include_total"
+                            | "cursor_created_at"
+                            | "cursor_id"
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+fn canonical_query_axis_scope(
+    principal_scope: &ExplicitScope,
+    resource_axis: Option<&str>,
+) -> Option<ExplicitScope> {
+    match resource_axis {
+        None => Some(principal_scope.clone()),
+        Some(value) if principal_scope.permits(Some(value)) => {
+            ExplicitScope::scoped(BTreeSet::from([value.to_string()])).ok()
+        }
+        Some(_) => None,
+    }
+}
+
+fn canonical_owner_scope(action: Action, principal: &VerifiedPrincipal) -> CanonicalOwnerScope {
+    match action {
+        Action::RequestList if policy_can_read_any(principal) => CanonicalOwnerScope::Any,
+        Action::RequestList => {
+            CanonicalOwnerScope::Principal(principal.effective_subject.principal_id)
+        }
+        _ => CanonicalOwnerScope::NotApplicable,
+    }
+}
+
+fn valid_query_filter(key: &str, value: &str) -> bool {
+    match key {
+        "site_id" | "environment_id" | "status" | "request_type" | "created_by_principal_id" => {
+            valid_identifier(value)
+        }
+        "q" => {
+            !value.is_empty()
+                && value.len() <= 4096
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+        }
+        "sort" => matches!(
+            value,
+            "created_at" | "updated_at" | "name" | "status" | "site" | "request_type"
+        ),
+        "direction" => matches!(value, "ASC" | "DESC"),
+        "include_total" => matches!(value, "true" | "false"),
+        "cursor_created_at" => DateTime::parse_from_rfc3339(value).is_ok(),
+        "cursor_id" => {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }
+        _ => false,
+    }
+}
+
 fn policy_entitles(principal: &VerifiedPrincipal, action: Action) -> bool {
     match (principal.actor_kind, action) {
-        (ActorKind::VerifiedHuman, Action::RequestRead) => {
+        (ActorKind::VerifiedHuman, Action::RequestRead | Action::RequestList) => {
             principal.policy_roles.iter().any(|role| {
                 matches!(
                     role,
@@ -2003,14 +2221,14 @@ fn policy_entitles(principal: &VerifiedPrincipal, action: Action) -> bool {
                 )
             })
         }
-        (ActorKind::Service, Action::RequestRead) => principal
+        (ActorKind::Service, Action::RequestRead | Action::RequestList) => principal
             .policy_roles
             .iter()
             .any(|role| matches!(role, PolicyRole::Requester | PolicyRole::ServiceReader)),
         (ActorKind::Service, Action::AuditRead) => {
             principal.policy_roles.contains(&PolicyRole::ServiceReader)
         }
-        (ActorKind::DevelopmentFixture, Action::RequestRead) => principal
+        (ActorKind::DevelopmentFixture, Action::RequestRead | Action::RequestList) => principal
             .policy_roles
             .contains(&PolicyRole::PlatformAdministrator),
         // These actions stay inactive until their complete policy and receipt
@@ -2046,10 +2264,14 @@ fn assurance_permits(
             AssuranceLevel::PhishingResistant
         }
         Action::AuditRead => AssuranceLevel::MultiFactor,
-        Action::RequestRead if matches!(sensitivity, ResourceSensitivity::Restricted) => {
+        Action::RequestRead | Action::RequestList
+            if matches!(sensitivity, ResourceSensitivity::Restricted) =>
+        {
             AssuranceLevel::MultiFactor
         }
-        Action::RequestRead | Action::AgentHeartbeat => AssuranceLevel::SingleFactor,
+        Action::RequestRead | Action::RequestList | Action::AgentHeartbeat => {
+            AssuranceLevel::SingleFactor
+        }
     };
     assurance >= required
 }
@@ -2060,7 +2282,10 @@ fn resource_lifecycle_permits(action: Action, lifecycle: ResourceLifecycle) -> b
         | ResourceLifecycle::Revoked
         | ResourceLifecycle::Unknown => false,
         ResourceLifecycle::Terminal => {
-            matches!(action, Action::RequestRead | Action::AuditRead)
+            matches!(
+                action,
+                Action::RequestRead | Action::RequestList | Action::AuditRead
+            )
         }
         ResourceLifecycle::Active => true,
     }
@@ -2091,7 +2316,7 @@ mod tests {
     fn kernel(profile: DeploymentProfile) -> AuthorizationKernel {
         let mut kernel = AuthorizationKernel::new(
             profile,
-            BTreeSet::from([Action::RequestRead, Action::AuditRead]),
+            BTreeSet::from([Action::RequestRead, Action::RequestList, Action::AuditRead]),
             None,
             version(11),
             digest("policy"),
@@ -2164,7 +2389,7 @@ mod tests {
             site_scope: ExplicitScope::scoped(BTreeSet::from(["site:one".into()])).unwrap(),
             environment_scope: ExplicitScope::scoped(BTreeSet::from(["env:prod".into()])).unwrap(),
             policy_roles: BTreeSet::from([match action {
-                Action::RequestRead => PolicyRole::Requester,
+                Action::RequestRead | Action::RequestList => PolicyRole::Requester,
                 Action::AuditRead => PolicyRole::Auditor,
                 Action::RequestApprove | Action::PlatformSettingsUpdate => {
                     PolicyRole::PlatformAdministrator
@@ -2247,7 +2472,7 @@ mod tests {
         let satisfied = kernel
             .satisfy_obligations(&decision, &receipts(kernel, &decision))
             .unwrap();
-        let snapshot = SnapshotContext::for_test(version(33), now + Duration::minutes(5));
+        let snapshot = SnapshotContext::for_test(version(22), now + Duration::minutes(5));
         let requested = RequestedQuery::new(
             BTreeMap::from([("site_id".into(), "site:one".into())]),
             50,
@@ -2258,6 +2483,34 @@ mod tests {
             .authorize_query(satisfied, requested, &snapshot)
             .unwrap();
         (principal, resource, snapshot, permit)
+    }
+
+    fn request_list_permit(
+        kernel: &AuthorizationKernel,
+        now: DateTime<Utc>,
+        principal: VerifiedPrincipal,
+    ) -> (ResolvedResource, SnapshotContext, QueryPermit) {
+        let resource = resource(Action::RequestList);
+        let decision = kernel.decide(&principal, Action::RequestList, &resource);
+        assert_eq!(decision.status(), DecisionStatus::AllowPending);
+        let satisfied = kernel
+            .satisfy_obligations(&decision, &receipts(kernel, &decision))
+            .unwrap();
+        let snapshot = SnapshotContext::for_test(version(22), now + Duration::minutes(5));
+        let requested = RequestedQuery::new(
+            BTreeMap::from([
+                ("sort".into(), "created_at".into()),
+                ("direction".into(), "DESC".into()),
+                ("include_total".into(), "false".into()),
+            ]),
+            50,
+            0,
+        )
+        .unwrap();
+        let permit = kernel
+            .authorize_query(satisfied, requested, &snapshot)
+            .unwrap();
+        (resource, snapshot, permit)
     }
 
     fn resign_receipt(kernel: &AuthorizationKernel, receipt: &mut ObligationReceipt) {
@@ -2828,7 +3081,7 @@ mod tests {
             .ensure_query_current(&permit, &principal, &resource, &snapshot)
             .unwrap();
 
-        let foreign_snapshot = SnapshotContext::for_test(version(33), now + Duration::minutes(5));
+        let foreign_snapshot = SnapshotContext::for_test(version(22), now + Duration::minutes(5));
         assert_eq!(
             kernel.ensure_query_current(&permit, &principal, &resource, &foreign_snapshot),
             Err(AuthorizationError::SnapshotMismatch)
@@ -2946,7 +3199,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let snapshot = SnapshotContext::for_test(version(33), now + Duration::minutes(5));
+        let snapshot = SnapshotContext::for_test(version(22), now + Duration::minutes(5));
         assert!(matches!(
             kernel.authorize_query(satisfied, requested, &snapshot),
             Err(AuthorizationError::QueryWouldWidenAuthority)
@@ -2963,7 +3216,7 @@ mod tests {
         let satisfied = kernel
             .satisfy_obligations(&decision, &receipts(&kernel, &decision))
             .unwrap();
-        let snapshot = SnapshotContext::for_test(version(33), now + Duration::minutes(5));
+        let snapshot = SnapshotContext::for_test(version(22), now + Duration::minutes(5));
         let requested = RequestedQuery::new(BTreeMap::new(), 50, 0).unwrap();
         let permit = kernel
             .authorize_query(satisfied, requested, &snapshot)
@@ -2978,6 +3231,83 @@ mod tests {
             permit.scope().environment_scope().values(),
             Some(&BTreeSet::from(["env:prod".to_string()]))
         );
+    }
+
+    #[test]
+    fn request_list_owner_scope_is_kernel_derived_and_role_sensitive() {
+        let now = test_now();
+        let kernel = kernel(DeploymentProfile::Test);
+        let requester = principal(now, Action::RequestList);
+        let (_, _, requester_permit) = request_list_permit(&kernel, now, requester.clone());
+        assert!(matches!(
+            requester_permit.scope().owner_scope(),
+            CanonicalOwnerScope::Principal(principal_id)
+                if principal_id == &requester.effective_subject.principal_id
+        ));
+
+        let mut auditor = requester;
+        auditor.policy_roles = BTreeSet::from([PolicyRole::Auditor]);
+        let (_, _, auditor_permit) = request_list_permit(&kernel, now, auditor);
+        assert!(matches!(
+            auditor_permit.scope().owner_scope(),
+            CanonicalOwnerScope::Any
+        ));
+    }
+
+    #[test]
+    fn request_list_query_sink_rejects_audit_permits() {
+        let now = test_now();
+        let kernel = kernel(DeploymentProfile::Test);
+        let (principal, resource, snapshot, permit) = query_permit(&kernel, now);
+        assert_eq!(
+            kernel.ensure_query_current_for(
+                &permit,
+                Action::RequestList,
+                &principal,
+                &resource,
+                &snapshot,
+            ),
+            Err(AuthorizationError::UnexpectedAction)
+        );
+    }
+
+    #[test]
+    fn request_list_owner_scope_and_snapshot_version_are_sealed() {
+        let now = test_now();
+        let kernel = kernel(DeploymentProfile::Test);
+        let principal = principal(now, Action::RequestList);
+        let (resource, snapshot, mut permit) = request_list_permit(&kernel, now, principal.clone());
+        permit.plan.scope.owner_scope = CanonicalOwnerScope::Any;
+        assert_eq!(
+            kernel.ensure_query_current_for(
+                &permit,
+                Action::RequestList,
+                &principal,
+                &resource,
+                &snapshot,
+            ),
+            Err(AuthorizationError::InvalidPermit)
+        );
+
+        let decision = kernel.decide(&principal, Action::RequestList, &resource);
+        let satisfied = kernel
+            .satisfy_obligations(&decision, &receipts(&kernel, &decision))
+            .unwrap();
+        let wrong_snapshot = SnapshotContext::for_test(version(23), now + Duration::minutes(5));
+        let requested = RequestedQuery::new(
+            BTreeMap::from([
+                ("sort".into(), "created_at".into()),
+                ("direction".into(), "DESC".into()),
+                ("include_total".into(), "false".into()),
+            ]),
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            kernel.authorize_query(satisfied, requested, &wrong_snapshot),
+            Err(AuthorizationError::QueryWouldWidenAuthority)
+        ));
     }
 
     #[test]

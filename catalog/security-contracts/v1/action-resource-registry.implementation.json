@@ -3,7 +3,7 @@
   "schema_version": "1.0.0",
   "contract_kind": "action-resource-registry",
   "document_id": "action-resource-registry:repository-implementation-v1",
-  "document_version": 1,
+  "document_version": 2,
   "lifecycle": {
     "state": "implementation_only",
     "effective_at": "2026-07-16T00:00:00Z"
@@ -13,7 +13,7 @@
     "security_profiles": ["development", "test", "production"],
     "enabled_feature_ids": ["repository-conformance"]
   },
-  "registry_version": 1,
+  "registry_version": 2,
   "inventory_closure": {
     "coverage_status": "transitional_snapshot",
     "router_inventory_equal": false,
@@ -35,7 +35,7 @@
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:6229fe9614fd9ac4d1265b9f054ac9fa08062d756bfc0fe817e35ee6e51b216c",
+        "content_digest": "sha256:300cc99b3b79392b4ede1fd5ecece89d9283dae35e2d9f8293e2c3f729481546",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
@@ -53,13 +53,13 @@
       {
         "document_id": "source:ryuki-api-request-authority",
         "document_version": 1,
-        "content_digest": "sha256:396bf12959f6752540b850f25d821d1fda30fb8e0f7fe43ab3c4eacb6fc78d19",
+        "content_digest": "sha256:b895b27682ead1802329589c6723f38cc48026ca40b9fdddaba3781ed69b789f",
         "artifact_locator": "sources/ryuki-api/src/request_authority.rs"
       },
       {
         "document_id": "source:ryuki-api-request-read-repository",
         "document_version": 1,
-        "content_digest": "sha256:e3670c8701ddade889d9f4444a6371f6909af5f47fae287d22361d10344c5b34",
+        "content_digest": "sha256:94cb56ddb8c24971c26ac8f0c0b4a22081a4cdf1936e785db6e887c07ce7ba1c",
         "artifact_locator": "sources/ryuki-api/src/repos/requests.rs"
       },
       {
@@ -101,13 +101,13 @@
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:c12d8d0730afd15a6befa6822c4de3fa44240e74bded43edc0e1525dbe045d39",
+        "content_digest": "sha256:fa8e92f611ec53ba83f22de49d522a9e7cfcbd0b084dd642f8a53b718593bf67",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {
         "document_id": "source:ryuki-engine-authorization-kernel",
         "document_version": 1,
-        "content_digest": "sha256:9954e8522125124118efda4ee87a98d9d31ebca0b1fd9b1338d9daf5df4c20b0",
+        "content_digest": "sha256:59d6708aef648a4c88ce50367d753a0d6d7d648935807483a926f1453daef83d",
         "artifact_locator": "sources/ryuki-engine/src/authorization.rs"
       }
     ]
@@ -133,6 +133,23 @@
         "development-fixture"
       ],
       "authorization_semantics": "instance",
+      "obligations": [
+        "audit"
+      ],
+      "risk_class": "ordinary",
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "action_id": "request.list",
+      "description": "Read the bounded request collection through a query permit.",
+      "resource_kind": "request",
+      "permitted_actor_kinds": [
+        "verified-human",
+        "service",
+        "development-fixture"
+      ],
+      "authorization_semantics": "query",
       "obligations": [
         "audit"
       ],
@@ -313,6 +330,19 @@
       "applicability_expression": "always"
     },
     {
+      "resolver_id": "resolver:request-query-v1",
+      "resolver_version": 1,
+      "resource_kind": "request",
+      "mode": "collection",
+      "canonical_id_source": "constant:request:collection",
+      "security_version_source": "maximum-authority-binding.version",
+      "state_digest_source": "maximum-authority-binding.digest",
+      "permit_kind": "QueryPermit",
+      "fail_closed": true,
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
       "resolver_id": "resolver:audit-log-query-v1",
       "resolver_version": 1,
       "resource_kind": "audit-log",
@@ -359,6 +389,20 @@
       "resolver_id": "resolver:request-instance-v1",
       "resolver_version": 1,
       "permit_kind": "AuthorizationPermit",
+      "permitted_actor_kinds": ["verified-human", "service", "development-fixture"],
+      "lifecycle": "active",
+      "applicability_expression": "always",
+      "source_file": "sources/ryuki-api/src/contracts.rs"
+    },
+    {
+      "mapping_id": "route:request-list-v1",
+      "method": "GET",
+      "path_template": "/api/requests",
+      "action_id": "request.list",
+      "resource_kind": "request",
+      "resolver_id": "resolver:request-query-v1",
+      "resolver_version": 1,
+      "permit_kind": "QueryPermit",
       "permitted_actor_kinds": ["verified-human", "service", "development-fixture"],
       "lifecycle": "active",
       "applicability_expression": "always",

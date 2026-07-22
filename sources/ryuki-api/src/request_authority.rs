@@ -936,6 +936,29 @@ impl RevalidatedRequestReadAuthority<'_> {
         }
     }
 
+    /// Return the exact audit projection for this revalidated authority. The
+    /// credential-free development fixture has no external session principal,
+    /// so the authority supplies its fixed internal fixture principal only
+    /// after the original session has passed [`Self::ensure_audit_session`].
+    pub(crate) fn audit_session(
+        &self,
+        session: &AuthSession,
+    ) -> Result<AuthSession, RequestAuthorityError> {
+        self.ensure_audit_session(session)?;
+        let mut attributed = session.clone();
+        match &self.authority.principal {
+            RequestReadPrincipal::DevelopmentFixture { principal_id, .. } => {
+                attributed.principal_id = Some(*principal_id);
+            }
+            #[cfg(test)]
+            RequestReadPrincipal::TestFixture { principal_id, .. } => {
+                attributed.principal_id = Some(*principal_id);
+            }
+            RequestReadPrincipal::Interactive(_) => {}
+        }
+        Ok(attributed)
+    }
+
     pub(crate) fn kernel_evidence(&self) -> RequestReadKernelEvidence {
         self.authority.kernel_evidence()
     }

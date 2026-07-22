@@ -656,7 +656,7 @@ pub fn routes() -> Router {
         .route("/api/requests/preflight-contract", get(requests_preflight))
         // ─── Request lifecycle endpoints (mock/dry-run) ───
         .route("/api/requests", post(requests_create))
-        .route("/api/requests", get(requests_list))
+        .route("/api/requests", get(requests_list_authorized))
         .route("/api/requests/{id}", get(requests_get))
         .route("/api/requests/{id}/validate", post(requests_validate))
         .route("/api/requests/{id}/plan", post(requests_plan))
@@ -3371,6 +3371,31 @@ pub(crate) struct LocalRequestReadLease {
     index: usize,
 }
 
+/// Opaque retained snapshot for an authorized local collection read. Only the
+/// request repository can exchange its private currentness capability for the
+/// rows protected by this lock.
+pub(crate) struct LocalRequestListLease {
+    store: tokio::sync::MutexGuard<'static, Vec<ryuki_engine::models::Request>>,
+}
+
+/// List-safe local projection. Collection reads never hand the repository a
+/// reference to the full request payload, plan, lifecycle evidence, approval
+/// route, or metadata. The retained lease constructs only fields needed for
+/// mandatory authorization predicates, supported filters/sorts, and output.
+pub(crate) struct LocalRequestListRow {
+    pub(crate) id: String,
+    pub(crate) request_type: String,
+    pub(crate) status: String,
+    pub(crate) name: String,
+    pub(crate) site: String,
+    pub(crate) environment: String,
+    pub(crate) stage: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) created_by: String,
+    pub(crate) owner: String,
+}
+
 /// Minimal authorization projection exposed before a request-read permit has
 /// passed its same-unit-of-work currentness check. Sensitive request payload,
 /// lifecycle evidence, and presentation fields are deliberately absent.
@@ -3389,6 +3414,12 @@ pub(crate) async fn lock_local_request_for_typed_read(
     let store = request_store().lock().await;
     let index = store.iter().position(|request| request.id == request_id)?;
     Some(LocalRequestReadLease { store, index })
+}
+
+pub(crate) async fn lock_local_requests_for_typed_list() -> LocalRequestListLease {
+    LocalRequestListLease {
+        store: request_store().lock().await,
+    }
 }
 
 impl LocalRequestReadLease {
@@ -3412,6 +3443,32 @@ impl LocalRequestReadLease {
         _permit: &crate::repos::requests::CurrentRequestReadPermit,
     ) -> Option<&ryuki_engine::models::Request> {
         self.store.get(self.index)
+    }
+}
+
+impl LocalRequestListLease {
+    pub(crate) fn authorized_rows(
+        &self,
+        _permit: &crate::repos::requests::CurrentRequestListPermit,
+    ) -> Vec<LocalRequestListRow> {
+        self.store
+            .iter()
+            .map(|request| LocalRequestListRow {
+                id: request.id.clone(),
+                request_type: request.request_type.to_string(),
+                status: request.status.as_str().to_string(),
+                // The local dry-run model historically uses requester as the
+                // request-list display name; preserve that compatibility seam.
+                name: request.requester.clone(),
+                site: request.site.clone(),
+                environment: request.environment.clone(),
+                stage: current_stage_name(request),
+                created_at: request.created_at.clone(),
+                updated_at: request.updated_at.clone(),
+                created_by: request.requester.clone(),
+                owner: request.owner.clone(),
+            })
+            .collect()
     }
 }
 
@@ -19158,17 +19215,29 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestReadAuthority
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts
+        if let Some(authority) = parts
             .extensions
             .get::<crate::request_authority::RequestReadAuthority>()
             .cloned()
-            .map(Self)
-            .ok_or_else(|| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "request-read authority is unavailable"})),
-                )
-            })
+        {
+            return Ok(Self(authority));
+        }
+        let derived_api_token = parts
+            .extensions
+            .get::<AuthSession>()
+            .is_some_and(|session| session.provider_mode == "api-token");
+        if derived_api_token {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "API tokens are not admitted for typed request reads"
+                })),
+            ));
+        }
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "request-read authority is unavailable"})),
+        ))
     }
 }
 
@@ -19217,13 +19286,7 @@ const MAX_REQUEST_LIST_OFFSET: usize = 10_000;
 /// Exact totals above this value are not useful for interactive pagination and
 /// turn a read into an attacker-selected full-table aggregate. Count at most one
 /// row beyond the supported offset window and mark that value as capped.
-const MAX_REQUEST_LIST_COUNT: i64 = MAX_REQUEST_LIST_OFFSET as i64 + 1;
-
-/// Optional aggregate metadata is a compatibility capability, not part of the
-/// ordinary page read. Give its database scan a much tighter wall-clock budget
-/// than the pool-wide timeout so a selective/unindexed filter cannot pin a
-/// connection while PostgreSQL searches for the capped number of matches.
-const REQUEST_LIST_COUNT_STATEMENT_TIMEOUT: &str = "250ms";
+const MAX_REQUEST_LIST_COUNT: i64 = crate::repos::requests::MAX_AUTHORIZED_REQUEST_COUNT;
 
 /// Snapshot totals remain enabled by default for compatibility, but their
 /// capped scan must not inherit the pool-wide 30-second statement budget.
@@ -19244,13 +19307,6 @@ fn bounded_snapshot_list_offset(offset: Option<i64>) -> Result<i64, &'static str
     } else {
         Ok(offset)
     }
-}
-
-fn bounded_request_count_sql(where_sql: &str) -> String {
-    format!(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM requests {where_sql} \
-         LIMIT {MAX_REQUEST_LIST_COUNT}) AS bounded_requests"
-    )
 }
 
 fn statement_timed_out(error: &sqlx::Error) -> bool {
@@ -20742,7 +20798,7 @@ async fn requests_create(
 /// Current lifecycle stage name for an in-memory request record: the first
 /// stage that is not completed, the last stage when all are completed, or
 /// "intake" when no stages exist (mirrors the requests.stage column default).
-fn current_stage_name(request: &ryuki_engine::models::Request) -> String {
+pub(crate) fn current_stage_name(request: &ryuki_engine::models::Request) -> String {
     request
         .stages
         .iter()
@@ -20893,37 +20949,6 @@ fn decode_request_list_cursor(
     })
 }
 
-fn request_list_cursor_predicate(
-    timestamp_position: usize,
-    id_position: usize,
-    direction: &str,
-) -> String {
-    let operator = if direction == "ASC" { ">" } else { "<" };
-    format!(
-        "(created_at, id) {operator} (${timestamp_position}::timestamptz, \
-         ${id_position}::uuid)"
-    )
-}
-
-fn local_request_is_after_cursor(
-    request: &ryuki_engine::models::Request,
-    cursor: &RequestListCursor,
-    direction: &str,
-) -> bool {
-    let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&request.created_at) else {
-        return false;
-    };
-    let order = created_at
-        .with_timezone(&chrono::Utc)
-        .cmp(&cursor.created_at)
-        .then_with(|| request.id.as_str().cmp(cursor.id.as_str()));
-    if direction == "ASC" {
-        order == std::cmp::Ordering::Greater
-    } else {
-        order == std::cmp::Ordering::Less
-    }
-}
-
 /// The persisted principal that owns a request. New rows carry `requester` as
 /// the authoritative identity; `created_by` is retained only as a compatibility
 /// fallback for legacy rows that predate the requester column.
@@ -20970,10 +20995,6 @@ fn request_owner_guard_or_404(
         Some(_) => Err(status_404(request_id)),
     }
 }
-
-/// Exact opaque requester binding used by both the page and count queries so
-/// pagination metadata cannot widen object visibility.
-const REQUEST_OWNER_SQL: &str = "requester_principal_id";
 
 /// Map a client `sort` value to an ALLOWLISTED column name. Never interpolate a
 /// raw client string into SQL — an unknown value falls back to `created_at`, so
@@ -21068,15 +21089,36 @@ fn request_list_headers(
 /// `X-Total-Count-Unavailable: true` is returned. `X-Total-Count-Capped: true`
 /// marks the navigation ceiling. `X-Next-Cursor` is emitted only when another
 /// deterministic `(created_at, id)` page exists.
+///
+/// Interactive session/federated credentials and the development fixture are
+/// admitted here. Derived `ryk_` API tokens remain rejected until the provider
+/// registry can prove their exact audience, action allowlist, and lifecycle.
+async fn requests_list_authorized(
+    AuthExtractor(session): AuthExtractor,
+    RequestReadAuthorityExtractor(authority): RequestReadAuthorityExtractor,
+    Query(params): Query<RequestListParams>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    requests_list_impl(session, authority, params).await
+}
+
+#[cfg(test)]
 async fn requests_list(
     AuthExtractor(session): AuthExtractor,
     Query(params): Query<RequestListParams>,
 ) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    let authority = crate::request_authority::RequestReadAuthority::test_fixture(&session);
+    requests_list_impl(session, authority, params).await
+}
+
+async fn requests_list_impl(
+    session: AuthSession,
+    authority: crate::request_authority::RequestReadAuthority,
+    params: RequestListParams,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let request_owner = request_read_owner(&session)?;
-    // Continuation cursors are bound to the admitted opaque principal. The
-    // deliberately credential-free dry-run administrator has no principal by
-    // design, so bind its non-authoritative demo cursor to a fixed mode key;
-    // request-only access can never reach this exception.
+    // The cursor remains a compatibility consistency token. Its decoded
+    // position and every normalized criterion are additionally sealed into the
+    // kernel-issued QueryPermit before either repository can execute.
     let session_principal = match session.principal_id {
         Some(principal_id) => principal_id.to_string(),
         None if request_owner.is_none()
@@ -21094,36 +21136,32 @@ async fn requests_list(
         }
         None => return Err(status_403()),
     };
-    // Blank filters are treated as "no filter".
-    let norm = |o: &Option<String>| {
-        o.as_deref()
+    let normalize = |value: &Option<String>| {
+        value
+            .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|value| !value.is_empty())
             .map(str::to_string)
     };
-    let f_status = norm(&params.status);
-    // #2: enforce the session's site/environment scopes. A scoped principal sees
-    // only its own scopes; omitting the filter narrows to its scope rather than
-    // listing every site's requests.
-    let (f_site, f_env) =
-        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
-    let f_type = norm(&params.request_type);
-    let f_creator = norm(&params.created_by);
-    let f_q = norm(&params.q);
+    let status = normalize(&params.status);
+    let (site, environment) = enforce_scope_filters(
+        &session,
+        normalize(&params.site),
+        normalize(&params.environment),
+    )?;
+    let request_type = normalize(&params.request_type);
+    let created_by = normalize(&params.created_by);
+    let q = normalize(&params.q);
     let include_total = params.include_total.unwrap_or(false);
     let limit = params.limit.unwrap_or(50).min(100);
-    let sort_col = request_sort_column(params.sort.as_deref());
-    let dir = request_sort_direction(params.direction.as_deref());
+    let sort_column = request_sort_column(params.sort.as_deref());
+    let direction = request_sort_direction(params.direction.as_deref());
     let cursor_raw = params
         .cursor
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    // Site/environment and object-owner authorization are resolved before any
-    // pagination work. Numeric offset is retained as a bounded compatibility
-    // mode; a continuation cursor uses constant-prefix keyset traversal and may
-    // not be combined with a non-zero offset.
     if cursor_raw.is_some() && !request_list_cursor_sort_supported(params.sort.as_deref()) {
         return Err(status_400(
             "request-list cursors support only the created_at sort",
@@ -21139,303 +21177,89 @@ async fn requests_list(
     let cursor_scope = request_list_cursor_scope(&[
         Some(session_principal.as_str()),
         request_owner.as_deref(),
-        f_status.as_deref(),
-        f_site.as_deref(),
-        f_env.as_deref(),
-        f_type.as_deref(),
-        f_creator.as_deref(),
-        f_q.as_deref(),
+        status.as_deref(),
+        site.as_deref(),
+        environment.as_deref(),
+        request_type.as_deref(),
+        created_by.as_deref(),
+        q.as_deref(),
     ]);
     let cursor = cursor_raw
-        .map(|raw| decode_request_list_cursor(raw, dir, &cursor_scope))
+        .map(|raw| decode_request_list_cursor(raw, direction, &cursor_scope))
         .transpose()
-        .map_err(status_400)?;
-
-    if let Some(pool) = get_db() {
-        // Escape LIKE metacharacters so `q` is a literal substring match, not a
-        // wildcard pattern. The bound param keeps it injection-safe; ESCAPE '\'
-        // makes the backslash the escape char. Order matters: escape '\' first.
-        let f_q_like = f_q.as_deref().map(|s| {
-            s.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
+        .map_err(status_400)?
+        .map(|cursor| crate::repos::requests::RequestListCursor {
+            created_at: cursor.created_at,
+            id: cursor.id,
         });
-        // Build the WHERE from ONLY the active filters, so the planner always sees
-        // a clean, sargable predicate (e.g. `site = $1 AND environment = $2`) and
-        // reliably uses idx_requests_site_env_created_at (migration 138). The old
-        // `($n IS NULL OR col = $n)` shape could fall back to a sequential scan
-        // under a GENERIC prepared plan (sqlx caches prepared statements),
-        // defeating that index even though a custom plan would have used it. Only
-        // allowlisted column names are ever formatted into the SQL; every value
-        // stays a BOUND parameter (`$n`), so this is injection-safe. After each
-        // push, `binds.len()` is that parameter's 1-based `$n` position.
-        let mut preds: Vec<String> = Vec::new();
-        let mut binds: Vec<&str> = Vec::new();
-        for (col, val) in [
-            ("status", &f_status),
-            ("site", &f_site),
-            ("environment", &f_env),
-            ("request_type", &f_type),
-            ("created_by_principal_id::text", &f_creator),
-        ] {
-            if let Some(v) = val {
-                binds.push(v.as_str());
-                preds.push(format!("{col} = ${}", binds.len()));
-            }
-        }
-        // Object-level authorization is an independent mandatory predicate for
-        // request-only principals. It is never replaced by the caller's optional
-        // `created_by` filter, so naming a foreign principal cannot widen access.
-        if let Some(owner) = request_owner.as_deref() {
-            binds.push(owner);
-            preds.push(format!("{REQUEST_OWNER_SQL} = ${}::uuid", binds.len()));
-        }
-        if let Some(v) = &f_q_like {
-            binds.push(v.as_str());
-            preds.push(format!(
-                "name ILIKE '%' || ${} || '%' ESCAPE '\\'",
-                binds.len()
-            ));
-        }
-        // Shared by the page SELECT and the COUNT so the two can never drift (a
-        // mismatched total would mislead pagination).
-        let where_sql = if preds.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", preds.join(" AND "))
-        };
 
-        let cursor_created_at = cursor.as_ref().map(|value| value.created_at.to_rfc3339());
-        let mut page_preds = preds.clone();
-        let mut page_binds = binds.clone();
-        if let Some(cursor) = &cursor {
-            // Database request ids are UUIDs. Validate before pool work rather
-            // than relying on a PostgreSQL cast failure from an opaque cursor.
-            Uuid::parse_str(&cursor.id).map_err(|_| status_400("invalid request-list cursor"))?;
-            page_binds.push(cursor_created_at.as_deref().unwrap_or_default());
-            let timestamp_position = page_binds.len();
-            page_binds.push(cursor.id.as_str());
-            page_preds.push(request_list_cursor_predicate(
-                timestamp_position,
-                page_binds.len(),
-                dir,
-            ));
-        }
-        let page_where_sql = if page_preds.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", page_preds.join(" AND "))
-        };
-
-        // Cursor mode never emits OFFSET. Both modes fetch one bounded probe row
-        // so `X-Next-Cursor` is emitted only when another page actually exists.
-        // The unique id tie-breaker prevents equal timestamps from duplicating or
-        // disappearing across pages.
-        let fetch_limit = if limit == 0 { 0 } else { limit + 1 };
-        let sql = if cursor.is_some() {
-            format!(
-                "SELECT {REQUEST_COLUMNS} FROM requests {page_where_sql} \
-                 ORDER BY {sort_col} {dir}, id {dir} LIMIT ${}",
-                page_binds.len() + 1,
-            )
-        } else {
-            format!(
-                "SELECT {REQUEST_COLUMNS} FROM requests {page_where_sql} \
-                 ORDER BY {sort_col} {dir}, id {dir} LIMIT ${} OFFSET ${}",
-                page_binds.len() + 1,
-                page_binds.len() + 2,
-            )
-        };
-        let mut list_q = sqlx::query_as::<_, DbRequestRow>(&sql);
-        for b in &page_binds {
-            list_q = list_q.bind(*b);
-        }
-        list_q = list_q.bind(fetch_limit as i64);
-        if cursor.is_none() {
-            list_q = list_q.bind(offset as i64);
-        }
-        let mut rows: Vec<DbRequestRow> = list_q.fetch_all(pool).await.unwrap_or_default();
-        let has_more = rows.len() > limit;
-        if has_more {
-            rows.truncate(limit);
-        }
-        let next_cursor = if has_more && request_list_cursor_sort_supported(params.sort.as_deref())
-        {
-            rows.last().and_then(|row| {
-                encode_request_list_cursor(row.created_at, &row.id.to_string(), dir, &cursor_scope)
-                    .ok()
-            })
-        } else {
-            None
-        };
-        let summaries: Vec<Value> = rows
-            .iter()
-            .map(|r| {
-                json!({
-                    "request_id": r.id.to_string(),
-                    "request_type": r.request_type,
-                    "status": r.status,
-                    "name": r.name,
-                    "site": r.site,
-                    "environment": r.environment,
-                    "stage": r.stage,
-                    "created_at": r.created_at.to_rfc3339()
-                })
-            })
-            .collect();
-        // The ordinary path deliberately skips COUNT entirely. Compatibility
-        // clients may opt in; even then, the aggregate stops at the supported
-        // 10,001-row navigation boundary and runs in a transaction-local 250ms
-        // statement budget. A timeout degrades only the optional metadata: the
-        // already-bounded page is returned with an explicit unavailable header.
-        let (total, total_unavailable) = if include_total {
-            let count_sql = bounded_request_count_sql(&where_sql);
-            let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-            for b in &binds {
-                count_q = count_q.bind(*b);
-            }
-            let mut count_tx = pool.begin().await.map_err(db_error)?;
-            if let Err(error) = sqlx::query("SELECT set_config('statement_timeout', $1, TRUE)")
-                .bind(REQUEST_LIST_COUNT_STATEMENT_TIMEOUT)
-                .execute(&mut *count_tx)
-                .await
-            {
-                count_tx.rollback().await.ok();
-                return Err(db_error(error));
-            }
-            match count_q.fetch_one(&mut *count_tx).await {
-                Ok(total) => {
-                    count_tx.commit().await.map_err(db_error)?;
-                    (Some(total), false)
-                }
-                Err(error) if statement_timed_out(&error) => {
-                    count_tx.rollback().await.ok();
-                    tracing::warn!(
-                        timeout = REQUEST_LIST_COUNT_STATEMENT_TIMEOUT,
-                        "optional request-list total exceeded its statement budget"
-                    );
-                    (None, true)
-                }
-                Err(error) => {
-                    count_tx.rollback().await.ok();
-                    return Err(db_error(error));
-                }
-            }
-        } else {
-            (None, false)
-        };
-        return Ok((
-            request_list_headers(total, next_cursor.as_deref(), total_unavailable),
-            Json(json!(summaries)),
-        ));
-    }
-
-    // No-DB (dry-run) path: apply the same filters in-memory. The in-memory
-    // record carries the requester as the display name.
-    let q_lower = f_q.as_deref().map(str::to_lowercase);
-    let store = request_store().lock().await;
-    let matches_request = |r: &ryuki_engine::models::Request| {
-        request_owner
-            .as_deref()
-            .is_none_or(|owner| request_is_owned_by(owner, Some(r.requester.as_str()), None))
-            && f_status.as_deref().is_none_or(|s| r.status.as_str() == s)
-            && f_site.as_deref().is_none_or(|s| r.site == s)
-            && f_env.as_deref().is_none_or(|s| r.environment == s)
-            && f_type
-                .as_deref()
-                .is_none_or(|s| r.request_type.to_string() == s)
-            && f_creator.as_deref().is_none_or(|s| r.requester == s)
-            && q_lower
-                .as_deref()
-                .is_none_or(|s| r.requester.to_lowercase().contains(s))
+    let sort = match sort_column {
+        "updated_at" => crate::repos::requests::RequestListSort::UpdatedAt,
+        "name" => crate::repos::requests::RequestListSort::Name,
+        "status" => crate::repos::requests::RequestListSort::Status,
+        "site" => crate::repos::requests::RequestListSort::Site,
+        "request_type" => crate::repos::requests::RequestListSort::RequestType,
+        _ => crate::repos::requests::RequestListSort::CreatedAt,
     };
-    // Successful local creates are inserted in `(created_at, id)` order and
-    // lifecycle transitions never mutate those keys. Scan the bounded store
-    // once, retain only the requested page plus one overflow probe, and count
-    // matches without allocating or sorting the complete match set.
-    let mut total = 0i64;
-    let page_capacity = if limit == 0 { 0 } else { limit + 1 };
-    let mut eligible = 0usize;
-    let mut page: Vec<ryuki_engine::models::Request> = Vec::with_capacity(page_capacity);
-    let mut visit = |request: &ryuki_engine::models::Request| -> bool {
-        if !matches_request(request) {
-            return false;
-        }
-        if include_total {
-            total = total.saturating_add(1);
-        }
-        if cursor
-            .as_ref()
-            .is_some_and(|cursor| !local_request_is_after_cursor(request, cursor, dir))
-        {
-            return false;
-        }
-        let match_index = eligible;
-        if match_index >= offset && page.len() < page_capacity {
-            page.push(request.clone());
-        }
-        eligible = eligible.saturating_add(1);
-        !include_total && page.len() >= page_capacity
+    let direction = if direction == "ASC" {
+        crate::repos::requests::RequestListDirection::Asc
+    } else {
+        crate::repos::requests::RequestListDirection::Desc
     };
-    if include_total || page_capacity > 0 {
-        if dir == "DESC" {
-            for request in store.iter().rev() {
-                if visit(request) {
-                    break;
-                }
-            }
-        } else {
-            for request in store.iter() {
-                if visit(request) {
-                    break;
-                }
-            }
-        }
-    }
-    drop(store);
-    let has_more = page.len() > limit;
-    if has_more {
-        page.truncate(limit);
-    }
-    let next_cursor = if has_more && request_list_cursor_sort_supported(params.sort.as_deref()) {
-        page.last().and_then(|request| {
-            chrono::DateTime::parse_from_rfc3339(&request.created_at)
-                .ok()
-                .and_then(|created_at| {
-                    encode_request_list_cursor(
-                        created_at.with_timezone(&chrono::Utc),
-                        &request.id,
-                        dir,
-                        &cursor_scope,
-                    )
-                    .ok()
-                })
+    let query = crate::repos::requests::RequestListRequest::new(
+        status,
+        site,
+        environment,
+        request_type,
+        created_by,
+        q,
+        sort,
+        direction,
+        include_total,
+        cursor,
+        limit,
+        offset,
+    )
+    .map_err(map_request_list_error)?;
+    let grant = crate::repos::requests::authorize_list(&session, &authority, query)
+        .await
+        .map_err(map_request_list_error)?;
+    let page = crate::repos::requests::list(grant)
+        .await
+        .map_err(map_request_list_error)?;
+
+    let next_cursor = if page.has_more && request_list_cursor_sort_supported(params.sort.as_deref())
+    {
+        page.items.last().and_then(|item| {
+            encode_request_list_cursor(
+                item.created_at,
+                &item.request_id,
+                direction.as_sql(),
+                &cursor_scope,
+            )
+            .ok()
         })
     } else {
         None
     };
-    // Transform only the bounded page after releasing the shared store lock.
-    let summaries: Vec<Value> = page
-        .iter()
-        .map(|r| {
+    let summaries = page
+        .items
+        .into_iter()
+        .map(|item| {
             json!({
-                "request_id": r.id,
-                "request_type": r.request_type.to_string(),
-                "status": r.status.as_str(),
-                "name": r.requester,
-                "site": r.site,
-                "environment": r.environment,
-                "stage": current_stage_name(r),
-                "created_at": r.created_at
+                "request_id": item.request_id,
+                "request_type": item.request_type,
+                "status": item.status,
+                "name": item.name,
+                "site": item.site,
+                "environment": item.environment,
+                "stage": item.stage,
+                "created_at": item.created_at.to_rfc3339(),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
     Ok((
-        request_list_headers(
-            include_total.then_some(total),
-            next_cursor.as_deref(),
-            false,
-        ),
+        request_list_headers(page.total, next_cursor.as_deref(), page.total_unavailable),
         Json(json!(summaries)),
     ))
 }
@@ -22089,6 +21913,7 @@ fn map_request_read_error(
             Json(json!({"error": "request-read credential is stale"})),
         ),
         RequestReadError::Stale => transition_conflict_409(request_id),
+        RequestReadError::InvalidQuery(message) => status_400(message),
         RequestReadError::AuthorityUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -22100,6 +21925,43 @@ fn map_request_read_error(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "request authorization failed"})),
+            )
+        }
+        RequestReadError::Database(error) => db_error(error),
+    }
+}
+
+fn map_request_list_error(
+    error: crate::repos::requests::RequestReadError,
+) -> (StatusCode, Json<Value>) {
+    use crate::repos::requests::RequestReadError;
+
+    match error {
+        RequestReadError::InvalidQuery(message) => status_400(message),
+        RequestReadError::Forbidden => (StatusCode::FORBIDDEN, Json(json!({"error": "Forbidden"}))),
+        RequestReadError::CredentialStale => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "request-list credential is stale"})),
+        ),
+        RequestReadError::AuthorityUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "typed request-list authorization is not admitted for this deployment"
+            })),
+        ),
+        RequestReadError::Stale => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "request-list authority changed during the read"})),
+        ),
+        RequestReadError::NotFound => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "request-list authorization failed"})),
+        ),
+        RequestReadError::Authorization(error) => {
+            tracing::error!(%error, "request-list authorization integration failed closed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "request-list authorization failed"})),
             )
         }
         RequestReadError::Database(error) => db_error(error),
@@ -49166,6 +49028,64 @@ mod router_tests {
         (status, json)
     }
 
+    async fn request_list_response(
+        session: AuthSession,
+        authority: Option<crate::request_authority::RequestReadAuthority>,
+    ) -> (StatusCode, Value) {
+        let app = routes();
+        let mut request = Request::builder()
+            .uri("/api/requests?limit=1")
+            .body(Body::empty())
+            .expect("request builds");
+        request.extensions_mut().insert(session);
+        if let Some(authority) = authority {
+            request.extensions_mut().insert(authority);
+        }
+        let response = app.oneshot(request).await.expect("router responds");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn request_list_route_requires_the_typed_authority_extension() {
+        let session = AuthSession::static_dry_run();
+        let (status, body) = request_list_response(session, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "request-read authority is unavailable");
+    }
+
+    #[tokio::test]
+    async fn request_list_route_explicitly_rejects_unadmitted_api_tokens() {
+        let mut session = AuthSession::static_dry_run();
+        session.token_valid = true;
+        session.actor_class = ryuki_engine::auth::ActorClass::Workload;
+        session.provider_mode = "api-token".into();
+        session.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.into()];
+        session.principal_id = Some(test_principal_id("request-list-api-token"));
+        let (status, body) = request_list_response(session, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["error"],
+            "API tokens are not admitted for typed request reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_list_route_accepts_an_admitted_typed_authority() {
+        let session = AuthSession::static_dry_run();
+        let authority = crate::request_authority::RequestReadAuthority::test_fixture(&session);
+        let (status, body) = request_list_response(session, Some(authority)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.is_array(),
+            "request-list response must remain a bare array"
+        );
+    }
+
     #[tokio::test]
     async fn router_serves_provider_neutral_secret_reference_kinds() {
         let (status, body) = get_json("/api/catalog/secret-references").await;
@@ -51964,6 +51884,23 @@ mod unit_tests {
     }
 
     #[tokio::test]
+    async fn requests_list_maps_malformed_filters_to_bad_request() {
+        let error = requests_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RequestListParams {
+                q: Some("x".repeat(4097)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("overlong query filter must be rejected before repository work");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid criterion")));
+    }
+
+    #[tokio::test]
     async fn requests_list_filters_in_memory_by_status_site_and_q() {
         let mut a = test_request("rl-filter-a");
         a.site = "DEFRA".into();
@@ -53348,12 +53285,6 @@ mod unit_tests {
         assert!(bounded_request_list_offset(MAX_REQUEST_LIST_OFFSET + 1).is_err());
         assert!(bounded_request_list_offset(usize::MAX).is_err());
 
-        let sql = bounded_request_count_sql("WHERE site = $1");
-        assert!(sql.contains("WHERE site = $1"));
-        assert!(sql.contains("LIMIT 10001"));
-        assert!(!sql.contains("SELECT COUNT(*) FROM requests"));
-        assert_eq!(REQUEST_LIST_COUNT_STATEMENT_TIMEOUT, "250ms");
-
         let exact = request_total_count_headers(MAX_REQUEST_LIST_COUNT - 1);
         assert!(exact.get("x-total-count-capped").is_none());
         let capped = request_total_count_headers(MAX_REQUEST_LIST_COUNT);
@@ -53413,14 +53344,6 @@ mod unit_tests {
             &scope,
         )
         .is_err());
-        assert_eq!(
-            request_list_cursor_predicate(7, 8, "DESC"),
-            "(created_at, id) < ($7::timestamptz, $8::uuid)"
-        );
-        assert_eq!(
-            request_list_cursor_predicate(7, 8, "ASC"),
-            "(created_at, id) > ($7::timestamptz, $8::uuid)"
-        );
         let headers = request_list_headers(Some(3), Some(&encoded), false);
         assert_eq!(
             headers
@@ -53486,17 +53409,6 @@ mod unit_tests {
                 .collect::<Vec<_>>(),
             vec!["local-keyset-a", "local-keyset-b", "local-keyset-c"]
         );
-
-        let cursor = RequestListCursor {
-            created_at: chrono::DateTime::parse_from_rfc3339(created_at)
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-            id: b.id.clone(),
-        };
-        assert!(local_request_is_after_cursor(&c, &cursor, "ASC"));
-        assert!(!local_request_is_after_cursor(&a, &cursor, "ASC"));
-        assert!(local_request_is_after_cursor(&a, &cursor, "DESC"));
-        assert!(!local_request_is_after_cursor(&c, &cursor, "DESC"));
     }
 
     #[tokio::test]
@@ -56489,11 +56401,10 @@ mod db_lifecycle_tests {
         cleanup_request(pool, id).await;
     }
 
-    /// C015: the database page/count predicates and by-id handler enforce the
-    /// same owner boundary as the no-database path. The current requester field
-    /// is authoritative, legacy created_by remains readable only as a fallback,
-    /// a caller-supplied foreign created_by filter cannot widen the result, and
-    /// audit-capable readers retain the intended cross-owner operational view.
+    /// C015: database list/detail reads consume only exact opaque owner
+    /// bindings. Legacy subject-labelled rows are quarantined even from broad
+    /// readers, a creator filter cannot replace the current-owner predicate,
+    /// and audit-capable readers retain cross-owner visibility for exact rows.
     #[tokio::test]
     async fn request_database_reads_are_limited_to_owner_or_auditor() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -56504,41 +56415,57 @@ mod db_lifecycle_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let alice = format!("owner-alice-{suffix}");
         let bob = format!("owner-bob-{suffix}");
+        let auditor_subject = format!("owner-auditor-{suffix}");
+        let requester_roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        let auditor_roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
+        let (_, alice_binding) =
+            seed_test_principal_binding(pool, "local", &alice, &requester_roles).await;
+        let (_, bob_binding) =
+            seed_test_principal_binding(pool, "local", &bob, &requester_roles).await;
+        let (_, auditor_binding) =
+            seed_test_principal_binding(pool, "local", &auditor_subject, &auditor_roles).await;
+        let alice_id = alice_binding.principal_id.into_uuid();
+        let bob_id = bob_binding.principal_id.into_uuid();
         let own_id = Uuid::new_v4();
         let legacy_id = Uuid::new_v4();
         let foreign_id = Uuid::new_v4();
 
-        for (id, created_by, requester, name) in [
-            (
-                own_id,
-                "legacy-other",
-                Some(alice.as_str()),
-                "owner-current",
-            ),
-            (legacy_id, alice.as_str(), None, "owner-legacy"),
-            (
-                foreign_id,
-                alice.as_str(),
-                Some(bob.as_str()),
-                "owner-foreign",
-            ),
+        for (id, created_by, requester, owner, name) in [
+            (own_id, alice_id, alice_id, alice_id, "owner-current"),
+            (foreign_id, alice_id, bob_id, bob_id, "owner-foreign"),
         ] {
             sqlx::query(
                 "INSERT INTO requests (id, request_type, status, stage, site, environment, \
-                 name, cpu, memory_gb, created_by, requester) \
+                 name, cpu, memory_gb, principal_binding_state, created_by_principal_id, \
+                 requester_principal_id, owner_principal_id) \
                  VALUES ($1, 'server-deployment', 'draft', 'request', 'DEFRA', \
-                 'production', $2, 2, 4, $3, $4)",
+                 'production', $2, 2, 4, 'exact-v1', $3, $4, $5)",
             )
             .bind(id)
             .bind(name)
             .bind(created_by)
             .bind(requester)
+            .bind(owner)
             .execute(pool)
             .await
             .expect("seed owner-bound request");
         }
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, \
+             name, cpu, memory_gb, legacy_created_by_label, legacy_requester_label, \
+             legacy_owner_label) \
+             VALUES ($1, 'server-deployment', 'draft', 'request', 'DEFRA', 'production', \
+                     'owner-legacy', 2, 4, $2, $2, $2)",
+        )
+        .bind(legacy_id)
+        .bind(&alice)
+        .execute(pool)
+        .await
+        .expect("seed quarantined legacy request");
 
-        let requester = request_read_session(&alice, ryuki_engine::auth::APP_ROLE_REQUESTER);
+        let mut requester = request_read_session(&alice, ryuki_engine::auth::APP_ROLE_REQUESTER);
+        requester.principal_id = Some(alice_binding.principal_id);
+        requester.display_user_id = alice_binding.principal_id.to_string();
         let (visible_headers, Json(visible)) = requests_list(
             AuthExtractor(requester.clone()),
             Query(RequestListParams {
@@ -56550,12 +56477,12 @@ mod db_lifecycle_tests {
             }),
         )
         .await
-        .expect("request owner may list its current and legacy rows");
+        .expect("request owner may list its exact current-owner row");
         assert_eq!(
             visible_headers
                 .get("x-total-count")
                 .and_then(|value| value.to_str().ok()),
-            Some("2")
+            Some("1")
         );
         let visible_ids: std::collections::HashSet<&str> = visible
             .as_array()
@@ -56564,7 +56491,7 @@ mod db_lifecycle_tests {
             .filter_map(|item| item["request_id"].as_str())
             .collect();
         assert!(visible_ids.contains(own_id.to_string().as_str()));
-        assert!(visible_ids.contains(legacy_id.to_string().as_str()));
+        assert!(!visible_ids.contains(legacy_id.to_string().as_str()));
         assert!(!visible_ids.contains(foreign_id.to_string().as_str()));
 
         let (filtered_headers, Json(filtered)) = requests_list(
@@ -56572,7 +56499,7 @@ mod db_lifecycle_tests {
             Query(RequestListParams {
                 site: Some("DEFRA".into()),
                 environment: Some("production".into()),
-                created_by: Some(alice.clone()),
+                created_by: Some(alice_binding.principal_id.to_string()),
                 limit: Some(100),
                 include_total: Some(true),
                 ..Default::default()
@@ -56592,7 +56519,7 @@ mod db_lifecycle_tests {
             .iter()
             .filter_map(|item| item["request_id"].as_str())
             .collect();
-        assert!(filtered_ids.contains(legacy_id.to_string().as_str()));
+        assert!(filtered_ids.contains(own_id.to_string().as_str()));
         assert!(
             !filtered_ids.contains(foreign_id.to_string().as_str()),
             "caller filters must not replace the mandatory owner predicate"
@@ -56602,32 +56529,35 @@ mod db_lifecycle_tests {
             requests_get_for_test(AuthExtractor(requester.clone()), Path(own_id.to_string()))
                 .await
                 .is_ok(),
-            "the current requester may read its own request"
+            "the exact current owner may read its own request"
         );
-        assert!(
-            requests_get_for_test(
-                AuthExtractor(requester.clone()),
-                Path(legacy_id.to_string())
-            )
-            .await
-            .is_ok(),
-            "created_by remains the fallback for a legacy row"
-        );
+        let legacy = requests_get_for_test(
+            AuthExtractor(requester.clone()),
+            Path(legacy_id.to_string()),
+        )
+        .await
+        .expect_err("legacy subject-labelled ownership must remain quarantined");
+        assert_eq!(legacy.0, StatusCode::NOT_FOUND);
         let foreign = requests_get_for_test(AuthExtractor(requester), Path(foreign_id.to_string()))
             .await
             .expect_err("a foreign request must be hidden from a request-only principal");
         assert_eq!(foreign.0, StatusCode::NOT_FOUND);
 
-        let auditor = request_read_session(
-            &format!("owner-auditor-{suffix}"),
-            ryuki_engine::auth::APP_ROLE_AUDITOR,
-        );
+        let mut auditor =
+            request_read_session(&auditor_subject, ryuki_engine::auth::APP_ROLE_AUDITOR);
+        auditor.principal_id = Some(auditor_binding.principal_id);
+        auditor.display_user_id = auditor_binding.principal_id.to_string();
         assert!(
-            requests_get_for_test(AuthExtractor(auditor), Path(foreign_id.to_string()))
+            requests_get_for_test(AuthExtractor(auditor.clone()), Path(foreign_id.to_string()))
                 .await
                 .is_ok(),
-            "an auditor retains cross-owner detail visibility"
+            "an auditor retains cross-owner visibility for exact rows"
         );
+        let auditor_legacy =
+            requests_get_for_test(AuthExtractor(auditor), Path(legacy_id.to_string()))
+                .await
+                .expect_err("broad readers must not recover quarantined legacy ownership");
+        assert_eq!(auditor_legacy.0, StatusCode::NOT_FOUND);
 
         for id in [own_id, legacy_id, foreign_id] {
             cleanup_request(pool, id).await;

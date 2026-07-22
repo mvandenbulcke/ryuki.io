@@ -3,7 +3,7 @@
   "schema_version": "1.0.0",
   "contract_kind": "deployment-security-profile",
   "document_id": "deployment-security-profile:repository-implementation-v1",
-  "document_version": 1,
+  "document_version": 2,
   "lifecycle": {
     "state": "implementation_only",
     "effective_at": "2026-07-16T00:00:00Z"
@@ -14,7 +14,7 @@
     "deployment_ids": ["deployment:repository-conformance-fixture"],
     "enabled_feature_ids": ["repository-conformance", "static-dry-run"]
   },
-  "deployment_profile_version": 1,
+  "deployment_profile_version": 2,
   "deployment_id": "deployment:repository-conformance-fixture",
   "security_profile": "test",
   "platform_configuration_version": 1,
@@ -57,8 +57,8 @@
   "action_resource_registry_ref": {
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
-    "document_version": 1,
-    "content_digest": "sha256:5f0964a8f3799ae3869a75f90f31b215c33b296b1a8e371a97057991f92de64b",
+    "document_version": 2,
+    "content_digest": "sha256:1a28b9d7108dbff061aacf70cbff2863920b3429638668e7acd84568c1ccb8be",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {

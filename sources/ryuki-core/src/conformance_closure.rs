@@ -6849,7 +6849,13 @@ pub mod tests {
             "/policy_version",
         ] {
             let mut changed = profile.clone();
-            *changed.pointer_mut(pointer).unwrap() = json!(2);
+            let next = changed
+                .pointer(pointer)
+                .and_then(Value::as_u64)
+                .expect("profile version is an unsigned integer")
+                .checked_add(1)
+                .expect("fixture version can advance");
+            *changed.pointer_mut(pointer).unwrap() = json!(next);
             assert_ne!(
                 baseline,
                 deployment_profile_conformance_binding_digest(&changed).unwrap(),
