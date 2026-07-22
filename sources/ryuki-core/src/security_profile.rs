@@ -816,9 +816,11 @@ pub struct AuthenticatorRuntimePathProjection {
     pub verifier: AuthenticatorVerifierRuntimeProjection,
     pub credential_profile: AuthenticatorCredentialProfileRuntimeProjection,
     /// Value-free digest of the retained cache-allocation inventory, whose
-    /// preimage binds provider/configuration, issuer, token profile, verifier,
-    /// and every discovery/JWKS/introspection/nonce/replay/key cache owned by
-    /// this path. Each path must have a distinct partition.
+    /// preimage binds provider identity/configuration version, independent
+    /// provider-policy Q, issuer, token profile, verifier, and every
+    /// discovery/JWKS/introspection/nonce/replay/key cache owned by this path.
+    /// P stays at R's top level to avoid a D/P fixed-point cycle. Each path must
+    /// have a distinct partition.
     pub cache_partition_binding_digest: String,
     pub protocol_binding_digest: String,
     pub retained_consumer_ids: Vec<String>,
@@ -836,14 +838,18 @@ pub enum AuthenticatorRuntimePathRole {
 }
 
 /// Identity leaves shared by the cache-partition and carrier-protocol
-/// preimages. Values are non-secret and bind one exact provider configuration,
-/// verifier allocation, and credential path.
+/// preimages. Values are non-secret and bind one exact provider-policy Q,
+/// configuration version, verifier allocation, and credential path. P is not
+/// repeated here because P includes D's content reference while D embeds these
+/// cache/protocol digests; feeding P back into either preimage would create a
+/// D/P fixed-point cycle. R binds P and Q independently at the top level.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthenticatorRuntimePathIdentityProjection {
     pub provider_id: String,
     pub provider_configuration_version: u64,
-    pub provider_configuration_payload_digest: String,
+    /// Q: provider policy after excluding only its top-level D reference.
+    pub provider_policy_binding_digest: String,
     pub path_role: AuthenticatorRuntimePathRole,
     pub path_id: String,
     pub path_version: u64,
@@ -1098,8 +1104,7 @@ pub fn validate_authenticator_runtime_path_preimages(
     if cache_partition.path_identity != protocol_binding.path_identity
         || identity.provider_id != runtime_binding.provider.provider_id
         || identity.provider_configuration_version != runtime_binding.provider.configuration_version
-        || identity.provider_configuration_payload_digest
-            != runtime_binding.provider.configuration_payload_digest
+        || identity.provider_policy_binding_digest != runtime_binding.provider_policy_binding_digest
         || identity.path_role != expected_role
         || identity.path_version != path.path_version
         || identity.verifier_id != path.verifier.verifier_id
@@ -1766,7 +1771,7 @@ fn validate_authenticator_runtime_path_identity_projection(
     identity: &AuthenticatorRuntimePathIdentityProjection,
 ) -> Result<(), RuntimeGuardDigestError> {
     let binding_digests = [
-        identity.provider_configuration_payload_digest.as_str(),
+        identity.provider_policy_binding_digest.as_str(),
         identity.issuer_binding_digest.as_str(),
         identity.audience_set_binding_digest.as_str(),
         identity.key_source_binding_digest.as_str(),
@@ -1790,7 +1795,7 @@ fn validate_authenticator_runtime_path_identity_projection(
 
     if !valid_canonical_scoped_id(&identity.provider_id, "provider:")
         || identity.provider_configuration_version == 0
-        || !valid_sha256_digest(&identity.provider_configuration_payload_digest)
+        || !valid_sha256_digest(&identity.provider_policy_binding_digest)
         || !valid_canonical_scoped_id(&identity.path_id, "authenticator-path:")
         || identity.path_version == 0
         || !valid_canonical_scoped_id(&identity.verifier_id, "authenticator-verifier:")
@@ -1814,7 +1819,7 @@ fn reject_authenticator_path_identity_digest_collision(
     identity: &AuthenticatorRuntimePathIdentityProjection,
 ) -> Result<(), RuntimeGuardDigestError> {
     if [
-        identity.provider_configuration_payload_digest.as_str(),
+        identity.provider_policy_binding_digest.as_str(),
         identity.issuer_binding_digest.as_str(),
         identity.audience_set_binding_digest.as_str(),
         identity.key_source_binding_digest.as_str(),
@@ -1986,7 +1991,7 @@ fn validate_authenticator_protocol_binding_projection(
     let mut authority_digests = vec![
         protocol
             .path_identity
-            .provider_configuration_payload_digest
+            .provider_policy_binding_digest
             .as_str(),
         protocol.path_identity.issuer_binding_digest.as_str(),
         protocol.path_identity.audience_set_binding_digest.as_str(),
@@ -3867,7 +3872,7 @@ mod tests {
         AuthenticatorRuntimePathIdentityProjection {
             provider_id: "provider:fixture-oidc".into(),
             provider_configuration_version: 7,
-            provider_configuration_payload_digest: fixture_digest('1'),
+            provider_policy_binding_digest: fixture_digest('1'),
             path_role: role,
             path_id: format!("authenticator-path:{path}"),
             path_version: 3,
@@ -4025,10 +4030,7 @@ mod tests {
         let identity = AuthenticatorRuntimePathIdentityProjection {
             provider_id: binding.provider.provider_id.clone(),
             provider_configuration_version: binding.provider.configuration_version,
-            provider_configuration_payload_digest: binding
-                .provider
-                .configuration_payload_digest
-                .clone(),
+            provider_policy_binding_digest: binding.provider_policy_binding_digest.clone(),
             path_role: role,
             path_id: path.path_id.clone(),
             path_version: path.path_version,
@@ -4048,6 +4050,9 @@ mod tests {
         protocol.carrier = path.credential_profile.carrier;
         protocol.proof_binding = path.credential_profile.proof_binding;
         protocol.replay = path.credential_profile.replay.clone();
+        if let Some(exchange) = protocol.browser_exchange_authority.as_mut() {
+            exchange.token_endpoint_binding_digest = fixture_digest('4');
+        }
         if let Some(session) = protocol.derived_session_authority.as_mut() {
             session.credential_key_identity_digest = fixture_digest('f');
             session.cookie_policy_binding_digest = fixture_digest('6');
@@ -5059,7 +5064,7 @@ mod tests {
                     "path_identity": {
                         "provider_id": "provider:fixture-oidc",
                         "provider_configuration_version": 7,
-                        "provider_configuration_payload_digest": fixture_digest('1'),
+                        "provider_policy_binding_digest": fixture_digest('1'),
                         "path_role": "direct-bearer",
                         "path_id": "authenticator-path:api-bearer",
                         "path_version": 3,
@@ -5084,7 +5089,7 @@ mod tests {
         let digest = authenticator_cache_partition_binding_digest(&cache).unwrap();
         assert!(
             ![
-                &cache.path_identity.provider_configuration_payload_digest,
+                &cache.path_identity.provider_policy_binding_digest,
                 &cache.path_identity.issuer_binding_digest,
                 &cache.path_identity.audience_set_binding_digest,
                 &cache.path_identity.key_source_binding_digest,
@@ -5105,7 +5110,7 @@ mod tests {
                     "path_identity": {
                         "provider_id": "provider:fixture-oidc",
                         "provider_configuration_version": 7,
-                        "provider_configuration_payload_digest": fixture_digest('1'),
+                        "provider_policy_binding_digest": fixture_digest('1'),
                         "path_role": "browser-derived-session",
                         "path_id": "authenticator-path:browser-sso",
                         "path_version": 3,
@@ -5193,7 +5198,7 @@ mod tests {
         let session = protocol.derived_session_authority.as_ref().unwrap();
         assert!(
             ![
-                &protocol.path_identity.provider_configuration_payload_digest,
+                &protocol.path_identity.provider_policy_binding_digest,
                 &protocol.path_identity.issuer_binding_digest,
                 &protocol.path_identity.audience_set_binding_digest,
                 &protocol.path_identity.key_source_binding_digest,
@@ -5245,11 +5250,9 @@ mod tests {
             }
         );
         assert_cache_leaf_bound!(
-            "provider_configuration_payload_digest",
+            "provider_policy_binding_digest",
             |candidate: &mut AuthenticatorCachePartitionProjection| {
-                candidate
-                    .path_identity
-                    .provider_configuration_payload_digest = fixture_digest('f');
+                candidate.path_identity.provider_policy_binding_digest = fixture_digest('f');
             }
         );
         assert_cache_leaf_bound!(
@@ -5354,11 +5357,9 @@ mod tests {
             }
         );
         assert_protocol_leaf_bound!(
-            "provider_configuration_payload_digest",
+            "provider_policy_binding_digest",
             |candidate: &mut AuthenticatorProtocolBindingProjection| {
-                candidate
-                    .path_identity
-                    .provider_configuration_payload_digest = fixture_digest('f');
+                candidate.path_identity.provider_policy_binding_digest = fixture_digest('f');
             }
         );
         assert_protocol_leaf_bound!(
@@ -5659,6 +5660,27 @@ mod tests {
                 "{role:?} provider substitution must fail reconciliation"
             );
         }
+
+        let mut binding = authenticator_runtime_binding(
+            "provider:fixture-oidc",
+            ProductionAuthenticatorKind::Oidc,
+        );
+        let (mut cache, mut protocol) = authenticator_runtime_path_preimages(
+            &binding,
+            0,
+            AuthenticatorRuntimePathRole::DirectBearer,
+        );
+        let forbidden_p = binding.provider.configuration_payload_digest.clone();
+        cache.path_identity.provider_policy_binding_digest = forbidden_p.clone();
+        protocol.path_identity.provider_policy_binding_digest = forbidden_p;
+        binding.credential_paths[0].cache_partition_binding_digest =
+            authenticator_cache_partition_binding_digest(&cache).unwrap();
+        binding.credential_paths[0].protocol_binding_digest =
+            authenticator_protocol_binding_digest(&protocol).unwrap();
+        assert!(
+            validate_authenticator_runtime_path_preimages(&binding, &cache, &protocol).is_err(),
+            "P must never alias or fall back to Q in a path preimage"
+        );
     }
 
     #[test]
@@ -5673,10 +5695,8 @@ mod tests {
         candidate.path_identity.provider_configuration_version = 0;
         malformed_caches.push(("provider version", candidate));
         let mut candidate = direct_cache.clone();
-        candidate
-            .path_identity
-            .provider_configuration_payload_digest = "sha256:invalid".into();
-        malformed_caches.push(("provider digest", candidate));
+        candidate.path_identity.provider_policy_binding_digest = "sha256:invalid".into();
+        malformed_caches.push(("provider-policy digest", candidate));
         let mut candidate = direct_cache.clone();
         candidate.path_identity.issuer_binding_digest =
             candidate.path_identity.audience_set_binding_digest.clone();
@@ -5971,6 +5991,17 @@ mod tests {
             .insert("fallback_partition".into(), json!(true));
         assert!(
             serde_json::from_value::<AuthenticatorCachePartitionProjection>(unknown_cache).is_err()
+        );
+        let mut legacy_p_alias = serde_json::to_value(&direct_cache).unwrap();
+        let legacy_identity = legacy_p_alias["path_identity"].as_object_mut().unwrap();
+        let q = legacy_identity
+            .remove("provider_policy_binding_digest")
+            .unwrap();
+        legacy_identity.insert("provider_configuration_payload_digest".into(), q);
+        assert!(
+            serde_json::from_value::<AuthenticatorCachePartitionProjection>(legacy_p_alias)
+                .is_err(),
+            "the cyclic P field name must not deserialize as a Q alias"
         );
         let mut unknown_protocol = serde_json::to_value(browser).unwrap();
         unknown_protocol
