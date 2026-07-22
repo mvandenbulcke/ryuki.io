@@ -28,6 +28,8 @@ pub const AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-cache-partition-v1";
 pub const AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-protocol-binding-v1";
+pub const AUTHENTICATOR_BROWSER_STATE_AUTHORITY_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-browser-state-authority-binding-v1";
 pub const AUTHENTICATOR_BROWSER_STATE_RELATION_V3: &str = "oidc_login_states_v3";
 pub const AUTHENTICATOR_BROWSER_STATE_CONTRACT_SETTING: &str = "ryuki.oidc_login_state_contract";
 pub const AUTHENTICATOR_BROWSER_STATE_CONTRACT_VERSION: u64 = 3;
@@ -986,6 +988,12 @@ struct AuthenticatorCachePartitionBindingDigestProjection<'a> {
 }
 
 #[derive(Serialize)]
+struct AuthenticatorBrowserStateAuthorityBindingDigestProjection<'a> {
+    digest_contract: &'static str,
+    browser_state_authority: &'a AuthenticatorBrowserStateAuthorityProjection,
+}
+
+#[derive(Serialize)]
 struct AuthenticatorProtocolBindingDigestProjection<'a> {
     digest_contract: &'static str,
     protocol_binding: &'a AuthenticatorProtocolBindingProjection,
@@ -1011,6 +1019,38 @@ pub fn authenticator_cache_partition_binding_digest(
         cache_partition,
     )?)?;
     reject_authenticator_path_identity_digest_collision(&digest, &cache_partition.path_identity)?;
+    Ok(digest)
+}
+
+/// Encode the exact validated v3 browser-state authority using
+/// `ryuki-canonical-json-v1`.
+pub fn authenticator_browser_state_authority_binding_canonical_bytes(
+    authority: &AuthenticatorBrowserStateAuthorityProjection,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    if !validate_authenticator_browser_state_authority_projection(authority) {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator browser-state authority binding",
+        ));
+    }
+    canonical_projection_bytes(AuthenticatorBrowserStateAuthorityBindingDigestProjection {
+        digest_contract: AUTHENTICATOR_BROWSER_STATE_AUTHORITY_BINDING_DIGEST_CONTRACT,
+        browser_state_authority: authority,
+    })
+}
+
+/// Digest the exact typed authority used by the browser credential replay
+/// store binding in D and by independent live R measurement.
+pub fn authenticator_browser_state_authority_binding_digest(
+    authority: &AuthenticatorBrowserStateAuthorityProjection,
+) -> Result<String, RuntimeGuardDigestError> {
+    let digest = digest_canonical_bytes(
+        authenticator_browser_state_authority_binding_canonical_bytes(authority)?,
+    )?;
+    if !valid_sha256_digest(&digest) {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator browser-state authority nonzero digest",
+        ));
+    }
     Ok(digest)
 }
 
@@ -2021,6 +2061,17 @@ fn validate_authenticator_protocol_binding_projection(
         .collect::<HashSet<_>>()
         .len()
         == authority_digests.len();
+    let browser_state_authority_binding_matches = match (
+        replay.replay_store_binding_digest.as_deref(),
+        protocol.browser_state_authority.as_ref(),
+    ) {
+        (Some(claimed), Some(authority)) => {
+            authenticator_browser_state_authority_binding_digest(authority)
+                .is_ok_and(|measured| measured == claimed)
+        }
+        (None, None) => true,
+        _ => false,
+    };
     let direct_bearer = protocol.path_identity.path_role
         == AuthenticatorRuntimePathRole::DirectBearer
         && protocol.carrier == AuthenticatorCredentialCarrier::AuthorizationBearer
@@ -2056,10 +2107,7 @@ fn validate_authenticator_protocol_binding_projection(
             .browser_exchange_authority
             .as_ref()
             .is_some_and(validate_authenticator_browser_exchange_authority_projection)
-        && protocol
-            .browser_state_authority
-            .as_ref()
-            .is_some_and(validate_authenticator_browser_state_authority_projection)
+        && browser_state_authority_binding_matches
         && protocol
             .derived_session_authority
             .as_ref()
@@ -3667,6 +3715,30 @@ mod tests {
         format!("sha256:{}", byte.to_string().repeat(64))
     }
 
+    fn authenticator_browser_state_authority() -> AuthenticatorBrowserStateAuthorityProjection {
+        AuthenticatorBrowserStateAuthorityProjection {
+            state_authority_id: "authenticator-state-authority:oidc-login-state".into(),
+            state_authority_version: 3,
+            relation_name: "oidc_login_states_v3".into(),
+            writer_contract_setting: "ryuki.oidc_login_state_contract".into(),
+            writer_contract_version: 3,
+            consume_operation: "delete-returning".into(),
+            state_lifetime_limit_id: "limit:authenticator.browser-state-lifetime".into(),
+            maximum_state_lifetime_seconds: 600,
+            pkce_method: "s256".into(),
+            nonce_required: true,
+            browser_binding_required: true,
+            exact_origin_match_required: true,
+        }
+    }
+
+    fn authenticator_browser_state_authority_digest() -> String {
+        authenticator_browser_state_authority_binding_digest(
+            &authenticator_browser_state_authority(),
+        )
+        .unwrap()
+    }
+
     fn assert_independent_canonical_golden(actual: Vec<u8>, expected: Value) {
         let expected = canonical_json_bytes(&expected).expect("golden JSON must canonicalize");
         assert_eq!(actual, expected);
@@ -3818,7 +3890,9 @@ mod tests {
                             presentation_replay_defense:
                                 AuthenticatorPresentationReplayDefense::SingleUseState,
                             nonce_binding: AuthenticatorNonceBinding::OidcLogin,
-                            replay_store_binding_digest: Some(fixture_digest('9')),
+                            replay_store_binding_digest: Some(
+                                authenticator_browser_state_authority_digest(),
+                            ),
                         },
                     },
                     cache_partition_binding_digest: fixture_digest('d'),
@@ -3939,6 +4013,10 @@ mod tests {
                 derived_session_authority: None,
             },
             AuthenticatorRuntimePathRole::BrowserDerivedSession => {
+                let browser_state_authority = authenticator_browser_state_authority();
+                let replay_store_binding_digest =
+                    authenticator_browser_state_authority_binding_digest(&browser_state_authority)
+                        .unwrap();
                 AuthenticatorProtocolBindingProjection {
                     path_identity: authenticator_path_identity(role),
                     carrier: AuthenticatorCredentialCarrier::OauthCallback,
@@ -3951,7 +4029,7 @@ mod tests {
                         presentation_replay_defense:
                             AuthenticatorPresentationReplayDefense::SingleUseState,
                         nonce_binding: AuthenticatorNonceBinding::OidcLogin,
-                        replay_store_binding_digest: Some(fixture_digest('7')),
+                        replay_store_binding_digest: Some(replay_store_binding_digest),
                     },
                     browser_exchange_authority: Some(
                         AuthenticatorBrowserExchangeAuthorityProjection {
@@ -3978,21 +4056,7 @@ mod tests {
                             provider_tokens_exposed: false,
                         },
                     ),
-                    browser_state_authority: Some(AuthenticatorBrowserStateAuthorityProjection {
-                        state_authority_id: "authenticator-state-authority:oidc-login-state".into(),
-                        state_authority_version: 3,
-                        relation_name: "oidc_login_states_v3".into(),
-                        writer_contract_setting: "ryuki.oidc_login_state_contract".into(),
-                        writer_contract_version: 3,
-                        consume_operation: "delete-returning".into(),
-                        state_lifetime_limit_id: "limit:authenticator.browser-state-lifetime"
-                            .into(),
-                        maximum_state_lifetime_seconds: 600,
-                        pkce_method: "s256".into(),
-                        nonce_required: true,
-                        browser_binding_required: true,
-                        exact_origin_match_required: true,
-                    }),
+                    browser_state_authority: Some(browser_state_authority),
                     derived_session_authority: Some(
                         AuthenticatorDerivedSessionAuthorityProjection {
                             session_authority_id: "authenticator-session-authority:browser-session"
@@ -5054,6 +5118,122 @@ mod tests {
     }
 
     #[test]
+    fn authenticator_browser_state_authority_has_an_independent_canonical_golden() {
+        let authority =
+            authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession)
+                .browser_state_authority
+                .unwrap();
+        assert_independent_canonical_golden(
+            authenticator_browser_state_authority_binding_canonical_bytes(&authority).unwrap(),
+            json!({
+                "digest_contract":
+                    "ryuki-authenticator-browser-state-authority-binding-v1",
+                "browser_state_authority": {
+                    "state_authority_id":
+                        "authenticator-state-authority:oidc-login-state",
+                    "state_authority_version": 3,
+                    "relation_name": "oidc_login_states_v3",
+                    "writer_contract_setting": "ryuki.oidc_login_state_contract",
+                    "writer_contract_version": 3,
+                    "consume_operation": "delete-returning",
+                    "state_lifetime_limit_id":
+                        "limit:authenticator.browser-state-lifetime",
+                    "maximum_state_lifetime_seconds": 600,
+                    "pkce_method": "s256",
+                    "nonce_required": true,
+                    "browser_binding_required": true,
+                    "exact_origin_match_required": true
+                }
+            }),
+        );
+        let digest = authenticator_browser_state_authority_binding_digest(&authority).unwrap();
+        assert!(valid_sha256_digest(&digest));
+    }
+
+    #[test]
+    fn authenticator_browser_state_authority_binds_every_leaf_and_rejects_malformed_values() {
+        let authority =
+            authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession)
+                .browser_state_authority
+                .unwrap();
+        let digest = authenticator_browser_state_authority_binding_digest(&authority).unwrap();
+
+        let mut mutable_leaf_changes = Vec::new();
+        let mut candidate = authority.clone();
+        candidate.state_authority_id = "authenticator-state-authority:oidc-login-state-next".into();
+        mutable_leaf_changes.push(("state_authority_id", candidate));
+        let mut candidate = authority.clone();
+        candidate.state_authority_version += 1;
+        mutable_leaf_changes.push(("state_authority_version", candidate));
+        let mut candidate = authority.clone();
+        candidate.state_lifetime_limit_id =
+            "limit:authenticator.browser-state-lifetime-next".into();
+        mutable_leaf_changes.push(("state_lifetime_limit_id", candidate));
+        for (leaf, candidate) in mutable_leaf_changes {
+            assert_ne!(
+                authenticator_browser_state_authority_binding_digest(&candidate)
+                    .unwrap_or_else(|error| panic!("valid {leaf} mutation rejected: {error}")),
+                digest,
+                "{leaf} mutation must change the browser-state authority digest"
+            );
+        }
+
+        let mut malformed = Vec::new();
+        let mut candidate = authority.clone();
+        candidate.state_authority_id = "runtime-owner:fixture".into();
+        malformed.push(("state_authority_id namespace", candidate));
+        let mut candidate = authority.clone();
+        candidate.state_authority_version = 0;
+        malformed.push(("state_authority_version", candidate));
+        let mut candidate = authority.clone();
+        candidate.relation_name = "oidc_login_states".into();
+        malformed.push(("relation_name", candidate));
+        let mut candidate = authority.clone();
+        candidate.writer_contract_setting = "ryuki.oidc_login_state_contract_v2".into();
+        malformed.push(("writer_contract_setting", candidate));
+        let mut candidate = authority.clone();
+        candidate.writer_contract_version = 2;
+        malformed.push(("writer_contract_version", candidate));
+        let mut candidate = authority.clone();
+        candidate.consume_operation = "select-delete".into();
+        malformed.push(("consume_operation", candidate));
+        let mut candidate = authority.clone();
+        candidate.state_lifetime_limit_id = "runtime-limit:fixture".into();
+        malformed.push(("state_lifetime_limit_id namespace", candidate));
+        let mut candidate = authority.clone();
+        candidate.maximum_state_lifetime_seconds = 599;
+        malformed.push(("maximum_state_lifetime_seconds", candidate));
+        let mut candidate = authority.clone();
+        candidate.pkce_method = "plain".into();
+        malformed.push(("pkce_method", candidate));
+        let mut candidate = authority.clone();
+        candidate.nonce_required = false;
+        malformed.push(("nonce_required", candidate));
+        let mut candidate = authority.clone();
+        candidate.browser_binding_required = false;
+        malformed.push(("browser_binding_required", candidate));
+        let mut candidate = authority.clone();
+        candidate.exact_origin_match_required = false;
+        malformed.push(("exact_origin_match_required", candidate));
+        for (leaf, candidate) in malformed {
+            assert!(
+                authenticator_browser_state_authority_binding_digest(&candidate).is_err(),
+                "malformed {leaf} must fail closed"
+            );
+        }
+
+        let mut unknown = serde_json::to_value(authority).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("fallback_relation".into(), json!("oidc_login_states_v2"));
+        assert!(
+            serde_json::from_value::<AuthenticatorBrowserStateAuthorityProjection>(unknown)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn authenticator_cache_partition_has_an_independent_canonical_golden() {
         let cache = authenticator_cache_partition(AuthenticatorRuntimePathRole::DirectBearer);
         assert_independent_canonical_golden(
@@ -5102,6 +5282,12 @@ mod tests {
     fn authenticator_protocol_has_an_independent_browser_canonical_golden() {
         let protocol =
             authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession);
+        let browser_state_digest = protocol
+            .replay
+            .replay_store_binding_digest
+            .as_ref()
+            .unwrap()
+            .clone();
         assert_independent_canonical_golden(
             authenticator_protocol_binding_canonical_bytes(&protocol).unwrap(),
             json!({
@@ -5131,7 +5317,7 @@ mod tests {
                         "sender_constraint": "none",
                         "presentation_replay_defense": "single-use-state",
                         "nonce_binding": "oidc-login",
-                        "replay_store_binding_digest": fixture_digest('7')
+                        "replay_store_binding_digest": browser_state_digest
                     },
                     "browser_exchange_authority": {
                         "exchange_authority_id":
@@ -5334,6 +5520,11 @@ mod tests {
             ($label:literal, $mutate:expr) => {{
                 let mut candidate = protocol.clone();
                 ($mutate)(&mut candidate);
+                if let Some(authority) = candidate.browser_state_authority.as_ref() {
+                    candidate.replay.replay_store_binding_digest = Some(
+                        authenticator_browser_state_authority_binding_digest(authority).unwrap(),
+                    );
+                }
                 assert_ne!(
                     authenticator_protocol_binding_digest(&candidate).unwrap_or_else(
                         |error| panic!("valid {} mutation rejected: {error}", $label)
@@ -5403,12 +5594,6 @@ mod tests {
             "key_source_binding_digest",
             |candidate: &mut AuthenticatorProtocolBindingProjection| {
                 candidate.path_identity.key_source_binding_digest = fixture_digest('f');
-            }
-        );
-        assert_protocol_leaf_bound!(
-            "replay_store_binding_digest",
-            |candidate: &mut AuthenticatorProtocolBindingProjection| {
-                candidate.replay.replay_store_binding_digest = Some(fixture_digest('f'));
             }
         );
         assert_protocol_leaf_bound!(
@@ -5803,6 +5988,10 @@ mod tests {
                 json!(fixture_digest('1')),
             ),
             (
+                "/replay/replay_store_binding_digest",
+                json!(fixture_digest('f')),
+            ),
+            (
                 "/browser_exchange_authority/exchange_authority_id",
                 json!("runtime-owner:fixture"),
             ),
@@ -6020,6 +6209,7 @@ mod tests {
             "provider:fixture-oidc",
             ProductionAuthenticatorKind::Oidc,
         );
+        let browser_state_digest = authenticator_browser_state_authority_digest();
         assert_independent_canonical_golden(
             authenticator_runtime_binding_canonical_bytes(&binding).unwrap(),
             json!({
@@ -6121,7 +6311,7 @@ mod tests {
                                     "sender_constraint": "none",
                                     "presentation_replay_defense": "single-use-state",
                                     "nonce_binding": "oidc-login",
-                                    "replay_store_binding_digest": fixture_digest('9')
+                                    "replay_store_binding_digest": browser_state_digest
                                 }
                             },
                             "cache_partition_binding_digest": fixture_digest('d'),
