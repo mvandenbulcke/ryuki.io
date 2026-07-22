@@ -19,7 +19,13 @@ pub const SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-secret-provider-runtime-binding-v1";
 pub const AUTHENTICATOR_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-authenticator-inventory-v1";
 pub const AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
-    "ryuki-authenticator-runtime-binding-v1";
+    "ryuki-authenticator-runtime-binding-v2";
+pub const AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-provider-policy-binding-v1";
+pub const AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-cache-partition-v1";
+pub const AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-protocol-binding-v1";
 pub const POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT: &str =
     "ryuki-postgresql-database-identity-v1";
 pub const POSTGRESQL_PROVIDER_ROUTE_BINDING_DIGEST_CONTRACT: &str =
@@ -668,9 +674,83 @@ pub enum AuthenticatorProofBinding {
     Bearer,
     Dpop,
     MutualTls,
+    PkceS256,
     Passkey,
     KeyedToken,
     WorkloadAssertion,
+}
+
+/// Whether the input credential itself may be presented more than once.
+///
+/// This is deliberately separate from presentation replay defence. OAuth
+/// access tokens and opaque sessions are reusable credentials even when each
+/// presentation is sender-constrained by a fresh proof.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorCredentialReuse {
+    SingleUse,
+    ReusableUntilExpiry,
+}
+
+/// Cryptographic binding between the credential and its presenter.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorSenderConstraint {
+    None,
+    Dpop,
+    MutualTls,
+    Passkey,
+    WorkloadAssertion,
+}
+
+/// Replay control applied to one presentation or browser ceremony.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorPresentationReplayDefense {
+    None,
+    SingleUseState,
+    DurableJti,
+}
+
+/// Closed nonce purpose. OIDC login nonces and DPoP nonces are not
+/// interchangeable replay controls.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorNonceBinding {
+    None,
+    OidcLogin,
+    Dpop,
+}
+
+fn deserialize_explicit_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorReplayRuntimeProjection {
+    pub credential_reuse: AuthenticatorCredentialReuse,
+    /// Registered security-limit identity governing the measured maximum
+    /// credential lifetime. Single-use browser ceremonies bind their separate
+    /// state lifetime through the protocol projection and use `None` here.
+    #[serde(deserialize_with = "deserialize_explicit_option")]
+    pub credential_lifetime_limit_id: Option<String>,
+    /// Exact maximum validity interval enforced for reusable credentials.
+    /// Single-use ceremonies carry their expiry in the protocol binding and
+    /// therefore use `None` here.
+    #[serde(deserialize_with = "deserialize_explicit_option")]
+    pub maximum_credential_lifetime_seconds: Option<u64>,
+    pub sender_constraint: AuthenticatorSenderConstraint,
+    pub presentation_replay_defense: AuthenticatorPresentationReplayDefense,
+    pub nonce_binding: AuthenticatorNonceBinding,
+    /// Exact non-secret identity of the retained state/JTI authority. It is
+    /// absent only when no presentation replay store exists.
+    #[serde(deserialize_with = "deserialize_explicit_option")]
+    pub replay_store_binding_digest: Option<String>,
 }
 
 /// Immutable verifier leaves measured from the exact initialized verifier.
@@ -681,15 +761,22 @@ pub enum AuthenticatorProofBinding {
 pub struct AuthenticatorVerifierRuntimeProjection {
     pub verifier_id: String,
     pub verifier_version: u64,
-    pub canonical_issuer: String,
-    pub audience_ids: Vec<String>,
+    /// Value-free digest of the exact canonical issuer identifier.
+    pub issuer_binding_digest: String,
+    /// Value-free digest of the exact canonical, sorted audience set.
+    pub audience_set_binding_digest: String,
     pub accepted_algorithm_ids: Vec<String>,
+    pub required_claim_ids: Vec<String>,
+    /// Exact signed claim selected as the provider-qualified principal subject.
+    /// The claim must also be present in `required_claim_ids`.
+    pub provider_subject_claim_id: String,
     pub key_source_kind: AuthenticatorKeySourceKind,
     pub key_source_binding_digest: String,
     pub expiration_required: bool,
+    pub not_before_required: bool,
     pub issued_at_required: bool,
     pub nonce_required: bool,
-    pub replay_protection_enabled: bool,
+    pub clock_skew_limit_id: String,
     pub maximum_clock_skew_seconds: u32,
     pub redirects_allowed: bool,
 }
@@ -702,8 +789,36 @@ pub struct AuthenticatorCredentialProfileRuntimeProjection {
     pub token_profile: String,
     pub carrier: AuthenticatorCredentialCarrier,
     pub proof_binding: AuthenticatorProofBinding,
-    pub interactive: bool,
-    pub emits_human_principal: bool,
+    pub replay: AuthenticatorReplayRuntimeProjection,
+}
+
+/// One complete, retained credential-admission path. Browser flow semantics
+/// (authorization endpoint, token endpoint, redirect, PKCE, state, browser
+/// binding and issued-session linkage) are represented by the value-free
+/// protocol digest rather than being flattened into verifier-only claims.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorRuntimePathProjection {
+    pub path_id: String,
+    pub path_version: u64,
+    pub verifier: AuthenticatorVerifierRuntimeProjection,
+    pub credential_profile: AuthenticatorCredentialProfileRuntimeProjection,
+    /// Value-free digest of the retained cache-allocation inventory, whose
+    /// preimage binds provider/configuration, issuer, token profile, verifier,
+    /// and every discovery/JWKS/introspection/nonce/replay/key cache owned by
+    /// this path. Each path must have a distinct partition.
+    pub cache_partition_binding_digest: String,
+    pub protocol_binding_digest: String,
+    pub retained_consumer_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorRuntimeBindingDocumentReference {
+    pub document_id: String,
+    pub document_version: u64,
+    pub content_digest: String,
+    pub artifact_locator: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -713,15 +828,22 @@ pub struct AuthenticatorRuntimeOwnership {
     pub ambient_reconfiguration_allowed: bool,
 }
 
-/// Closed R projection for one retained authenticator allocation.
+/// Closed R projection foundation for one retained OIDC authenticator
+/// allocation. It is not guard evidence until the provider D/P reference,
+/// registered limits, complete derived-session path, and retained runtime
+/// objects are independently reconciled by the production witness.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthenticatorRuntimeBindingProjection {
     pub provider: ExpectedProviderBinding,
+    /// D: reference to the exact raw, value-free binding document. The active
+    /// provider payload P contains the same reference, while this independent
+    /// copy is retained in the measured R preimage to prevent substitution.
+    pub binding_document_reference: AuthenticatorRuntimeBindingDocumentReference,
     pub authenticator_kind: ProductionAuthenticatorKind,
-    pub verifier: AuthenticatorVerifierRuntimeProjection,
-    pub credential_profile: AuthenticatorCredentialProfileRuntimeProjection,
-    pub retained_consumer_ids: Vec<String>,
+    pub provider_policy_binding_digest: String,
+    pub capability_ids: Vec<String>,
+    pub credential_paths: Vec<AuthenticatorRuntimePathProjection>,
     pub ownership: AuthenticatorRuntimeOwnership,
 }
 
@@ -744,7 +866,15 @@ pub fn authenticator_runtime_binding_canonical_bytes(
 pub fn authenticator_runtime_binding_digest(
     binding: &AuthenticatorRuntimeBindingProjection,
 ) -> Result<String, RuntimeGuardDigestError> {
-    digest_canonical_bytes(authenticator_runtime_binding_canonical_bytes(binding)?)
+    let digest = digest_canonical_bytes(authenticator_runtime_binding_canonical_bytes(binding)?)?;
+    if digest == binding.binding_document_reference.content_digest
+        || digest == binding.provider.configuration_payload_digest
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator D/P/R digest separation",
+        ));
+    }
+    Ok(digest)
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -1096,13 +1226,6 @@ fn strictly_sorted_unique_strings(values: &[String]) -> bool {
     !values.is_empty() && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn valid_sorted_runtime_identifiers(values: &[String]) -> bool {
-    strictly_sorted_unique_strings(values)
-        && values
-            .iter()
-            .all(|value| valid_canonical_runtime_identifier(value))
-}
-
 fn valid_provider_projection(provider: &ExpectedProviderBinding) -> bool {
     let mut errors = Vec::new();
     validate_provider_binding("runtime-guard provider", provider, &mut errors);
@@ -1226,33 +1349,31 @@ fn validate_postgresql_migration_inventory_projection(
 fn validate_authenticator_runtime_binding_projection(
     binding: &AuthenticatorRuntimeBindingProjection,
 ) -> Result<(), RuntimeGuardDigestError> {
-    let verifier = &binding.verifier;
-    let profile = &binding.credential_profile;
-    let issuer_is_canonical = !verifier.canonical_issuer.is_empty()
-        && verifier.canonical_issuer.len() <= 2048
-        && verifier.canonical_issuer.trim() == verifier.canonical_issuer
-        && !verifier.canonical_issuer.chars().any(char::is_whitespace);
     if !valid_provider_projection(&binding.provider)
-        || binding.authenticator_kind.is_legacy_mechanism()
-        || !valid_canonical_scoped_id(&verifier.verifier_id, "authenticator-verifier:")
-        || verifier.verifier_version == 0
-        || !issuer_is_canonical
-        || !valid_sorted_runtime_identifiers(&verifier.audience_ids)
-        || !valid_sorted_runtime_identifiers(&verifier.accepted_algorithm_ids)
-        || !valid_sha256_digest(&verifier.key_source_binding_digest)
-        || !verifier.expiration_required
-        || !verifier.replay_protection_enabled
-        || verifier.maximum_clock_skew_seconds > 300
-        || verifier.redirects_allowed
-        || !valid_canonical_scoped_id(&profile.profile_id, "credential-profile:")
-        || profile.profile_version == 0
-        || !valid_canonical_runtime_identifier(&profile.token_profile)
-        || profile.emits_human_principal != binding.authenticator_kind.is_human()
-        || !valid_sorted_runtime_identifiers(&binding.retained_consumer_ids)
+        || !matches!(
+            binding.authenticator_kind,
+            ProductionAuthenticatorKind::Oidc | ProductionAuthenticatorKind::OidcBroker
+        )
+        || !valid_canonical_scoped_id(
+            &binding.binding_document_reference.document_id,
+            "authenticator-runtime-binding:",
+        )
+        || binding.binding_document_reference.document_version == 0
+        || !valid_sha256_digest(&binding.binding_document_reference.content_digest)
+        || binding.binding_document_reference.content_digest
+            == binding.provider.configuration_payload_digest
+        || !valid_authenticator_binding_locator(
+            &binding.binding_document_reference.artifact_locator,
+        )
+        || !valid_sha256_digest(&binding.provider_policy_binding_digest)
+        || binding.capability_ids.len() > 128
+        || !valid_sorted_authenticator_identifiers(&binding.capability_ids)
+        || binding.credential_paths.is_empty()
+        || binding.credential_paths.len() > 32
         || !binding
-            .retained_consumer_ids
-            .iter()
-            .all(|consumer| consumer.starts_with("runtime-consumer:"))
+            .credential_paths
+            .windows(2)
+            .all(|pair| pair[0].path_id < pair[1].path_id)
         || !binding.ownership.single_runtime_owner
         || binding.ownership.ambient_reconfiguration_allowed
     {
@@ -1260,7 +1381,180 @@ fn validate_authenticator_runtime_binding_projection(
             "authenticator runtime binding",
         ));
     }
+
+    let mut verifier_ids = HashSet::new();
+    let mut profile_ids = HashSet::new();
+    let mut resolution_tuples = HashSet::new();
+    let mut consumer_ids = HashSet::new();
+    let mut cache_partition_digests = HashSet::new();
+    for path in &binding.credential_paths {
+        let verifier = &path.verifier;
+        let profile = &path.credential_profile;
+        let replay_store_present = profile.replay.replay_store_binding_digest.is_some();
+        let reusable_lifetime_valid = profile
+            .replay
+            .maximum_credential_lifetime_seconds
+            .is_some_and(|seconds| seconds > 0)
+            && profile
+                .replay
+                .credential_lifetime_limit_id
+                .as_deref()
+                .is_some_and(|limit_id| valid_canonical_scoped_id(limit_id, "limit:"));
+        let replay_store_valid = profile
+            .replay
+            .replay_store_binding_digest
+            .as_deref()
+            .is_none_or(valid_sha256_digest);
+        let bearer_profile = profile.token_profile == "jwt-access-token"
+            && profile.carrier == AuthenticatorCredentialCarrier::AuthorizationBearer
+            && profile.proof_binding == AuthenticatorProofBinding::Bearer
+            && profile.replay.credential_reuse == AuthenticatorCredentialReuse::ReusableUntilExpiry
+            && reusable_lifetime_valid
+            && profile.replay.sender_constraint == AuthenticatorSenderConstraint::None
+            && profile.replay.presentation_replay_defense
+                == AuthenticatorPresentationReplayDefense::None
+            && profile.replay.nonce_binding == AuthenticatorNonceBinding::None
+            && !replay_store_present;
+        let browser_profile = profile.token_profile == "oidc-id-token"
+            && profile.carrier == AuthenticatorCredentialCarrier::OauthCallback
+            && profile.proof_binding == AuthenticatorProofBinding::PkceS256
+            && profile.replay.credential_reuse == AuthenticatorCredentialReuse::SingleUse
+            && profile.replay.credential_lifetime_limit_id.is_none()
+            && profile.replay.maximum_credential_lifetime_seconds.is_none()
+            && profile.replay.sender_constraint == AuthenticatorSenderConstraint::None
+            && profile.replay.presentation_replay_defense
+                == AuthenticatorPresentationReplayDefense::SingleUseState
+            && profile.replay.nonce_binding == AuthenticatorNonceBinding::OidcLogin
+            && replay_store_present;
+        let credential_profile_shape_valid = bearer_profile || browser_profile;
+        let required_claim_shape_valid = authenticator_claim_flags_match(verifier)
+            && verifier
+                .required_claim_ids
+                .binary_search(&verifier.provider_subject_claim_id)
+                .is_ok()
+            && match profile.token_profile.as_str() {
+                "jwt-access-token" => {
+                    verifier.key_source_kind == AuthenticatorKeySourceKind::JwtJwks
+                        && verifier.expiration_required
+                        && verifier.not_before_required
+                        && verifier.issued_at_required
+                        && !verifier.nonce_required
+                        && authenticator_claims_include(
+                            &verifier.required_claim_ids,
+                            &["aud", "exp", "iat", "iss", "nbf", "sub"],
+                        )
+                }
+                "oidc-id-token" => {
+                    verifier.key_source_kind == AuthenticatorKeySourceKind::JwtJwks
+                        && verifier.expiration_required
+                        && verifier.not_before_required
+                        && verifier.nonce_required
+                        && authenticator_claims_include(
+                            &verifier.required_claim_ids,
+                            &["aud", "exp", "iss", "nbf", "nonce", "sub"],
+                        )
+                }
+                _ => false,
+            };
+
+        if !valid_canonical_scoped_id(&path.path_id, "authenticator-path:")
+            || path.path_version == 0
+            || !valid_canonical_scoped_id(&verifier.verifier_id, "authenticator-verifier:")
+            || !verifier_ids.insert(verifier.verifier_id.as_str())
+            || verifier.verifier_version == 0
+            || !valid_sha256_digest(&verifier.issuer_binding_digest)
+            || !valid_sha256_digest(&verifier.audience_set_binding_digest)
+            || verifier.accepted_algorithm_ids.len() > 16
+            || !valid_sorted_authenticator_identifiers(&verifier.accepted_algorithm_ids)
+            || verifier.accepted_algorithm_ids.as_slice() != ["rs256"]
+            || verifier.required_claim_ids.len() > 64
+            || !valid_sorted_authenticator_identifiers(&verifier.required_claim_ids)
+            || !matches!(verifier.provider_subject_claim_id.as_str(), "oid" | "sub")
+            || match binding.provider.adapter_kind.as_str() {
+                "auth.entra-id" => verifier.provider_subject_claim_id != "oid",
+                _ => verifier.provider_subject_claim_id != "sub",
+            }
+            || !valid_sha256_digest(&verifier.key_source_binding_digest)
+            || !required_claim_shape_valid
+            || !valid_canonical_scoped_id(&verifier.clock_skew_limit_id, "limit:")
+            || verifier.redirects_allowed
+            || !valid_canonical_scoped_id(&profile.profile_id, "credential-profile:")
+            || !profile_ids.insert(profile.profile_id.as_str())
+            || profile.profile_version == 0
+            || !replay_store_valid
+            || !credential_profile_shape_valid
+            || !valid_sha256_digest(&path.cache_partition_binding_digest)
+            || !cache_partition_digests.insert(path.cache_partition_binding_digest.as_str())
+            || !valid_sha256_digest(&path.protocol_binding_digest)
+            || path.retained_consumer_ids.len() > 128
+            || !strictly_sorted_unique_strings(&path.retained_consumer_ids)
+            || !path
+                .retained_consumer_ids
+                .iter()
+                .all(|consumer| valid_canonical_scoped_id(consumer, "runtime-consumer:"))
+            || path
+                .retained_consumer_ids
+                .iter()
+                .any(|consumer| !consumer_ids.insert(consumer.as_str()))
+            || !resolution_tuples.insert((
+                verifier.issuer_binding_digest.as_str(),
+                profile.token_profile.as_str(),
+            ))
+        {
+            return Err(RuntimeGuardDigestError::InvalidProjection(
+                "authenticator runtime binding path",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_authenticator_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (2..=96).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn valid_sorted_authenticator_identifiers(values: &[String]) -> bool {
+    strictly_sorted_unique_strings(values)
+        && values
+            .iter()
+            .all(|value| valid_authenticator_identifier(value))
+}
+
+fn authenticator_claims_include(claims: &[String], required: &[&str]) -> bool {
+    required.iter().all(|required| {
+        claims
+            .binary_search_by(|claim| claim.as_str().cmp(required))
+            .is_ok()
+    })
+}
+
+fn authenticator_claim_flags_match(verifier: &AuthenticatorVerifierRuntimeProjection) -> bool {
+    let contains = |claim: &str| {
+        verifier
+            .required_claim_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(claim))
+            .is_ok()
+    };
+    verifier.expiration_required == contains("exp")
+        && verifier.not_before_required == contains("nbf")
+        && verifier.issued_at_required == contains("iat")
+        && verifier.nonce_required == contains("nonce")
+}
+
+fn valid_authenticator_binding_locator(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.starts_with("json-pointer:")
+        && !value.contains('\\')
+        && !path.is_absolute()
+        && path.extension().and_then(|extension| extension.to_str()) == Some("json")
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn validate_external_signing_key_identity_projection(
@@ -2608,44 +2902,127 @@ mod tests {
         provider_id: &str,
         authenticator_kind: ProductionAuthenticatorKind,
     ) -> AuthenticatorRuntimeBindingProjection {
-        let provider = expected_provider_binding(provider_id);
+        let mut provider = expected_provider_binding(provider_id);
+        provider.adapter_kind = "auth.entra-id".into();
         AuthenticatorRuntimeBindingProjection {
             provider,
+            binding_document_reference: AuthenticatorRuntimeBindingDocumentReference {
+                document_id: "authenticator-runtime-binding:fixture-oidc".into(),
+                document_version: 1,
+                content_digest: fixture_digest('2'),
+                artifact_locator:
+                    "catalog/security-contracts/v1/authenticator-runtime-binding.fixture.json"
+                        .into(),
+            },
             authenticator_kind,
-            verifier: AuthenticatorVerifierRuntimeProjection {
-                verifier_id: format!(
-                    "authenticator-verifier:{}",
-                    provider_id.strip_prefix("provider:").unwrap()
-                ),
-                verifier_version: 1,
-                canonical_issuer: format!(
-                    "https://identity.example.test/{}",
-                    provider_id.strip_prefix("provider:").unwrap()
-                ),
-                audience_ids: vec!["ryuki-api".into()],
-                accepted_algorithm_ids: vec!["rs256".into()],
-                key_source_kind: AuthenticatorKeySourceKind::JwtJwks,
-                key_source_binding_digest: fixture_digest('7'),
-                expiration_required: true,
-                issued_at_required: true,
-                nonce_required: authenticator_kind.is_human(),
-                replay_protection_enabled: true,
-                maximum_clock_skew_seconds: 60,
-                redirects_allowed: false,
-            },
-            credential_profile: AuthenticatorCredentialProfileRuntimeProjection {
-                profile_id: format!(
-                    "credential-profile:{}",
-                    provider_id.strip_prefix("provider:").unwrap()
-                ),
-                profile_version: 1,
-                token_profile: "jwt-access-token".into(),
-                carrier: AuthenticatorCredentialCarrier::AuthorizationBearer,
-                proof_binding: AuthenticatorProofBinding::Bearer,
-                interactive: authenticator_kind.is_human(),
-                emits_human_principal: authenticator_kind.is_human(),
-            },
-            retained_consumer_ids: vec!["runtime-consumer:api-admission".into()],
+            provider_policy_binding_digest: fixture_digest('b'),
+            capability_ids: vec!["browser-sso".into(), "token-validation".into()],
+            credential_paths: vec![
+                AuthenticatorRuntimePathProjection {
+                    path_id: "authenticator-path:api-bearer".into(),
+                    path_version: 1,
+                    verifier: AuthenticatorVerifierRuntimeProjection {
+                        verifier_id: "authenticator-verifier:fixture-oidc-api-bearer".into(),
+                        verifier_version: 1,
+                        issuer_binding_digest: fixture_digest('3'),
+                        audience_set_binding_digest: fixture_digest('4'),
+                        accepted_algorithm_ids: vec!["rs256".into()],
+                        required_claim_ids: vec![
+                            "aud".into(),
+                            "exp".into(),
+                            "iat".into(),
+                            "iss".into(),
+                            "nbf".into(),
+                            "oid".into(),
+                            "sub".into(),
+                        ],
+                        provider_subject_claim_id: "oid".into(),
+                        key_source_kind: AuthenticatorKeySourceKind::JwtJwks,
+                        key_source_binding_digest: fixture_digest('5'),
+                        expiration_required: true,
+                        not_before_required: true,
+                        issued_at_required: true,
+                        nonce_required: false,
+                        clock_skew_limit_id: "limit:authenticator.clock-skew".into(),
+                        maximum_clock_skew_seconds: 60,
+                        redirects_allowed: false,
+                    },
+                    credential_profile: AuthenticatorCredentialProfileRuntimeProjection {
+                        profile_id: "credential-profile:fixture-oidc-api-bearer".into(),
+                        profile_version: 1,
+                        token_profile: "jwt-access-token".into(),
+                        carrier: AuthenticatorCredentialCarrier::AuthorizationBearer,
+                        proof_binding: AuthenticatorProofBinding::Bearer,
+                        replay: AuthenticatorReplayRuntimeProjection {
+                            credential_reuse: AuthenticatorCredentialReuse::ReusableUntilExpiry,
+                            credential_lifetime_limit_id: Some(
+                                "limit:authenticator.oidc-access-token-lifetime".into(),
+                            ),
+                            maximum_credential_lifetime_seconds: Some(3_600),
+                            sender_constraint: AuthenticatorSenderConstraint::None,
+                            presentation_replay_defense:
+                                AuthenticatorPresentationReplayDefense::None,
+                            nonce_binding: AuthenticatorNonceBinding::None,
+                            replay_store_binding_digest: None,
+                        },
+                    },
+                    cache_partition_binding_digest: fixture_digest('c'),
+                    protocol_binding_digest: fixture_digest('6'),
+                    retained_consumer_ids: vec![
+                        "runtime-consumer:entra-bearer-request-admission".into(),
+                    ],
+                },
+                AuthenticatorRuntimePathProjection {
+                    path_id: "authenticator-path:browser-sso".into(),
+                    path_version: 1,
+                    verifier: AuthenticatorVerifierRuntimeProjection {
+                        verifier_id: "authenticator-verifier:fixture-oidc-browser-sso".into(),
+                        verifier_version: 1,
+                        issuer_binding_digest: fixture_digest('3'),
+                        audience_set_binding_digest: fixture_digest('7'),
+                        accepted_algorithm_ids: vec!["rs256".into()],
+                        required_claim_ids: vec![
+                            "aud".into(),
+                            "exp".into(),
+                            "iss".into(),
+                            "nbf".into(),
+                            "nonce".into(),
+                            "oid".into(),
+                            "sub".into(),
+                        ],
+                        provider_subject_claim_id: "oid".into(),
+                        key_source_kind: AuthenticatorKeySourceKind::JwtJwks,
+                        key_source_binding_digest: fixture_digest('8'),
+                        expiration_required: true,
+                        not_before_required: true,
+                        issued_at_required: false,
+                        nonce_required: true,
+                        clock_skew_limit_id: "limit:authenticator.clock-skew".into(),
+                        maximum_clock_skew_seconds: 60,
+                        redirects_allowed: false,
+                    },
+                    credential_profile: AuthenticatorCredentialProfileRuntimeProjection {
+                        profile_id: "credential-profile:fixture-oidc-browser-sso".into(),
+                        profile_version: 1,
+                        token_profile: "oidc-id-token".into(),
+                        carrier: AuthenticatorCredentialCarrier::OauthCallback,
+                        proof_binding: AuthenticatorProofBinding::PkceS256,
+                        replay: AuthenticatorReplayRuntimeProjection {
+                            credential_reuse: AuthenticatorCredentialReuse::SingleUse,
+                            credential_lifetime_limit_id: None,
+                            maximum_credential_lifetime_seconds: None,
+                            sender_constraint: AuthenticatorSenderConstraint::None,
+                            presentation_replay_defense:
+                                AuthenticatorPresentationReplayDefense::SingleUseState,
+                            nonce_binding: AuthenticatorNonceBinding::OidcLogin,
+                            replay_store_binding_digest: Some(fixture_digest('9')),
+                        },
+                    },
+                    cache_partition_binding_digest: fixture_digest('d'),
+                    protocol_binding_digest: fixture_digest('a'),
+                    retained_consumer_ids: vec!["runtime-consumer:entra-browser-sso".into()],
+                },
+            ],
             ownership: AuthenticatorRuntimeOwnership {
                 single_runtime_owner: true,
                 ambient_reconfiguration_allowed: false,
@@ -3453,7 +3830,7 @@ mod tests {
         assert_independent_canonical_golden(
             authenticator_runtime_binding_canonical_bytes(&binding).unwrap(),
             json!({
-                "digest_contract": "ryuki-authenticator-runtime-binding-v1",
+                "digest_contract": "ryuki-authenticator-runtime-binding-v2",
                 "runtime_binding": {
                     "provider": {
                         "provider_id": "provider:fixture-oidc",
@@ -3463,35 +3840,102 @@ mod tests {
                         "lifecycle_state": "active",
                         "capability_descriptor_id": "capability-descriptor:fixture-provider",
                         "capability_descriptor_version": 1,
-                        "adapter_kind": "fixture.provider",
+                        "adapter_kind": "auth.entra-id",
                         "adapter_version": "1.0.0"
                     },
+                    "binding_document_reference": {
+                        "document_id": "authenticator-runtime-binding:fixture-oidc",
+                        "document_version": 1,
+                        "content_digest": fixture_digest('2'),
+                        "artifact_locator": "catalog/security-contracts/v1/authenticator-runtime-binding.fixture.json"
+                    },
                     "authenticator_kind": "oidc",
-                    "verifier": {
-                        "verifier_id": "authenticator-verifier:fixture-oidc",
-                        "verifier_version": 1,
-                        "canonical_issuer": "https://identity.example.test/fixture-oidc",
-                        "audience_ids": ["ryuki-api"],
-                        "accepted_algorithm_ids": ["rs256"],
-                        "key_source_kind": "jwt-jwks",
-                        "key_source_binding_digest": fixture_digest('7'),
-                        "expiration_required": true,
-                        "issued_at_required": true,
-                        "nonce_required": true,
-                        "replay_protection_enabled": true,
-                        "maximum_clock_skew_seconds": 60,
-                        "redirects_allowed": false
-                    },
-                    "credential_profile": {
-                        "profile_id": "credential-profile:fixture-oidc",
-                        "profile_version": 1,
-                        "token_profile": "jwt-access-token",
-                        "carrier": "authorization-bearer",
-                        "proof_binding": "bearer",
-                        "interactive": true,
-                        "emits_human_principal": true
-                    },
-                    "retained_consumer_ids": ["runtime-consumer:api-admission"],
+                    "provider_policy_binding_digest": fixture_digest('b'),
+                    "capability_ids": ["browser-sso", "token-validation"],
+                    "credential_paths": [
+                        {
+                            "path_id": "authenticator-path:api-bearer",
+                            "path_version": 1,
+                            "verifier": {
+                                "verifier_id": "authenticator-verifier:fixture-oidc-api-bearer",
+                                "verifier_version": 1,
+                                "issuer_binding_digest": fixture_digest('3'),
+                                "audience_set_binding_digest": fixture_digest('4'),
+                                "accepted_algorithm_ids": ["rs256"],
+                                "required_claim_ids": ["aud", "exp", "iat", "iss", "nbf", "oid", "sub"],
+                                "provider_subject_claim_id": "oid",
+                                "key_source_kind": "jwt-jwks",
+                                "key_source_binding_digest": fixture_digest('5'),
+                                "expiration_required": true,
+                                "not_before_required": true,
+                                "issued_at_required": true,
+                                "nonce_required": false,
+                                "clock_skew_limit_id": "limit:authenticator.clock-skew",
+                                "maximum_clock_skew_seconds": 60,
+                                "redirects_allowed": false
+                            },
+                            "credential_profile": {
+                                "profile_id": "credential-profile:fixture-oidc-api-bearer",
+                                "profile_version": 1,
+                                "token_profile": "jwt-access-token",
+                                "carrier": "authorization-bearer",
+                                "proof_binding": "bearer",
+                                "replay": {
+                                    "credential_reuse": "reusable-until-expiry",
+                                    "credential_lifetime_limit_id": "limit:authenticator.oidc-access-token-lifetime",
+                                    "maximum_credential_lifetime_seconds": 3600,
+                                    "sender_constraint": "none",
+                                    "presentation_replay_defense": "none",
+                                    "nonce_binding": "none",
+                                    "replay_store_binding_digest": null
+                                }
+                            },
+                            "cache_partition_binding_digest": fixture_digest('c'),
+                            "protocol_binding_digest": fixture_digest('6'),
+                            "retained_consumer_ids": ["runtime-consumer:entra-bearer-request-admission"]
+                        },
+                        {
+                            "path_id": "authenticator-path:browser-sso",
+                            "path_version": 1,
+                            "verifier": {
+                                "verifier_id": "authenticator-verifier:fixture-oidc-browser-sso",
+                                "verifier_version": 1,
+                                "issuer_binding_digest": fixture_digest('3'),
+                                "audience_set_binding_digest": fixture_digest('7'),
+                                "accepted_algorithm_ids": ["rs256"],
+                                "required_claim_ids": ["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"],
+                                "provider_subject_claim_id": "oid",
+                                "key_source_kind": "jwt-jwks",
+                                "key_source_binding_digest": fixture_digest('8'),
+                                "expiration_required": true,
+                                "not_before_required": true,
+                                "issued_at_required": false,
+                                "nonce_required": true,
+                                "clock_skew_limit_id": "limit:authenticator.clock-skew",
+                                "maximum_clock_skew_seconds": 60,
+                                "redirects_allowed": false
+                            },
+                            "credential_profile": {
+                                "profile_id": "credential-profile:fixture-oidc-browser-sso",
+                                "profile_version": 1,
+                                "token_profile": "oidc-id-token",
+                                "carrier": "oauth-callback",
+                                "proof_binding": "pkce-s256",
+                                "replay": {
+                                    "credential_reuse": "single-use",
+                                    "credential_lifetime_limit_id": null,
+                                    "maximum_credential_lifetime_seconds": null,
+                                    "sender_constraint": "none",
+                                    "presentation_replay_defense": "single-use-state",
+                                    "nonce_binding": "oidc-login",
+                                    "replay_store_binding_digest": fixture_digest('9')
+                                }
+                            },
+                            "cache_partition_binding_digest": fixture_digest('d'),
+                            "protocol_binding_digest": fixture_digest('a'),
+                            "retained_consumer_ids": ["runtime-consumer:entra-browser-sso"]
+                        }
+                    ],
                     "ownership": {
                         "single_runtime_owner": true,
                         "ambient_reconfiguration_allowed": false
@@ -3499,26 +3943,166 @@ mod tests {
                 }
             }),
         );
+        let canonical = authenticator_runtime_binding_canonical_bytes(&binding).unwrap();
+        let canonical_text = String::from_utf8(canonical).unwrap();
+        assert!(!canonical_text.contains("identity.example"));
+        assert!(!canonical_text.contains("tenant"));
+        assert!(!canonical_text.contains("client"));
+
         let digest = authenticator_runtime_binding_digest(&binding).unwrap();
         let mut drifted = binding.clone();
-        drifted.verifier.maximum_clock_skew_seconds = 61;
+        drifted.credential_paths[0]
+            .verifier
+            .maximum_clock_skew_seconds = 61;
         assert_ne!(
             authenticator_runtime_binding_digest(&drifted).unwrap(),
             digest
         );
 
         let mut reordered = binding.clone();
-        reordered.retained_consumer_ids = vec![
+        reordered.credential_paths[0].retained_consumer_ids = vec![
             "runtime-consumer:zeta".into(),
             "runtime-consumer:alpha".into(),
         ];
         assert!(authenticator_runtime_binding_digest(&reordered).is_err());
+
+        let mut reordered_paths = binding.clone();
+        reordered_paths.credential_paths.swap(0, 1);
+        assert!(authenticator_runtime_binding_digest(&reordered_paths).is_err());
+
+        let mut duplicate_consumer = binding.clone();
+        duplicate_consumer.credential_paths[1].retained_consumer_ids = duplicate_consumer
+            .credential_paths[0]
+            .retained_consumer_ids
+            .clone();
+        assert!(authenticator_runtime_binding_digest(&duplicate_consumer).is_err());
+
+        let mut false_replay_claim = binding.clone();
+        false_replay_claim.credential_paths[0]
+            .credential_profile
+            .replay
+            .presentation_replay_defense = AuthenticatorPresentationReplayDefense::DurableJti;
+        assert!(authenticator_runtime_binding_digest(&false_replay_claim).is_err());
+
+        let mut coordinated_browser_relabel = binding.clone();
+        coordinated_browser_relabel.credential_paths[0]
+            .credential_profile
+            .token_profile = "oidc-id-token".into();
+        coordinated_browser_relabel.credential_paths[0]
+            .credential_profile
+            .carrier = AuthenticatorCredentialCarrier::OauthCallback;
+        coordinated_browser_relabel.credential_paths[0]
+            .credential_profile
+            .proof_binding = AuthenticatorProofBinding::PkceS256;
+        coordinated_browser_relabel.credential_paths[0]
+            .credential_profile
+            .replay = binding.credential_paths[1]
+            .credential_profile
+            .replay
+            .clone();
+        assert!(authenticator_runtime_binding_digest(&coordinated_browser_relabel).is_err());
+
+        for required_claim in ["aud", "exp", "iat", "iss", "nbf", "sub"] {
+            let mut missing_claim = binding.clone();
+            missing_claim.credential_paths[0]
+                .verifier
+                .required_claim_ids
+                .retain(|claim| claim != required_claim);
+            assert!(
+                authenticator_runtime_binding_digest(&missing_claim).is_err(),
+                "missing {required_claim} must reject the access-token verifier"
+            );
+        }
+
+        let mut missing_provider_subject = binding.clone();
+        missing_provider_subject.credential_paths[0]
+            .verifier
+            .required_claim_ids
+            .retain(|claim| claim != "oid");
+        assert!(authenticator_runtime_binding_digest(&missing_provider_subject).is_err());
+
+        let mut duplicate_cache_partition = binding.clone();
+        duplicate_cache_partition.credential_paths[1].cache_partition_binding_digest =
+            duplicate_cache_partition.credential_paths[0]
+                .cache_partition_binding_digest
+                .clone();
+        assert!(authenticator_runtime_binding_digest(&duplicate_cache_partition).is_err());
+
+        let mut unsupported_kind = binding.clone();
+        unsupported_kind.authenticator_kind = ProductionAuthenticatorKind::Passkey;
+        assert!(authenticator_runtime_binding_digest(&unsupported_kind).is_err());
+
+        let mut unimplemented_dpop = binding.clone();
+        unimplemented_dpop.credential_paths[0]
+            .credential_profile
+            .proof_binding = AuthenticatorProofBinding::Dpop;
+        assert!(authenticator_runtime_binding_digest(&unimplemented_dpop).is_err());
+
+        for confused_algorithm in ["none", "hs256"] {
+            let mut algorithm_confusion = binding.clone();
+            algorithm_confusion.credential_paths[0]
+                .verifier
+                .accepted_algorithm_ids = vec![confused_algorithm.into()];
+            assert!(authenticator_runtime_binding_digest(&algorithm_confusion).is_err());
+        }
+
+        let mut generic_oidc_with_entra_subject = binding.clone();
+        generic_oidc_with_entra_subject.provider.adapter_kind = "auth.generic-oidc".into();
+        assert!(authenticator_runtime_binding_digest(&generic_oidc_with_entra_subject).is_err());
+        for path in &mut generic_oidc_with_entra_subject.credential_paths {
+            path.verifier.provider_subject_claim_id = "sub".into();
+        }
+        assert!(authenticator_runtime_binding_digest(&generic_oidc_with_entra_subject).is_ok());
+
+        let mut bearer_only = binding.clone();
+        bearer_only.credential_paths.truncate(1);
+        let bearer_only_digest = authenticator_runtime_binding_digest(&bearer_only).unwrap();
+        let mut approved_variant_change = bearer_only.clone();
+        approved_variant_change.credential_paths[0].verifier =
+            binding.credential_paths[1].verifier.clone();
+        approved_variant_change.credential_paths[0].credential_profile =
+            binding.credential_paths[1].credential_profile.clone();
+        assert_ne!(
+            authenticator_runtime_binding_digest(&approved_variant_change).unwrap(),
+            bearer_only_digest,
+            "a coordinated switch to another valid admission variant must change R"
+        );
+
+        let mut digest_collision = binding.clone();
+        digest_collision.binding_document_reference.content_digest = digest_collision
+            .provider
+            .configuration_payload_digest
+            .clone();
+        assert!(authenticator_runtime_binding_digest(&digest_collision).is_err());
 
         let mut raw = serde_json::to_value(binding).unwrap();
         raw.as_object_mut()
             .unwrap()
             .insert("fallback".into(), json!(true));
         assert!(serde_json::from_value::<AuthenticatorRuntimeBindingProjection>(raw).is_err());
+
+        let mut missing_explicit_null = serde_json::to_value(bearer_only).unwrap();
+        missing_explicit_null["credential_paths"][0]["credential_profile"]["replay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("replay_store_binding_digest");
+        assert!(
+            serde_json::from_value::<AuthenticatorRuntimeBindingProjection>(missing_explicit_null)
+                .is_err()
+        );
+
+        let v1 = json!({
+            "provider": expected_provider_binding("provider:fixture-oidc"),
+            "authenticator_kind": "oidc",
+            "verifier": {},
+            "credential_profile": {},
+            "retained_consumer_ids": ["runtime-consumer:api-admission"],
+            "ownership": {
+                "single_runtime_owner": true,
+                "ambient_reconfiguration_allowed": false
+            }
+        });
+        assert!(serde_json::from_value::<AuthenticatorRuntimeBindingProjection>(v1).is_err());
     }
 
     #[test]

@@ -52,10 +52,14 @@ const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
 
-const SCHEMAS: [(&str, &str); 16] = [
+const SCHEMAS: [(&str, &str); 17] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
+    ),
+    (
+        "authenticator-runtime-binding.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
     ),
     (
         "conformance-bundle.schema.json",
@@ -9683,6 +9687,230 @@ mod tests {
         assert!(errors.iter().any(|error| {
             error.contains("advertised_capabilities must be non-empty and strictly sorted")
         }));
+    }
+
+    #[test]
+    fn authenticator_runtime_binding_schema_distinguishes_bearer_and_browser_replay() {
+        let schema =
+            load("catalog/security-contracts/v1/authenticator-runtime-binding.schema.json");
+        let digest = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        let verifier = |id: &str, audience: char, key: char, claims: Value, nonce: bool| {
+            json!({
+                "verifier_id": id,
+                "verifier_version": 1,
+                "issuer_binding_digest": digest('1'),
+                "audience_set_binding_digest": digest(audience),
+                "accepted_algorithm_ids": ["rs256"],
+                "required_claim_ids": claims,
+                "provider_subject_claim_id": "oid",
+                "key_source_kind": "jwt-jwks",
+                "key_source_binding_digest": digest(key),
+                "expiration_required": true,
+                "not_before_required": true,
+                "issued_at_required": !nonce,
+                "nonce_required": nonce,
+                "clock_skew_limit_id": "limit:authenticator.clock-skew",
+                "maximum_clock_skew_seconds": 60,
+                "redirects_allowed": false
+            })
+        };
+        let document = json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "authenticator-runtime-binding",
+            "document_id": "authenticator-runtime-binding:validator-fixture",
+            "document_version": 1,
+            "value_free": true,
+            "provider_id": "provider:validator-oidc",
+            "provider_configuration_version": 1,
+            "deployment_id": "deployment:validator-fixture",
+            "trust_domain_id": "trust-domain:validator-fixture",
+            "capability_descriptor_id": "capability-descriptor:validator-oidc",
+            "capability_descriptor_version": 1,
+            "adapter_kind": "auth.entra-id",
+            "adapter_version": "1.0.0",
+            "authenticator_kind": "oidc",
+            "provider_policy": {
+                "digest_contract": "ryuki-authenticator-provider-policy-binding-v1",
+                "binding_digest": digest('2')
+            },
+            "capability_ids": ["browser-sso", "token-validation"],
+            "credential_paths": [
+                {
+                    "path_id": "authenticator-path:api-bearer",
+                    "path_version": 1,
+                    "verifier": verifier(
+                        "authenticator-verifier:api-bearer",
+                        '3',
+                        '4',
+                        json!(["aud", "exp", "iat", "iss", "nbf", "oid", "sub"]),
+                        false,
+                    ),
+                    "credential_profile": {
+                        "profile_id": "credential-profile:api-bearer",
+                        "profile_version": 1,
+                        "token_profile": "jwt-access-token",
+                        "carrier": "authorization-bearer",
+                        "proof_binding": "bearer",
+                        "replay": {
+                            "credential_reuse": "reusable-until-expiry",
+                            "credential_lifetime_limit_id": "limit:authenticator.oidc-access-token-lifetime",
+                            "maximum_credential_lifetime_seconds": 3600,
+                            "sender_constraint": "none",
+                            "presentation_replay_defense": "none",
+                            "nonce_binding": "none",
+                            "replay_store_binding_digest": null
+                        }
+                    },
+                    "cache_partition": {
+                        "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                        "binding_digest": digest('a')
+                    },
+                    "protocol_binding": {
+                        "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                        "binding_digest": digest('5')
+                    },
+                    "retained_consumer_ids": ["runtime-consumer:entra-bearer-request-admission"]
+                },
+                {
+                    "path_id": "authenticator-path:browser-sso",
+                    "path_version": 1,
+                    "verifier": verifier(
+                        "authenticator-verifier:browser-sso",
+                        '6',
+                        '7',
+                        json!(["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"]),
+                        true,
+                    ),
+                    "credential_profile": {
+                        "profile_id": "credential-profile:browser-sso",
+                        "profile_version": 1,
+                        "token_profile": "oidc-id-token",
+                        "carrier": "oauth-callback",
+                        "proof_binding": "pkce-s256",
+                        "replay": {
+                            "credential_reuse": "single-use",
+                            "credential_lifetime_limit_id": null,
+                            "maximum_credential_lifetime_seconds": null,
+                            "sender_constraint": "none",
+                            "presentation_replay_defense": "single-use-state",
+                            "nonce_binding": "oidc-login",
+                            "replay_store_binding_digest": digest('8')
+                        }
+                    },
+                    "cache_partition": {
+                        "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                        "binding_digest": digest('b')
+                    },
+                    "protocol_binding": {
+                        "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                        "binding_digest": digest('9')
+                    },
+                    "retained_consumer_ids": ["runtime-consumer:entra-browser-sso"]
+                }
+            ],
+            "ownership": {
+                "single_runtime_owner": true,
+                "ambient_reconfiguration_allowed": false
+            }
+        });
+
+        let mut errors = Vec::new();
+        validate_instance(
+            "authenticator runtime binding fixture",
+            "authenticator-runtime-binding.schema.json",
+            &schema,
+            &document,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        for invalid in [
+            {
+                let mut value = document.clone();
+                value["credential_paths"][1]["credential_profile"]["replay"]
+                    ["replay_store_binding_digest"] = Value::Null;
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["credential_profile"]["replay"]
+                    ["presentation_replay_defense"] = json!("durable-jti");
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["credential_profile"]["token_profile"] =
+                    json!("oidc-id-token");
+                value["credential_paths"][0]["credential_profile"]["carrier"] =
+                    json!("oauth-callback");
+                value["credential_paths"][0]["credential_profile"]["proof_binding"] =
+                    json!("pkce-s256");
+                value["credential_paths"][0]["credential_profile"]["replay"] =
+                    document["credential_paths"][1]["credential_profile"]["replay"].clone();
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["verifier"]["required_claim_ids"] =
+                    json!(["aud", "exp", "iat", "nbf", "oid", "sub"]);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][1]["verifier"]["required_claim_ids"] =
+                    json!(["aud", "exp", "iss", "nbf", "nonce", "sub"]);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["authenticator_kind"] = json!("passkey");
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["credential_profile"]["proof_binding"] = json!("dpop");
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["verifier"]["required_claim_ids"] =
+                    json!(["aud", "exp", "iat", "iss", "nbf", "nonce", "oid", "sub"]);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][1]["verifier"]["issued_at_required"] = json!(true);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["verifier"]["accepted_algorithm_ids"] =
+                    json!(["hs256"]);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["adapter_kind"] = json!("auth.generic-oidc");
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_paths"][0]["verifier"]["raw_issuer"] =
+                    json!("https://identity.example.test");
+                value
+            },
+        ] {
+            let mut errors = Vec::new();
+            validate_instance(
+                "invalid authenticator runtime binding fixture",
+                "authenticator-runtime-binding.schema.json",
+                &schema,
+                &invalid,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "invalid binding unexpectedly passed");
+        }
     }
 
     #[test]

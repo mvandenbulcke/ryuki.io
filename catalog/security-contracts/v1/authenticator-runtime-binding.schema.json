@@ -1,0 +1,448 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+  "title": "Ryuki Authenticator Runtime Binding",
+  "description": "Closed, value-free contract foundation for retained OIDC or OIDC-broker credential-establishment paths. Version 1 admits only the implemented OAuth JWT bearer and OIDC authorization-code/PKCE browser paths; DPoP, mTLS, passkey, API-token, and workload profiles remain ineligible until their complete retained proof paths have dedicated closed variants. Schema validity alone grants no authority: production use additionally requires an exact content-addressed provider reference, semantic limit and digest resolution, complete derived-session coverage, and independent retained-runtime measurement. The exact raw document digest is D; the provider payload digest is P; the independently measured runtime digest is R. This document contains none of D, P, R, inventory, registry, profile, guard, receipt, closure, workload-response, raw issuer, tenant, client, endpoint, credential, token, or key values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_kind",
+    "document_id",
+    "document_version",
+    "value_free",
+    "provider_id",
+    "provider_configuration_version",
+    "deployment_id",
+    "trust_domain_id",
+    "capability_descriptor_id",
+    "capability_descriptor_version",
+    "adapter_kind",
+    "adapter_version",
+    "authenticator_kind",
+    "provider_policy",
+    "capability_ids",
+    "credential_paths",
+    "ownership"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json"
+    },
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "authenticator-runtime-binding" },
+    "document_id": {
+      "type": "string",
+      "pattern": "^authenticator-runtime-binding:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "document_version": { "$ref": "#/$defs/positiveVersion" },
+    "value_free": { "const": true },
+    "provider_id": { "$ref": "#/$defs/providerId" },
+    "provider_configuration_version": { "$ref": "#/$defs/positiveVersion" },
+    "deployment_id": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trust_domain_id": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "capability_descriptor_id": { "$ref": "#/$defs/referenceId" },
+    "capability_descriptor_version": { "$ref": "#/$defs/positiveVersion" },
+    "adapter_kind": { "$ref": "#/$defs/canonicalId" },
+    "adapter_version": { "$ref": "#/$defs/semanticVersion" },
+    "authenticator_kind": {
+      "enum": ["oidc", "oidc-broker"]
+    },
+    "provider_policy": { "$ref": "#/$defs/providerPolicyBinding" },
+    "capability_ids": {
+      "description": "Exact nonempty capability inventory. Runtime semantic validation additionally requires strict bytewise ordering and uniqueness.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/canonicalId" }
+    },
+    "credential_paths": {
+      "description": "Complete credential-path inventory. Runtime semantic validation requires strict path_id ordering, unique verifier/profile identities, globally disjoint consumers, and exact equality with independently measured retained objects.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/credentialPath" }
+    },
+    "ownership": { "$ref": "#/$defs/runtimeOwnership" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "adapter_kind": { "const": "auth.entra-id" } },
+        "required": ["adapter_kind"]
+      },
+      "then": {
+        "properties": {
+          "credential_paths": {
+            "items": {
+              "properties": {
+                "verifier": {
+                  "properties": {
+                    "provider_subject_claim_id": { "const": "oid" },
+                    "required_claim_ids": { "contains": { "const": "oid" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "credential_paths": {
+            "items": {
+              "properties": {
+                "verifier": {
+                  "properties": {
+                    "provider_subject_claim_id": { "const": "sub" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "positiveVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{1,95}$"
+    },
+    "providerId": {
+      "type": "string",
+      "pattern": "^provider:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "referenceId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "semanticVersion": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "nonzeroDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "providerPolicyBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_contract", "binding_digest"],
+      "properties": {
+        "digest_contract": { "const": "ryuki-authenticator-provider-policy-binding-v1" },
+        "binding_digest": {
+          "description": "Independently recomputed digest of the complete provider kind configuration except runtime_binding_ref. It contains only value-free content references and closed policy identifiers.",
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
+    },
+    "credentialPath": {
+      "oneOf": [
+        { "$ref": "#/$defs/bearerCredentialPath" },
+        { "$ref": "#/$defs/browserCredentialPath" }
+      ]
+    },
+    "credentialPathBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_id",
+        "path_version",
+        "verifier",
+        "credential_profile",
+        "cache_partition",
+        "protocol_binding",
+        "retained_consumer_ids"
+      ],
+      "properties": {
+        "path_id": {
+          "type": "string",
+          "pattern": "^authenticator-path:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "path_version": { "$ref": "#/$defs/positiveVersion" },
+        "verifier": {},
+        "credential_profile": {},
+        "cache_partition": { "$ref": "#/$defs/cachePartitionBinding" },
+        "protocol_binding": { "$ref": "#/$defs/protocolBinding" },
+        "retained_consumer_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^runtime-consumer:[a-z0-9][a-z0-9._-]{2,126}$"
+          }
+        }
+      }
+    },
+    "bearerCredentialPath": {
+      "allOf": [
+        { "$ref": "#/$defs/credentialPathBase" },
+        {
+          "properties": {
+            "verifier": { "$ref": "#/$defs/jwtAccessTokenVerifier" },
+            "credential_profile": { "$ref": "#/$defs/bearerCredentialProfile" }
+          }
+        }
+      ]
+    },
+    "browserCredentialPath": {
+      "allOf": [
+        { "$ref": "#/$defs/credentialPathBase" },
+        {
+          "properties": {
+            "verifier": { "$ref": "#/$defs/oidcIdTokenVerifier" },
+            "credential_profile": { "$ref": "#/$defs/browserCredentialProfile" }
+          }
+        }
+      ]
+    },
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verifier_id",
+        "verifier_version",
+        "issuer_binding_digest",
+        "audience_set_binding_digest",
+        "accepted_algorithm_ids",
+        "required_claim_ids",
+        "provider_subject_claim_id",
+        "key_source_kind",
+        "key_source_binding_digest",
+        "expiration_required",
+        "not_before_required",
+        "issued_at_required",
+        "nonce_required",
+        "clock_skew_limit_id",
+        "maximum_clock_skew_seconds",
+        "redirects_allowed"
+      ],
+      "properties": {
+        "verifier_id": {
+          "type": "string",
+          "pattern": "^authenticator-verifier:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "verifier_version": { "$ref": "#/$defs/positiveVersion" },
+        "issuer_binding_digest": { "$ref": "#/$defs/nonzeroDigest" },
+        "audience_set_binding_digest": { "$ref": "#/$defs/nonzeroDigest" },
+        "accepted_algorithm_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/canonicalId" }
+        },
+        "required_claim_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/canonicalId" }
+        },
+        "provider_subject_claim_id": { "enum": ["oid", "sub"] },
+        "key_source_kind": { "const": "jwt-jwks" },
+        "key_source_binding_digest": { "$ref": "#/$defs/nonzeroDigest" },
+        "expiration_required": { "type": "boolean" },
+        "not_before_required": { "type": "boolean" },
+        "issued_at_required": { "type": "boolean" },
+        "nonce_required": { "type": "boolean" },
+        "clock_skew_limit_id": {
+          "type": "string",
+          "pattern": "^limit:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "maximum_clock_skew_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "redirects_allowed": { "const": false }
+      }
+    },
+    "jwtAccessTokenVerifier": {
+      "allOf": [
+        { "$ref": "#/$defs/verifier" },
+        {
+          "properties": {
+            "required_claim_ids": {
+              "allOf": [
+                { "contains": { "const": "aud" } },
+                { "contains": { "const": "exp" } },
+                { "contains": { "const": "iat" } },
+                { "contains": { "const": "iss" } },
+                { "contains": { "const": "nbf" } },
+                { "contains": { "const": "sub" } },
+                { "not": { "contains": { "const": "nonce" } } }
+              ]
+            },
+            "accepted_algorithm_ids": { "const": ["rs256"] },
+            "expiration_required": { "const": true },
+            "not_before_required": { "const": true },
+            "issued_at_required": { "const": true },
+            "nonce_required": { "const": false }
+          }
+        }
+      ]
+    },
+    "oidcIdTokenVerifier": {
+      "allOf": [
+        { "$ref": "#/$defs/verifier" },
+        {
+          "properties": {
+            "required_claim_ids": {
+              "allOf": [
+                { "contains": { "const": "aud" } },
+                { "contains": { "const": "exp" } },
+                { "contains": { "const": "iss" } },
+                { "contains": { "const": "nbf" } },
+                { "contains": { "const": "nonce" } },
+                { "contains": { "const": "sub" } }
+              ]
+            },
+            "accepted_algorithm_ids": { "const": ["rs256"] },
+            "expiration_required": { "const": true },
+            "not_before_required": { "const": true },
+            "nonce_required": { "const": true }
+          }
+        },
+        {
+          "if": {
+            "properties": { "issued_at_required": { "const": true } },
+            "required": ["issued_at_required"]
+          },
+          "then": {
+            "properties": {
+              "required_claim_ids": { "contains": { "const": "iat" } }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_claim_ids": {
+                "not": { "contains": { "const": "iat" } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "bearerCredentialProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_version", "token_profile", "carrier", "proof_binding", "replay"],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "pattern": "^credential-profile:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "profile_version": { "$ref": "#/$defs/positiveVersion" },
+        "token_profile": { "const": "jwt-access-token" },
+        "carrier": { "const": "authorization-bearer" },
+        "proof_binding": { "const": "bearer" },
+        "replay": { "$ref": "#/$defs/reusableBearerReplayPolicy" }
+      }
+    },
+    "browserCredentialProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_version", "token_profile", "carrier", "proof_binding", "replay"],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "pattern": "^credential-profile:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "profile_version": { "$ref": "#/$defs/positiveVersion" },
+        "token_profile": { "const": "oidc-id-token" },
+        "carrier": { "const": "oauth-callback" },
+        "proof_binding": { "const": "pkce-s256" },
+        "replay": { "$ref": "#/$defs/singleUseBrowserReplayPolicy" }
+      }
+    },
+    "reusableBearerReplayPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_reuse", "credential_lifetime_limit_id", "maximum_credential_lifetime_seconds", "sender_constraint", "presentation_replay_defense", "nonce_binding", "replay_store_binding_digest"],
+      "properties": {
+        "credential_reuse": { "const": "reusable-until-expiry" },
+        "credential_lifetime_limit_id": {
+          "type": "string",
+          "pattern": "^limit:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "maximum_credential_lifetime_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sender_constraint": { "const": "none" },
+        "presentation_replay_defense": { "const": "none" },
+        "nonce_binding": { "const": "none" },
+        "replay_store_binding_digest": { "type": "null" }
+      }
+    },
+    "singleUseBrowserReplayPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_reuse", "credential_lifetime_limit_id", "maximum_credential_lifetime_seconds", "sender_constraint", "presentation_replay_defense", "nonce_binding", "replay_store_binding_digest"],
+      "properties": {
+        "credential_reuse": { "const": "single-use" },
+        "credential_lifetime_limit_id": { "type": "null" },
+        "maximum_credential_lifetime_seconds": { "type": "null" },
+        "sender_constraint": { "const": "none" },
+        "presentation_replay_defense": { "const": "single-use-state" },
+        "nonce_binding": { "const": "oidc-login" },
+        "replay_store_binding_digest": { "$ref": "#/$defs/nonzeroDigest" }
+      }
+    },
+    "cachePartitionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_contract", "binding_digest"],
+      "properties": {
+        "digest_contract": { "const": "ryuki-authenticator-cache-partition-v1" },
+        "binding_digest": {
+          "description": "Value-free digest of the exact retained cache allocation inventory. Its canonical preimage binds provider id, configuration version, issuer digest, token profile, verifier identity, and every discovery, JWKS, introspection, nonce, replay, and key-cache allocation owned by this path.",
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
+    },
+    "protocolBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest_contract", "binding_digest"],
+      "properties": {
+        "digest_contract": { "const": "ryuki-authenticator-protocol-binding-v1" },
+        "binding_digest": {
+          "description": "Value-free digest of the exact retained carrier protocol. Browser paths include authorization/token/redirect endpoints, client authentication reference, scopes, PKCE S256, state/nonce/browser binding, one-use state authority, server-side token custody, issued-session linkage, transport bounds, and redirect policy.",
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
+    },
+    "runtimeOwnership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["single_runtime_owner", "ambient_reconfiguration_allowed"],
+      "properties": {
+        "single_runtime_owner": { "const": true },
+        "ambient_reconfiguration_allowed": { "const": false }
+      }
+    }
+  }
+}

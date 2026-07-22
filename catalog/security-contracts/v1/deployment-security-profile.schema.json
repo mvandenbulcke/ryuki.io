@@ -380,7 +380,7 @@
           "enum": ["oidc", "oidc-broker", "passkey", "oauth-service", "api-token", "workload"]
         },
         "runtime_binding_digest": {
-          "description": "ryuki-authenticator-runtime-binding-v1 digest of the exact non-secret initialized verifier, credential-profile, and retained-consumer projection for this provider.",
+          "description": "ryuki-authenticator-runtime-binding-v2 digest of the exact content-addressed binding reference and strictly ordered retained external credential-establishment inventory for this provider. The current v2 projection admits only closed OIDC/OIDC-broker JWT-bearer and browser-code/PKCE paths; every other listed authenticator kind remains production-ineligible until a dedicated closed runtime variant exists. A pinned expectation is not evidence and cannot satisfy the guard until provider linkage, derived-session coverage, registered-limit resolution, and independent retained-runtime measurement are complete. Each admitted path independently binds its verifier, credential profile, replay/reuse semantics, cache partition, protocol policy, registered security limits, and authority-bearing consumers.",
           "$ref": "#/$defs/nonzeroDigest"
         }
       }

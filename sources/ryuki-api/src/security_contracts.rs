@@ -207,6 +207,9 @@ const CONFORMANCE_BUNDLE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/conformance-bundle.schema.json");
 const PROVIDER_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/provider-registry.schema.json");
+const AUTHENTICATOR_RUNTIME_BINDING_SCHEMA: &str = include_str!(
+    "../../../catalog/security-contracts/v1/authenticator-runtime-binding.schema.json"
+);
 const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
@@ -7054,6 +7057,14 @@ fn validate_typed_reference_document(
             "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
             PROVIDER_SCHEMA,
         ),
+        Some("authenticator-runtime-binding") => require_contract_document(
+            reference,
+            document,
+            schema_uri,
+            "authenticator-runtime-binding",
+            "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+            AUTHENTICATOR_RUNTIME_BINDING_SCHEMA,
+        ),
         Some("secret-provider-runtime-binding") => require_contract_document(
             reference,
             document,
@@ -7148,6 +7159,16 @@ fn validate_typed_reference_document(
             Some(
                 "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
             ) => validate_against_schema("provider registry", PROVIDER_SCHEMA, document),
+            Some(
+                "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+            ) => require_contract_document(
+                reference,
+                document,
+                schema_uri,
+                "authenticator-runtime-binding",
+                "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+                AUTHENTICATOR_RUNTIME_BINDING_SCHEMA,
+            ),
             Some(
                 "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
             ) => require_contract_document(
@@ -10875,6 +10896,82 @@ mod tests {
         })
     }
 
+    fn genuine_authenticator_runtime_binding_document() -> Value {
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "authenticator-runtime-binding",
+            "document_id": "authenticator-runtime-binding:runtime-test",
+            "document_version": 1,
+            "value_free": true,
+            "provider_id": "provider:runtime-test-oidc",
+            "provider_configuration_version": 1,
+            "deployment_id": DEPLOYMENT_ID,
+            "trust_domain_id": "trust-domain:repository-fixture",
+            "capability_descriptor_id": "capability-descriptor:runtime-test-oidc",
+            "capability_descriptor_version": 1,
+            "adapter_kind": "auth.entra-id",
+            "adapter_version": "1.0.0",
+            "authenticator_kind": "oidc",
+            "provider_policy": {
+                "digest_contract": "ryuki-authenticator-provider-policy-binding-v1",
+                "binding_digest": raw_digest(b"runtime-test authenticator policy")
+            },
+            "capability_ids": ["token-validation"],
+            "credential_paths": [{
+                "path_id": "authenticator-path:runtime-test-bearer",
+                "path_version": 1,
+                "verifier": {
+                    "verifier_id": "authenticator-verifier:runtime-test-bearer",
+                    "verifier_version": 1,
+                    "issuer_binding_digest": raw_digest(b"runtime-test issuer"),
+                    "audience_set_binding_digest": raw_digest(b"runtime-test audiences"),
+                    "accepted_algorithm_ids": ["rs256"],
+                    "required_claim_ids": ["aud", "exp", "iat", "iss", "nbf", "oid", "sub"],
+                    "provider_subject_claim_id": "oid",
+                    "key_source_kind": "jwt-jwks",
+                    "key_source_binding_digest": raw_digest(b"runtime-test key source"),
+                    "expiration_required": true,
+                    "not_before_required": true,
+                    "issued_at_required": true,
+                    "nonce_required": false,
+                    "clock_skew_limit_id": "limit:authenticator.clock-skew",
+                    "maximum_clock_skew_seconds": 60,
+                    "redirects_allowed": false
+                },
+                "credential_profile": {
+                    "profile_id": "credential-profile:runtime-test-bearer",
+                    "profile_version": 1,
+                    "token_profile": "jwt-access-token",
+                    "carrier": "authorization-bearer",
+                    "proof_binding": "bearer",
+                    "replay": {
+                        "credential_reuse": "reusable-until-expiry",
+                        "credential_lifetime_limit_id": "limit:authenticator.oidc-access-token-lifetime",
+                        "maximum_credential_lifetime_seconds": 3600,
+                        "sender_constraint": "none",
+                        "presentation_replay_defense": "none",
+                        "nonce_binding": "none",
+                        "replay_store_binding_digest": null
+                    }
+                },
+                "cache_partition": {
+                    "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                    "binding_digest": raw_digest(b"runtime-test authenticator cache partition")
+                },
+                "protocol_binding": {
+                    "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                    "binding_digest": raw_digest(b"runtime-test bearer protocol")
+                },
+                "retained_consumer_ids": ["runtime-consumer:runtime-test-bearer"]
+            }],
+            "ownership": {
+                "single_runtime_owner": true,
+                "ambient_reconfiguration_allowed": false
+            }
+        })
+    }
+
     struct SecretProviderBindingCase {
         profile: DeploymentSecurityProfile,
         capability_descriptor: ProviderCapabilityDescriptorBinding,
@@ -13767,6 +13864,27 @@ mod tests {
         )
         .unwrap_err()
         .contains("does not bind to_state"));
+    }
+
+    #[test]
+    fn typed_authenticator_runtime_binding_route_rejects_profile_relabeling() {
+        let reference = ReferenceBinding {
+            locator: "bindings/authenticator-runtime-test.json".into(),
+            digest: raw_digest(b"typed authenticator route fixture"),
+            artifact_kind: Some("authenticator-runtime-binding".into()),
+            document_id: Some("authenticator-runtime-binding:runtime-test".into()),
+            document_version: Some(1),
+        };
+        let document = genuine_authenticator_runtime_binding_document();
+        assert!(validate_typed_reference_document(&reference, &document).is_ok());
+
+        let mut relabeled = document;
+        relabeled["credential_paths"][0]["credential_profile"]["token_profile"] =
+            json!("oidc-id-token");
+        relabeled["credential_paths"][0]["credential_profile"]["carrier"] = json!("oauth-callback");
+        relabeled["credential_paths"][0]["credential_profile"]["proof_binding"] =
+            json!("pkce-s256");
+        assert!(validate_typed_reference_document(&reference, &relabeled).is_err());
     }
 
     #[test]
