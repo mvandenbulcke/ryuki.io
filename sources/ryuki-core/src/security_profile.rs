@@ -853,6 +853,45 @@ struct AuthenticatorRuntimeBindingDigestProjection<'a> {
     runtime_binding: &'a AuthenticatorRuntimeBindingProjection,
 }
 
+#[derive(Serialize)]
+struct AuthenticatorProviderPolicyBindingProjection<'a> {
+    digest_contract: &'static str,
+    kind_config: &'a Value,
+}
+
+/// Canonically project an already schema-validated OIDC provider
+/// `kind_config` into the independent provider-policy binding Q preimage.
+///
+/// Only the top-level `runtime_binding_ref` is excluded: that reference binds
+/// P to D separately and including it here would make D's own content digest
+/// recursive. A missing reference is accepted so callers can construct Q
+/// before D exists. All other values, including array order, are preserved.
+pub fn authenticator_provider_policy_binding_canonical_bytes(
+    kind_config: &Value,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    let mut kind_config = kind_config.clone();
+    let object = kind_config
+        .as_object_mut()
+        .ok_or(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator provider kind_config must be an object",
+        ))?;
+    object.remove("runtime_binding_ref");
+
+    canonical_projection_bytes(AuthenticatorProviderPolicyBindingProjection {
+        digest_contract: AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
+        kind_config: &kind_config,
+    })
+}
+
+/// Digest the exact canonical provider-policy binding Q preimage.
+pub fn authenticator_provider_policy_binding_digest(
+    kind_config: &Value,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(authenticator_provider_policy_binding_canonical_bytes(
+        kind_config,
+    )?)
+}
+
 pub fn authenticator_runtime_binding_canonical_bytes(
     binding: &AuthenticatorRuntimeBindingProjection,
 ) -> Result<Vec<u8>, RuntimeGuardDigestError> {
@@ -869,9 +908,10 @@ pub fn authenticator_runtime_binding_digest(
     let digest = digest_canonical_bytes(authenticator_runtime_binding_canonical_bytes(binding)?)?;
     if digest == binding.binding_document_reference.content_digest
         || digest == binding.provider.configuration_payload_digest
+        || digest == binding.provider_policy_binding_digest
     {
         return Err(RuntimeGuardDigestError::InvalidProjection(
-            "authenticator D/P/R digest separation",
+            "authenticator D/P/Q/R digest separation",
         ));
     }
     Ok(digest)
@@ -1366,6 +1406,10 @@ fn validate_authenticator_runtime_binding_projection(
             &binding.binding_document_reference.artifact_locator,
         )
         || !valid_sha256_digest(&binding.provider_policy_binding_digest)
+        || binding.binding_document_reference.content_digest
+            == binding.provider_policy_binding_digest
+        || binding.provider.configuration_payload_digest == binding.provider_policy_binding_digest
+        || binding.capability_ids.is_empty()
         || binding.capability_ids.len() > 128
         || !valid_sorted_authenticator_identifiers(&binding.capability_ids)
         || binding.credential_paths.is_empty()
@@ -4032,6 +4076,10 @@ mod tests {
         unsupported_kind.authenticator_kind = ProductionAuthenticatorKind::Passkey;
         assert!(authenticator_runtime_binding_digest(&unsupported_kind).is_err());
 
+        let mut empty_capabilities = binding.clone();
+        empty_capabilities.capability_ids.clear();
+        assert!(authenticator_runtime_binding_digest(&empty_capabilities).is_err());
+
         let mut unimplemented_dpop = binding.clone();
         unimplemented_dpop.credential_paths[0]
             .credential_profile
@@ -4075,6 +4123,22 @@ mod tests {
             .clone();
         assert!(authenticator_runtime_binding_digest(&digest_collision).is_err());
 
+        let mut document_policy_collision = binding.clone();
+        document_policy_collision
+            .binding_document_reference
+            .content_digest = document_policy_collision
+            .provider_policy_binding_digest
+            .clone();
+        assert!(authenticator_runtime_binding_digest(&document_policy_collision).is_err());
+
+        let mut provider_policy_collision = binding.clone();
+        provider_policy_collision
+            .provider
+            .configuration_payload_digest = provider_policy_collision
+            .provider_policy_binding_digest
+            .clone();
+        assert!(authenticator_runtime_binding_digest(&provider_policy_collision).is_err());
+
         let mut raw = serde_json::to_value(binding).unwrap();
         raw.as_object_mut()
             .unwrap()
@@ -4103,6 +4167,61 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<AuthenticatorRuntimeBindingProjection>(v1).is_err());
+    }
+
+    #[test]
+    fn authenticator_provider_policy_binding_is_exact_and_reference_independent() {
+        let kind_config = json!({
+            "configuration_kind": "oidc",
+            "validation_mode": "jwt-jwks",
+            "accepted_algorithms": ["RS256", "PS256"],
+            "runtime_binding_ref": {
+                "document_id": "authenticator-runtime-binding:fixture-oidc",
+                "document_version": 1,
+                "content_digest": fixture_digest('a'),
+                "artifact_locator": "catalog/security-contracts/v1/authenticator-runtime-binding.fixture.json"
+            }
+        });
+
+        assert_independent_canonical_golden(
+            authenticator_provider_policy_binding_canonical_bytes(&kind_config).unwrap(),
+            json!({
+                "digest_contract": "ryuki-authenticator-provider-policy-binding-v1",
+                "kind_config": {
+                    "configuration_kind": "oidc",
+                    "validation_mode": "jwt-jwks",
+                    "accepted_algorithms": ["RS256", "PS256"]
+                }
+            }),
+        );
+
+        let digest = authenticator_provider_policy_binding_digest(&kind_config).unwrap();
+        let mut reference_drift = kind_config.clone();
+        reference_drift["runtime_binding_ref"]["content_digest"] =
+            Value::String(fixture_digest('b'));
+        assert_eq!(
+            authenticator_provider_policy_binding_digest(&reference_drift).unwrap(),
+            digest,
+            "Q must exclude only the top-level D reference"
+        );
+
+        let mut leaf_drift = kind_config.clone();
+        leaf_drift["validation_mode"] = json!("authenticated-introspection");
+        assert_ne!(
+            authenticator_provider_policy_binding_digest(&leaf_drift).unwrap(),
+            digest,
+            "every non-reference provider-policy leaf must remain bound"
+        );
+
+        let mut reordered_algorithms = kind_config.clone();
+        reordered_algorithms["accepted_algorithms"] = json!(["PS256", "RS256"]);
+        assert_ne!(
+            authenticator_provider_policy_binding_digest(&reordered_algorithms).unwrap(),
+            digest,
+            "provider-policy arrays must not be normalized or reordered"
+        );
+
+        assert!(authenticator_provider_policy_binding_digest(&json!([])).is_err());
     }
 
     #[test]

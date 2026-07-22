@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
   "title": "Ryuki Provider Registry",
-  "description": "Closed immutable provider configuration and separately versioned lifecycle registry.",
+  "description": "Closed immutable provider configuration and separately versioned lifecycle registry. Version 1 is a pre-production contract: every OIDC or OIDC-broker configuration requires an exact authenticator-runtime-binding reference, and no legacy reference-free OIDC shape is admitted.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -101,6 +101,28 @@
         {
           "required": ["content_digest"],
           "properties": {
+            "content_digest": {
+              "not": {
+                "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            },
+            "artifact_locator": {
+              "pattern": "\\.json$"
+            }
+          }
+        }
+      ]
+    },
+    "authenticatorRuntimeBindingReference": {
+      "description": "Exact reference to an authenticator-runtime-binding document. The raw document bytes are the D input to the production authenticator boundary and can never use the all-zero digest sentinel.",
+      "allOf": [
+        { "$ref": "#/$defs/contentReference" },
+        {
+          "required": ["document_id", "content_digest", "artifact_locator"],
+          "properties": {
+            "document_id": {
+              "pattern": "^authenticator-runtime-binding:[a-z0-9][a-z0-9._-]{2,126}$"
+            },
             "content_digest": {
               "not": {
                 "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -371,9 +393,10 @@
     "oidcConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["configuration_kind", "issuer_ref", "endpoint_policy_ref", "validation_mode", "client_id_ref", "client_authentication_method", "accepted_audiences_ref", "accepted_algorithms", "redirect_policy_ref", "claim_mapping_ref", "assurance_mapping_ref", "logout_mode", "lifecycle_mode", "revocation_mode"],
+      "required": ["configuration_kind", "runtime_binding_ref", "issuer_ref", "endpoint_policy_ref", "validation_mode", "client_id_ref", "client_authentication_method", "accepted_audiences_ref", "accepted_algorithms", "redirect_policy_ref", "claim_mapping_ref", "assurance_mapping_ref", "logout_mode", "lifecycle_mode", "revocation_mode"],
       "properties": {
         "configuration_kind": { "enum": ["oidc", "oidc-broker"] },
+        "runtime_binding_ref": { "$ref": "#/$defs/authenticatorRuntimeBindingReference" },
         "issuer_ref": { "$ref": "#/$defs/contentReference" },
         "endpoint_policy_ref": { "$ref": "#/$defs/contentReference" },
         "validation_mode": { "enum": ["jwt-jwks", "authenticated-introspection"] },

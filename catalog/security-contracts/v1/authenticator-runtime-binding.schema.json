@@ -150,7 +150,7 @@
       "properties": {
         "digest_contract": { "const": "ryuki-authenticator-provider-policy-binding-v1" },
         "binding_digest": {
-          "description": "Independently recomputed digest of the complete provider kind configuration except runtime_binding_ref. It contains only value-free content references and closed policy identifiers.",
+          "description": "Independently recomputed SHA-256 digest of ryuki-canonical-json-v1({\"digest_contract\":\"ryuki-authenticator-provider-policy-binding-v1\",\"kind_config\":K-minus}), where K-minus is the complete schema-validated provider kind_config with only its top-level runtime_binding_ref member removed. Object keys are canonicalized, array order is preserved, and no other member is omitted or normalized. It contains only value-free content references and closed policy identifiers.",
           "$ref": "#/$defs/nonzeroDigest"
         }
       }

@@ -48,6 +48,11 @@ const MAX_APPLICABILITY_EXPRESSION_DEPTH: usize = 32;
 const MAX_APPLICABILITY_EXPRESSION_NODES: usize = 4096;
 const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
 const MAX_RECEIPT_DIGESTS: usize = 4096;
+const AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-provider-policy-binding-v1";
+const AUTHENTICATOR_RUNTIME_BINDING_SCHEMA: &str = include_str!(
+    "../../../catalog/security-contracts/v1/authenticator-runtime-binding.schema.json"
+);
 const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
@@ -3495,6 +3500,7 @@ fn validate_cross_document_semantics(
 
     if let Some(provider) = instances.get("provider-registry.implementation.json") {
         validate_provider_registry(provider, errors);
+        validate_authenticator_runtime_binding_refs(root, deployment, provider, errors);
         validate_secret_provider_runtime_binding_refs(root, deployment, provider, errors);
     }
     if let Some(registry) = instances.get("action-resource-registry.implementation.json") {
@@ -5301,6 +5307,391 @@ fn validate_provider_registry(registry: &Value, errors: &mut Vec<String>) {
     }
 }
 
+fn authenticator_provider_policy_binding_digest(kind_config: &Value) -> Result<String, String> {
+    let mut kind_config_without_runtime_binding = kind_config.clone();
+    let Some(kind_config_object) = kind_config_without_runtime_binding.as_object_mut() else {
+        return Err("OIDC kind_config must be an object".to_string());
+    };
+    if kind_config_object.remove("runtime_binding_ref").is_none() {
+        return Err("OIDC kind_config omits runtime_binding_ref".to_string());
+    }
+
+    let mut preimage = Map::new();
+    preimage.insert(
+        "digest_contract".to_string(),
+        Value::String(AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT.to_string()),
+    );
+    preimage.insert(
+        "kind_config".to_string(),
+        kind_config_without_runtime_binding,
+    );
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_json(&Value::Object(preimage)).as_bytes())
+    ))
+}
+
+fn strict_string_array(value: &Value) -> Option<Vec<&str>> {
+    let values = value.as_array()?;
+    values.iter().map(Value::as_str).collect()
+}
+
+fn validate_authenticator_runtime_binding_semantics(
+    document: &Value,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(paths) = document.get("credential_paths").and_then(Value::as_array) else {
+        return;
+    };
+    let path_ids = paths
+        .iter()
+        .filter_map(|path| string_field(path, "path_id"))
+        .collect::<Vec<_>>();
+    if path_ids.len() != paths.len() || path_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        errors.push(format!(
+            "{context}: credential paths must be strictly ordered by path_id"
+        ));
+    }
+
+    let mut verifier_ids = BTreeSet::new();
+    let mut profile_ids = BTreeSet::new();
+    let mut cache_partition_digests = BTreeSet::new();
+    let mut resolution_tuples = BTreeSet::new();
+    let mut global_consumer_ids = BTreeSet::new();
+    for (path_index, path) in paths.iter().enumerate() {
+        let verifier = path.get("verifier").unwrap_or(&Value::Null);
+        let profile = path.get("credential_profile").unwrap_or(&Value::Null);
+        for (label, value, identities) in [
+            (
+                "verifier_id",
+                string_field(verifier, "verifier_id"),
+                &mut verifier_ids,
+            ),
+            (
+                "profile_id",
+                string_field(profile, "profile_id"),
+                &mut profile_ids,
+            ),
+        ] {
+            if value.is_none_or(|value| !identities.insert(value.to_string())) {
+                errors.push(format!(
+                    "{context}: credential path {path_index} has a missing or duplicate {label}"
+                ));
+            }
+        }
+        let cache_digest = path
+            .pointer("/cache_partition/binding_digest")
+            .and_then(Value::as_str);
+        if cache_digest.is_none_or(|digest| !cache_partition_digests.insert(digest.to_string())) {
+            errors.push(format!(
+                "{context}: credential path {path_index} has a missing or duplicate cache partition"
+            ));
+        }
+        let resolution_tuple = (
+            string_field(verifier, "issuer_binding_digest"),
+            string_field(profile, "token_profile"),
+        );
+        if !matches!(resolution_tuple, (Some(_), Some(_)))
+            || !resolution_tuples.insert((
+                resolution_tuple.0.unwrap_or_default().to_string(),
+                resolution_tuple.1.unwrap_or_default().to_string(),
+            ))
+        {
+            errors.push(format!(
+                "{context}: credential path {path_index} has a missing or duplicate issuer/token-profile resolution tuple"
+            ));
+        }
+
+        let claims = verifier
+            .get("required_claim_ids")
+            .and_then(strict_string_array);
+        if claims.as_ref().is_none_or(|claims| {
+            claims.is_empty() || claims.windows(2).any(|pair| pair[0] >= pair[1])
+        }) {
+            errors.push(format!(
+                "{context}: credential path {path_index} required claims must be nonempty and strictly ordered"
+            ));
+        }
+        let consumers = path
+            .get("retained_consumer_ids")
+            .and_then(strict_string_array);
+        if consumers.as_ref().is_none_or(|consumers| {
+            consumers.is_empty() || consumers.windows(2).any(|pair| pair[0] >= pair[1])
+        }) {
+            errors.push(format!(
+                "{context}: credential path {path_index} retained consumers must be nonempty and strictly ordered"
+            ));
+        }
+        if consumers.is_some_and(|consumers| {
+            consumers
+                .into_iter()
+                .any(|consumer| !global_consumer_ids.insert(consumer.to_string()))
+        }) {
+            errors.push(format!(
+                "{context}: retained consumers must be globally disjoint across credential paths"
+            ));
+        }
+    }
+}
+
+fn validate_authenticator_runtime_binding_refs(
+    root: &Path,
+    deployment: &Value,
+    registry: &Value,
+    errors: &mut Vec<String>,
+) {
+    let schema = match parse_json_strict(AUTHENTICATOR_RUNTIME_BINDING_SCHEMA.as_bytes()) {
+        Ok(schema) => schema,
+        Err(error) => {
+            errors.push(format!(
+                "embedded authenticator runtime-binding schema is invalid: {error}"
+            ));
+            return;
+        }
+    };
+    let mut latest_lifecycle = BTreeMap::<(String, u64), (u64, &str)>::new();
+    for record in array(registry, "provider_lifecycle") {
+        let Some(provider_id) = string_field(record, "provider_id") else {
+            continue;
+        };
+        let Some(configuration_version) = record.get("config_version").and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let Some(record_version) = record
+            .get("lifecycle_record_version")
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let state = string_field(record, "state").unwrap_or("");
+        let entry = latest_lifecycle
+            .entry((provider_id.to_string(), configuration_version))
+            .or_insert((0, ""));
+        if record_version > entry.0 {
+            *entry = (record_version, state);
+        }
+    }
+
+    let production = string_field(deployment, "security_profile") == Some("production");
+    for (index, configuration) in array(registry, "configurations").iter().enumerate() {
+        let provider_kind = string_field(configuration, "kind").unwrap_or("");
+        if !matches!(provider_kind, "oidc" | "oidc-broker") {
+            continue;
+        }
+        let context = format!(
+            "provider-registry.implementation.json:/configurations/{index}/kind_config/runtime_binding_ref"
+        );
+        let Some(reference_value) = configuration.pointer("/kind_config/runtime_binding_ref")
+        else {
+            let provider_id = string_field(configuration, "provider_id").unwrap_or("");
+            let configuration_version = configuration
+                .get("config_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if production
+                && latest_lifecycle
+                    .get(&(provider_id.to_string(), configuration_version))
+                    .is_some_and(|(_, state)| *state == "active")
+            {
+                errors.push(format!(
+                    "{context}: active production {provider_kind} provider requires runtime_binding_ref"
+                ));
+            }
+            continue;
+        };
+        let Some(reference) = reference_value.as_object() else {
+            errors.push(format!("{context}: runtime_binding_ref must be an object"));
+            continue;
+        };
+        let Some(locator) = reference.get("artifact_locator").and_then(Value::as_str) else {
+            errors.push(format!(
+                "{context}: runtime_binding_ref omits artifact_locator"
+            ));
+            continue;
+        };
+        if Path::new(locator)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("json")
+        {
+            errors.push(format!(
+                "{context}: authenticator runtime binding artifact_locator must end in lowercase .json"
+            ));
+            continue;
+        }
+        let provider_policy_binding_digest = match authenticator_provider_policy_binding_digest(
+            configuration.get("kind_config").unwrap_or(&Value::Null),
+        ) {
+            Ok(digest) => digest,
+            Err(error) => {
+                errors.push(format!("{context}: {error}"));
+                continue;
+            }
+        };
+        let Some(target) = safe_repository_path(root, locator, &context, errors) else {
+            continue;
+        };
+        let raw_bytes = match fs::read(&target) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: cannot read authenticator runtime binding {locator}: {error}"
+                ));
+                continue;
+            }
+        };
+        let actual_digest = format!("sha256:{:x}", Sha256::digest(&raw_bytes));
+        if reference.get("content_digest").and_then(Value::as_str) != Some(actual_digest.as_str()) {
+            errors.push(format!(
+                "{context}: content_digest does not match exact authenticator runtime-binding bytes"
+            ));
+        }
+        let document = match parse_json_strict(&raw_bytes) {
+            Ok(document) => document,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: authenticator runtime binding {locator} is not strict JSON: {error}"
+                ));
+                continue;
+            }
+        };
+        validate_instance(
+            locator,
+            "authenticator-runtime-binding.schema.json",
+            &schema,
+            &document,
+            errors,
+        );
+        validate_authenticator_runtime_binding_semantics(&document, &context, errors);
+        for (field, expected) in [
+            (
+                "$schema",
+                Some(Value::String(
+                    "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json"
+                        .into(),
+                )),
+            ),
+            (
+                "contract_kind",
+                Some(Value::String("authenticator-runtime-binding".into())),
+            ),
+            ("document_id", reference.get("document_id").cloned()),
+            (
+                "document_version",
+                reference.get("document_version").cloned(),
+            ),
+            ("provider_id", configuration.get("provider_id").cloned()),
+            (
+                "provider_configuration_version",
+                configuration.get("config_version").cloned(),
+            ),
+            ("deployment_id", deployment.get("deployment_id").cloned()),
+            (
+                "trust_domain_id",
+                configuration.get("trust_domain_id").cloned(),
+            ),
+            (
+                "capability_descriptor_id",
+                configuration
+                    .pointer("/capability_descriptor/descriptor_id")
+                    .cloned(),
+            ),
+            (
+                "capability_descriptor_version",
+                configuration
+                    .pointer("/capability_descriptor/descriptor_version")
+                    .cloned(),
+            ),
+            (
+                "adapter_kind",
+                configuration
+                    .pointer("/capability_descriptor/adapter_kind")
+                    .cloned(),
+            ),
+            (
+                "adapter_version",
+                configuration
+                    .pointer("/capability_descriptor/adapter_version")
+                    .cloned(),
+            ),
+            (
+                "authenticator_kind",
+                Some(Value::String(provider_kind.to_string())),
+            ),
+        ] {
+            if expected
+                .as_ref()
+                .is_none_or(|expected| document.get(field) != Some(expected))
+            {
+                errors.push(format!(
+                    "{context}: binding document {field} does not exactly match its reference/provider/deployment authority"
+                ));
+            }
+        }
+        if document.get("authenticator_kind")
+            != configuration.pointer("/kind_config/configuration_kind")
+        {
+            errors.push(format!(
+                "{context}: binding document authenticator_kind does not match kind_config.configuration_kind"
+            ));
+        }
+        let bound_capabilities = document
+            .get("capability_ids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let advertised_capabilities = configuration
+            .pointer("/capability_descriptor/advertised_capabilities")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if bound_capabilities != advertised_capabilities {
+            errors.push(format!(
+                "{context}: binding capability inventory does not exactly match the provider descriptor"
+            ));
+        }
+        if document
+            .pointer("/provider_policy/digest_contract")
+            .and_then(Value::as_str)
+            != Some(AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT)
+            || document
+                .pointer("/provider_policy/binding_digest")
+                .and_then(Value::as_str)
+                != Some(provider_policy_binding_digest.as_str())
+        {
+            errors.push(format!(
+                "{context}: provider-policy digest does not match the independently recomputed OIDC kind_config"
+            ));
+        }
+        let accepted_algorithms = configuration
+            .pointer("/kind_config/accepted_algorithms")
+            .and_then(Value::as_array);
+        if configuration
+            .pointer("/kind_config/validation_mode")
+            .and_then(Value::as_str)
+            != Some("jwt-jwks")
+            || accepted_algorithms.is_none_or(|algorithms| {
+                algorithms.as_slice() != [Value::String("RS256".to_string())]
+            })
+        {
+            errors.push(format!(
+                "{context}: authenticator runtime binding requires the exact implemented jwt-jwks/RS256 OIDC provider policy"
+            ));
+        }
+        if string_field(configuration, "payload_digest").is_some_and(|payload_digest| {
+            actual_digest == payload_digest
+                || provider_policy_binding_digest == payload_digest
+                || actual_digest == provider_policy_binding_digest
+        }) {
+            errors.push(format!(
+                "{context}: authenticator binding violates D/P/Q digest separation"
+            ));
+        }
+    }
+}
+
 fn validate_secret_provider_runtime_binding_refs(
     root: &Path,
     deployment: &Value,
@@ -6405,6 +6796,88 @@ mod tests {
     fn load(relative: &str) -> Value {
         serde_json::from_slice(&fs::read(root().join(relative)).expect("read fixture"))
             .expect("parse fixture")
+    }
+
+    fn authenticator_runtime_binding_document(
+        deployment: &Value,
+        configuration: &Value,
+        provider_policy_binding_digest: &str,
+    ) -> Value {
+        let descriptor = &configuration["capability_descriptor"];
+        let digest = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "authenticator-runtime-binding",
+            "document_id": "authenticator-runtime-binding:validator-provider-fixture",
+            "document_version": 1,
+            "value_free": true,
+            "provider_id": configuration["provider_id"].clone(),
+            "provider_configuration_version": configuration["config_version"].clone(),
+            "deployment_id": deployment["deployment_id"].clone(),
+            "trust_domain_id": configuration["trust_domain_id"].clone(),
+            "capability_descriptor_id": descriptor["descriptor_id"].clone(),
+            "capability_descriptor_version": descriptor["descriptor_version"].clone(),
+            "adapter_kind": descriptor["adapter_kind"].clone(),
+            "adapter_version": descriptor["adapter_version"].clone(),
+            "authenticator_kind": configuration["kind"].clone(),
+            "provider_policy": {
+                "digest_contract": AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
+                "binding_digest": provider_policy_binding_digest
+            },
+            "capability_ids": descriptor["advertised_capabilities"].clone(),
+            "credential_paths": [{
+                "path_id": "authenticator-path:validator-api-bearer",
+                "path_version": 1,
+                "verifier": {
+                    "verifier_id": "authenticator-verifier:validator-api-bearer",
+                    "verifier_version": 1,
+                    "issuer_binding_digest": digest('1'),
+                    "audience_set_binding_digest": digest('2'),
+                    "accepted_algorithm_ids": ["rs256"],
+                    "required_claim_ids": ["aud", "exp", "iat", "iss", "nbf", "oid", "sub"],
+                    "provider_subject_claim_id": "oid",
+                    "key_source_kind": "jwt-jwks",
+                    "key_source_binding_digest": digest('3'),
+                    "expiration_required": true,
+                    "not_before_required": true,
+                    "issued_at_required": true,
+                    "nonce_required": false,
+                    "clock_skew_limit_id": "limit:authenticator.clock-skew",
+                    "maximum_clock_skew_seconds": 60,
+                    "redirects_allowed": false
+                },
+                "credential_profile": {
+                    "profile_id": "credential-profile:validator-api-bearer",
+                    "profile_version": 1,
+                    "token_profile": "jwt-access-token",
+                    "carrier": "authorization-bearer",
+                    "proof_binding": "bearer",
+                    "replay": {
+                        "credential_reuse": "reusable-until-expiry",
+                        "credential_lifetime_limit_id": "limit:authenticator.oidc-access-token-lifetime",
+                        "maximum_credential_lifetime_seconds": 3600,
+                        "sender_constraint": "none",
+                        "presentation_replay_defense": "none",
+                        "nonce_binding": "none",
+                        "replay_store_binding_digest": null
+                    }
+                },
+                "cache_partition": {
+                    "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                    "binding_digest": digest('4')
+                },
+                "protocol_binding": {
+                    "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                    "binding_digest": digest('5')
+                },
+                "retained_consumer_ids": ["runtime-consumer:validator-api-bearer"]
+            }],
+            "ownership": {
+                "single_runtime_owner": true,
+                "ambient_reconfiguration_allowed": false
+            }
+        })
     }
 
     fn secret_provider_runtime_binding_document(
@@ -9911,6 +10384,175 @@ mod tests {
             );
             assert!(!errors.is_empty(), "invalid binding unexpectedly passed");
         }
+    }
+
+    #[test]
+    fn authenticator_binding_reference_is_strict_and_cross_document_bound() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "bindings/authenticator-provider.json";
+        fs::create_dir_all(temporary_root.path().join("bindings")).unwrap();
+        let mut deployment =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        deployment["security_profile"] = json!("production");
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        registry["provider_lifecycle"][0]["state"] = json!("active");
+        let content_reference = registry["configurations"][0]["capability_descriptor"]
+            ["mandatory_baseline_ref"]
+            .clone();
+        {
+            let configuration = &mut registry["configurations"][0];
+            configuration["kind"] = json!("oidc");
+            configuration["capability_descriptor"]["adapter_kind"] = json!("auth.entra-id");
+            configuration["capability_descriptor"]["advertised_capabilities"] =
+                json!(["token-validation"]);
+            configuration["kind_config"] = json!({
+                "configuration_kind": "oidc",
+                "runtime_binding_ref": {
+                    "document_id": "authenticator-runtime-binding:validator-provider-fixture",
+                    "document_version": 1,
+                    "content_digest": format!("sha256:{}", "a".repeat(64)),
+                    "artifact_locator": locator
+                },
+                "issuer_ref": content_reference,
+                "endpoint_policy_ref": content_reference,
+                "validation_mode": "jwt-jwks",
+                "client_id_ref": content_reference,
+                "client_authentication_method": "private_key_jwt",
+                "accepted_audiences_ref": content_reference,
+                "accepted_algorithms": ["RS256"],
+                "redirect_policy_ref": content_reference,
+                "claim_mapping_ref": content_reference,
+                "assurance_mapping_ref": content_reference,
+                "logout_mode": "back-channel",
+                "lifecycle_mode": "scim-and-reconciliation",
+                "revocation_mode": "event-and-introspection"
+            });
+            configuration["payload_digest"] = json!(format!("sha256:{}", "f".repeat(64)));
+        }
+        let q = authenticator_provider_policy_binding_digest(
+            &registry["configurations"][0]["kind_config"],
+        )
+        .unwrap();
+        let document =
+            authenticator_runtime_binding_document(&deployment, &registry["configurations"][0], &q);
+        let pin_document = |registry: &mut Value, document: &Value| {
+            let bytes = serde_json::to_vec_pretty(document).unwrap();
+            fs::write(temporary_root.path().join(locator), &bytes).unwrap();
+            let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+            registry["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+                json!(digest);
+        };
+        pin_document(&mut registry, &document);
+
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &registry,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut q_substitution_registry = registry.clone();
+        let mut q_substitution_document = document.clone();
+        q_substitution_document["provider_policy"]["binding_digest"] =
+            json!(format!("sha256:{}", "e".repeat(64)));
+        pin_document(&mut q_substitution_registry, &q_substitution_document);
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &q_substitution_registry,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("independently recomputed OIDC kind_config")));
+
+        let mut authority_substitution_registry = registry.clone();
+        let mut authority_substitution_document = document.clone();
+        authority_substitution_document["provider_id"] = json!("provider:substituted-runtime");
+        pin_document(
+            &mut authority_substitution_registry,
+            &authority_substitution_document,
+        );
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &authority_substitution_registry,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("provider_id does not exactly match")));
+
+        let mut digest_drift = registry.clone();
+        digest_drift["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+            json!(format!("sha256:{}", "d".repeat(64)));
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &digest_drift,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exact authenticator")));
+
+        let mut noncanonical_registry = registry.clone();
+        let mut noncanonical_document = document.clone();
+        noncanonical_document["credential_paths"][0]["verifier"]["required_claim_ids"] =
+            json!(["sub", "oid", "nbf", "iss", "iat", "exp", "aud"]);
+        pin_document(&mut noncanonical_registry, &noncanonical_document);
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &noncanonical_registry,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("required claims must be nonempty and strictly ordered")));
+
+        let mut digest_confusion = registry.clone();
+        digest_confusion["configurations"][0]["payload_digest"] = digest_confusion
+            ["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"]
+            .clone();
+        pin_document(&mut digest_confusion, &document);
+        let reference_digest = digest_confusion["configurations"][0]["kind_config"]
+            ["runtime_binding_ref"]["content_digest"]
+            .clone();
+        digest_confusion["configurations"][0]["payload_digest"] = reference_digest;
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &digest_confusion,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("D/P/Q digest separation")));
+
+        let mut missing = registry;
+        missing["configurations"][0]["kind_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_binding_ref");
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &missing,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("active production oidc provider requires")));
     }
 
     #[test]

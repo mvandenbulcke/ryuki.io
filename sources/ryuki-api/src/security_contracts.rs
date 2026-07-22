@@ -64,10 +64,15 @@ use ryuki_core::public_ingress::{
     MAX_PUBLIC_INGRESS_REQUEST_BYTES, MAX_PUBLIC_INGRESS_RESPONSE_BYTES,
 };
 use ryuki_core::security_profile::{
-    secret_provider_inventory_digest, ArtifactKind, DeploymentSecurityProfile,
-    ExpectedProviderBinding, ExpectedSecretProviderBinding, GuardId, MigrationAuthoritySource,
-    ProductionDatabaseProvider, ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile,
-    StartupAdmissionContext, TenancyMode, VersionedContentReference,
+    authenticator_provider_policy_binding_digest, secret_provider_inventory_digest, ArtifactKind,
+    AuthenticatorCredentialCarrier, AuthenticatorCredentialProfileRuntimeProjection,
+    AuthenticatorCredentialReuse, AuthenticatorKeySourceKind, AuthenticatorNonceBinding,
+    AuthenticatorPresentationReplayDefense, AuthenticatorProofBinding,
+    AuthenticatorRuntimeOwnership, AuthenticatorSenderConstraint,
+    AuthenticatorVerifierRuntimeProjection, DeploymentSecurityProfile, ExpectedProviderBinding,
+    ExpectedSecretProviderBinding, GuardId, MigrationAuthoritySource, ProductionDatabaseProvider,
+    ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile, StartupAdmissionContext,
+    TenancyMode, VersionedContentReference, AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
     SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -514,10 +519,11 @@ struct DevelopmentFixtureKindConfig {
     live_execution_allowed: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct OidcKindConfig {
     configuration_kind: String,
+    runtime_binding_ref: ContentReferenceBinding,
     issuer_ref: ContentReferenceBinding,
     endpoint_policy_ref: ContentReferenceBinding,
     validation_mode: String,
@@ -531,6 +537,118 @@ struct OidcKindConfig {
     logout_mode: String,
     lifecycle_mode: String,
     revocation_mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatorProviderPolicyBinding {
+    digest_contract: String,
+    binding_digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatorDigestBinding {
+    digest_contract: String,
+    binding_digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatorCredentialPathDocument {
+    path_id: String,
+    path_version: u64,
+    verifier: AuthenticatorVerifierRuntimeProjection,
+    credential_profile: AuthenticatorCredentialProfileRuntimeProjection,
+    cache_partition: AuthenticatorDigestBinding,
+    protocol_binding: AuthenticatorDigestBinding,
+    retained_consumer_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatorRuntimeBindingDocument {
+    #[serde(rename = "$schema")]
+    schema_uri: String,
+    schema_version: String,
+    contract_kind: String,
+    document_id: String,
+    document_version: u64,
+    value_free: bool,
+    provider_id: String,
+    provider_configuration_version: u64,
+    deployment_id: String,
+    trust_domain_id: String,
+    capability_descriptor_id: String,
+    capability_descriptor_version: u64,
+    adapter_kind: String,
+    adapter_version: String,
+    authenticator_kind: String,
+    provider_policy: AuthenticatorProviderPolicyBinding,
+    capability_ids: Vec<String>,
+    credential_paths: Vec<AuthenticatorCredentialPathDocument>,
+    ownership: AuthenticatorRuntimeOwnership,
+}
+
+/// Exact value-free authenticator document authenticated by the OIDC provider
+/// configuration. This is D and its typed interpretation; it is deliberately
+/// not runtime measurement R or production guard evidence.
+pub(crate) struct VerifiedAuthenticatorRuntimeBinding {
+    reference: ContentReferenceBinding,
+    raw_bytes: Box<[u8]>,
+    document: AuthenticatorRuntimeBindingDocument,
+}
+
+impl fmt::Debug for VerifiedAuthenticatorRuntimeBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedAuthenticatorRuntimeBinding")
+            .field("document_id", &self.document.document_id)
+            .field("document_version", &self.document.document_version)
+            .field("content_digest", &self.reference.content_digest)
+            .field("byte_len", &self.raw_bytes.len())
+            .field("provider_id", &self.document.provider_id)
+            .field(
+                "provider_configuration_version",
+                &self.document.provider_configuration_version,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedAuthenticatorRuntimeBinding {
+    /// Re-hash and losslessly reparse the exact authenticated document bytes.
+    /// A cached typed value is never sufficient to preserve D.
+    fn verify_integrity(&self) -> Result<(), String> {
+        self.reference.validate()?;
+        if self.raw_bytes.is_empty() || raw_digest(&self.raw_bytes) != self.reference.content_digest
+        {
+            return Err(
+                "retained authenticator runtime-binding bytes no longer match their exact digest"
+                    .into(),
+            );
+        }
+        let exact_value = parse_json_strict(&self.raw_bytes).map_err(|error| {
+            format!("retained authenticator runtime-binding JSON is invalid: {error}")
+        })?;
+        validate_against_schema(
+            "retained authenticator runtime binding",
+            AUTHENTICATOR_RUNTIME_BINDING_SCHEMA,
+            &exact_value,
+        )?;
+        let reparsed = serde_json::from_value::<AuthenticatorRuntimeBindingDocument>(exact_value)
+            .map_err(|error| {
+            format!("retained authenticator runtime binding is not losslessly typed: {error}")
+        })?;
+        reparsed.validate()?;
+        if reparsed != self.document {
+            return Err(
+                "retained authenticator runtime-binding bytes differ from the sealed typed document"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -727,7 +845,10 @@ impl VerifiedSecretProviderRuntimeBinding {
 #[derive(Debug, Clone)]
 enum ActiveProviderKindConfig {
     DevelopmentFixture(Box<DevelopmentFixtureKindConfig>),
-    Oidc(Box<OidcKindConfig>),
+    Oidc {
+        configuration: Box<OidcKindConfig>,
+        verified_runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+    },
     LocalWebauthn(Box<LocalWebauthnKindConfig>),
     SecretService {
         configuration: Box<CapabilityProviderKindConfig>,
@@ -3829,7 +3950,21 @@ impl SecurityContractContext {
                 provider.provider_id,
                 config.auth_mode.as_str()
             )),
-            (AuthMode::EntraId, ActiveProviderKindConfig::Oidc(oidc)) => {
+            (
+                AuthMode::EntraId,
+                ActiveProviderKindConfig::Oidc {
+                    configuration: oidc,
+                    ..
+                },
+            ) => {
+                if provider.kind != "oidc"
+                    || provider.capability_descriptor.adapter_kind != "auth.entra-id"
+                {
+                    return Err(format!(
+                        "selected provider {} does not exactly match the compiled entra-id authenticator selector",
+                        provider.provider_id
+                    ));
+                }
                 // The v1 provider schema intentionally stores content references, not
                 // the resolved Entra tenant/client/endpoint values in `RyukiConfig`.
                 // Accepting on provider kind alone would leave two authorities. Until
@@ -3862,14 +3997,30 @@ impl SecurityContractContext {
 
 impl ActiveProviderConfiguration {
     fn matches_auth_mode(&self, auth_mode: &AuthMode) -> bool {
-        matches!(
-            (auth_mode, &self.kind_config),
+        match (auth_mode, &self.kind_config) {
             (
                 AuthMode::MockDryRun | AuthMode::StaticDryRun,
-                ActiveProviderKindConfig::DevelopmentFixture(_)
-            ) | (AuthMode::EntraId, ActiveProviderKindConfig::Oidc(_))
-                | (AuthMode::Local, ActiveProviderKindConfig::LocalWebauthn(_))
-        )
+                ActiveProviderKindConfig::DevelopmentFixture(_),
+            )
+            | (AuthMode::Local, ActiveProviderKindConfig::LocalWebauthn(_)) => true,
+            (AuthMode::EntraId, ActiveProviderKindConfig::Oidc { .. }) => {
+                self.kind == "oidc" && self.capability_descriptor.adapter_kind == "auth.entra-id"
+            }
+            _ => false,
+        }
+    }
+
+    fn verified_authenticator_runtime_binding(
+        &self,
+    ) -> Option<&Arc<VerifiedAuthenticatorRuntimeBinding>> {
+        let ActiveProviderKindConfig::Oidc {
+            verified_runtime_binding,
+            ..
+        } = &self.kind_config
+        else {
+            return None;
+        };
+        Some(verified_runtime_binding)
     }
 
     fn verified_secret_provider_runtime_binding(
@@ -7537,6 +7688,22 @@ fn validate_provider_registry(
                 ));
             }
             if profile.security_profile.is_production()
+                && matches!(configuration.kind.as_str(), "oidc" | "oidc-broker")
+            {
+                let binding = configuration
+                    .verified_authenticator_runtime_binding()
+                    .ok_or_else(|| {
+                        format!(
+                            "active production authenticator provider {provider_id}@{config_version} has no exact verified runtime-binding document"
+                        )
+                    })?;
+                binding.verify_integrity().map_err(|error| {
+                    format!(
+                        "active production authenticator provider {provider_id}@{config_version} failed retained binding verification: {error}"
+                    )
+                })?;
+            }
+            if profile.security_profile.is_production()
                 && !configuration.capability_descriptor.production_eligible
             {
                 return Err(format!(
@@ -7625,10 +7792,32 @@ fn parse_active_provider_configuration(
                 format!("development fixture kind_config is not typed: {error}")
             })?,
         )),
-        "oidc" | "oidc-broker" => ActiveProviderKindConfig::Oidc(Box::new(
-            serde_json::from_value(raw_kind_config)
-                .map_err(|error| format!("OIDC kind_config is not typed: {error}"))?,
-        )),
+        "oidc" | "oidc-broker" => {
+            let configuration =
+                serde_json::from_value::<OidcKindConfig>(raw_kind_config.clone())
+                    .map_err(|error| format!("OIDC kind_config is not typed: {error}"))?;
+            let verified_runtime_binding = verify_authenticator_runtime_binding(
+                &configuration.runtime_binding_ref,
+                AuthenticatorBindingVerificationContext {
+                    provider_id,
+                    provider_configuration_version: config_version,
+                    provider_payload_digest: payload_digest,
+                    provider_kind: kind,
+                    trust_domain_id,
+                    capability_descriptor: &capability_descriptor,
+                    oidc_configuration: &configuration,
+                    raw_oidc_kind_config: &raw_kind_config,
+                    deployment_profile: profile,
+                },
+                documents,
+                document_bytes,
+                reference_document_digests,
+            )?;
+            ActiveProviderKindConfig::Oidc {
+                configuration: Box::new(configuration),
+                verified_runtime_binding: Arc::new(verified_runtime_binding),
+            }
+        }
         "local-webauthn" => ActiveProviderKindConfig::LocalWebauthn(Box::new(
             serde_json::from_value(raw_kind_config)
                 .map_err(|error| format!("local WebAuthn kind_config is not typed: {error}"))?,
@@ -7696,6 +7885,150 @@ fn parse_active_provider_configuration(
         capability_descriptor,
         credential_refs,
         kind_config,
+    })
+}
+
+struct AuthenticatorBindingVerificationContext<'a> {
+    provider_id: &'a str,
+    provider_configuration_version: u64,
+    provider_payload_digest: &'a str,
+    provider_kind: &'a str,
+    trust_domain_id: &'a str,
+    capability_descriptor: &'a ProviderCapabilityDescriptorBinding,
+    oidc_configuration: &'a OidcKindConfig,
+    raw_oidc_kind_config: &'a Value,
+    deployment_profile: &'a DeploymentSecurityProfile,
+}
+
+fn verify_authenticator_runtime_binding(
+    reference: &ContentReferenceBinding,
+    context: AuthenticatorBindingVerificationContext<'_>,
+    documents: &BTreeMap<String, Value>,
+    document_bytes: &BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
+) -> Result<VerifiedAuthenticatorRuntimeBinding, String> {
+    reference.validate()?;
+    validate_namespaced_id(
+        "authenticator runtime-binding reference document id",
+        &reference.document_id,
+        "authenticator-runtime-binding:",
+    )?;
+    if Path::new(&reference.artifact_locator)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("json")
+    {
+        return Err(
+            "authenticator runtime-binding reference locator must end in lowercase .json".into(),
+        );
+    }
+
+    let locator = &reference.artifact_locator;
+    let traversed_digest = reference_document_digests.get(locator).ok_or_else(|| {
+        format!("authenticator runtime binding {locator} has no verified traversal digest")
+    })?;
+    let raw_bytes = document_bytes.get(locator).ok_or_else(|| {
+        format!("authenticator runtime binding {locator} has no exact traversed bytes")
+    })?;
+    let traversed_document = documents.get(locator).ok_or_else(|| {
+        format!("authenticator runtime binding {locator} did not resolve to typed JSON")
+    })?;
+    let exact_document = parse_json_strict(raw_bytes).map_err(|error| {
+        format!("authenticator runtime binding {locator} JSON is invalid: {error}")
+    })?;
+    let exact_digest = raw_digest(raw_bytes);
+    if traversed_digest != &reference.content_digest
+        || exact_digest != reference.content_digest
+        || &exact_document != traversed_document
+    {
+        return Err(format!(
+            "authenticator runtime binding {locator} differs across its reference, exact bytes, and verified traversal"
+        ));
+    }
+    validate_against_schema(
+        "authenticator runtime binding",
+        AUTHENTICATOR_RUNTIME_BINDING_SCHEMA,
+        &exact_document,
+    )?;
+    let document = serde_json::from_value::<AuthenticatorRuntimeBindingDocument>(exact_document)
+        .map_err(|error| {
+            format!("authenticator runtime binding {locator} is not losslessly typed: {error}")
+        })?;
+    document.validate()?;
+    let typed_oidc_kind_config =
+        serde_json::to_value(context.oidc_configuration).map_err(|error| {
+            format!("OIDC kind_config could not be losslessly reprojected: {error}")
+        })?;
+    if typed_oidc_kind_config != *context.raw_oidc_kind_config {
+        return Err(format!(
+            "authenticator runtime binding {locator} received divergent raw and typed OIDC kind_config authorities"
+        ));
+    }
+    let provider_policy_binding_digest =
+        authenticator_provider_policy_binding_digest(context.raw_oidc_kind_config).map_err(
+            |error| {
+                format!(
+                    "authenticator runtime binding {locator} provider-policy digest could not be independently recomputed: {error}"
+                )
+            },
+        )?;
+
+    let descriptor = context.capability_descriptor;
+    if context.oidc_configuration.runtime_binding_ref != *reference
+        || document.document_id != reference.document_id
+        || document.document_version != reference.document_version
+        || document.provider_id != context.provider_id
+        || document.provider_configuration_version != context.provider_configuration_version
+        || document.deployment_id != context.deployment_profile.deployment_id
+        || document.trust_domain_id != context.trust_domain_id
+        || document.capability_descriptor_id != descriptor.descriptor_id
+        || document.capability_descriptor_version != descriptor.descriptor_version
+        || document.adapter_kind != descriptor.adapter_kind
+        || document.adapter_version != descriptor.adapter_version
+        || document.authenticator_kind != context.provider_kind
+        || document.authenticator_kind != context.oidc_configuration.configuration_kind
+    {
+        return Err(format!(
+            "authenticator runtime binding {locator} does not exactly match its reference, provider, deployment, trust-domain, descriptor, adapter, and authenticator-kind authority"
+        ));
+    }
+    if context.oidc_configuration.validation_mode != "jwt-jwks"
+        || context.oidc_configuration.accepted_algorithms.as_slice() != ["RS256"]
+    {
+        return Err(format!(
+            "authenticator runtime binding {locator} requires the exact implemented jwt-jwks/RS256 OIDC provider policy"
+        ));
+    }
+    if document.capability_ids != descriptor.advertised_capabilities {
+        return Err(format!(
+            "authenticator runtime binding {locator} capability inventory does not exactly match its provider descriptor"
+        ));
+    }
+    if document.provider_policy.digest_contract
+        != AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT
+        || document.provider_policy.binding_digest != provider_policy_binding_digest
+    {
+        return Err(format!(
+            "authenticator runtime binding {locator} provider-policy digest does not match the independently recomputed OIDC kind_config"
+        ));
+    }
+    validate_digest_pin(
+        "OIDC provider configuration payload digest",
+        context.provider_payload_digest,
+    )?;
+    if reference.content_digest == context.provider_payload_digest
+        || reference.content_digest == provider_policy_binding_digest
+        || context.provider_payload_digest == provider_policy_binding_digest
+    {
+        return Err(format!(
+            "authenticator runtime binding {locator} violates D/P/Q digest separation"
+        ));
+    }
+
+    Ok(VerifiedAuthenticatorRuntimeBinding {
+        reference: reference.clone(),
+        raw_bytes: raw_bytes.clone().into_boxed_slice(),
+        document,
     })
 }
 
@@ -7786,6 +8119,322 @@ fn verify_secret_provider_runtime_binding(
         raw_bytes: raw_bytes.clone().into_boxed_slice(),
         document,
     })
+}
+
+impl AuthenticatorRuntimeBindingDocument {
+    fn validate(&self) -> Result<(), String> {
+        const SCHEMA_URI: &str = "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json";
+        if self.schema_uri != SCHEMA_URI
+            || self.schema_version != "1.0.0"
+            || self.contract_kind != "authenticator-runtime-binding"
+            || !self.value_free
+            || self.document_version == 0
+            || self.provider_configuration_version == 0
+            || self.capability_descriptor_version == 0
+            || !matches!(self.authenticator_kind.as_str(), "oidc" | "oidc-broker")
+        {
+            return Err(
+                "authenticator runtime binding has an invalid identity, version, contract kind, authenticator kind, or value-free marker"
+                    .into(),
+            );
+        }
+        for (label, value, prefix) in [
+            (
+                "authenticator runtime-binding document id",
+                self.document_id.as_str(),
+                "authenticator-runtime-binding:",
+            ),
+            (
+                "authenticator runtime-binding provider id",
+                self.provider_id.as_str(),
+                "provider:",
+            ),
+            (
+                "authenticator runtime-binding deployment id",
+                self.deployment_id.as_str(),
+                "deployment:",
+            ),
+            (
+                "authenticator runtime-binding trust-domain id",
+                self.trust_domain_id.as_str(),
+                "trust-domain:",
+            ),
+        ] {
+            validate_namespaced_id(label, value, prefix)?;
+        }
+        for (label, value) in [
+            (
+                "capability descriptor id",
+                self.capability_descriptor_id.as_str(),
+            ),
+            ("adapter kind", self.adapter_kind.as_str()),
+            ("adapter version", self.adapter_version.as_str()),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(format!(
+                    "authenticator runtime binding {label} must be nonempty and canonical"
+                ));
+            }
+        }
+        if self.provider_policy.digest_contract
+            != AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT
+        {
+            return Err(
+                "authenticator runtime binding provider-policy digest contract is invalid".into(),
+            );
+        }
+        validate_digest_pin(
+            "authenticator provider-policy binding digest",
+            &self.provider_policy.binding_digest,
+        )?;
+        if self.capability_ids.is_empty()
+            || !self.capability_ids.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(
+                "authenticator runtime binding capabilities must be nonempty, strictly sorted, and unique"
+                    .into(),
+            );
+        }
+        if self.credential_paths.is_empty()
+            || !self
+                .credential_paths
+                .windows(2)
+                .all(|pair| pair[0].path_id < pair[1].path_id)
+        {
+            return Err(
+                "authenticator runtime binding paths must be nonempty, strictly sorted, and unique"
+                    .into(),
+            );
+        }
+
+        let mut verifier_ids = BTreeSet::new();
+        let mut profile_ids = BTreeSet::new();
+        let mut cache_partition_digests = BTreeSet::new();
+        let mut resolution_tuples = BTreeSet::new();
+        let mut consumer_ids = BTreeSet::new();
+        for path in &self.credential_paths {
+            let verifier = &path.verifier;
+            let profile = &path.credential_profile;
+            validate_namespaced_id(
+                "authenticator path id",
+                &path.path_id,
+                "authenticator-path:",
+            )?;
+            validate_namespaced_id(
+                "authenticator verifier id",
+                &verifier.verifier_id,
+                "authenticator-verifier:",
+            )?;
+            validate_namespaced_id(
+                "authenticator credential-profile id",
+                &profile.profile_id,
+                "credential-profile:",
+            )?;
+            if path.path_version == 0
+                || verifier.verifier_version == 0
+                || profile.profile_version == 0
+                || !verifier_ids.insert(verifier.verifier_id.as_str())
+                || !profile_ids.insert(profile.profile_id.as_str())
+            {
+                return Err(
+                    "authenticator runtime binding path/verifier/profile identity is invalid or duplicated"
+                        .into(),
+                );
+            }
+            for (label, digest) in [
+                (
+                    "authenticator issuer binding digest",
+                    verifier.issuer_binding_digest.as_str(),
+                ),
+                (
+                    "authenticator audience-set binding digest",
+                    verifier.audience_set_binding_digest.as_str(),
+                ),
+                (
+                    "authenticator key-source binding digest",
+                    verifier.key_source_binding_digest.as_str(),
+                ),
+                (
+                    "authenticator cache-partition binding digest",
+                    path.cache_partition.binding_digest.as_str(),
+                ),
+                (
+                    "authenticator protocol binding digest",
+                    path.protocol_binding.binding_digest.as_str(),
+                ),
+            ] {
+                validate_digest_pin(label, digest)?;
+            }
+            if path.cache_partition.digest_contract != "ryuki-authenticator-cache-partition-v1"
+                || path.protocol_binding.digest_contract
+                    != "ryuki-authenticator-protocol-binding-v1"
+                || !cache_partition_digests.insert(path.cache_partition.binding_digest.as_str())
+            {
+                return Err(
+                    "authenticator runtime binding cache/protocol contract or cache partition is invalid"
+                        .into(),
+                );
+            }
+            if verifier.accepted_algorithm_ids.as_slice() != ["rs256"]
+                || verifier.required_claim_ids.is_empty()
+                || !verifier
+                    .required_claim_ids
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                || verifier
+                    .required_claim_ids
+                    .binary_search(&verifier.provider_subject_claim_id)
+                    .is_err()
+                || !authenticator_document_claim_flags_match(verifier)
+                || verifier.key_source_kind != AuthenticatorKeySourceKind::JwtJwks
+                || verifier.redirects_allowed
+            {
+                return Err("authenticator runtime binding verifier semantics are invalid".into());
+            }
+            match self.adapter_kind.as_str() {
+                "auth.entra-id" if verifier.provider_subject_claim_id != "oid" => {
+                    return Err(
+                        "Entra authenticator runtime bindings must use the signed oid claim".into(),
+                    );
+                }
+                "auth.entra-id" => {}
+                _ if verifier.provider_subject_claim_id != "sub" => {
+                    return Err(
+                        "generic OIDC authenticator runtime bindings must use the signed sub claim"
+                            .into(),
+                    );
+                }
+                _ => {}
+            }
+            validate_namespaced_id(
+                "authenticator clock-skew limit id",
+                &verifier.clock_skew_limit_id,
+                "limit:",
+            )?;
+
+            let claims_include = |required: &[&str]| {
+                required.iter().all(|claim| {
+                    verifier
+                        .required_claim_ids
+                        .binary_search_by(|candidate| candidate.as_str().cmp(claim))
+                        .is_ok()
+                })
+            };
+            let bearer_profile = profile.token_profile == "jwt-access-token"
+                && profile.carrier == AuthenticatorCredentialCarrier::AuthorizationBearer
+                && profile.proof_binding == AuthenticatorProofBinding::Bearer
+                && profile.replay.credential_reuse
+                    == AuthenticatorCredentialReuse::ReusableUntilExpiry
+                && profile
+                    .replay
+                    .credential_lifetime_limit_id
+                    .as_deref()
+                    .is_some_and(|limit_id| {
+                        validate_namespaced_id(
+                            "authenticator credential-lifetime limit id",
+                            limit_id,
+                            "limit:",
+                        )
+                        .is_ok()
+                    })
+                && profile
+                    .replay
+                    .maximum_credential_lifetime_seconds
+                    .is_some_and(|seconds| seconds > 0)
+                && profile.replay.sender_constraint == AuthenticatorSenderConstraint::None
+                && profile.replay.presentation_replay_defense
+                    == AuthenticatorPresentationReplayDefense::None
+                && profile.replay.nonce_binding == AuthenticatorNonceBinding::None
+                && profile.replay.replay_store_binding_digest.is_none()
+                && verifier.expiration_required
+                && verifier.not_before_required
+                && verifier.issued_at_required
+                && !verifier.nonce_required
+                && claims_include(&["aud", "exp", "iat", "iss", "nbf", "sub"]);
+            let browser_profile = profile.token_profile == "oidc-id-token"
+                && profile.carrier == AuthenticatorCredentialCarrier::OauthCallback
+                && profile.proof_binding == AuthenticatorProofBinding::PkceS256
+                && profile.replay.credential_reuse == AuthenticatorCredentialReuse::SingleUse
+                && profile.replay.credential_lifetime_limit_id.is_none()
+                && profile.replay.maximum_credential_lifetime_seconds.is_none()
+                && profile.replay.sender_constraint == AuthenticatorSenderConstraint::None
+                && profile.replay.presentation_replay_defense
+                    == AuthenticatorPresentationReplayDefense::SingleUseState
+                && profile.replay.nonce_binding == AuthenticatorNonceBinding::OidcLogin
+                && profile
+                    .replay
+                    .replay_store_binding_digest
+                    .as_deref()
+                    .is_some_and(|digest| {
+                        validate_digest_pin("replay-store digest", digest).is_ok()
+                    })
+                && verifier.expiration_required
+                && verifier.not_before_required
+                && verifier.nonce_required
+                && claims_include(&["aud", "exp", "iss", "nbf", "nonce", "sub"]);
+            if !bearer_profile && !browser_profile {
+                return Err(
+                    "authenticator runtime binding credential profile is not an admitted closed OIDC path"
+                        .into(),
+                );
+            }
+            if !resolution_tuples.insert((
+                verifier.issuer_binding_digest.as_str(),
+                profile.token_profile.as_str(),
+            )) {
+                return Err(
+                    "authenticator runtime binding repeats an issuer/token-profile resolution tuple"
+                        .into(),
+                );
+            }
+            if path.retained_consumer_ids.is_empty()
+                || !path
+                    .retained_consumer_ids
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            {
+                return Err(
+                    "authenticator runtime binding retained consumers must be nonempty, strictly sorted, and unique"
+                        .into(),
+                );
+            }
+            for consumer in &path.retained_consumer_ids {
+                validate_namespaced_id(
+                    "authenticator retained consumer id",
+                    consumer,
+                    "runtime-consumer:",
+                )?;
+                if !consumer_ids.insert(consumer.as_str()) {
+                    return Err(
+                        "authenticator runtime binding retained consumers must be globally disjoint"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if !self.ownership.single_runtime_owner || self.ownership.ambient_reconfiguration_allowed {
+            return Err(
+                "authenticator runtime binding requires one retained owner and forbids ambient reconfiguration"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn authenticator_document_claim_flags_match(
+    verifier: &AuthenticatorVerifierRuntimeProjection,
+) -> bool {
+    let contains = |claim: &str| {
+        verifier
+            .required_claim_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(claim))
+            .is_ok()
+    };
+    verifier.expiration_required == contains("exp")
+        && verifier.not_before_required == contains("nbf")
+        && verifier.issued_at_required == contains("iat")
+        && verifier.nonce_required == contains("nonce")
 }
 
 impl SecretProviderRuntimeBindingDocument {
@@ -8144,9 +8793,12 @@ impl ActiveProviderKindConfig {
             {
                 Ok(())
             }
-            Self::Oidc(oidc)
-                if matches!(provider_kind, "oidc" | "oidc-broker")
-                    && oidc.configuration_kind == provider_kind =>
+            Self::Oidc {
+                configuration: oidc,
+                verified_runtime_binding,
+            } if matches!(provider_kind, "oidc" | "oidc-broker")
+                && oidc.configuration_kind == provider_kind
+                && verified_runtime_binding.document.authenticator_kind == provider_kind =>
             {
                 oidc.security_binding_summary().map(|_| ())
             }
@@ -8266,6 +8918,7 @@ impl CapabilityProviderKindConfig {
 impl OidcKindConfig {
     fn security_binding_summary(&self) -> Result<usize, String> {
         for reference in [
+            &self.runtime_binding_ref,
             &self.issuer_ref,
             &self.endpoint_policy_ref,
             &self.client_id_ref,
@@ -8652,6 +9305,8 @@ mod tests {
         "catalog/security-contracts/v1/control-trace.runtime-test.json";
     const SECRET_PROVIDER_RUNTIME_BINDING_PATH: &str =
         "catalog/security-contracts/v1/secret-provider-runtime-binding.runtime-test.json";
+    const AUTHENTICATOR_RUNTIME_BINDING_PATH: &str =
+        "catalog/security-contracts/v1/authenticator-runtime-binding.runtime-test.json";
 
     fn maximum_authority_projection_fixture() -> Value {
         json!({
@@ -10705,6 +11360,48 @@ mod tests {
             });
         }
 
+        fn install_authenticator_runtime_binding(&mut self) {
+            let provider_path = "catalog/security-contracts/v1/provider-registry.runtime-test.json";
+            let provider: Value = serde_json::from_slice(
+                &fs::read(self.root.join(provider_path)).expect("provider registry bytes"),
+            )
+            .expect("provider registry JSON");
+            let content_reference = provider["configurations"][0]["capability_descriptor"]
+                ["mandatory_baseline_ref"]
+                .clone();
+            let mut runtime_binding_ref = json!({
+                "document_id": "authenticator-runtime-binding:runtime-test",
+                "document_version": 1,
+                "content_digest": raw_digest(b"temporary authenticator runtime binding"),
+                "artifact_locator": AUTHENTICATOR_RUNTIME_BINDING_PATH
+            });
+            let mut kind_config = oidc_kind_config(runtime_binding_ref.clone(), &content_reference);
+            let provider_policy_digest =
+                authenticator_provider_policy_binding_digest(&kind_config).unwrap();
+            let document = genuine_authenticator_runtime_binding_document_with_policy_digest(
+                &provider_policy_digest,
+            );
+            runtime_binding_ref["content_digest"] = json!(write_json(
+                &self.root,
+                AUTHENTICATOR_RUNTIME_BINDING_PATH,
+                &document,
+            ));
+            kind_config["runtime_binding_ref"] = runtime_binding_ref;
+
+            let root = self.root.clone();
+            self.rewrite_provider(|provider| {
+                provider["applicability"]["provider_kinds"] = json!(["oidc"]);
+                let configuration = &mut provider["configurations"][0];
+                configuration["kind"] = json!("oidc");
+                configuration["capability_descriptor"]["adapter_kind"] = json!("auth.entra-id");
+                configuration["capability_descriptor"]["advertised_capabilities"] =
+                    json!(["token-validation"]);
+                configuration["kind_config"] = kind_config;
+                refresh_reference_digests(provider, &root);
+                refresh_provider_payload_digests(provider);
+            });
+        }
+
         fn rewrite_profile(&mut self, mutate: impl FnOnce(&mut Value)) {
             let path = self.root.join(PROFILE_PATH);
             let mut profile: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -10896,7 +11593,29 @@ mod tests {
         })
     }
 
-    fn genuine_authenticator_runtime_binding_document() -> Value {
+    fn oidc_kind_config(runtime_binding_ref: Value, content_reference: &Value) -> Value {
+        json!({
+            "configuration_kind": "oidc",
+            "runtime_binding_ref": runtime_binding_ref,
+            "issuer_ref": content_reference,
+            "endpoint_policy_ref": content_reference,
+            "validation_mode": "jwt-jwks",
+            "client_id_ref": content_reference,
+            "client_authentication_method": "private_key_jwt",
+            "accepted_audiences_ref": content_reference,
+            "accepted_algorithms": ["RS256"],
+            "redirect_policy_ref": content_reference,
+            "claim_mapping_ref": content_reference,
+            "assurance_mapping_ref": content_reference,
+            "logout_mode": "back-channel",
+            "lifecycle_mode": "scim-and-reconciliation",
+            "revocation_mode": "event-and-introspection"
+        })
+    }
+
+    fn genuine_authenticator_runtime_binding_document_with_policy_digest(
+        provider_policy_binding_digest: &str,
+    ) -> Value {
         json!({
             "$schema": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
             "schema_version": "1.0.0",
@@ -10904,18 +11623,18 @@ mod tests {
             "document_id": "authenticator-runtime-binding:runtime-test",
             "document_version": 1,
             "value_free": true,
-            "provider_id": "provider:runtime-test-oidc",
+            "provider_id": "provider:repository-static-dry-run",
             "provider_configuration_version": 1,
             "deployment_id": DEPLOYMENT_ID,
             "trust_domain_id": "trust-domain:repository-fixture",
-            "capability_descriptor_id": "capability-descriptor:runtime-test-oidc",
+            "capability_descriptor_id": "capability-descriptor:repository-static-dry-run-v1",
             "capability_descriptor_version": 1,
             "adapter_kind": "auth.entra-id",
             "adapter_version": "1.0.0",
             "authenticator_kind": "oidc",
             "provider_policy": {
                 "digest_contract": "ryuki-authenticator-provider-policy-binding-v1",
-                "binding_digest": raw_digest(b"runtime-test authenticator policy")
+                "binding_digest": provider_policy_binding_digest
             },
             "capability_ids": ["token-validation"],
             "credential_paths": [{
@@ -10970,6 +11689,127 @@ mod tests {
                 "ambient_reconfiguration_allowed": false
             }
         })
+    }
+
+    fn genuine_authenticator_runtime_binding_document() -> Value {
+        genuine_authenticator_runtime_binding_document_with_policy_digest(&raw_digest(
+            b"runtime-test authenticator policy",
+        ))
+    }
+
+    struct AuthenticatorBindingCase {
+        profile: DeploymentSecurityProfile,
+        capability_descriptor: ProviderCapabilityDescriptorBinding,
+        oidc_configuration: OidcKindConfig,
+        raw_oidc_kind_config: Value,
+        provider_payload_digest: String,
+        reference: ContentReferenceBinding,
+        documents: BTreeMap<String, Value>,
+        document_bytes: BTreeMap<String, Vec<u8>>,
+        reference_document_digests: BTreeMap<String, String>,
+    }
+
+    impl AuthenticatorBindingCase {
+        fn build() -> Self {
+            let fixture = ActiveFixture::build();
+            let profile = serde_json::from_slice(
+                &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+            )
+            .expect("typed deployment profile");
+            let registry: Value = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .root
+                        .join("catalog/security-contracts/v1/provider-registry.runtime-test.json"),
+                )
+                .expect("provider registry bytes"),
+            )
+            .expect("provider registry JSON");
+            let mut descriptor_value =
+                registry["configurations"][0]["capability_descriptor"].clone();
+            descriptor_value["adapter_kind"] = json!("auth.entra-id");
+            descriptor_value["advertised_capabilities"] = json!(["token-validation"]);
+            let capability_descriptor =
+                serde_json::from_value(descriptor_value).expect("typed OIDC capability descriptor");
+            let reference = ContentReferenceBinding {
+                document_id: "authenticator-runtime-binding:runtime-test".into(),
+                document_version: 1,
+                content_digest: raw_digest(b"temporary authenticator runtime binding"),
+                artifact_locator: AUTHENTICATOR_RUNTIME_BINDING_PATH.into(),
+            };
+            let reference_value = serde_json::to_value(&reference).unwrap();
+            let kind_config_value = oidc_kind_config(
+                reference_value,
+                &registry["configurations"][0]["capability_descriptor"]["mandatory_baseline_ref"],
+            );
+            let provider_policy_binding_digest =
+                authenticator_provider_policy_binding_digest(&kind_config_value).unwrap();
+            let oidc_configuration = serde_json::from_value(kind_config_value.clone())
+                .expect("typed OIDC provider configuration");
+            let mut case = Self {
+                profile,
+                capability_descriptor,
+                oidc_configuration,
+                raw_oidc_kind_config: kind_config_value,
+                provider_payload_digest: raw_digest(b"runtime-test OIDC provider payload"),
+                reference,
+                documents: BTreeMap::new(),
+                document_bytes: BTreeMap::new(),
+                reference_document_digests: BTreeMap::new(),
+            };
+            case.repin_document(
+                genuine_authenticator_runtime_binding_document_with_policy_digest(
+                    &provider_policy_binding_digest,
+                ),
+            );
+            case
+        }
+
+        fn repin_document(&mut self, document: Value) {
+            let bytes = serde_json::to_vec_pretty(&document).expect("runtime binding bytes");
+            let digest = raw_digest(&bytes);
+            self.reference.document_id = document["document_id"]
+                .as_str()
+                .expect("runtime binding document id")
+                .into();
+            self.reference.document_version = document["document_version"]
+                .as_u64()
+                .expect("runtime binding document version");
+            self.reference.content_digest = digest.clone();
+            self.oidc_configuration.runtime_binding_ref = self.reference.clone();
+            self.raw_oidc_kind_config["runtime_binding_ref"] =
+                serde_json::to_value(&self.reference).unwrap();
+            self.documents
+                .insert(AUTHENTICATOR_RUNTIME_BINDING_PATH.into(), document);
+            self.document_bytes
+                .insert(AUTHENTICATOR_RUNTIME_BINDING_PATH.into(), bytes);
+            self.reference_document_digests
+                .insert(AUTHENTICATOR_RUNTIME_BINDING_PATH.into(), digest);
+        }
+
+        fn document(&self) -> Value {
+            self.documents[AUTHENTICATOR_RUNTIME_BINDING_PATH].clone()
+        }
+
+        fn verify(&self) -> Result<VerifiedAuthenticatorRuntimeBinding, String> {
+            verify_authenticator_runtime_binding(
+                &self.reference,
+                AuthenticatorBindingVerificationContext {
+                    provider_id: "provider:repository-static-dry-run",
+                    provider_configuration_version: 1,
+                    provider_payload_digest: &self.provider_payload_digest,
+                    provider_kind: "oidc",
+                    trust_domain_id: "trust-domain:repository-fixture",
+                    capability_descriptor: &self.capability_descriptor,
+                    oidc_configuration: &self.oidc_configuration,
+                    raw_oidc_kind_config: &self.raw_oidc_kind_config,
+                    deployment_profile: &self.profile,
+                },
+                &self.documents,
+                &self.document_bytes,
+                &self.reference_document_digests,
+            )
+        }
     }
 
     struct SecretProviderBindingCase {
@@ -13022,6 +13862,259 @@ mod tests {
             .load()
             .unwrap_err()
             .contains("tombstoned provider"));
+    }
+
+    #[test]
+    fn finalized_startup_retains_the_exact_verified_authenticator_binding_arc() {
+        let mut fixture = ActiveFixture::build();
+        fixture.install_authenticator_runtime_binding();
+
+        let prepared = prepare_startup_security_contract(&fixture.pins, fixed_now())
+            .expect("the authenticator binding must survive full reference traversal");
+        let provider = &prepared.active_providers["provider:repository-static-dry-run"];
+        let prepared_binding = Arc::clone(
+            provider
+                .verified_authenticator_runtime_binding()
+                .expect("pre-finalization OIDC provider must retain exact D"),
+        );
+        assert_eq!(provider.kind, "oidc");
+        assert_eq!(provider.capability_descriptor.adapter_kind, "auth.entra-id");
+        prepared_binding
+            .verify_integrity()
+            .expect("retained exact D bytes must re-hash and reparse");
+
+        let context = finalize_startup_security_contract(prepared, None, None, fixed_now)
+            .expect("non-production finalization must preserve the authenticator projection");
+        let retained_binding = context.active_providers["provider:repository-static-dry-run"]
+            .verified_authenticator_runtime_binding()
+            .expect("final context must retain exact authenticator D");
+        assert!(Arc::ptr_eq(&prepared_binding, retained_binding));
+        assert_eq!(
+            retained_binding.reference.artifact_locator,
+            AUTHENTICATOR_RUNTIME_BINDING_PATH
+        );
+        assert_eq!(
+            retained_binding.document.provider_policy.digest_contract,
+            AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT
+        );
+        assert_ne!(
+            retained_binding.reference.content_digest,
+            context.active_providers["provider:repository-static-dry-run"].payload_digest
+        );
+    }
+
+    #[test]
+    fn authenticator_binding_requires_exact_reference_traversal_and_raw_bytes() {
+        let valid = AuthenticatorBindingCase::build();
+        valid.verify().expect("exact D/P/Q binding must verify");
+
+        let mut raw_substitution = AuthenticatorBindingCase::build();
+        raw_substitution
+            .document_bytes
+            .get_mut(AUTHENTICATOR_RUNTIME_BINDING_PATH)
+            .unwrap()
+            .push(b' ');
+        assert!(raw_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+
+        let mut traversal_substitution = AuthenticatorBindingCase::build();
+        traversal_substitution.reference_document_digests.insert(
+            AUTHENTICATOR_RUNTIME_BINDING_PATH.into(),
+            raw_digest(b"substituted authenticator traversal digest"),
+        );
+        assert!(traversal_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+
+        let mut parsed_substitution = AuthenticatorBindingCase::build();
+        parsed_substitution
+            .documents
+            .get_mut(AUTHENTICATOR_RUNTIME_BINDING_PATH)
+            .unwrap()["adapter_version"] = json!("2.0.0");
+        assert!(parsed_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+
+        let mut retained = valid.verify().unwrap();
+        retained.raw_bytes[0] ^= 1;
+        assert!(retained
+            .verify_integrity()
+            .unwrap_err()
+            .contains("exact digest"));
+    }
+
+    #[test]
+    fn authenticator_binding_rejects_authority_capability_and_policy_substitution() {
+        for (pointer, substituted) in [
+            ("/provider_id", json!("provider:substituted-runtime")),
+            ("/provider_configuration_version", json!(2)),
+            ("/deployment_id", json!("deployment:substituted-runtime")),
+            (
+                "/trust_domain_id",
+                json!("trust-domain:substituted-runtime"),
+            ),
+            (
+                "/capability_descriptor_id",
+                json!("capability-descriptor:substituted-runtime-v1"),
+            ),
+            ("/capability_descriptor_version", json!(2)),
+            ("/adapter_version", json!("2.0.0")),
+            ("/authenticator_kind", json!("oidc-broker")),
+        ] {
+            let mut case = AuthenticatorBindingCase::build();
+            let mut document = case.document();
+            *document.pointer_mut(pointer).unwrap() = substituted;
+            case.repin_document(document);
+            let error = case
+                .verify()
+                .expect_err("authority substitution must fail closed");
+            assert!(
+                error.contains("does not exactly match"),
+                "{pointer}: {error}"
+            );
+        }
+
+        let mut adapter_substitution = AuthenticatorBindingCase::build();
+        let mut document = adapter_substitution.document();
+        document["adapter_kind"] = json!("auth.generic-oidc");
+        document["credential_paths"][0]["verifier"]["provider_subject_claim_id"] = json!("sub");
+        adapter_substitution.repin_document(document);
+        assert!(adapter_substitution
+            .verify()
+            .unwrap_err()
+            .contains("does not exactly match"));
+
+        let mut capability_substitution = AuthenticatorBindingCase::build();
+        let mut document = capability_substitution.document();
+        document["capability_ids"] = json!(["browser-sso"]);
+        capability_substitution.repin_document(document);
+        assert!(capability_substitution
+            .verify()
+            .unwrap_err()
+            .contains("capability inventory does not exactly match"));
+
+        let mut document_q_substitution = AuthenticatorBindingCase::build();
+        let mut document = document_q_substitution.document();
+        document["provider_policy"]["binding_digest"] =
+            json!(raw_digest(b"caller-supplied provider policy"));
+        document_q_substitution.repin_document(document);
+        assert!(document_q_substitution
+            .verify()
+            .unwrap_err()
+            .contains("independently recomputed OIDC kind_config"));
+
+        let mut provider_policy_drift = AuthenticatorBindingCase::build();
+        provider_policy_drift
+            .oidc_configuration
+            .client_authentication_method = "mtls".into();
+        provider_policy_drift.raw_oidc_kind_config["client_authentication_method"] = json!("mtls");
+        assert!(provider_policy_drift
+            .verify()
+            .unwrap_err()
+            .contains("independently recomputed OIDC kind_config"));
+
+        let mut digest_domain_confusion = AuthenticatorBindingCase::build();
+        digest_domain_confusion.provider_payload_digest =
+            digest_domain_confusion.reference.content_digest.clone();
+        assert!(digest_domain_confusion
+            .verify()
+            .unwrap_err()
+            .contains("D/P/Q digest separation"));
+    }
+
+    #[test]
+    fn authenticator_binding_rejects_reference_schema_and_implemented_policy_confusion() {
+        let mut reference_identity = AuthenticatorBindingCase::build();
+        reference_identity.reference.document_id =
+            "authenticator-runtime-binding:substituted-runtime".into();
+        assert!(reference_identity
+            .verify()
+            .unwrap_err()
+            .contains("does not exactly match"));
+
+        let mut non_json = AuthenticatorBindingCase::build();
+        non_json.reference.artifact_locator =
+            "catalog/security-contracts/v1/authenticator-runtime-binding.runtime-test.JSON".into();
+        non_json.oidc_configuration.runtime_binding_ref = non_json.reference.clone();
+        non_json.raw_oidc_kind_config["runtime_binding_ref"] =
+            serde_json::to_value(&non_json.reference).unwrap();
+        assert!(non_json.verify().unwrap_err().contains("lowercase .json"));
+
+        for (pointer, substituted) in [
+            (
+                "/$schema",
+                json!(
+                    "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json"
+                ),
+            ),
+            ("/contract_kind", json!("action-resource-registry")),
+        ] {
+            let mut case = AuthenticatorBindingCase::build();
+            let mut document = case.document();
+            *document.pointer_mut(pointer).unwrap() = substituted;
+            case.repin_document(document);
+            assert!(case.verify().is_err(), "{pointer} relabel was accepted");
+        }
+
+        for (validation_mode, algorithms) in [
+            ("authenticated-introspection", vec!["RS256".to_string()]),
+            ("jwt-jwks", vec!["PS256".to_string()]),
+        ] {
+            let mut case = AuthenticatorBindingCase::build();
+            case.oidc_configuration.validation_mode = validation_mode.into();
+            case.oidc_configuration.accepted_algorithms = algorithms.clone();
+            case.raw_oidc_kind_config["validation_mode"] = json!(validation_mode);
+            case.raw_oidc_kind_config["accepted_algorithms"] = json!(algorithms);
+            assert!(case
+                .verify()
+                .unwrap_err()
+                .contains("exact implemented jwt-jwks/RS256"));
+        }
+    }
+
+    #[test]
+    fn provider_schema_requires_a_nonzero_json_authenticator_runtime_reference() {
+        let mut fixture = ActiveFixture::build();
+        fixture.install_authenticator_runtime_binding();
+        let provider_path = "catalog/security-contracts/v1/provider-registry.runtime-test.json";
+        let provider: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join(provider_path)).unwrap()).unwrap();
+        validate_against_schema("OIDC provider fixture", PROVIDER_SCHEMA, &provider)
+            .expect("the exact authenticator reference must satisfy the provider schema");
+
+        let mut omitted = provider.clone();
+        omitted["configurations"][0]["kind_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_binding_ref");
+        assert!(
+            validate_against_schema("OIDC provider fixture", PROVIDER_SCHEMA, &omitted)
+                .unwrap_err()
+                .contains("runtime_binding_ref")
+        );
+
+        let mut zero_digest = provider.clone();
+        zero_digest["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+            json!(format!("sha256:{}", "0".repeat(64)));
+        assert!(
+            validate_against_schema("OIDC provider fixture", PROVIDER_SCHEMA, &zero_digest)
+                .is_err()
+        );
+
+        let mut uppercase_extension = provider;
+        uppercase_extension["configurations"][0]["kind_config"]["runtime_binding_ref"]
+            ["artifact_locator"] =
+            json!("catalog/security-contracts/v1/authenticator-runtime-binding.runtime-test.JSON");
+        assert!(validate_against_schema(
+            "OIDC provider fixture",
+            PROVIDER_SCHEMA,
+            &uppercase_extension
+        )
+        .is_err());
     }
 
     #[test]
