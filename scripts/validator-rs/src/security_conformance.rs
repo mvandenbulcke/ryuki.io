@@ -50,6 +50,9 @@ const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
 const MAX_RECEIPT_DIGESTS: usize = 4096;
 const AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-provider-policy-binding-v1";
+const AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID: &str = "limit:authenticator.clock-skew";
+const AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID: &str =
+    "limit:authenticator.oidc-access-token-lifetime";
 const AUTHENTICATOR_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/authenticator-runtime-binding.schema.json"
 );
@@ -3500,7 +3503,13 @@ fn validate_cross_document_semantics(
 
     if let Some(provider) = instances.get("provider-registry.implementation.json") {
         validate_provider_registry(provider, errors);
-        validate_authenticator_runtime_binding_refs(root, deployment, provider, errors);
+        validate_authenticator_runtime_binding_refs(
+            root,
+            deployment,
+            provider,
+            instances.get("security-limit-profile.implementation.json"),
+            errors,
+        );
         validate_secret_provider_runtime_binding_refs(root, deployment, provider, errors);
     }
     if let Some(registry) = instances.get("action-resource-registry.implementation.json") {
@@ -5435,10 +5444,544 @@ fn validate_authenticator_runtime_binding_semantics(
     }
 }
 
+#[derive(Clone, Copy)]
+struct AuthenticatorIntegerHardBounds {
+    minimum: u64,
+    maximum: u64,
+    minimum_inclusive: bool,
+    maximum_inclusive: bool,
+}
+
+impl AuthenticatorIntegerHardBounds {
+    fn contains(self, value: u64) -> bool {
+        (value > self.minimum || (self.minimum_inclusive && value == self.minimum))
+            && (value < self.maximum || (self.maximum_inclusive && value == self.maximum))
+    }
+}
+
+fn authenticator_limit_profile_is_active_and_applicable(
+    profile: &Value,
+    deployment: &Value,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> bool {
+    let mut valid = true;
+    if profile.pointer("/lifecycle/state").and_then(Value::as_str) != Some("active") {
+        errors.push(format!(
+            "{context}: referenced security-limit profile must have active lifecycle"
+        ));
+        valid = false;
+    }
+    match profile
+        .pointer("/lifecycle/effective_at")
+        .and_then(Value::as_str)
+    {
+        Some(effective_at) => match DateTime::parse_from_rfc3339(effective_at) {
+            Ok(effective_at) if effective_at.with_timezone(&Utc) <= Utc::now() => {}
+            Ok(_) => {
+                errors.push(format!(
+                    "{context}: referenced security-limit profile lifecycle is future-dated"
+                ));
+                valid = false;
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "{context}: referenced security-limit profile lifecycle.effective_at is invalid"
+                ));
+                valid = false;
+            }
+        },
+        None => {
+            errors.push(format!(
+                "{context}: referenced security-limit profile omits lifecycle.effective_at"
+            ));
+            valid = false;
+        }
+    }
+
+    let applicability = profile.get("applicability").unwrap_or(&Value::Null);
+    let deployment_profile = string_field(deployment, "security_profile").unwrap_or("");
+    if !array(applicability, "security_profiles")
+        .iter()
+        .any(|profile| profile.as_str() == Some(deployment_profile))
+    {
+        errors.push(format!(
+            "{context}: referenced security-limit profile is not applicable to security profile {deployment_profile}"
+        ));
+        valid = false;
+    }
+
+    let deployment_id = string_field(deployment, "deployment_id").unwrap_or("");
+    if string_field(applicability, "evaluation_scope") != Some("deployment") {
+        errors.push(format!(
+            "{context}: referenced security-limit profile must use deployment applicability"
+        ));
+        valid = false;
+    }
+    let deployment_ids = array(applicability, "deployment_ids");
+    if deployment_ids.len() != 1 || deployment_ids[0].as_str() != Some(deployment_id) {
+        errors.push(format!(
+            "{context}: referenced security-limit profile must apply to exactly deployment {deployment_id}"
+        ));
+        valid = false;
+    }
+    let enabled_features = string_set(array(deployment, "enabled_features"));
+    for feature in array(applicability, "enabled_feature_ids") {
+        if feature
+            .as_str()
+            .is_none_or(|feature| !enabled_features.contains(feature))
+        {
+            errors.push(format!(
+                "{context}: referenced security-limit profile requires an unselected feature"
+            ));
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn authenticator_integer_hard_bounds(
+    limit: &Value,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> Option<AuthenticatorIntegerHardBounds> {
+    let hard_bounds = limit.get("hard_bounds").unwrap_or(&Value::Null);
+    let Some(minimum) = hard_bounds.get("minimum").and_then(Value::as_u64) else {
+        errors.push(format!(
+            "{context}: hard_bounds.minimum must be a nonnegative integer"
+        ));
+        return None;
+    };
+    let Some(maximum) = hard_bounds.get("maximum").and_then(Value::as_u64) else {
+        errors.push(format!(
+            "{context}: hard_bounds.maximum must be a nonnegative integer"
+        ));
+        return None;
+    };
+    let Some(minimum_inclusive) = hard_bounds
+        .get("minimum_inclusive")
+        .and_then(Value::as_bool)
+    else {
+        errors.push(format!(
+            "{context}: hard_bounds.minimum_inclusive must be a boolean"
+        ));
+        return None;
+    };
+    let Some(maximum_inclusive) = hard_bounds
+        .get("maximum_inclusive")
+        .and_then(Value::as_bool)
+    else {
+        errors.push(format!(
+            "{context}: hard_bounds.maximum_inclusive must be a boolean"
+        ));
+        return None;
+    };
+    if minimum > maximum || (minimum == maximum && (!minimum_inclusive || !maximum_inclusive)) {
+        errors.push(format!(
+            "{context}: hard bounds do not define a nonempty integer interval"
+        ));
+        return None;
+    }
+    Some(AuthenticatorIntegerHardBounds {
+        minimum,
+        maximum,
+        minimum_inclusive,
+        maximum_inclusive,
+    })
+}
+
+fn authenticator_override_dimension_value<'a>(
+    dimension: &str,
+    deployment: &'a Value,
+    configuration: &'a Value,
+) -> Option<&'a str> {
+    match dimension {
+        "deployment_id" => string_field(deployment, "deployment_id"),
+        "provider_id" => string_field(configuration, "provider_id"),
+        "trust_domain_id" => string_field(configuration, "trust_domain_id"),
+        _ => None,
+    }
+}
+
+fn validate_authenticator_ttl_limit(
+    profile: &Value,
+    deployment: &Value,
+    configuration: &Value,
+    limit_id: &str,
+    document_maximum: u64,
+    document_field: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let matching_limits = array(profile, "limits")
+        .iter()
+        .filter(|limit| string_field(limit, "limit_id") == Some(limit_id))
+        .collect::<Vec<_>>();
+    if matching_limits.len() != 1 {
+        errors.push(format!(
+            "{context}: {document_field} limit {limit_id} must resolve to exactly one security-limit row; found {}",
+            matching_limits.len()
+        ));
+        return;
+    }
+    let limit = matching_limits[0];
+    let limit_context = format!("{context}: security limit {limit_id}");
+    let mut valid = true;
+    for (field, expected) in [
+        ("category", "ttl"),
+        ("unit", "seconds"),
+        ("enforcement_status", "enforced"),
+        ("lifecycle", "active"),
+        ("applicability_expression", "always"),
+    ] {
+        if string_field(limit, field) != Some(expected) {
+            errors.push(format!(
+                "{limit_context}: {field} must be exactly {expected} for an authenticator TTL"
+            ));
+            valid = false;
+        }
+    }
+    let expected_scope_dimensions =
+        BTreeSet::from(["deployment_id", "provider_id", "trust_domain_id"]);
+    let scope = limit.get("scope").unwrap_or(&Value::Null);
+    let scope_dimensions = array(scope, "dimensions");
+    let actual_scope_dimensions = scope_dimensions
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if string_field(scope, "kind") != Some("provider")
+        || actual_scope_dimensions != expected_scope_dimensions
+        || scope_dimensions.len() != expected_scope_dimensions.len()
+    {
+        errors.push(format!(
+            "{limit_context}: scope must be the exact provider/deployment/trust-domain scope"
+        ));
+        valid = false;
+    }
+
+    let Some(selected_value) = limit.get("selected_value").and_then(Value::as_u64) else {
+        errors.push(format!(
+            "{limit_context}: selected_value must be a nonnegative integer"
+        ));
+        return;
+    };
+    let published_default = limit.get("published_default").and_then(Value::as_u64);
+    if published_default.is_none() {
+        errors.push(format!(
+            "{limit_context}: published_default must be a nonnegative integer"
+        ));
+        valid = false;
+    }
+    let bounds = authenticator_integer_hard_bounds(limit, &limit_context, errors);
+    if bounds.is_none_or(|bounds| !bounds.contains(selected_value)) {
+        errors.push(format!(
+            "{limit_context}: selected_value {selected_value} is outside its integer hard bounds"
+        ));
+        valid = false;
+    }
+    if published_default.is_some_and(|published_default| {
+        bounds.is_none_or(|bounds| !bounds.contains(published_default))
+    }) {
+        errors.push(format!(
+            "{limit_context}: published_default {} is outside its integer hard bounds",
+            published_default.expect("checked above")
+        ));
+        valid = false;
+    }
+
+    let mut seen_override_ids = BTreeSet::new();
+    let mut applicable_overrides = Vec::<(&str, u64)>::new();
+    for (override_index, override_value) in array(limit, "overrides").iter().enumerate() {
+        let override_context = format!("{limit_context}/overrides/{override_index}");
+        let override_id = string_field(override_value, "override_id").unwrap_or("");
+        if override_id.is_empty() || !seen_override_ids.insert(override_id.to_string()) {
+            errors.push(format!(
+                "{override_context}: override_id must be present and unique"
+            ));
+            valid = false;
+        }
+        let Some(override_selected_value) =
+            override_value.get("selected_value").and_then(Value::as_u64)
+        else {
+            errors.push(format!(
+                "{override_context}: selected_value must be a nonnegative integer"
+            ));
+            valid = false;
+            continue;
+        };
+        if override_value.get("tightens_only").and_then(Value::as_bool) != Some(true)
+            || override_selected_value >= selected_value
+        {
+            errors.push(format!(
+                "{override_context}: authenticator TTL override must tighten selected_value {selected_value}"
+            ));
+            valid = false;
+        }
+        if bounds.is_none_or(|bounds| !bounds.contains(override_selected_value)) {
+            errors.push(format!(
+                "{override_context}: selected_value {override_selected_value} is outside the integer hard bounds"
+            ));
+            valid = false;
+        }
+
+        let dimensions = array(override_value, "scope_dimensions");
+        let mut seen_dimensions = BTreeSet::new();
+        let mut known_mismatch = false;
+        let mut unsupported_dimension = false;
+        if dimensions.is_empty() {
+            errors.push(format!(
+                "{override_context}: scope_dimensions must be nonempty"
+            ));
+            valid = false;
+            continue;
+        }
+        for dimension in dimensions {
+            let dimension_name = string_field(dimension, "dimension").unwrap_or("");
+            let dimension_value = string_field(dimension, "value").unwrap_or("");
+            if dimension_name.is_empty() || !seen_dimensions.insert(dimension_name.to_string()) {
+                errors.push(format!(
+                    "{override_context}: scope dimensions must be named and unique"
+                ));
+                valid = false;
+                continue;
+            }
+            match authenticator_override_dimension_value(dimension_name, deployment, configuration)
+            {
+                Some(expected) if expected != dimension_value => known_mismatch = true,
+                Some(_) => {}
+                None => {
+                    errors.push(format!(
+                        "{override_context}: unsupported scope dimension {dimension_name}"
+                    ));
+                    valid = false;
+                    unsupported_dimension = true;
+                }
+            }
+        }
+        if known_mismatch || unsupported_dimension {
+            continue;
+        }
+        applicable_overrides.push((override_id, override_selected_value));
+    }
+
+    if applicable_overrides.len() > 1 {
+        let override_ids = applicable_overrides
+            .iter()
+            .map(|(override_id, _)| *override_id)
+            .collect::<Vec<_>>();
+        errors.push(format!(
+            "{limit_context}: applicable overrides are ambiguous: {override_ids:?}"
+        ));
+        return;
+    }
+    if !valid {
+        return;
+    }
+    let applied_value = applicable_overrides
+        .first()
+        .map_or(selected_value, |(_, selected_value)| *selected_value);
+    if document_maximum != applied_value {
+        errors.push(format!(
+            "{context}: D {document_field} {document_maximum} does not equal applied security-limit value {applied_value} for {limit_id}"
+        ));
+    }
+}
+
+fn validate_authenticator_credential_path_limits(
+    document: &Value,
+    deployment: &Value,
+    configuration: &Value,
+    security_limit_profile: Option<&Value>,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let advertised_capabilities = configuration
+        .pointer("/capability_descriptor/advertised_capabilities")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let requires_direct_jwt = advertised_capabilities
+        .iter()
+        .any(|capability| capability.as_str() == Some("token-validation"));
+    let requires_browser = advertised_capabilities
+        .iter()
+        .any(|capability| capability.as_str() == Some("browser-sso"));
+    let bearer_paths = array(document, "credential_paths")
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| {
+            path.pointer("/credential_profile/token_profile")
+                .and_then(Value::as_str)
+                == Some("jwt-access-token")
+        })
+        .collect::<Vec<_>>();
+    let browser_paths = array(document, "credential_paths")
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| {
+            path.pointer("/credential_profile/token_profile")
+                .and_then(Value::as_str)
+                == Some("oidc-id-token")
+        })
+        .collect::<Vec<_>>();
+
+    if requires_direct_jwt && bearer_paths.len() != 1 {
+        errors.push(format!(
+            "{context}: authenticator runtime binding must retain exactly one JWT bearer credential path; found {}",
+            bearer_paths.len()
+        ));
+    } else if !requires_direct_jwt && !bearer_paths.is_empty() {
+        errors.push(format!(
+            "{context}: authenticator runtime binding retains a JWT bearer credential path without token-validation capability"
+        ));
+    }
+    if requires_browser && browser_paths.len() != 1 {
+        errors.push(format!(
+            "{context}: active browser-sso authenticator binding must retain exactly one OIDC ID-token credential path; found {}",
+            browser_paths.len()
+        ));
+    } else if !requires_browser && !browser_paths.is_empty() {
+        errors.push(format!(
+            "{context}: authenticator runtime binding retains an OIDC ID-token credential path without browser-sso capability"
+        ));
+    }
+
+    let validate_direct_jwt = requires_direct_jwt && bearer_paths.len() == 1;
+    let validate_browser = requires_browser && browser_paths.len() == 1;
+    if !validate_direct_jwt && !validate_browser {
+        return;
+    }
+    let Some(profile) = security_limit_profile else {
+        errors.push(format!(
+            "{context}: authenticator credential paths require the checked-in security-limit profile"
+        ));
+        return;
+    };
+    if !authenticator_limit_profile_is_active_and_applicable(profile, deployment, context, errors) {
+        return;
+    }
+
+    if validate_direct_jwt {
+        let (path_index, path) = bearer_paths[0];
+        let path_id = string_field(path, "path_id").unwrap_or("<unknown>");
+        let path_context = format!("{context}: credential path {path_index} ({path_id})");
+        let verifier = path.get("verifier").unwrap_or(&Value::Null);
+        match (
+            string_field(verifier, "clock_skew_limit_id"),
+            verifier
+                .get("maximum_clock_skew_seconds")
+                .and_then(Value::as_u64),
+        ) {
+            (Some(limit_id), Some(document_maximum))
+                if limit_id == AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID =>
+            {
+                validate_authenticator_ttl_limit(
+                    profile,
+                    deployment,
+                    configuration,
+                    limit_id,
+                    document_maximum,
+                    "maximum_clock_skew_seconds",
+                    &path_context,
+                    errors,
+                )
+            }
+            (Some(limit_id), Some(_)) => errors.push(format!(
+                "{path_context}: bearer verifier uses noncanonical clock-skew limit {limit_id}"
+            )),
+            _ => errors.push(format!(
+                "{path_context}: bearer verifier must bind an integer maximum_clock_skew_seconds to clock_skew_limit_id"
+            )),
+        }
+
+        let replay = path
+            .pointer("/credential_profile/replay")
+            .unwrap_or(&Value::Null);
+        match (
+            string_field(replay, "credential_lifetime_limit_id"),
+            replay
+                .get("maximum_credential_lifetime_seconds")
+                .and_then(Value::as_u64),
+        ) {
+            (Some(limit_id), Some(document_maximum))
+                if limit_id == AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID =>
+            {
+                validate_authenticator_ttl_limit(
+                    profile,
+                    deployment,
+                    configuration,
+                    limit_id,
+                    document_maximum,
+                    "maximum_credential_lifetime_seconds",
+                    &path_context,
+                    errors,
+                )
+            }
+            (Some(limit_id), Some(_)) => errors.push(format!(
+                "{path_context}: bearer replay policy uses noncanonical credential-lifetime limit {limit_id}"
+            )),
+            _ => errors.push(format!(
+                "{path_context}: bearer replay policy must bind an integer maximum_credential_lifetime_seconds to credential_lifetime_limit_id"
+            )),
+        }
+    }
+
+    if validate_browser {
+        let (path_index, path) = browser_paths[0];
+        let path_id = string_field(path, "path_id").unwrap_or("<unknown>");
+        let path_context = format!("{context}: credential path {path_index} ({path_id})");
+        let verifier = path.get("verifier").unwrap_or(&Value::Null);
+        if verifier.get("issued_at_required").and_then(Value::as_bool) != Some(false) {
+            errors.push(format!(
+                "{path_context}: browser ID-token verifier must set issued_at_required to false"
+            ));
+        }
+        match (
+            string_field(verifier, "clock_skew_limit_id"),
+            verifier
+                .get("maximum_clock_skew_seconds")
+                .and_then(Value::as_u64),
+        ) {
+            (Some(limit_id), Some(document_maximum))
+                if limit_id == AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID =>
+            {
+                validate_authenticator_ttl_limit(
+                    profile,
+                    deployment,
+                    configuration,
+                    limit_id,
+                    document_maximum,
+                    "maximum_clock_skew_seconds",
+                    &path_context,
+                    errors,
+                )
+            }
+            (Some(limit_id), Some(_)) => errors.push(format!(
+                "{path_context}: browser verifier uses noncanonical clock-skew limit {limit_id}"
+            )),
+            _ => errors.push(format!(
+                "{path_context}: browser verifier must bind an integer maximum_clock_skew_seconds to clock_skew_limit_id"
+            )),
+        }
+
+        let replay = path
+            .pointer("/credential_profile/replay")
+            .unwrap_or(&Value::Null);
+        if replay.get("credential_lifetime_limit_id") != Some(&Value::Null)
+            || replay.get("maximum_credential_lifetime_seconds") != Some(&Value::Null)
+        {
+            errors.push(format!(
+                "{path_context}: browser replay policy must keep bearer credential-lifetime limit id and maximum null"
+            ));
+        }
+    }
+}
+
 fn validate_authenticator_runtime_binding_refs(
     root: &Path,
     deployment: &Value,
     registry: &Value,
+    security_limit_profile: Option<&Value>,
     errors: &mut Vec<String>,
 ) {
     let schema = match parse_json_strict(AUTHENTICATOR_RUNTIME_BINDING_SCHEMA.as_bytes()) {
@@ -5565,6 +6108,14 @@ fn validate_authenticator_runtime_binding_refs(
             errors,
         );
         validate_authenticator_runtime_binding_semantics(&document, &context, errors);
+        validate_authenticator_credential_path_limits(
+            &document,
+            deployment,
+            configuration,
+            security_limit_profile,
+            &context,
+            errors,
+        );
         for (field, expected) in [
             (
                 "$schema",
@@ -6872,12 +7423,142 @@ mod tests {
                     "binding_digest": digest('5')
                 },
                 "retained_consumer_ids": ["runtime-consumer:validator-api-bearer"]
+            }, {
+                "path_id": "authenticator-path:validator-browser-sso",
+                "path_version": 1,
+                "verifier": {
+                    "verifier_id": "authenticator-verifier:validator-browser-sso",
+                    "verifier_version": 1,
+                    "issuer_binding_digest": digest('1'),
+                    "audience_set_binding_digest": digest('6'),
+                    "accepted_algorithm_ids": ["rs256"],
+                    "required_claim_ids": ["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"],
+                    "provider_subject_claim_id": "oid",
+                    "key_source_kind": "jwt-jwks",
+                    "key_source_binding_digest": digest('7'),
+                    "expiration_required": true,
+                    "not_before_required": true,
+                    "issued_at_required": false,
+                    "nonce_required": true,
+                    "clock_skew_limit_id": "limit:authenticator.clock-skew",
+                    "maximum_clock_skew_seconds": 60,
+                    "redirects_allowed": false
+                },
+                "credential_profile": {
+                    "profile_id": "credential-profile:validator-browser-sso",
+                    "profile_version": 1,
+                    "token_profile": "oidc-id-token",
+                    "carrier": "oauth-callback",
+                    "proof_binding": "pkce-s256",
+                    "replay": {
+                        "credential_reuse": "single-use",
+                        "credential_lifetime_limit_id": null,
+                        "maximum_credential_lifetime_seconds": null,
+                        "sender_constraint": "none",
+                        "presentation_replay_defense": "single-use-state",
+                        "nonce_binding": "oidc-login",
+                        "replay_store_binding_digest": digest('8')
+                    }
+                },
+                "cache_partition": {
+                    "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                    "binding_digest": digest('9')
+                },
+                "protocol_binding": {
+                    "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                    "binding_digest": digest('a')
+                },
+                "retained_consumer_ids": ["runtime-consumer:validator-browser-sso"]
             }],
             "ownership": {
                 "single_runtime_owner": true,
                 "ambient_reconfiguration_allowed": false
             }
         })
+    }
+
+    fn authenticator_security_limit_profile(deployment: &Value) -> Value {
+        let mut profile =
+            load("catalog/security-contracts/v1/security-limit-profile.implementation.json");
+        profile["lifecycle"]["state"] = json!("active");
+        profile["applicability"]["evaluation_scope"] = json!("deployment");
+        profile["applicability"]["security_profiles"] =
+            json!([deployment["security_profile"].clone()]);
+        profile["applicability"]["deployment_ids"] = json!([deployment["deployment_id"].clone()]);
+        profile["applicability"]["enabled_feature_ids"] = json!([]);
+
+        let ttl_template = profile["limits"]
+            .as_array()
+            .expect("security limits")
+            .iter()
+            .find(|limit| string_field(limit, "category") == Some("ttl"))
+            .expect("checked-in TTL template")
+            .clone();
+        let row =
+            |limit_id: &str, description: &str, selected_value: u64, minimum: u64, maximum: u64| {
+                let mut row = ttl_template.clone();
+                row["limit_id"] = json!(limit_id);
+                row["category"] = json!("ttl");
+                row["description"] = json!(description);
+                row["selected_value"] = json!(selected_value);
+                row["published_default"] = json!(selected_value);
+                row["unit"] = json!("seconds");
+                row["scope"] = json!({
+                    "kind": "provider",
+                    "dimensions": ["deployment_id", "trust_domain_id", "provider_id"]
+                });
+                row["hard_bounds"] = json!({
+                    "minimum": minimum,
+                    "maximum": maximum,
+                    "minimum_inclusive": true,
+                    "maximum_inclusive": true
+                });
+                row["enforcement_status"] = json!("enforced");
+                row["source_binding"] = json!({
+                    "source_file": "scripts/validator-rs/src/security_conformance.rs",
+                    "source_symbol": "authenticator_security_limit_profile"
+                });
+                row["overrides"] = json!([]);
+                row["lifecycle"] = json!("active");
+                row["applicability_expression"] = json!("always");
+                row
+            };
+        for desired in [
+            row(
+                "limit:authenticator.clock-skew",
+                "Maximum accepted authenticator clock skew.",
+                60,
+                0,
+                300,
+            ),
+            row(
+                "limit:authenticator.oidc-access-token-lifetime",
+                "Maximum accepted OIDC access-token lifetime.",
+                3600,
+                1,
+                86400,
+            ),
+        ] {
+            let limits = profile["limits"].as_array_mut().expect("security limits");
+            if let Some(existing) = limits
+                .iter_mut()
+                .find(|limit| string_field(limit, "limit_id") == string_field(&desired, "limit_id"))
+            {
+                *existing = desired;
+            } else {
+                limits.push(desired);
+            }
+        }
+        profile
+    }
+
+    fn authenticator_limit_mut<'a>(profile: &'a mut Value, limit_id: &str) -> &'a mut Value {
+        profile["limits"]
+            .as_array_mut()
+            .expect("security limits")
+            .iter_mut()
+            .find(|limit| string_field(limit, "limit_id") == Some(limit_id))
+            .expect("authenticator limit row")
     }
 
     fn secret_provider_runtime_binding_document(
@@ -10405,7 +11086,7 @@ mod tests {
             configuration["kind"] = json!("oidc");
             configuration["capability_descriptor"]["adapter_kind"] = json!("auth.entra-id");
             configuration["capability_descriptor"]["advertised_capabilities"] =
-                json!(["token-validation"]);
+                json!(["browser-sso", "token-validation"]);
             configuration["kind_config"] = json!({
                 "configuration_kind": "oidc",
                 "runtime_binding_ref": {
@@ -10436,6 +11117,7 @@ mod tests {
         .unwrap();
         let document =
             authenticator_runtime_binding_document(&deployment, &registry["configurations"][0], &q);
+        let limit_profile = authenticator_security_limit_profile(&deployment);
         let pin_document = |registry: &mut Value, document: &Value| {
             let bytes = serde_json::to_vec_pretty(document).unwrap();
             fs::write(temporary_root.path().join(locator), &bytes).unwrap();
@@ -10450,6 +11132,7 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &registry,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -10464,6 +11147,7 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &q_substitution_registry,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors
@@ -10482,6 +11166,7 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &authority_substitution_registry,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors
@@ -10496,6 +11181,7 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &digest_drift,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors
@@ -10512,6 +11198,7 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &noncanonical_registry,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors
@@ -10532,13 +11219,521 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &digest_confusion,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors
             .iter()
             .any(|error| error.contains("D/P/Q digest separation")));
 
-        let mut missing = registry;
+        let validate_limit_case = |profile: &Value, document: &Value| {
+            let mut case_registry = registry.clone();
+            pin_document(&mut case_registry, document);
+            let mut errors = Vec::new();
+            validate_authenticator_runtime_binding_refs(
+                temporary_root.path(),
+                &deployment,
+                &case_registry,
+                Some(profile),
+                &mut errors,
+            );
+            errors
+        };
+
+        for (name, pointer, replacement, expected_error) in [
+            (
+                "unknown clock-skew limit",
+                "/credential_paths/0/verifier/clock_skew_limit_id",
+                json!("limit:authenticator.unknown-clock-skew"),
+                "uses noncanonical clock-skew limit limit:authenticator.unknown-clock-skew",
+            ),
+            (
+                "clock-skew value drift",
+                "/credential_paths/0/verifier/maximum_clock_skew_seconds",
+                json!(61),
+                "D maximum_clock_skew_seconds 61 does not equal applied security-limit value 60",
+            ),
+            (
+                "unknown credential-lifetime limit",
+                "/credential_paths/0/credential_profile/replay/credential_lifetime_limit_id",
+                json!("limit:authenticator.unknown-credential-lifetime"),
+                "uses noncanonical credential-lifetime limit limit:authenticator.unknown-credential-lifetime",
+            ),
+            (
+                "credential-lifetime value drift",
+                "/credential_paths/0/credential_profile/replay/maximum_credential_lifetime_seconds",
+                json!(3601),
+                "D maximum_credential_lifetime_seconds 3601 does not equal applied security-limit value 3600",
+            ),
+            (
+                "unknown browser clock-skew limit",
+                "/credential_paths/1/verifier/clock_skew_limit_id",
+                json!("limit:authenticator.unknown-browser-clock-skew"),
+                "browser verifier uses noncanonical clock-skew limit limit:authenticator.unknown-browser-clock-skew",
+            ),
+            (
+                "browser clock-skew value drift",
+                "/credential_paths/1/verifier/maximum_clock_skew_seconds",
+                json!(61),
+                "D maximum_clock_skew_seconds 61 does not equal applied security-limit value 60",
+            ),
+            (
+                "browser issued-at requirement",
+                "/credential_paths/1/verifier/issued_at_required",
+                json!(true),
+                "browser ID-token verifier must set issued_at_required to false",
+            ),
+            (
+                "browser credential-lifetime limit id",
+                "/credential_paths/1/credential_profile/replay/credential_lifetime_limit_id",
+                json!("limit:authenticator.oidc-access-token-lifetime"),
+                "browser replay policy must keep bearer credential-lifetime limit id and maximum null",
+            ),
+            (
+                "browser credential-lifetime maximum",
+                "/credential_paths/1/credential_profile/replay/maximum_credential_lifetime_seconds",
+                json!(3600),
+                "browser replay policy must keep bearer credential-lifetime limit id and maximum null",
+            ),
+        ] {
+            let mut mutated_document = document.clone();
+            *mutated_document
+                .pointer_mut(pointer)
+                .expect("authenticator limit pointer") = replacement;
+            let errors = validate_limit_case(&limit_profile, &mutated_document);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "{name} unexpectedly passed: {errors:?}"
+            );
+        }
+
+        let mut missing_browser_document = document.clone();
+        missing_browser_document["credential_paths"]
+            .as_array_mut()
+            .expect("credential path array")
+            .remove(1);
+        let errors = validate_limit_case(&limit_profile, &missing_browser_document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "active browser-sso authenticator binding must retain exactly one OIDC ID-token credential path; found 0"
+            )),
+            "missing browser path unexpectedly passed: {errors:?}"
+        );
+
+        let mut wrong_browser_path_document = document.clone();
+        wrong_browser_path_document["credential_paths"][1]["credential_profile"]["token_profile"] =
+            json!("jwt-access-token");
+        let errors = validate_limit_case(&limit_profile, &wrong_browser_path_document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "active browser-sso authenticator binding must retain exactly one OIDC ID-token credential path; found 0"
+            )),
+            "wrong browser token profile unexpectedly passed: {errors:?}"
+        );
+
+        let mut duplicate_browser_document = document.clone();
+        let mut duplicate_browser_path = duplicate_browser_document["credential_paths"][1].clone();
+        duplicate_browser_path["path_id"] =
+            json!("authenticator-path:validator-browser-sso-secondary");
+        duplicate_browser_path["verifier"]["verifier_id"] =
+            json!("authenticator-verifier:validator-browser-sso-secondary");
+        duplicate_browser_path["credential_profile"]["profile_id"] =
+            json!("credential-profile:validator-browser-sso-secondary");
+        duplicate_browser_path["cache_partition"]["binding_digest"] =
+            json!(format!("sha256:{}", "b".repeat(64)));
+        duplicate_browser_path["retained_consumer_ids"] =
+            json!(["runtime-consumer:validator-browser-sso-secondary"]);
+        duplicate_browser_document["credential_paths"]
+            .as_array_mut()
+            .expect("credential path array")
+            .push(duplicate_browser_path);
+        let errors = validate_limit_case(&limit_profile, &duplicate_browser_document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "active browser-sso authenticator binding must retain exactly one OIDC ID-token credential path; found 2"
+            )),
+            "duplicate browser path unexpectedly passed: {errors:?}"
+        );
+
+        let mut duplicate_bearer_document = document.clone();
+        let mut duplicate_bearer_path = duplicate_bearer_document["credential_paths"][0].clone();
+        duplicate_bearer_path["path_id"] =
+            json!("authenticator-path:validator-api-bearer-secondary");
+        duplicate_bearer_path["verifier"]["verifier_id"] =
+            json!("authenticator-verifier:validator-api-bearer-secondary");
+        duplicate_bearer_path["credential_profile"]["profile_id"] =
+            json!("credential-profile:validator-api-bearer-secondary");
+        duplicate_bearer_path["retained_consumer_ids"] =
+            json!(["runtime-consumer:validator-api-bearer-secondary"]);
+        duplicate_bearer_document["credential_paths"]
+            .as_array_mut()
+            .expect("credential path array")
+            .push(duplicate_bearer_path);
+        let errors = validate_limit_case(&limit_profile, &duplicate_bearer_document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "authenticator runtime binding must retain exactly one JWT bearer credential path; found 2"
+            )),
+            "duplicate bearer path unexpectedly passed: {errors:?}"
+        );
+
+        let duplicate = {
+            let mut profile = limit_profile.clone();
+            let duplicate =
+                authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID).clone();
+            profile["limits"]
+                .as_array_mut()
+                .expect("security limits")
+                .push(duplicate);
+            profile
+        };
+        let inactive_row = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(
+                &mut profile,
+                AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID,
+            )["lifecycle"] = json!("retired");
+            profile
+        };
+        let inapplicable_row = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+                ["applicability_expression"] = json!("provider-specific-expression");
+            profile
+        };
+        let wrong_category = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)["category"] =
+                json!("rate");
+            profile
+        };
+        let wrong_unit = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(
+                &mut profile,
+                AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID,
+            )["unit"] = json!("milliseconds");
+            profile
+        };
+        let wrong_status = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+                ["enforcement_status"] = json!("partially_enforced");
+            profile
+        };
+        let wrong_scope = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)["scope"] =
+                json!({"kind": "global", "dimensions": []});
+            profile
+        };
+        let fractional_value = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+                ["selected_value"] = json!(60.5);
+            profile
+        };
+        let outside_bounds = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(
+                &mut profile,
+                AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID,
+            )["hard_bounds"]["maximum"] = json!(3599);
+            profile
+        };
+        let fractional_minimum = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+                ["hard_bounds"]["minimum"] = json!(0.5);
+            profile
+        };
+        let exclusive_selected_endpoint = {
+            let mut profile = limit_profile.clone();
+            let limit = authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+            limit["hard_bounds"]["minimum"] = json!(60);
+            limit["hard_bounds"]["minimum_inclusive"] = json!(false);
+            profile
+        };
+        let fractional_published_default = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+                ["published_default"] = json!(60.5);
+            profile
+        };
+        let published_default_outside_bounds = {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+                ["published_default"] = json!(301);
+            profile
+        };
+        let inactive_profile = {
+            let mut profile = limit_profile.clone();
+            profile["lifecycle"]["state"] = json!("candidate");
+            profile
+        };
+        let future_dated_profile = {
+            let mut profile = limit_profile.clone();
+            profile["lifecycle"]["effective_at"] = json!("9999-01-01T00:00:00Z");
+            profile
+        };
+        let inapplicable_profile = {
+            let mut profile = limit_profile.clone();
+            profile["applicability"]["deployment_ids"] =
+                json!(["deployment:other-validator-fixture"]);
+            profile
+        };
+        for (name, profile, expected_error) in [
+            (
+                "duplicate row",
+                duplicate,
+                "must resolve to exactly one security-limit row; found 2",
+            ),
+            (
+                "inactive row",
+                inactive_row,
+                "lifecycle must be exactly active",
+            ),
+            (
+                "inapplicable row",
+                inapplicable_row,
+                "applicability_expression must be exactly always",
+            ),
+            (
+                "wrong category",
+                wrong_category,
+                "category must be exactly ttl",
+            ),
+            ("wrong unit", wrong_unit, "unit must be exactly seconds"),
+            (
+                "wrong enforcement status",
+                wrong_status,
+                "enforcement_status must be exactly enforced",
+            ),
+            (
+                "wrong scope",
+                wrong_scope,
+                "scope must be the exact provider/deployment/trust-domain scope",
+            ),
+            (
+                "fractional selected value",
+                fractional_value,
+                "selected_value must be a nonnegative integer",
+            ),
+            (
+                "selected value outside bounds",
+                outside_bounds,
+                "selected_value 3600 is outside its integer hard bounds",
+            ),
+            (
+                "fractional hard-bound minimum",
+                fractional_minimum,
+                "hard_bounds.minimum must be a nonnegative integer",
+            ),
+            (
+                "exclusive selected endpoint",
+                exclusive_selected_endpoint,
+                "selected_value 60 is outside its integer hard bounds",
+            ),
+            (
+                "fractional published default",
+                fractional_published_default,
+                "published_default must be a nonnegative integer",
+            ),
+            (
+                "published default outside bounds",
+                published_default_outside_bounds,
+                "published_default 301 is outside its integer hard bounds",
+            ),
+            (
+                "inactive profile",
+                inactive_profile,
+                "security-limit profile must have active lifecycle",
+            ),
+            (
+                "future-dated profile",
+                future_dated_profile,
+                "security-limit profile lifecycle is future-dated",
+            ),
+            (
+                "inapplicable profile",
+                inapplicable_profile,
+                "security-limit profile must apply to exactly deployment",
+            ),
+        ] {
+            let errors = validate_limit_case(&profile, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "{name} unexpectedly passed: {errors:?}"
+            );
+        }
+
+        let applicable_override = |override_id: &str, selected_value: u64| {
+            json!({
+                "override_id": override_id,
+                "selected_value": selected_value,
+                "scope_dimensions": [
+                    {
+                        "dimension": "deployment_id",
+                        "value": deployment["deployment_id"].clone()
+                    },
+                    {
+                        "dimension": "provider_id",
+                        "value": registry["configurations"][0]["provider_id"].clone()
+                    },
+                    {
+                        "dimension": "trust_domain_id",
+                        "value": registry["configurations"][0]["trust_domain_id"].clone()
+                    }
+                ],
+                "tightens_only": true,
+                "reason": "validator fixture"
+            })
+        };
+        let mut overridden_profile = limit_profile.clone();
+        authenticator_limit_mut(&mut overridden_profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+            ["overrides"] = json!([applicable_override("override:authenticator-clock-skew", 30)]);
+        let mut overridden_document = document.clone();
+        overridden_document["credential_paths"][0]["verifier"]["maximum_clock_skew_seconds"] =
+            json!(30);
+        overridden_document["credential_paths"][1]["verifier"]["maximum_clock_skew_seconds"] =
+            json!(30);
+        let errors = validate_limit_case(&overridden_profile, &overridden_document);
+        assert!(errors.is_empty(), "unambiguous override failed: {errors:?}");
+
+        let validate_override_case = |name: &str, overrides: Vec<Value>, expected_error: &str| {
+            let mut profile = limit_profile.clone();
+            authenticator_limit_mut(&mut profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)["overrides"] =
+                Value::Array(overrides);
+            let errors = validate_limit_case(&profile, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "{name} unexpectedly passed: {errors:?}"
+            );
+        };
+
+        validate_override_case(
+            "equal-valued override",
+            vec![applicable_override(
+                "override:authenticator-clock-skew-equal",
+                60,
+            )],
+            "authenticator TTL override must tighten selected_value 60",
+        );
+        validate_override_case(
+            "widening override",
+            vec![applicable_override(
+                "override:authenticator-clock-skew-widening",
+                61,
+            )],
+            "authenticator TTL override must tighten selected_value 60",
+        );
+
+        let mut non_tightening_override =
+            applicable_override("override:authenticator-clock-skew-not-tightening-only", 30);
+        non_tightening_override["tightens_only"] = json!(false);
+        validate_override_case(
+            "override without tightening-only marker",
+            vec![non_tightening_override],
+            "authenticator TTL override must tighten selected_value 60",
+        );
+
+        validate_override_case(
+            "duplicate override ids",
+            vec![
+                applicable_override("override:authenticator-clock-skew-duplicate", 30),
+                applicable_override("override:authenticator-clock-skew-duplicate", 20),
+            ],
+            "override_id must be present and unique",
+        );
+
+        let mut duplicate_dimension_override =
+            applicable_override("override:authenticator-clock-skew-duplicate-dimension", 30);
+        let duplicate_dimension = duplicate_dimension_override["scope_dimensions"][0].clone();
+        duplicate_dimension_override["scope_dimensions"]
+            .as_array_mut()
+            .expect("override dimensions")
+            .push(duplicate_dimension);
+        validate_override_case(
+            "duplicate override dimensions",
+            vec![duplicate_dimension_override],
+            "scope dimensions must be named and unique",
+        );
+
+        let mut empty_dimension_override =
+            applicable_override("override:authenticator-clock-skew-empty-dimensions", 30);
+        empty_dimension_override["scope_dimensions"] = json!([]);
+        validate_override_case(
+            "empty override dimensions",
+            vec![empty_dimension_override],
+            "scope_dimensions must be nonempty",
+        );
+
+        let mut fractional_override =
+            applicable_override("override:authenticator-clock-skew-fractional", 30);
+        fractional_override["selected_value"] = json!(30.5);
+        validate_override_case(
+            "fractional override value",
+            vec![fractional_override],
+            "selected_value must be a nonnegative integer",
+        );
+
+        validate_override_case(
+            "override outside hard bounds",
+            vec![applicable_override(
+                "override:authenticator-clock-skew-outside-bounds",
+                301,
+            )],
+            "selected_value 301 is outside the integer hard bounds",
+        );
+
+        let mut nonmatching_override =
+            applicable_override("override:authenticator-clock-skew-other-deployment", 30);
+        nonmatching_override["scope_dimensions"][0]["value"] =
+            json!("deployment:other-validator-fixture");
+        let mut nonmatching_override_profile = limit_profile.clone();
+        authenticator_limit_mut(
+            &mut nonmatching_override_profile,
+            AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID,
+        )["overrides"] = json!([nonmatching_override]);
+        let errors = validate_limit_case(&nonmatching_override_profile, &document);
+        assert!(
+            errors.is_empty(),
+            "nonmatching override did not fall back to selected_value: {errors:?}"
+        );
+
+        authenticator_limit_mut(&mut overridden_profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
+            ["overrides"] = json!([
+            applicable_override("override:authenticator-clock-skew-a", 30),
+            applicable_override("override:authenticator-clock-skew-b", 20)
+        ]);
+        let errors = validate_limit_case(&overridden_profile, &overridden_document);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("applicable overrides are ambiguous")),
+            "ambiguous overrides unexpectedly passed: {errors:?}"
+        );
+
+        let mut unsupported_override_profile = limit_profile.clone();
+        let mut unsupported_override =
+            applicable_override("override:authenticator-clock-skew-replica", 30);
+        unsupported_override["scope_dimensions"] = json!([{
+            "dimension": "replica_id",
+            "value": "replica:validator"
+        }]);
+        authenticator_limit_mut(
+            &mut unsupported_override_profile,
+            AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID,
+        )["overrides"] = json!([unsupported_override]);
+        let errors = validate_limit_case(&unsupported_override_profile, &document);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unsupported scope dimension replica_id")),
+            "unresolved override scope unexpectedly passed: {errors:?}"
+        );
+
+        let mut missing = registry.clone();
         missing["configurations"][0]["kind_config"]
             .as_object_mut()
             .unwrap()
@@ -10548,6 +11743,7 @@ mod tests {
             temporary_root.path(),
             &deployment,
             &missing,
+            Some(&limit_profile),
             &mut errors,
         );
         assert!(errors

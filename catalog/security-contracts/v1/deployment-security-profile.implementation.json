@@ -12,7 +12,7 @@
     "evaluation_scope": "deployment",
     "security_profiles": ["test"],
     "deployment_ids": ["deployment:repository-conformance-fixture"],
-    "enabled_feature_ids": ["repository-conformance", "static-dry-run"]
+    "enabled_feature_ids": ["authenticator-runtime-admission", "repository-conformance", "static-dry-run"]
   },
   "deployment_profile_version": 2,
   "deployment_id": "deployment:repository-conformance-fixture",
@@ -58,14 +58,14 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 2,
-    "content_digest": "sha256:77d03d759c1814d3a60ac90b3e38a84218a7a61277d8725dff20ca46e697eea1",
+    "content_digest": "sha256:23d5a36ff5e1103beaef677c1a0c2c1bf3a8d0988f51206730f9c83983e26ec6",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {
     "artifact_kind": "security-limit-profile",
     "document_id": "security-limit-profile:repository-implementation-v1",
-    "document_version": 1,
-    "content_digest": "sha256:eb013d07b1b76d47e5304c265e05c2a90866ecdab651451adba172ae71867564",
+    "document_version": 2,
+    "content_digest": "sha256:5647238adb449c8d97fb5e844cc04db1972ebbfb51c7fb84397bce5c310bbca2",
     "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
   },
   "control_plane_topology_ref": {
@@ -90,7 +90,7 @@
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "production_acceptance_receipt_ref": null,
-  "enabled_features": ["repository-conformance", "static-dry-run"],
+  "enabled_features": ["authenticator-runtime-admission", "repository-conformance", "static-dry-run"],
   "runtime_guard_evidence": {
     "mode": "not_applicable",
     "guards": [],

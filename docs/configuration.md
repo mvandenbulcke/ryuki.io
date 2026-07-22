@@ -280,7 +280,11 @@ Copy `.env.example` to `.env` for Compose workflows, or export the same variable
 | `RYUKI_ENTRA_AUTHORITY` | OIDC authority URL | `https://login.microsoftonline.com` |
 | `RYUKI_ENTRA_REDIRECT_URI` | Browser SSO callback URL, e.g. `https://<host>/api/auth/entra/callback` | Required for the browser sign-in flow; empty leaves bearer-token auth only |
 | `RYUKI_ENTRA_JWKS_TTL_SECS` | Cached JWKS lifetime in seconds (`1..=86400`) | `86400` |
-| `RYUKI_ENTRA_LEEWAY_SECS` | Token `exp`/`nbf` clock leeway in seconds (`0..=300`) | `60` |
+
+Token clock skew is selected by the exact authenticated
+`SecurityLimitProfile` referenced by the deployment profile. The retired
+`RYUKI_ENTRA_LEEWAY_SECS` input is rejected at startup so an ambient setting
+cannot compete with that authority.
 
 Two Entra paths coexist. Bearer-token validation (API callers presenting
 `Authorization: Bearer <jwt>`) needs only tenant + client. The browser
@@ -296,10 +300,12 @@ store. It also requires the separate
 An empty redirect URI keeps the browser button disabled.
 
 Startup rejects a zero or greater-than-one-day Entra JWKS TTL so a successful
-generation has a meaningful but bounded retirement deadline. It also rejects
-token-clock leeway above five minutes; larger values would materially weaken
-`exp` and `nbf` enforcement. These bounds are validated even before Entra mode
-is enabled, preventing dormant unsafe configuration from becoming active later.
+generation has a meaningful but bounded retirement deadline. Authenticator
+clock skew instead comes from the active `SecurityLimitProfile`: startup
+requires the exact referenced TTL row to be active, enforced, integral,
+applicable, inside its authenticated hard bounds, and equal to the selected
+authenticator binding. A legacy ambient leeway setting is rejected rather than
+kept as dormant competing authority.
 
 ### Generic OIDC (current single-provider flow)
 

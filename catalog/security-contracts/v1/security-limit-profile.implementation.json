@@ -3,7 +3,7 @@
   "schema_version": "1.0.0",
   "contract_kind": "security-limit-profile",
   "document_id": "security-limit-profile:repository-implementation-v1",
-  "document_version": 1,
+  "document_version": 2,
   "lifecycle": {
     "state": "implementation_only",
     "effective_at": "2026-07-16T00:00:00Z"
@@ -12,10 +12,10 @@
     "evaluation_scope": "implementation",
     "security_profiles": ["development", "test", "production"],
     "deployment_ids": [],
-    "enabled_feature_ids": ["session-lookup-admission"]
+    "enabled_feature_ids": ["authenticator-runtime-admission", "session-lookup-admission"]
   },
-  "profile_version": 1,
-  "hard_bounds_revision": 1,
+  "profile_version": 2,
+  "hard_bounds_revision": 2,
   "coverage_status": "transitional_snapshot",
   "normative_categories": ["request-bytes", "response-bytes", "parsing-work", "concurrency", "queue-growth", "durable-state-growth", "query-page", "query-lookback", "scheduler-batch", "retention-batch", "subprocess-count", "subprocess-runtime", "subprocess-tree", "output-bytes", "artifact-bytes", "disk-bytes", "memory-bytes", "probe", "retry", "replay-retention", "idempotency-retention", "fairness"],
   "covered_categories": ["cache-capacity", "ttl", "rate", "concurrency", "query-page"],
@@ -778,6 +778,116 @@
         "source_digest": "sha256:3b64e49b50f20ad38af2c8fef91989c4354ffc9f8cb204299b137a70ec7cd693"
       },
       "overrides": []
+    },
+    {
+      "limit_id": "limit:authenticator.clock-skew",
+      "category": "ttl",
+      "description": "Maximum clock skew accepted by the retained OIDC authenticator verifier after resolution from the active security-limit profile.",
+      "selected_value": 60,
+      "published_default": 60,
+      "unit": "seconds",
+      "scope": {
+        "kind": "provider",
+        "dimensions": ["deployment_id", "provider_id", "trust_domain_id"]
+      },
+      "hard_bounds": {
+        "minimum": 0,
+        "maximum": 300,
+        "minimum_inclusive": true,
+        "maximum_inclusive": true
+      },
+      "owner": "api-security",
+      "value_change_authority": {
+        "authority_id": "authority:runtime-security-config",
+        "owning_team": "platform-security",
+        "required_controls": ["review", "step-up"]
+      },
+      "bound_change_authority": {
+        "authority_id": "authority:security-contract-bounds",
+        "owning_team": "platform-security",
+        "required_controls": ["review", "maker-checker", "contract-revision", "new-conformance-evidence"]
+      },
+      "failure_projection": {
+        "mode": "expire",
+        "stable_code": "AUTHENTICATOR_CLOCK_SKEW_LIMIT_EXCEEDED",
+        "retryable": false,
+        "queueing_allowed": false,
+        "value_free": true
+      },
+      "telemetry": {
+        "metric_name": "ryuki_authenticator_runtime_limit_profile",
+        "cardinality": "bounded-low",
+        "value_free": true
+      },
+      "procedures": {
+        "value_change": "procedure:security-limit-value-change-v1",
+        "bound_change": "procedure:security-limit-bound-change-v1",
+        "rollback": "procedure:security-limit-rollback-v1",
+        "evidence_requirements": ["evidence-requirement:boundary-and-plus-one-v1"]
+      },
+      "enforcement_status": "enforced",
+      "source_binding": {
+        "source_file": "sources/ryuki-api/src/security_contracts.rs",
+        "source_symbol": "ResolvedAuthenticatorBearerLimits::maximum_clock_skew_seconds"
+      },
+      "overrides": [],
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "limit_id": "limit:authenticator.oidc-access-token-lifetime",
+      "category": "ttl",
+      "description": "Maximum accepted OIDC access-token lifetime resolved from the active security-limit profile for retained bearer admission.",
+      "selected_value": 3600,
+      "published_default": 3600,
+      "unit": "seconds",
+      "scope": {
+        "kind": "provider",
+        "dimensions": ["deployment_id", "provider_id", "trust_domain_id"]
+      },
+      "hard_bounds": {
+        "minimum": 1,
+        "maximum": 86400,
+        "minimum_inclusive": true,
+        "maximum_inclusive": true
+      },
+      "owner": "api-security",
+      "value_change_authority": {
+        "authority_id": "authority:runtime-security-config",
+        "owning_team": "platform-security",
+        "required_controls": ["review", "step-up"]
+      },
+      "bound_change_authority": {
+        "authority_id": "authority:security-contract-bounds",
+        "owning_team": "platform-security",
+        "required_controls": ["review", "maker-checker", "contract-revision", "new-conformance-evidence"]
+      },
+      "failure_projection": {
+        "mode": "expire",
+        "stable_code": "AUTHENTICATOR_ACCESS_TOKEN_LIFETIME_EXCEEDED",
+        "retryable": false,
+        "queueing_allowed": false,
+        "value_free": true
+      },
+      "telemetry": {
+        "metric_name": "ryuki_authenticator_runtime_limit_profile",
+        "cardinality": "bounded-low",
+        "value_free": true
+      },
+      "procedures": {
+        "value_change": "procedure:security-limit-value-change-v1",
+        "bound_change": "procedure:security-limit-bound-change-v1",
+        "rollback": "procedure:security-limit-rollback-v1",
+        "evidence_requirements": ["evidence-requirement:boundary-and-plus-one-v1"]
+      },
+      "enforcement_status": "enforced",
+      "source_binding": {
+        "source_file": "sources/ryuki-api/src/security_contracts.rs",
+        "source_symbol": "ResolvedAuthenticatorBearerLimits::maximum_credential_lifetime_seconds"
+      },
+      "overrides": [],
+      "lifecycle": "active",
+      "applicability_expression": "always"
     }
   ]
 }

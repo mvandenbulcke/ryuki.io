@@ -23,6 +23,9 @@ use crate::entra_sso::EntraSsoDeps;
 use crate::oidc_callback::{
     OidcCallbackDeps, OidcIdTokenValidator, ReqwestTokenExchanger, TokenExchanger,
 };
+use crate::security_contracts::{
+    ResolvedAuthenticatorBearerLimits, ResolvedAuthenticatorBrowserLimits,
+};
 use crate::session_credentials::{
     DerivedSessionCredentialRuntime, DerivedSessionRuntimeObservation,
 };
@@ -93,6 +96,8 @@ pub(crate) struct AuthenticatorRuntimeObservation {
     posture: ProductionAuthenticatorPosture,
     consumers: Box<[AuthenticatorRuntimeConsumer]>,
     entra_validator_observation: Option<Arc<EntraBearerRuntimeObservation>>,
+    entra_browser_clock_skew_limit_id: Option<String>,
+    entra_browser_maximum_clock_skew_seconds: Option<u64>,
     derived_session_observation: Arc<DerivedSessionRuntimeObservation>,
     generic_oidc_enabled: bool,
     generic_oidc_issuer_authority_binding_digest: Option<String>,
@@ -110,6 +115,7 @@ impl fmt::Debug for AuthenticatorRuntimeObservation {
             .field("consumers", &self.consumers)
             .field("identity_bindings", &"[REDACTED]")
             .field("verifier_policy", &"[RETAINED]")
+            .field("limit_authorities", &"[RETAINED]")
             .finish()
     }
 }
@@ -117,7 +123,8 @@ impl fmt::Debug for AuthenticatorRuntimeObservation {
 impl AuthenticatorRuntimeObservation {
     fn measure(
         config: &RyukiConfig,
-        entra_validator_observation: Arc<EntraBearerRuntimeObservation>,
+        entra_validator_observation: Option<Arc<EntraBearerRuntimeObservation>>,
+        authenticator_browser_limits: Option<&ResolvedAuthenticatorBrowserLimits>,
         derived_session_observation: Arc<DerivedSessionRuntimeObservation>,
     ) -> Result<Self, String> {
         let posture = match &config.auth_mode {
@@ -153,7 +160,9 @@ impl AuthenticatorRuntimeObservation {
         }
 
         if posture == ProductionAuthenticatorPosture::EntraOidc {
-            let exact_policy = entra_validator_observation.as_ref();
+            let exact_policy = entra_validator_observation.as_deref().ok_or_else(|| {
+                "Entra posture has no retained bearer validator observation".to_string()
+            })?;
             if exact_policy.key_source_kind() != EntraBearerKeySourceKind::NetworkJwks
                 || !exact_policy
                     .issuer_authority_binding_digest()
@@ -165,7 +174,11 @@ impl AuthenticatorRuntimeObservation {
                     .key_source_binding_digest()
                     .starts_with("sha256:")
                 || exact_policy.jwks_ttl_seconds().is_none()
-                || u32::try_from(exact_policy.validation_leeway_seconds()).is_err()
+                || exact_policy.clock_skew_limit_id() != "limit:authenticator.clock-skew"
+                || u32::try_from(exact_policy.maximum_clock_skew_seconds()).is_err()
+                || exact_policy.credential_lifetime_limit_id()
+                    != "limit:authenticator.oidc-access-token-lifetime"
+                || exact_policy.maximum_credential_lifetime_seconds() == 0
                 || exact_policy.accepted_algorithm_ids() != ["rs256"]
                 || exact_policy.required_claim_ids() != ["aud", "exp", "iat", "iss", "nbf", "sub"]
                 || exact_policy.provider_subject_claim_id() != "oid"
@@ -180,15 +193,65 @@ impl AuthenticatorRuntimeObservation {
                         .to_string(),
                 );
             }
+        } else if entra_validator_observation.is_some() {
+            return Err(
+                "non-Entra posture cannot retain a dormant bearer validator observation".into(),
+            );
         }
+
+        let entra_browser_configured = posture == ProductionAuthenticatorPosture::EntraOidc
+            && !config.entra_redirect_uri.is_empty();
+        let (entra_browser_clock_skew_limit_id, entra_browser_maximum_clock_skew_seconds) = match (
+            entra_browser_configured,
+            authenticator_browser_limits,
+        ) {
+            (true, Some(limits)) => {
+                limits.verify_integrity()?;
+                if limits.clock_skew_limit_id() != "limit:authenticator.clock-skew"
+                    || u32::try_from(limits.maximum_clock_skew_seconds()).is_err()
+                {
+                    return Err(
+                        "retained Entra browser limits do not implement the closed runtime policy"
+                            .into(),
+                    );
+                }
+                let bearer_observation =
+                    entra_validator_observation.as_deref().ok_or_else(|| {
+                        "configured Entra browser path has no retained bearer observation"
+                            .to_string()
+                    })?;
+                if bearer_observation.clock_skew_limit_id() != limits.clock_skew_limit_id()
+                    || bearer_observation.maximum_clock_skew_seconds()
+                        != limits.maximum_clock_skew_seconds()
+                {
+                    return Err(
+                        "retained Entra bearer and browser paths resolve different clock-skew authority"
+                            .into(),
+                    );
+                }
+                (
+                    Some(limits.clock_skew_limit_id().to_owned()),
+                    Some(limits.maximum_clock_skew_seconds()),
+                )
+            }
+            (true, None) => {
+                return Err(
+                    "configured Entra browser path has no retained browser-limit authority".into(),
+                );
+            }
+            (false, Some(_)) => {
+                return Err(
+                    "runtime observation cannot retain dormant Entra browser-limit authority"
+                        .into(),
+                );
+            }
+            (false, None) => (None, None),
+        };
 
         let mut consumers = match posture {
             ProductionAuthenticatorPosture::EntraOidc => {
                 let mut consumers = vec![AuthenticatorRuntimeConsumer::EntraBearerRequestAdmission];
-                if !config.entra_tenant_id.is_empty()
-                    && !config.entra_client_id.is_empty()
-                    && !config.entra_redirect_uri.is_empty()
-                {
+                if entra_browser_configured {
                     consumers.push(AuthenticatorRuntimeConsumer::EntraBrowserSso);
                 }
                 consumers
@@ -233,8 +296,9 @@ impl AuthenticatorRuntimeObservation {
         Ok(Self {
             posture,
             consumers: consumers.into_boxed_slice(),
-            entra_validator_observation: (posture == ProductionAuthenticatorPosture::EntraOidc)
-                .then_some(entra_validator_observation),
+            entra_validator_observation,
+            entra_browser_clock_skew_limit_id,
+            entra_browser_maximum_clock_skew_seconds,
             derived_session_observation,
             generic_oidc_enabled: config.oidc.enabled,
             generic_oidc_issuer_authority_binding_digest,
@@ -299,6 +363,37 @@ impl AuthenticatorRuntimeObservation {
             .as_deref()
             .map(EntraBearerRuntimeObservation::validation_leeway_seconds)
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_clock_skew_limit_id(&self) -> Option<&str> {
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::clock_skew_limit_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_credential_lifetime_limit_id(&self) -> Option<&str> {
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::credential_lifetime_limit_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_maximum_credential_lifetime_seconds(&self) -> Option<u64> {
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::maximum_credential_lifetime_seconds)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_browser_clock_skew_limit_id(&self) -> Option<&str> {
+        self.entra_browser_clock_skew_limit_id.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_browser_maximum_clock_skew_seconds(&self) -> Option<u64> {
+        self.entra_browser_maximum_clock_skew_seconds
     }
 
     #[cfg(test)]
@@ -398,8 +493,10 @@ pub(crate) struct ApiAuthenticatorRuntime {
     generic_oidc_enabled: bool,
     operational_observation: Arc<AuthenticatorRuntimeObservation>,
     api_cookie_runtime: Arc<ApiCookieRuntime>,
-    entra_bearer_validator: Arc<EntraTokenValidator>,
-    entra_bearer_observation: Arc<EntraBearerRuntimeObservation>,
+    authenticator_bearer_limits: Option<Arc<ResolvedAuthenticatorBearerLimits>>,
+    authenticator_browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+    entra_bearer_validator: Option<Arc<EntraTokenValidator>>,
+    entra_bearer_observation: Option<Arc<EntraBearerRuntimeObservation>>,
     derived_session_credentials: Arc<DerivedSessionCredentialRuntime>,
     derived_session_observation: Arc<DerivedSessionRuntimeObservation>,
     oidc_callback_dependencies: Arc<OidcCallbackDeps>,
@@ -413,19 +510,71 @@ impl ApiAuthenticatorRuntime {
     pub(crate) fn from_admitted_config(
         config: &RyukiConfig,
         api_cookie_runtime: Arc<ApiCookieRuntime>,
+        authenticator_bearer_limits: Option<Arc<ResolvedAuthenticatorBearerLimits>>,
+        authenticator_browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
         production_profile: bool,
     ) -> Result<Arc<Self>, String> {
         api_cookie_runtime
             .validate_config_binding(config, production_profile)
             .map_err(|error| error.to_string())?;
-        let entra_bearer_validator = Arc::new(EntraTokenValidator::from_app_config(
-            &config.entra_tenant_id,
-            &config.entra_client_id,
-            &config.entra_authority,
-            config.entra_jwks_ttl_secs,
-            config.entra_leeway_secs,
-        ));
-        let entra_bearer_observation = Arc::new(entra_bearer_validator.runtime_observation());
+        let (entra_bearer_validator, entra_bearer_observation) = if config.auth_mode
+            == AuthMode::EntraId
+        {
+            let limits = authenticator_bearer_limits.as_ref().ok_or_else(|| {
+                    "Entra runtime requires exact bearer limits resolved from the active security contract"
+                        .to_string()
+                })?;
+            limits.verify_integrity()?;
+            let validator = Arc::new(EntraTokenValidator::from_app_config(
+                &config.entra_tenant_id,
+                &config.entra_client_id,
+                &config.entra_authority,
+                config.entra_jwks_ttl_secs,
+                Arc::clone(limits),
+            ));
+            if !validator.retains_bearer_limits(limits) {
+                return Err(
+                    "Entra bearer validator did not retain the admitted limit authority".into(),
+                );
+            }
+            let observation = Arc::new(validator.runtime_observation());
+            (Some(validator), Some(observation))
+        } else {
+            if authenticator_bearer_limits.is_some() || authenticator_browser_limits.is_some() {
+                return Err("non-Entra runtime cannot retain dormant Entra limit authority".into());
+            }
+            (None, None)
+        };
+        match (
+            config.auth_mode == AuthMode::EntraId && !config.entra_redirect_uri.is_empty(),
+            authenticator_browser_limits.is_some(),
+        ) {
+            (true, false) => {
+                return Err(
+                    "configured Entra browser SSO requires exact browser limits resolved from the active security contract"
+                        .into(),
+                );
+            }
+            (false, true) => {
+                return Err("runtime cannot retain dormant Entra browser-limit authority".into());
+            }
+            _ => {}
+        }
+        if let Some(browser_limits) = authenticator_browser_limits.as_deref() {
+            browser_limits.verify_integrity()?;
+            let bearer_limits = authenticator_bearer_limits.as_deref().ok_or_else(|| {
+                "Entra browser limits cannot be retained without bearer-limit authority".to_string()
+            })?;
+            if browser_limits.clock_skew_limit_id() != bearer_limits.clock_skew_limit_id()
+                || browser_limits.maximum_clock_skew_seconds()
+                    != bearer_limits.maximum_clock_skew_seconds()
+            {
+                return Err(
+                    "Entra bearer and browser paths must retain the same resolved clock-skew authority"
+                        .into(),
+                );
+            }
+        }
         let derived_session_credentials =
             DerivedSessionCredentialRuntime::from_admitted_config(&config.session)
                 .map_err(|error| error.to_string())?;
@@ -433,7 +582,8 @@ impl ApiAuthenticatorRuntime {
             Arc::new(derived_session_credentials.runtime_observation());
         let operational_observation = Arc::new(AuthenticatorRuntimeObservation::measure(
             config,
-            Arc::clone(&entra_bearer_observation),
+            entra_bearer_observation.as_ref().map(Arc::clone),
+            authenticator_browser_limits.as_deref(),
             Arc::clone(&derived_session_observation),
         )?);
 
@@ -476,15 +626,23 @@ impl ApiAuthenticatorRuntime {
         });
         let entra_sso_dependencies = EntraSsoDeps::from_app_config(
             config,
+            authenticator_browser_limits.as_ref().map(Arc::clone),
             Arc::clone(&derived_session_credentials),
             Arc::clone(&api_cookie_runtime),
         );
+        if !entra_sso_dependencies.retains_browser_limits(&authenticator_browser_limits) {
+            return Err(
+                "Entra browser SSO dependencies did not retain the admitted limit authority".into(),
+            );
+        }
 
         Ok(Arc::new(Self {
             auth_mode: config.auth_mode.clone(),
             generic_oidc_enabled: config.oidc.enabled,
             operational_observation,
             api_cookie_runtime,
+            authenticator_bearer_limits,
+            authenticator_browser_limits,
             entra_bearer_validator,
             entra_bearer_observation,
             derived_session_credentials,
@@ -518,6 +676,12 @@ impl ApiAuthenticatorRuntime {
             {
                 Err(AuthenticatorRuntimePostureError::DerivedSessionCredentialUnavailable)
             }
+            ProductionAuthenticatorPosture::EntraOidc
+                if !self.has_closed_entra_bearer_authority()
+                    || !self.has_closed_entra_browser_authority() =>
+            {
+                Err(AuthenticatorRuntimePostureError::UnboundAuthenticator)
+            }
             ProductionAuthenticatorPosture::EntraOidc if self.generic_oidc_enabled => {
                 Err(AuthenticatorRuntimePostureError::UnboundAuthenticator)
             }
@@ -532,16 +696,67 @@ impl ApiAuthenticatorRuntime {
         }
     }
 
+    fn has_closed_entra_bearer_authority(&self) -> bool {
+        match (
+            self.authenticator_bearer_limits.as_ref(),
+            self.entra_bearer_validator.as_deref(),
+            self.entra_bearer_observation.as_deref(),
+        ) {
+            (Some(limits), Some(validator), Some(observation)) => {
+                limits.verify_integrity().is_ok()
+                    && validator.retains_bearer_limits(limits)
+                    && *observation == validator.runtime_observation()
+            }
+            _ => false,
+        }
+    }
+
+    fn has_closed_entra_browser_authority(&self) -> bool {
+        match (
+            self.authenticator_browser_limits.as_ref(),
+            self.operational_observation
+                .entra_browser_clock_skew_limit_id
+                .as_deref(),
+            self.operational_observation
+                .entra_browser_maximum_clock_skew_seconds,
+        ) {
+            (Some(limits), Some(limit_id), Some(maximum_seconds)) => {
+                limits.verify_integrity().is_ok()
+                    && limits.clock_skew_limit_id() == limit_id
+                    && limits.maximum_clock_skew_seconds() == maximum_seconds
+                    && self
+                        .entra_sso_dependencies
+                        .retains_browser_limits(&self.authenticator_browser_limits)
+            }
+            (None, None, None) => self.entra_sso_dependencies.retains_browser_limits(&None),
+            _ => false,
+        }
+    }
+
     pub(crate) fn api_cookie_runtime(&self) -> Arc<ApiCookieRuntime> {
         Arc::clone(&self.api_cookie_runtime)
     }
 
-    pub(crate) fn entra_bearer_validator(&self) -> Arc<EntraTokenValidator> {
-        Arc::clone(&self.entra_bearer_validator)
+    #[cfg(test)]
+    pub(crate) fn authenticator_bearer_limits(
+        &self,
+    ) -> Option<Arc<ResolvedAuthenticatorBearerLimits>> {
+        self.authenticator_bearer_limits.as_ref().map(Arc::clone)
     }
 
-    pub(crate) fn entra_bearer_observation(&self) -> Arc<EntraBearerRuntimeObservation> {
-        Arc::clone(&self.entra_bearer_observation)
+    #[cfg(test)]
+    pub(crate) fn authenticator_browser_limits(
+        &self,
+    ) -> Option<Arc<ResolvedAuthenticatorBrowserLimits>> {
+        self.authenticator_browser_limits.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn entra_bearer_validator(&self) -> Option<Arc<EntraTokenValidator>> {
+        self.entra_bearer_validator.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn entra_bearer_observation(&self) -> Option<Arc<EntraBearerRuntimeObservation>> {
+        self.entra_bearer_observation.as_ref().map(Arc::clone)
     }
 
     pub(crate) fn derived_session_credentials(&self) -> Arc<DerivedSessionCredentialRuntime> {
@@ -577,20 +792,67 @@ impl ApiAuthenticatorRuntime {
 
     pub(crate) fn retains_entra_bearer_validator(
         &self,
-        validator: &Arc<EntraTokenValidator>,
+        validator: &Option<Arc<EntraTokenValidator>>,
     ) -> bool {
-        Arc::ptr_eq(&self.entra_bearer_validator, validator)
+        match (&self.entra_bearer_validator, validator) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn retains_entra_bearer_observation(
         &self,
-        observation: &Arc<EntraBearerRuntimeObservation>,
+        observation: &Option<Arc<EntraBearerRuntimeObservation>>,
     ) -> bool {
-        Arc::ptr_eq(&self.entra_bearer_observation, observation)
+        match (&self.entra_bearer_observation, observation) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn remeasures_entra_bearer_observation(&self) -> bool {
-        *self.entra_bearer_observation == self.entra_bearer_validator.runtime_observation()
+        match (
+            self.entra_bearer_validator.as_deref(),
+            self.entra_bearer_observation.as_deref(),
+        ) {
+            (Some(validator), Some(observation)) => *observation == validator.runtime_observation(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn retains_authenticator_bearer_limits(
+        &self,
+        limits: &Option<Arc<ResolvedAuthenticatorBearerLimits>>,
+    ) -> bool {
+        let same_owner = match (&self.authenticator_bearer_limits, limits) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        };
+        same_owner
+            && match (
+                self.entra_bearer_validator.as_deref(),
+                self.authenticator_bearer_limits.as_ref(),
+            ) {
+                (Some(validator), Some(retained)) => validator.retains_bearer_limits(retained),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(crate) fn retains_authenticator_browser_limits(
+        &self,
+        limits: &Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+    ) -> bool {
+        let same_owner = match (&self.authenticator_browser_limits, limits) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        };
+        same_owner && self.entra_sso_dependencies.retains_browser_limits(limits)
     }
 
     pub(crate) fn retains_derived_session_credentials(
@@ -639,6 +901,8 @@ impl fmt::Debug for ApiAuthenticatorRuntime {
             .field("generic_oidc_enabled", &self.generic_oidc_enabled)
             .field("operational_observation", &"[RETAINED]")
             .field("api_cookie_runtime", &"[RETAINED]")
+            .field("authenticator_bearer_limits", &"[RETAINED]")
+            .field("authenticator_browser_limits", &"[RETAINED]")
             .field("entra_bearer_validator", &"[RETAINED]")
             .field("entra_bearer_observation", &"[RETAINED]")
             .field("derived_session_credentials", &"[RETAINED]")
@@ -657,11 +921,27 @@ mod tests {
     fn build_runtime(
         config: &RyukiConfig,
     ) -> (Arc<ApiCookieRuntime>, Arc<ApiAuthenticatorRuntime>) {
+        build_runtime_with_limits(config, 60, 3_600)
+    }
+
+    fn build_runtime_with_limits(
+        config: &RyukiConfig,
+        clock_skew_seconds: u64,
+        maximum_lifetime_seconds: u64,
+    ) -> (Arc<ApiCookieRuntime>, Arc<ApiAuthenticatorRuntime>) {
         let cookie_runtime = ApiCookieRuntime::from_admitted_config(config, false)
             .expect("test config must construct cookie runtime");
+        let bearer_limits = (config.auth_mode == AuthMode::EntraId).then(|| {
+            ResolvedAuthenticatorBearerLimits::fixture(clock_skew_seconds, maximum_lifetime_seconds)
+        });
+        let browser_limits = (config.auth_mode == AuthMode::EntraId
+            && !config.entra_redirect_uri.is_empty())
+        .then(|| ResolvedAuthenticatorBrowserLimits::fixture(clock_skew_seconds));
         let authenticator_runtime = ApiAuthenticatorRuntime::from_admitted_config(
             config,
             Arc::clone(&cookie_runtime),
+            bearer_limits,
+            browser_limits,
             false,
         )
         .expect("test config must construct authenticator runtime");
@@ -670,9 +950,18 @@ mod tests {
 
     #[test]
     fn retains_exact_cookie_and_authenticator_allocations() {
-        let config = RyukiConfig::default();
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        config.entra_tenant_id = "tenant-retention-fixture".into();
+        config.entra_client_id = "client-retention-fixture".into();
+        config.entra_redirect_uri = "https://portal.example.test/entra/callback".into();
+        config.session.credential_hmac_key = "k".repeat(32);
         let (cookie_runtime, runtime) = build_runtime(&config);
         let observation = Arc::clone(runtime.operational_observation());
+        let bearer_limits = runtime.authenticator_bearer_limits();
+        let browser_limits = runtime.authenticator_browser_limits();
         let entra_bearer_validator = runtime.entra_bearer_validator();
         let entra_bearer_observation = runtime.entra_bearer_observation();
         let derived_session_credentials = runtime.derived_session_credentials();
@@ -683,6 +972,8 @@ mod tests {
 
         assert!(runtime.retains_cookie_runtime(&cookie_runtime));
         assert!(runtime.retains_operational_observation(&observation));
+        assert!(runtime.retains_authenticator_bearer_limits(&bearer_limits));
+        assert!(runtime.retains_authenticator_browser_limits(&browser_limits));
         assert!(runtime.retains_entra_bearer_validator(&entra_bearer_validator));
         assert!(runtime.retains_entra_bearer_observation(&entra_bearer_observation));
         assert!(runtime.remeasures_entra_bearer_observation());
@@ -698,17 +989,40 @@ mod tests {
         assert!(oidc_callback_dependencies.retains_cookie_runtime(&cookie_runtime));
         assert!(entra_sso_dependencies.retains_session_credentials(&derived_session_credentials));
         assert!(entra_sso_dependencies.retains_cookie_runtime(&cookie_runtime));
+        assert!(entra_sso_dependencies.retains_browser_limits(&browser_limits));
         assert!(Arc::ptr_eq(
             &runtime.api_cookie_runtime(),
             &runtime.api_cookie_runtime()
         ));
         assert!(Arc::ptr_eq(
-            &runtime.entra_bearer_validator(),
-            &runtime.entra_bearer_validator()
+            bearer_limits.as_ref().expect("Entra bearer limits"),
+            runtime
+                .authenticator_bearer_limits()
+                .as_ref()
+                .expect("same Entra bearer limits")
         ));
         assert!(Arc::ptr_eq(
-            &runtime.entra_bearer_observation(),
-            &runtime.entra_bearer_observation()
+            browser_limits.as_ref().expect("Entra browser limits"),
+            runtime
+                .authenticator_browser_limits()
+                .as_ref()
+                .expect("same Entra browser limits")
+        ));
+        assert!(Arc::ptr_eq(
+            entra_bearer_validator.as_ref().expect("Entra validator"),
+            runtime
+                .entra_bearer_validator()
+                .as_ref()
+                .expect("same Entra validator")
+        ));
+        assert!(Arc::ptr_eq(
+            entra_bearer_observation
+                .as_ref()
+                .expect("Entra observation"),
+            runtime
+                .entra_bearer_observation()
+                .as_ref()
+                .expect("same Entra observation")
         ));
         assert!(Arc::ptr_eq(
             &runtime.derived_session_credentials(),
@@ -734,6 +1048,10 @@ mod tests {
         let (other_cookie_runtime, other_runtime) = build_runtime(&config);
         assert!(!runtime.retains_cookie_runtime(&other_cookie_runtime));
         assert!(!runtime.retains_operational_observation(other_runtime.operational_observation()));
+        assert!(!runtime
+            .retains_authenticator_bearer_limits(&other_runtime.authenticator_bearer_limits()));
+        assert!(!runtime
+            .retains_authenticator_browser_limits(&other_runtime.authenticator_browser_limits()));
         assert!(!runtime.retains_entra_bearer_validator(&other_runtime.entra_bearer_validator()));
         assert!(
             !runtime.retains_entra_bearer_observation(&other_runtime.entra_bearer_observation())
@@ -746,6 +1064,11 @@ mod tests {
             .retains_oidc_callback_dependencies(&other_runtime.oidc_callback_dependencies()));
         assert!(!runtime.retains_entra_sso_dependencies(&other_runtime.entra_sso_dependencies()));
         assert!(!runtime.retains_local_login_throttle(&other_runtime.local_login_throttle()));
+
+        let equal_but_distinct_limits = Some(ResolvedAuthenticatorBearerLimits::fixture(60, 3_600));
+        let equal_but_distinct_browser = Some(ResolvedAuthenticatorBrowserLimits::fixture(60));
+        assert!(!runtime.retains_authenticator_bearer_limits(&equal_but_distinct_limits));
+        assert!(!runtime.retains_authenticator_browser_limits(&equal_but_distinct_browser));
     }
 
     #[test]
@@ -779,6 +1102,80 @@ mod tests {
             .is_none());
         assert_eq!(observation.generic_oidc_validation_leeway_seconds(), None);
         assert_eq!(observation.generic_oidc_signature_algorithm(), None);
+        assert_eq!(observation.entra_browser_clock_skew_limit_id(), None);
+        assert_eq!(observation.entra_browser_maximum_clock_skew_seconds(), None);
+        assert!(runtime.authenticator_bearer_limits().is_none());
+        assert!(runtime.authenticator_browser_limits().is_none());
+        assert!(runtime.entra_bearer_validator().is_none());
+        assert!(runtime.entra_bearer_observation().is_none());
+    }
+
+    #[test]
+    fn constructor_rejects_missing_dormant_and_mixed_entra_limit_authority() {
+        let mut entra = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        entra.entra_tenant_id = "tenant-limit-construction-fixture".into();
+        entra.entra_client_id = "client-limit-construction-fixture".into();
+        let cookie_runtime = ApiCookieRuntime::from_admitted_config(&entra, false)
+            .expect("test config must construct cookie runtime");
+
+        let missing_direct_limits = ApiAuthenticatorRuntime::from_admitted_config(
+            &entra,
+            Arc::clone(&cookie_runtime),
+            None,
+            None,
+            false,
+        )
+        .expect_err("Entra must not construct without retained bearer limits");
+        assert!(missing_direct_limits.contains("requires exact bearer limits"));
+
+        let dormant_browser = ApiAuthenticatorRuntime::from_admitted_config(
+            &entra,
+            Arc::clone(&cookie_runtime),
+            Some(ResolvedAuthenticatorBearerLimits::fixture(60, 3_600)),
+            Some(ResolvedAuthenticatorBrowserLimits::fixture(60)),
+            false,
+        )
+        .expect_err("bearer-only Entra must reject dormant browser limits");
+        assert!(dormant_browser.contains("dormant Entra browser-limit authority"));
+
+        entra.entra_redirect_uri = "https://portal.example.test/entra/callback".into();
+        let browser_cookie_runtime = ApiCookieRuntime::from_admitted_config(&entra, false)
+            .expect("browser test config must construct cookie runtime");
+        let missing_browser = ApiAuthenticatorRuntime::from_admitted_config(
+            &entra,
+            Arc::clone(&browser_cookie_runtime),
+            Some(ResolvedAuthenticatorBearerLimits::fixture(60, 3_600)),
+            None,
+            false,
+        )
+        .expect_err("configured Entra browser SSO must retain browser limits");
+        assert!(missing_browser.contains("requires exact browser limits"));
+
+        let mixed_clock_authority = ApiAuthenticatorRuntime::from_admitted_config(
+            &entra,
+            browser_cookie_runtime,
+            Some(ResolvedAuthenticatorBearerLimits::fixture(60, 3_600)),
+            Some(ResolvedAuthenticatorBrowserLimits::fixture(61)),
+            false,
+        )
+        .expect_err("bearer and browser paths must not mix security-limit selections");
+        assert!(mixed_clock_authority.contains("same resolved clock-skew authority"));
+
+        let non_entra = RyukiConfig::default();
+        let non_entra_cookie_runtime = ApiCookieRuntime::from_admitted_config(&non_entra, false)
+            .expect("non-Entra test config must construct cookie runtime");
+        let dormant_direct_limits = ApiAuthenticatorRuntime::from_admitted_config(
+            &non_entra,
+            non_entra_cookie_runtime,
+            Some(ResolvedAuthenticatorBearerLimits::fixture(60, 3_600)),
+            None,
+            false,
+        )
+        .expect_err("non-Entra modes must reject dormant bearer limits");
+        assert!(dormant_direct_limits.contains("non-Entra runtime cannot retain dormant"));
     }
 
     #[test]
@@ -917,9 +1314,29 @@ mod tests {
             observation.entra_jwks_ttl_seconds(),
             config.entra_jwks_ttl_secs
         );
+        assert_eq!(observation.entra_validation_leeway_seconds(), 60);
         assert_eq!(
-            observation.entra_validation_leeway_seconds(),
-            config.entra_leeway_secs
+            observation.entra_clock_skew_limit_id(),
+            Some("limit:authenticator.clock-skew")
+        );
+        assert_eq!(
+            observation.entra_credential_lifetime_limit_id(),
+            Some("limit:authenticator.oidc-access-token-lifetime")
+        );
+        assert_eq!(
+            observation.entra_maximum_credential_lifetime_seconds(),
+            Some(3_600)
+        );
+        assert_eq!(
+            observation.entra_browser_clock_skew_limit_id(),
+            Some("limit:authenticator.clock-skew")
+        );
+        assert_eq!(
+            observation.entra_browser_maximum_clock_skew_seconds(),
+            Some(60)
+        );
+        assert!(
+            runtime.retains_authenticator_browser_limits(&runtime.authenticator_browser_limits())
         );
         assert!(observation.derived_session_observation().enabled());
     }
@@ -1045,8 +1462,7 @@ mod tests {
         let mut changed_client = config.clone();
         changed_client.entra_client_id = "different-entra-client-fixture".to_string();
         changed_client.entra_jwks_ttl_secs += 1;
-        changed_client.entra_leeway_secs += 1;
-        let (_, changed_runtime) = build_runtime(&changed_client);
+        let (_, changed_runtime) = build_runtime_with_limits(&changed_client, 61, 3_599);
         assert_eq!(
             runtime
                 .operational_observation()
@@ -1085,6 +1501,22 @@ mod tests {
             changed_runtime
                 .operational_observation()
                 .entra_validation_leeway_seconds()
+        );
+        assert_ne!(
+            runtime
+                .operational_observation()
+                .entra_browser_maximum_clock_skew_seconds(),
+            changed_runtime
+                .operational_observation()
+                .entra_browser_maximum_clock_skew_seconds()
+        );
+        assert_ne!(
+            runtime
+                .operational_observation()
+                .entra_maximum_credential_lifetime_seconds(),
+            changed_runtime
+                .operational_observation()
+                .entra_maximum_credential_lifetime_seconds()
         );
         assert_eq!(
             changed_runtime

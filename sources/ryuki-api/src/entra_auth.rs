@@ -14,6 +14,9 @@
 //!   `header.alg == RS256` defensively before key lookup.
 //! - Signature, issuer, audience, exp and nbf are verified atomically by
 //!   `jsonwebtoken::decode`.
+//! - The exact registered bearer limits retained by the validator supply JWT
+//!   clock skew and bound `exp - iat`; non-positive lifetimes and issued-at
+//!   timestamps beyond `now + skew` fail closed with checked arithmetic.
 //! - Every failure path is FAIL-CLOSED: it returns `AuthSession::unverified_entra()`
 //!   (token_valid=false, zero roles, provider_mode="entra-id-unverified"), which
 //!   the downstream RBAC / verified-admin gates already reject.
@@ -22,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -206,7 +210,10 @@ pub(crate) struct EntraBearerRuntimeObservation {
     key_source_kind: EntraBearerKeySourceKind,
     key_source_binding_digest: String,
     jwks_ttl_seconds: Option<u64>,
-    validation_leeway_seconds: u64,
+    clock_skew_limit_id: String,
+    maximum_clock_skew_seconds: u64,
+    credential_lifetime_limit_id: String,
+    maximum_credential_lifetime_seconds: u64,
     accepted_algorithm_ids: [&'static str; 1],
     required_claim_ids: [&'static str; 6],
     provider_subject_claim_id: &'static str,
@@ -250,8 +257,28 @@ impl EntraBearerRuntimeObservation {
         self.jwks_ttl_seconds
     }
 
+    pub(crate) fn clock_skew_limit_id(&self) -> &str {
+        &self.clock_skew_limit_id
+    }
+
+    pub(crate) fn maximum_clock_skew_seconds(&self) -> u64 {
+        self.maximum_clock_skew_seconds
+    }
+
+    /// Compatibility name for test projections of the validator's JWT leeway.
+    /// The value is the exact registered clock-skew limit rather than an
+    /// independent runtime knob.
+    #[cfg(test)]
     pub(crate) fn validation_leeway_seconds(&self) -> u64 {
-        self.validation_leeway_seconds
+        self.maximum_clock_skew_seconds
+    }
+
+    pub(crate) fn credential_lifetime_limit_id(&self) -> &str {
+        &self.credential_lifetime_limit_id
+    }
+
+    pub(crate) fn maximum_credential_lifetime_seconds(&self) -> u64 {
+        self.maximum_credential_lifetime_seconds
     }
 
     pub(crate) fn accepted_algorithm_ids(&self) -> &[&str] {
@@ -479,6 +506,33 @@ fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// Enforce the registered reusable-bearer validity interval after the token's
+/// signature and standard JWT claims have been verified. Every arithmetic edge
+/// is checked: malformed or unrepresentable intervals fail closed instead of
+/// wrapping into an apparently short-lived credential.
+fn registered_credential_window_is_valid(
+    issued_at: i64,
+    expires_at: i64,
+    now: i64,
+    limits: &crate::security_contracts::ResolvedAuthenticatorBearerLimits,
+) -> bool {
+    let Ok(maximum_lifetime) = i64::try_from(limits.maximum_credential_lifetime_seconds()) else {
+        return false;
+    };
+    let Some(lifetime) = expires_at.checked_sub(issued_at) else {
+        return false;
+    };
+    if lifetime <= 0 || lifetime > maximum_lifetime {
+        return false;
+    }
+
+    let Ok(clock_skew) = i64::try_from(limits.maximum_clock_skew_seconds()) else {
+        return false;
+    };
+    now.checked_add(clock_skew)
+        .is_some_and(|latest_issued_at| issued_at <= latest_issued_at)
+}
+
 fn authenticator_leaf_binding_digest(domain: &[u8], values: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
     for value in std::iter::once(AUTHENTICATOR_LEAF_DIGEST_CONTRACT)
@@ -525,19 +579,19 @@ pub struct EntraTokenValidator {
     issuer: String,
     audiences: Vec<String>,
     keys: KeySource,
-    leeway_secs: u64,
+    bearer_limits: Arc<crate::security_contracts::ResolvedAuthenticatorBearerLimits>,
 }
 
 impl EntraTokenValidator {
     /// Production constructor: derives `EntraConfig` from the app config values
     /// (so `enabled` is computed consistently with every other Entra consumer)
     /// and wires up a network-backed JWKS cache.
-    pub fn from_app_config(
+    pub(crate) fn from_app_config(
         tenant_id: &str,
         client_id: &str,
         instance: &str,
         jwks_ttl_secs: u64,
-        leeway_secs: u64,
+        bearer_limits: Arc<crate::security_contracts::ResolvedAuthenticatorBearerLimits>,
     ) -> Self {
         let config = get_entra_config_from_env(tenant_id, client_id, instance);
         let (issuer, audiences, jwks_uri) = Self::derive_identity_endpoints(&config)
@@ -554,7 +608,7 @@ impl EntraTokenValidator {
             issuer,
             audiences,
             keys: KeySource::Network(cache),
-            leeway_secs,
+            bearer_limits,
         }
     }
 
@@ -639,7 +693,15 @@ impl EntraTokenValidator {
             key_source_kind,
             key_source_binding_digest,
             jwks_ttl_seconds,
-            validation_leeway_seconds: self.leeway_secs,
+            clock_skew_limit_id: self.bearer_limits.clock_skew_limit_id().to_owned(),
+            maximum_clock_skew_seconds: self.bearer_limits.maximum_clock_skew_seconds(),
+            credential_lifetime_limit_id: self
+                .bearer_limits
+                .credential_lifetime_limit_id()
+                .to_owned(),
+            maximum_credential_lifetime_seconds: self
+                .bearer_limits
+                .maximum_credential_lifetime_seconds(),
             accepted_algorithm_ids: ["rs256"],
             required_claim_ids: ENTRA_REQUIRED_CLAIM_IDS,
             provider_subject_claim_id: "oid",
@@ -651,11 +713,29 @@ impl EntraTokenValidator {
         }
     }
 
-    /// Test/injection constructor: a pre-built `kid -> DecodingKey` keyset with
-    /// no network. `config` is supplied directly so tests can pin a known
-    /// tenant/client/authority.
+    /// Return the exact registered limits retained by this validator. Runtime
+    /// composition may clone this Arc, but cannot substitute another allocation
+    /// without failing [`Self::retains_bearer_limits`].
     #[cfg(test)]
-    pub fn with_static_keys(config: EntraConfig, keys: HashMap<String, DecodingKey>) -> Self {
+    pub(crate) fn bearer_limits(
+        &self,
+    ) -> Arc<crate::security_contracts::ResolvedAuthenticatorBearerLimits> {
+        Arc::clone(&self.bearer_limits)
+    }
+
+    pub(crate) fn retains_bearer_limits(
+        &self,
+        limits: &Arc<crate::security_contracts::ResolvedAuthenticatorBearerLimits>,
+    ) -> bool {
+        Arc::ptr_eq(&self.bearer_limits, limits)
+    }
+
+    #[cfg(test)]
+    fn with_static_keys_and_limits(
+        config: EntraConfig,
+        keys: HashMap<String, DecodingKey>,
+        bearer_limits: Arc<crate::security_contracts::ResolvedAuthenticatorBearerLimits>,
+    ) -> Self {
         let (issuer, audiences, _) = Self::derive_identity_endpoints(&config)
             .expect("Entra authority must be a parsed HTTPS URL (loopback HTTP is unit-test only)");
         Self {
@@ -663,7 +743,7 @@ impl EntraTokenValidator {
             issuer,
             audiences,
             keys: KeySource::Static(keys),
-            leeway_secs: 60,
+            bearer_limits,
         }
     }
 
@@ -780,7 +860,7 @@ impl EntraTokenValidator {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(std::slice::from_ref(&self.issuer));
         validation.set_audience(&self.audiences);
-        validation.leeway = self.leeway_secs;
+        validation.leeway = self.bearer_limits.maximum_clock_skew_seconds();
         validation.validate_exp = true;
         validation.validate_nbf = true;
         // Demand the pinned claims and signed OIDC subject are PRESENT, not
@@ -798,6 +878,14 @@ impl EntraTokenValidator {
 
         // Step 6: map claims into a verified session.
         let claims = data.claims;
+        if !registered_credential_window_is_valid(
+            claims.iat,
+            claims.exp,
+            chrono::Utc::now().timestamp(),
+            &self.bearer_limits,
+        ) {
+            return ValidationOutcome::unverified("invalid-token");
+        }
         if claims.sub.is_empty() {
             return ValidationOutcome::unverified("invalid-token");
         }
@@ -1147,7 +1235,9 @@ mod tests {
             issuer: expected_issuer(),
             audiences: vec![TEST_CLIENT.to_string(), format!("api://{TEST_CLIENT}")],
             keys: KeySource::Network(cache),
-            leeway_secs: 60,
+            bearer_limits: crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(
+                60, 3_600,
+            ),
         }
     }
 
@@ -1393,11 +1483,58 @@ mod tests {
         enabled: bool,
         leeway_secs: u64,
     ) -> EntraTokenValidator {
+        static_validator_with_limits(decoding, enabled, leeway_secs, 3_600)
+    }
+
+    fn static_validator_with_limits(
+        decoding: DecodingKey,
+        enabled: bool,
+        clock_skew_seconds: u64,
+        maximum_credential_lifetime_seconds: u64,
+    ) -> EntraTokenValidator {
         let mut map = HashMap::new();
         map.insert(TEST_KID.to_string(), decoding);
-        let mut validator = EntraTokenValidator::with_static_keys(test_config(enabled), map);
-        validator.leeway_secs = leeway_secs;
-        validator
+        EntraTokenValidator::with_static_keys_and_limits(
+            test_config(enabled),
+            map,
+            crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(
+                clock_skew_seconds,
+                maximum_credential_lifetime_seconds,
+            ),
+        )
+    }
+
+    #[test]
+    fn retained_bearer_limits_are_observable_and_identity_checked() {
+        let (_encoding, decoding, _) = make_keypair();
+        let retained =
+            crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(17, 1_700);
+        let mut keys = HashMap::new();
+        keys.insert(TEST_KID.to_string(), decoding);
+        let validator = EntraTokenValidator::with_static_keys_and_limits(
+            test_config(true),
+            keys,
+            Arc::clone(&retained),
+        );
+
+        let observed = validator.runtime_observation();
+        assert_eq!(
+            observed.clock_skew_limit_id(),
+            retained.clock_skew_limit_id()
+        );
+        assert_eq!(observed.maximum_clock_skew_seconds(), 17);
+        assert_eq!(
+            observed.credential_lifetime_limit_id(),
+            retained.credential_lifetime_limit_id()
+        );
+        assert_eq!(observed.maximum_credential_lifetime_seconds(), 1_700);
+
+        let accessor_clone = validator.bearer_limits();
+        assert!(Arc::ptr_eq(&accessor_clone, &retained));
+        assert!(validator.retains_bearer_limits(&retained));
+        let equal_but_distinct =
+            crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(17, 1_700);
+        assert!(!validator.retains_bearer_limits(&equal_but_distinct));
     }
 
     /// Signs a claims object with RS256 under TEST_KID using `encoding`.
@@ -1412,6 +1549,7 @@ mod tests {
     }
 
     fn valid_claims() -> serde_json::Value {
+        let reference_time = now();
         json!({
             "iss": expected_issuer(),
             "aud": TEST_CLIENT,
@@ -1419,9 +1557,9 @@ mod tests {
             "oid": TEST_OBJECT_ID,
             "name": "Ada Admin",
             "preferred_username": "ada@contoso.example",
-            "exp": now() + 3600,
-            "nbf": now() - 60,
-            "iat": now() - 60,
+            "exp": reference_time + 3540,
+            "nbf": reference_time - 60,
+            "iat": reference_time - 60,
             "roles": ["PlatformAdmin"],
             "idtyp": "user",
             "scp": "user_impersonation",
@@ -1541,6 +1679,7 @@ mod tests {
         let mut within_window = valid_claims();
         within_window["exp"] = json!(reference_time - 240);
         within_window["nbf"] = json!(reference_time + 240);
+        within_window["iat"] = json!(reference_time - 3_600);
         let token = sign(&enc, within_window);
         assert!(
             validator.validate(&auth(&token)).await.token_valid,
@@ -1560,6 +1699,83 @@ mod tests {
         let outcome = validator.validate_with_reason(&auth(&token)).await;
         assert!(!outcome.session.token_valid);
         assert_eq!(outcome.failure_reason, Some("not-yet-valid"));
+    }
+
+    #[tokio::test]
+    async fn registered_bearer_lifetime_accepts_the_exact_boundary() {
+        const MAXIMUM_LIFETIME_SECONDS: u64 = 1_800;
+
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator_with_limits(dec, true, 60, MAXIMUM_LIFETIME_SECONDS);
+        let issued_at = now() - 30;
+        let mut claims = valid_claims();
+        claims["iat"] = json!(issued_at);
+        claims["nbf"] = json!(issued_at);
+        claims["exp"] = json!(issued_at + MAXIMUM_LIFETIME_SECONDS as i64);
+
+        let outcome = validator
+            .validate_with_reason(&auth(&sign(&enc, claims)))
+            .await;
+        assert_eq!(outcome.failure_reason, None);
+        assert!(outcome.session.token_valid);
+    }
+
+    #[tokio::test]
+    async fn registered_bearer_lifetime_rejects_boundary_plus_one() {
+        const MAXIMUM_LIFETIME_SECONDS: u64 = 1_800;
+
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator_with_limits(dec, true, 60, MAXIMUM_LIFETIME_SECONDS);
+        let issued_at = now() - 30;
+        let mut claims = valid_claims();
+        claims["iat"] = json!(issued_at);
+        claims["nbf"] = json!(issued_at);
+        claims["exp"] = json!(issued_at + MAXIMUM_LIFETIME_SECONDS as i64 + 1);
+
+        let outcome = validator
+            .validate_with_reason(&auth(&sign(&enc, claims)))
+            .await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.failure_reason, Some("invalid-token"));
+    }
+
+    #[tokio::test]
+    async fn registered_bearer_lifetime_rejects_expiration_at_or_before_issuance() {
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator_with_limits(dec, true, 60, 1_800);
+        let issued_at = now() + 30;
+
+        for expires_at in [issued_at, issued_at - 1] {
+            let mut claims = valid_claims();
+            claims["iat"] = json!(issued_at);
+            claims["nbf"] = json!(now() - 30);
+            claims["exp"] = json!(expires_at);
+
+            let outcome = validator
+                .validate_with_reason(&auth(&sign(&enc, claims)))
+                .await;
+            assert!(!outcome.session.token_valid);
+            assert_eq!(outcome.failure_reason, Some("invalid-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_bearer_lifetime_rejects_future_issued_at_beyond_clock_skew() {
+        const CLOCK_SKEW_SECONDS: u64 = 60;
+
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator_with_limits(dec, true, CLOCK_SKEW_SECONDS, 1_800);
+        let issued_at = now() + CLOCK_SKEW_SECONDS as i64 + 30;
+        let mut claims = valid_claims();
+        claims["iat"] = json!(issued_at);
+        claims["nbf"] = json!(now() - 30);
+        claims["exp"] = json!(issued_at + 1_800);
+
+        let outcome = validator
+            .validate_with_reason(&auth(&sign(&enc, claims)))
+            .await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.failure_reason, Some("invalid-token"));
     }
 
     #[tokio::test]

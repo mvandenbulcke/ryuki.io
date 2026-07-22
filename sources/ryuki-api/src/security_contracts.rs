@@ -91,6 +91,9 @@ use crate::boundary::trust_checkpoint_transport::{
 const PRODUCTION_RUNTIME_GUARD_CHALLENGE_DIGEST_CONTRACT: &str =
     "ryuki-production-runtime-guard-challenge-v1";
 const MAXIMUM_AUTHORITY_BINDING_DIGEST_CONTRACT: &str = "ryuki-maximum-authority-binding-v1";
+const AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID: &str = "limit:authenticator.clock-skew";
+const AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID: &str =
+    "limit:authenticator.oidc-access-token-lifetime";
 
 pub(crate) const SECURITY_CONTRACT_ROOT_ENV: &str = "RYUKI_SECURITY_CONTRACT_ROOT";
 pub(crate) const SECURITY_PROFILE_PATH_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH";
@@ -649,6 +652,1146 @@ impl VerifiedAuthenticatorRuntimeBinding {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct SecurityLimitScopeBinding {
+    kind: String,
+    dimensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct SecurityLimitHardBoundsBinding {
+    minimum: Number,
+    maximum: Number,
+    minimum_inclusive: bool,
+    maximum_inclusive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct SecurityLimitOverrideDimensionBinding {
+    dimension: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct SecurityLimitOverrideBinding {
+    override_id: String,
+    selected_value: Number,
+    scope_dimensions: Vec<SecurityLimitOverrideDimensionBinding>,
+    tightens_only: bool,
+}
+
+/// Typed subset of one schema-validated security-limit row. The complete
+/// document remains retained as exact JSON alongside these enforcement fields,
+/// so fields irrelevant to authenticator limit resolution cannot be silently
+/// rewritten or discarded.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct SecurityLimitRowBinding {
+    limit_id: String,
+    category: String,
+    selected_value: Number,
+    published_default: Number,
+    unit: String,
+    scope: SecurityLimitScopeBinding,
+    hard_bounds: SecurityLimitHardBoundsBinding,
+    enforcement_status: String,
+    overrides: Vec<SecurityLimitOverrideBinding>,
+    #[serde(default)]
+    lifecycle: Option<String>,
+    #[serde(default)]
+    applicability_expression: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SecurityLimitDeploymentSelection {
+    deployment_id: String,
+    security_profile: SecurityProfile,
+    enabled_features: BTreeSet<String>,
+    admitted_at: DateTime<Utc>,
+}
+
+impl SecurityLimitDeploymentSelection {
+    fn from_profile(profile: &DeploymentSecurityProfile, admitted_at: DateTime<Utc>) -> Self {
+        Self {
+            deployment_id: profile.deployment_id.clone(),
+            security_profile: profile.security_profile,
+            enabled_features: profile.enabled_features.iter().cloned().collect(),
+            admitted_at,
+        }
+    }
+}
+
+/// Exact active security-limit authority selected by the deployment profile.
+///
+/// The raw bytes, their content reference, the strict parsed document and the
+/// typed enforcement rows are retained together. This object is deliberately
+/// opaque: callers can resolve a closed authenticator policy, but cannot build
+/// a parallel numeric authority from configuration.
+pub(crate) struct VerifiedSecurityLimitProfile {
+    reference: VersionedContentReference,
+    raw_bytes: Box<[u8]>,
+    document: Value,
+    limits: Box<[SecurityLimitRowBinding]>,
+    selection: SecurityLimitDeploymentSelection,
+}
+
+impl fmt::Debug for VerifiedSecurityLimitProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedSecurityLimitProfile")
+            .field("document_id", &self.reference.document_id)
+            .field("document_version", &self.reference.document_version)
+            .field("content_digest", &self.reference.content_digest)
+            .field("byte_len", &self.raw_bytes.len())
+            .field("limit_count", &self.limits.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedSecurityLimitProfile {
+    fn seal(
+        reference: VersionedContentReference,
+        raw_bytes: Vec<u8>,
+        traversed_document: &Value,
+        selection: SecurityLimitDeploymentSelection,
+    ) -> Result<Self, String> {
+        if reference.artifact_kind != ArtifactKind::SecurityLimitProfile
+            || reference.document_version == 0
+        {
+            return Err(
+                "security-limit profile reference has the wrong artifact kind or version".into(),
+            );
+        }
+        validate_digest_pin(
+            "security-limit profile reference digest",
+            &reference.content_digest,
+        )?;
+        validate_relative_path(
+            "security-limit profile reference locator",
+            Path::new(&reference.artifact_locator),
+        )?;
+        if raw_bytes.is_empty() || raw_digest(&raw_bytes) != reference.content_digest {
+            return Err(
+                "security-limit profile exact bytes do not match the selected reference".into(),
+            );
+        }
+        let document = parse_json_strict(&raw_bytes)
+            .map_err(|error| format!("security-limit profile JSON is invalid: {error}"))?;
+        validate_against_schema("security limit profile", LIMIT_SCHEMA, &document)?;
+        if &document != traversed_document {
+            return Err(
+                "security-limit profile exact bytes differ from the verified traversal".into(),
+            );
+        }
+        let limits = typed_security_limit_rows(&document)?;
+        let verified = Self {
+            reference,
+            raw_bytes: raw_bytes.into_boxed_slice(),
+            document,
+            limits,
+            selection,
+        };
+        verified.verify_integrity()?;
+        Ok(verified)
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<(), String> {
+        if self.reference.artifact_kind != ArtifactKind::SecurityLimitProfile
+            || self.reference.document_version == 0
+        {
+            return Err(
+                "retained security-limit profile reference has the wrong artifact kind or version"
+                    .into(),
+            );
+        }
+        validate_digest_pin(
+            "retained security-limit profile digest",
+            &self.reference.content_digest,
+        )?;
+        if self.raw_bytes.is_empty() || raw_digest(&self.raw_bytes) != self.reference.content_digest
+        {
+            return Err(
+                "retained security-limit profile bytes no longer match their exact digest".into(),
+            );
+        }
+        let reparsed = parse_json_strict(&self.raw_bytes)
+            .map_err(|error| format!("retained security-limit profile JSON is invalid: {error}"))?;
+        validate_against_schema("retained security limit profile", LIMIT_SCHEMA, &reparsed)?;
+        if reparsed != self.document || typed_security_limit_rows(&reparsed)? != self.limits {
+            return Err(
+                "retained security-limit profile bytes differ from the sealed typed document"
+                    .into(),
+            );
+        }
+        validate_security_limit_profile_identity(&self.reference, &reparsed, &self.selection)
+    }
+
+    fn resolve_exact_seconds_limit(
+        &self,
+        limit_id: &str,
+        scope: &AuthenticatorLimitResolutionScope<'_>,
+    ) -> Result<ResolvedSecondsLimit, String> {
+        self.verify_integrity()?;
+        let matches = self
+            .limits
+            .iter()
+            .filter(|limit| limit.limit_id == limit_id)
+            .collect::<Vec<_>>();
+        let limit = match matches.as_slice() {
+            [limit] => *limit,
+            [] => {
+                return Err(format!(
+                    "active security-limit profile omits required authenticator limit {limit_id}"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "active security-limit profile duplicates authenticator limit {limit_id}"
+                ));
+            }
+        };
+        if limit.category != "ttl" || limit.unit != "seconds" {
+            return Err(format!(
+                "authenticator limit {limit_id} must use category ttl and unit seconds"
+            ));
+        }
+        if limit.enforcement_status != "enforced" || limit.lifecycle.as_deref() != Some("active") {
+            return Err(format!(
+                "authenticator limit {limit_id} must be active and fully enforced"
+            ));
+        }
+        if limit.applicability_expression.as_deref() != Some("always") {
+            return Err(format!(
+                "authenticator limit {limit_id} must have exact always applicability"
+            ));
+        }
+        let expected_scope_dimensions =
+            BTreeSet::from(["deployment_id", "provider_id", "trust_domain_id"]);
+        let actual_scope_dimensions = limit
+            .scope
+            .dimensions
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if limit.scope.kind != "provider"
+            || actual_scope_dimensions != expected_scope_dimensions
+            || limit.scope.dimensions.len() != expected_scope_dimensions.len()
+        {
+            return Err(format!(
+                "authenticator limit {limit_id} must use the exact provider/deployment/trust-domain scope"
+            ));
+        }
+
+        let minimum = exact_limit_integer(&limit.hard_bounds.minimum, limit_id, "hard minimum")?;
+        let maximum = exact_limit_integer(&limit.hard_bounds.maximum, limit_id, "hard maximum")?;
+        validate_limit_bounds(
+            limit_id,
+            minimum,
+            maximum,
+            limit.hard_bounds.minimum_inclusive,
+            limit.hard_bounds.maximum_inclusive,
+        )?;
+        let published_default =
+            exact_limit_integer(&limit.published_default, limit_id, "published default")?;
+        validate_limit_value(
+            limit_id,
+            "published default",
+            published_default,
+            minimum,
+            maximum,
+            limit.hard_bounds.minimum_inclusive,
+            limit.hard_bounds.maximum_inclusive,
+        )?;
+        let selected = exact_limit_integer(&limit.selected_value, limit_id, "selected value")?;
+        validate_limit_value(
+            limit_id,
+            "selected value",
+            selected,
+            minimum,
+            maximum,
+            limit.hard_bounds.minimum_inclusive,
+            limit.hard_bounds.maximum_inclusive,
+        )?;
+
+        let mut override_ids = BTreeSet::new();
+        let mut matching_override: Option<(&str, u64)> = None;
+        for candidate in &limit.overrides {
+            if !override_ids.insert(candidate.override_id.as_str()) {
+                return Err(format!(
+                    "authenticator limit {limit_id} repeats override {}",
+                    candidate.override_id
+                ));
+            }
+            if !candidate.tightens_only {
+                return Err(format!(
+                    "authenticator limit {limit_id} override {} is not tightening-only",
+                    candidate.override_id
+                ));
+            }
+            let value = exact_limit_integer(
+                &candidate.selected_value,
+                limit_id,
+                "override selected value",
+            )?;
+            validate_limit_value(
+                limit_id,
+                "override selected value",
+                value,
+                minimum,
+                maximum,
+                limit.hard_bounds.minimum_inclusive,
+                limit.hard_bounds.maximum_inclusive,
+            )?;
+            if value >= selected {
+                return Err(format!(
+                    "authenticator limit {limit_id} override {} does not strictly tighten the selected maximum",
+                    candidate.override_id
+                ));
+            }
+
+            let mut dimensions = BTreeSet::new();
+            let mut applies = true;
+            for dimension in &candidate.scope_dimensions {
+                if !dimensions.insert(dimension.dimension.as_str()) {
+                    return Err(format!(
+                        "authenticator limit {limit_id} override {} repeats scope dimension {}",
+                        candidate.override_id, dimension.dimension
+                    ));
+                }
+                let expected = match dimension.dimension.as_str() {
+                    "deployment_id" => scope.deployment_id,
+                    "provider_id" => scope.provider_id,
+                    "trust_domain_id" => scope.trust_domain_id,
+                    unsupported => {
+                        return Err(format!(
+                            "authenticator limit {limit_id} override {} uses unsupported scope dimension {unsupported}",
+                            candidate.override_id
+                        ));
+                    }
+                };
+                applies &= dimension.value == expected;
+            }
+            if dimensions.is_empty() {
+                return Err(format!(
+                    "authenticator limit {limit_id} override {} has no scope",
+                    candidate.override_id
+                ));
+            }
+            if applies {
+                if matching_override.is_some() {
+                    return Err(format!(
+                        "authenticator limit {limit_id} has ambiguous applicable overrides"
+                    ));
+                }
+                matching_override = Some((candidate.override_id.as_str(), value));
+            }
+        }
+
+        let (applied_override_id, effective_seconds) = matching_override
+            .map(|(override_id, value)| (Some(override_id.to_owned()), value))
+            .unwrap_or((None, selected));
+        Ok(ResolvedSecondsLimit {
+            limit_id: limit_id.to_owned(),
+            effective_seconds,
+            applied_override_id,
+        })
+    }
+
+    #[cfg(test)]
+    fn content_digest(&self) -> &str {
+        &self.reference.content_digest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSecondsLimit {
+    limit_id: String,
+    effective_seconds: u64,
+    applied_override_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAuthenticatorBearerLimitValues {
+    provider_id: String,
+    path_id: String,
+    clock_skew: ResolvedSecondsLimit,
+    credential_lifetime: ResolvedSecondsLimit,
+}
+
+struct AuthenticatorLimitResolutionScope<'a> {
+    deployment_id: &'a str,
+    trust_domain_id: &'a str,
+    provider_id: &'a str,
+}
+
+/// Closed limit authority for the exact retained Entra bearer verifier.
+/// Clones share this allocation through `Arc`; there is no public constructor
+/// and no caller-supplied numeric fallback.
+pub(crate) struct ResolvedAuthenticatorBearerLimits {
+    security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
+    runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+    values: ResolvedAuthenticatorBearerLimitValues,
+}
+
+impl fmt::Debug for ResolvedAuthenticatorBearerLimits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedAuthenticatorBearerLimits")
+            .field("provider_id", &self.values.provider_id)
+            .field("path_id", &self.values.path_id)
+            .field(
+                "clock_skew_override_id",
+                &self.values.clock_skew.applied_override_id,
+            )
+            .field(
+                "credential_lifetime_override_id",
+                &self.values.credential_lifetime.applied_override_id,
+            )
+            .field("security_limit_profile", &"[RETAINED]")
+            .field("runtime_binding", &"[RETAINED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedAuthenticatorBearerLimits {
+    fn seal(
+        security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
+        runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+        provider_id: &str,
+    ) -> Result<Arc<Self>, String> {
+        let values = resolve_entra_bearer_limit_values(
+            &security_limit_profile,
+            &runtime_binding,
+            provider_id,
+        )?;
+        let resolved = Arc::new(Self {
+            security_limit_profile,
+            runtime_binding,
+            values,
+        });
+        resolved.verify_integrity()?;
+        Ok(resolved)
+    }
+
+    pub(crate) fn clock_skew_limit_id(&self) -> &str {
+        &self.values.clock_skew.limit_id
+    }
+
+    pub(crate) fn maximum_clock_skew_seconds(&self) -> u64 {
+        self.values.clock_skew.effective_seconds
+    }
+
+    pub(crate) fn credential_lifetime_limit_id(&self) -> &str {
+        &self.values.credential_lifetime.limit_id
+    }
+
+    pub(crate) fn maximum_credential_lifetime_seconds(&self) -> u64 {
+        self.values.credential_lifetime.effective_seconds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.values.provider_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_id(&self) -> &str {
+        &self.values.path_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn security_limit_profile_content_digest(&self) -> &str {
+        self.security_limit_profile.content_digest()
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<(), String> {
+        self.security_limit_profile.verify_integrity()?;
+        self.runtime_binding.verify_integrity()?;
+        let remeasured = resolve_entra_bearer_limit_values(
+            &self.security_limit_profile,
+            &self.runtime_binding,
+            &self.values.provider_id,
+        )?;
+        if remeasured != self.values {
+            return Err(
+                "retained authenticator bearer limits differ from exact D/profile remeasurement"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remeasures_exact_values(&self) -> bool {
+        self.verify_integrity().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(clock_skew_seconds: u64, maximum_lifetime_seconds: u64) -> Arc<Self> {
+        let security_limit_profile = Arc::new(fixture_security_limit_profile(
+            clock_skew_seconds,
+            maximum_lifetime_seconds,
+        ));
+        let runtime_binding = Arc::new(fixture_authenticator_runtime_binding(
+            clock_skew_seconds,
+            maximum_lifetime_seconds,
+        ));
+        Self::seal(
+            security_limit_profile,
+            runtime_binding,
+            "provider:fixture-entra",
+        )
+        .expect("canonical authenticator bearer limit fixture must resolve")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAuthenticatorBrowserLimitValues {
+    provider_id: String,
+    path_id: String,
+    clock_skew: ResolvedSecondsLimit,
+}
+
+/// Closed clock-skew authority for the exact Entra browser ID-token path.
+/// Browser credentials deliberately have no bearer credential-lifetime arm.
+pub(crate) struct ResolvedAuthenticatorBrowserLimits {
+    security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
+    runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+    values: ResolvedAuthenticatorBrowserLimitValues,
+}
+
+impl fmt::Debug for ResolvedAuthenticatorBrowserLimits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedAuthenticatorBrowserLimits")
+            .field("provider_id", &self.values.provider_id)
+            .field("path_id", &self.values.path_id)
+            .field(
+                "clock_skew_override_id",
+                &self.values.clock_skew.applied_override_id,
+            )
+            .field("security_limit_profile", &"[RETAINED]")
+            .field("runtime_binding", &"[RETAINED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedAuthenticatorBrowserLimits {
+    fn seal(
+        security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
+        runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+        provider_id: &str,
+    ) -> Result<Arc<Self>, String> {
+        let values = resolve_entra_browser_limit_values(
+            &security_limit_profile,
+            &runtime_binding,
+            provider_id,
+        )?;
+        let resolved = Arc::new(Self {
+            security_limit_profile,
+            runtime_binding,
+            values,
+        });
+        resolved.verify_integrity()?;
+        Ok(resolved)
+    }
+
+    pub(crate) fn clock_skew_limit_id(&self) -> &str {
+        &self.values.clock_skew.limit_id
+    }
+
+    pub(crate) fn maximum_clock_skew_seconds(&self) -> u64 {
+        self.values.clock_skew.effective_seconds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.values.provider_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_id(&self) -> &str {
+        &self.values.path_id
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<(), String> {
+        self.security_limit_profile.verify_integrity()?;
+        self.runtime_binding.verify_integrity()?;
+        let remeasured = resolve_entra_browser_limit_values(
+            &self.security_limit_profile,
+            &self.runtime_binding,
+            &self.values.provider_id,
+        )?;
+        if remeasured != self.values {
+            return Err(
+                "retained authenticator browser limits differ from exact D/profile remeasurement"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remeasures_exact_values(&self) -> bool {
+        self.verify_integrity().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(clock_skew_seconds: u64) -> Arc<Self> {
+        Self::seal(
+            Arc::new(fixture_security_limit_profile(clock_skew_seconds, 3_600)),
+            Arc::new(fixture_authenticator_runtime_binding(
+                clock_skew_seconds,
+                3_600,
+            )),
+            "provider:fixture-entra",
+        )
+        .expect("canonical authenticator browser limit fixture must resolve")
+    }
+}
+
+fn typed_security_limit_rows(document: &Value) -> Result<Box<[SecurityLimitRowBinding]>, String> {
+    serde_json::from_value::<Vec<SecurityLimitRowBinding>>(
+        document
+            .get("limits")
+            .cloned()
+            .ok_or_else(|| "security-limit profile omits limits".to_string())?,
+    )
+    .map(Vec::into_boxed_slice)
+    .map_err(|error| format!("security-limit profile rows are not losslessly typed: {error}"))
+}
+
+fn validate_security_limit_profile_identity(
+    reference: &VersionedContentReference,
+    document: &Value,
+    selection: &SecurityLimitDeploymentSelection,
+) -> Result<(), String> {
+    if document.get("contract_kind").and_then(Value::as_str) != Some("security-limit-profile")
+        || document.get("document_id").and_then(Value::as_str)
+            != Some(reference.document_id.as_str())
+        || document.get("document_version").and_then(Value::as_u64)
+            != Some(reference.document_version)
+    {
+        return Err(
+            "security-limit profile identity differs from its exact selected reference".into(),
+        );
+    }
+    let lifecycle = document
+        .get("lifecycle")
+        .ok_or_else(|| "security-limit profile omits lifecycle".to_string())?;
+    let lifecycle_state = lifecycle
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "security-limit profile omits lifecycle.state".to_string())?;
+    let effective_at = DateTime::parse_from_rfc3339(
+        lifecycle
+            .get("effective_at")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "security-limit profile omits lifecycle.effective_at".to_string())?,
+    )
+    .map_err(|_| "security-limit profile lifecycle.effective_at is invalid".to_string())?
+    .with_timezone(&Utc);
+    if effective_at > selection.admitted_at {
+        return Err("security-limit profile lifecycle is future-dated".into());
+    }
+    let applicability = document
+        .get("applicability")
+        .ok_or_else(|| "security-limit profile omits applicability".to_string())?;
+    let evaluation_scope = applicability
+        .get("evaluation_scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "security-limit profile omits applicability evaluation scope".to_string())?;
+    let security_profiles = string_set(applicability.get("security_profiles"));
+    if !security_profiles.contains(selection.security_profile.as_str()) {
+        return Err(
+            "security-limit profile is not applicable to the selected security profile".into(),
+        );
+    }
+    if selection.security_profile.is_production() {
+        if lifecycle_state != "active" || evaluation_scope != "deployment" {
+            return Err(
+                "production security-limit profile must retain active deployment applicability"
+                    .into(),
+            );
+        }
+        let deployment_ids = string_set(applicability.get("deployment_ids"));
+        if deployment_ids.len() != 1 || !deployment_ids.contains(selection.deployment_id.as_str()) {
+            return Err(
+                "security-limit profile deployment applicability does not match the workload root"
+                    .into(),
+            );
+        }
+        for feature in string_set(applicability.get("enabled_feature_ids")) {
+            if !selection.enabled_features.contains(feature) {
+                return Err(format!(
+                    "security-limit profile requires unselected feature {feature}"
+                ));
+            }
+        }
+    } else if !matches!(lifecycle_state, "active" | "implementation_only")
+        || !matches!(evaluation_scope, "deployment" | "implementation")
+    {
+        return Err(
+            "non-production security-limit profile has an inadmissible lifecycle or applicability scope"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn exact_limit_integer(number: &Number, limit_id: &str, label: &str) -> Result<u64, String> {
+    number.as_u64().ok_or_else(|| {
+        format!("authenticator limit {limit_id} {label} must be an exact nonnegative integer")
+    })
+}
+
+fn validate_limit_bounds(
+    limit_id: &str,
+    minimum: u64,
+    maximum: u64,
+    minimum_inclusive: bool,
+    maximum_inclusive: bool,
+) -> Result<(), String> {
+    if minimum > maximum || (minimum == maximum && (!minimum_inclusive || !maximum_inclusive)) {
+        return Err(format!(
+            "authenticator limit {limit_id} has empty or inverted hard bounds"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_limit_value(
+    limit_id: &str,
+    label: &str,
+    value: u64,
+    minimum: u64,
+    maximum: u64,
+    minimum_inclusive: bool,
+    maximum_inclusive: bool,
+) -> Result<(), String> {
+    if value < minimum
+        || value > maximum
+        || (value == minimum && !minimum_inclusive)
+        || (value == maximum && !maximum_inclusive)
+    {
+        return Err(format!(
+            "authenticator limit {limit_id} {label} {value} is outside its exact hard bounds"
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_entra_bearer_limit_values(
+    security_limit_profile: &VerifiedSecurityLimitProfile,
+    runtime_binding: &VerifiedAuthenticatorRuntimeBinding,
+    provider_id: &str,
+) -> Result<ResolvedAuthenticatorBearerLimitValues, String> {
+    security_limit_profile.verify_integrity()?;
+    runtime_binding.verify_integrity()?;
+    let document = &runtime_binding.document;
+    if document.adapter_kind != "auth.entra-id"
+        || document.authenticator_kind != "oidc"
+        || document.provider_id != provider_id
+    {
+        return Err(
+            "authenticator bearer limits require the exact active Entra OIDC binding".into(),
+        );
+    }
+    if security_limit_profile.selection.deployment_id != document.deployment_id {
+        return Err(
+            "authenticator bearer D and security-limit profile identify different deployments"
+                .into(),
+        );
+    }
+    let bearer_paths = document
+        .credential_paths
+        .iter()
+        .filter(|path| path.credential_profile.token_profile == "jwt-access-token")
+        .collect::<Vec<_>>();
+    let bearer_path = match bearer_paths.as_slice() {
+        [path] => *path,
+        [] => return Err("active Entra binding omits its bearer credential path".into()),
+        _ => return Err("active Entra binding has ambiguous bearer credential paths".into()),
+    };
+    let verifier = &bearer_path.verifier;
+    let replay = &bearer_path.credential_profile.replay;
+    if verifier.clock_skew_limit_id != AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID
+        || replay.credential_lifetime_limit_id.as_deref()
+            != Some(AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID)
+    {
+        return Err(
+            "active Entra bearer path does not reference the canonical authenticator limit ids"
+                .into(),
+        );
+    }
+    let scope = AuthenticatorLimitResolutionScope {
+        deployment_id: &document.deployment_id,
+        trust_domain_id: &document.trust_domain_id,
+        provider_id: &document.provider_id,
+    };
+    let clock_skew = security_limit_profile
+        .resolve_exact_seconds_limit(AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID, &scope)?;
+    let credential_lifetime = security_limit_profile
+        .resolve_exact_seconds_limit(AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID, &scope)?;
+    if clock_skew.effective_seconds != u64::from(verifier.maximum_clock_skew_seconds) {
+        return Err(
+            "active Entra bearer D clock-skew maximum differs from the resolved security limit"
+                .into(),
+        );
+    }
+    if replay.maximum_credential_lifetime_seconds != Some(credential_lifetime.effective_seconds) {
+        return Err(
+            "active Entra bearer D credential-lifetime maximum differs from the resolved security limit"
+                .into(),
+        );
+    }
+    Ok(ResolvedAuthenticatorBearerLimitValues {
+        provider_id: provider_id.to_owned(),
+        path_id: bearer_path.path_id.clone(),
+        clock_skew,
+        credential_lifetime,
+    })
+}
+
+fn resolve_entra_browser_limit_values(
+    security_limit_profile: &VerifiedSecurityLimitProfile,
+    runtime_binding: &VerifiedAuthenticatorRuntimeBinding,
+    provider_id: &str,
+) -> Result<ResolvedAuthenticatorBrowserLimitValues, String> {
+    security_limit_profile.verify_integrity()?;
+    runtime_binding.verify_integrity()?;
+    let document = &runtime_binding.document;
+    if document.adapter_kind != "auth.entra-id"
+        || document.authenticator_kind != "oidc"
+        || document.provider_id != provider_id
+        || security_limit_profile.selection.deployment_id != document.deployment_id
+    {
+        return Err("authenticator browser limits require the exact active Entra OIDC binding and deployment".into());
+    }
+    let browser_paths = document
+        .credential_paths
+        .iter()
+        .filter(|path| path.credential_profile.token_profile == "oidc-id-token")
+        .collect::<Vec<_>>();
+    let browser_path = match browser_paths.as_slice() {
+        [path] => *path,
+        [] => return Err("active Entra binding omits its browser ID-token credential path".into()),
+        _ => {
+            return Err(
+                "active Entra binding has ambiguous browser ID-token credential paths".into(),
+            )
+        }
+    };
+    let verifier = &browser_path.verifier;
+    let replay = &browser_path.credential_profile.replay;
+    if verifier.clock_skew_limit_id != AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID {
+        return Err(
+            "active Entra browser path does not reference the canonical clock-skew limit id".into(),
+        );
+    }
+    if replay.credential_lifetime_limit_id.is_some()
+        || replay.maximum_credential_lifetime_seconds.is_some()
+    {
+        return Err(
+            "active Entra browser path must not apply bearer credential-lifetime limits".into(),
+        );
+    }
+    let scope = AuthenticatorLimitResolutionScope {
+        deployment_id: &document.deployment_id,
+        trust_domain_id: &document.trust_domain_id,
+        provider_id: &document.provider_id,
+    };
+    let clock_skew = security_limit_profile
+        .resolve_exact_seconds_limit(AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID, &scope)?;
+    if clock_skew.effective_seconds != u64::from(verifier.maximum_clock_skew_seconds) {
+        return Err(
+            "active Entra browser D clock-skew maximum differs from the resolved security limit"
+                .into(),
+        );
+    }
+    Ok(ResolvedAuthenticatorBrowserLimitValues {
+        provider_id: provider_id.to_owned(),
+        path_id: browser_path.path_id.clone(),
+        clock_skew,
+    })
+}
+
+#[cfg(test)]
+fn fixture_security_limit_profile(
+    clock_skew_seconds: u64,
+    maximum_lifetime_seconds: u64,
+) -> VerifiedSecurityLimitProfile {
+    let mut document: Value = serde_json::from_str(include_str!(
+        "../../../catalog/security-contracts/v1/security-limit-profile.implementation.json"
+    ))
+    .expect("repository security-limit fixture must be valid JSON");
+    document["lifecycle"]["state"] = Value::String("active".into());
+    document["applicability"] = serde_json::json!({
+        "evaluation_scope": "deployment",
+        "security_profiles": ["test"],
+        "deployment_ids": ["deployment:fixture-authenticator"],
+        "enabled_feature_ids": ["authenticator-runtime-admission"]
+    });
+    document["limits"] = serde_json::json!([
+        fixture_authenticator_limit_row(
+            AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID,
+            clock_skew_seconds,
+            0,
+            clock_skew_seconds.max(300),
+        ),
+        fixture_authenticator_limit_row(
+            AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID,
+            maximum_lifetime_seconds,
+            1,
+            maximum_lifetime_seconds.max(86_400),
+        )
+    ]);
+    fixture_verified_security_limit_profile(document)
+}
+
+#[cfg(test)]
+fn fixture_authenticator_limit_row(
+    limit_id: &str,
+    selected_value: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Value {
+    serde_json::json!({
+        "limit_id": limit_id,
+        "category": "ttl",
+        "description": "Test-only exact authenticator runtime limit.",
+        "selected_value": selected_value,
+        "published_default": selected_value,
+        "unit": "seconds",
+        "scope": {
+            "kind": "provider",
+            "dimensions": ["deployment_id", "provider_id", "trust_domain_id"]
+        },
+        "hard_bounds": {
+            "minimum": minimum,
+            "maximum": maximum,
+            "minimum_inclusive": true,
+            "maximum_inclusive": true
+        },
+        "owner": "api-security",
+        "value_change_authority": {
+            "authority_id": "authority:runtime-security-config",
+            "owning_team": "platform-security",
+            "required_controls": ["review", "step-up"]
+        },
+        "bound_change_authority": {
+            "authority_id": "authority:security-contract-bounds",
+            "owning_team": "platform-security",
+            "required_controls": ["review", "maker-checker", "contract-revision", "new-conformance-evidence"]
+        },
+        "failure_projection": {
+            "mode": "fail-feature-readiness",
+            "stable_code": "AUTHENTICATOR_LIMIT_INVALID",
+            "retryable": false,
+            "queueing_allowed": false,
+            "value_free": true
+        },
+        "telemetry": {
+            "metric_name": "ryuki_authenticator_limit",
+            "cardinality": "constant",
+            "value_free": true
+        },
+        "procedures": {
+            "value_change": "procedure:security-limit-value-change-v1",
+            "bound_change": "procedure:security-limit-bound-change-v1",
+            "rollback": "procedure:security-limit-rollback-v1",
+            "evidence_requirements": ["evidence-requirement:boundary-and-plus-one-v1"]
+        },
+        "enforcement_status": "enforced",
+        "source_binding": {
+            "source_file": "sources/ryuki-api/src/security_contracts.rs",
+            "source_symbol": match limit_id {
+                AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID => "ResolvedAuthenticatorBearerLimits::maximum_clock_skew_seconds",
+                AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID => "ResolvedAuthenticatorBearerLimits::maximum_credential_lifetime_seconds",
+                _ => "ResolvedAuthenticatorBearerLimits",
+            }
+        },
+        "overrides": [],
+        "lifecycle": "active",
+        "applicability_expression": "always"
+    })
+}
+
+#[cfg(test)]
+fn fixture_verified_security_limit_profile(document: Value) -> VerifiedSecurityLimitProfile {
+    let raw_bytes = serde_json::to_vec(&document)
+        .expect("test security-limit profile must serialize to exact JSON");
+    let reference = VersionedContentReference {
+        artifact_kind: ArtifactKind::SecurityLimitProfile,
+        document_id: document["document_id"]
+            .as_str()
+            .expect("test security-limit profile document id")
+            .to_owned(),
+        document_version: document["document_version"]
+            .as_u64()
+            .expect("test security-limit profile document version"),
+        content_digest: raw_digest(&raw_bytes),
+        artifact_locator: "catalog/security-contracts/v1/security-limit-profile.test.json".into(),
+    };
+    let admitted_at = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .expect("test admission timestamp")
+        .with_timezone(&Utc);
+    VerifiedSecurityLimitProfile::seal(
+        reference,
+        raw_bytes,
+        &document,
+        SecurityLimitDeploymentSelection {
+            deployment_id: "deployment:fixture-authenticator".into(),
+            security_profile: SecurityProfile::Test,
+            enabled_features: BTreeSet::from(["authenticator-runtime-admission".into()]),
+            admitted_at,
+        },
+    )
+    .expect("test security-limit profile must retain exact authority")
+}
+
+#[cfg(test)]
+fn fixture_authenticator_runtime_binding(
+    clock_skew_seconds: u64,
+    maximum_lifetime_seconds: u64,
+) -> VerifiedAuthenticatorRuntimeBinding {
+    let maximum_clock_skew_seconds = u32::try_from(clock_skew_seconds)
+        .expect("test authenticator clock skew must fit the D contract");
+    let digest = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+    let mut document_value = serde_json::json!({
+        "$schema": "https://ryuki.io/schemas/security-contracts/v1/authenticator-runtime-binding.schema.json",
+        "schema_version": "1.0.0",
+        "contract_kind": "authenticator-runtime-binding",
+        "document_id": "authenticator-runtime-binding:fixture-entra",
+        "document_version": 1,
+        "value_free": true,
+        "provider_id": "provider:fixture-entra",
+        "provider_configuration_version": 1,
+        "deployment_id": "deployment:fixture-authenticator",
+        "trust_domain_id": "trust-domain:fixture-authenticator",
+        "capability_descriptor_id": "capability-descriptor:fixture-entra",
+        "capability_descriptor_version": 1,
+        "adapter_kind": "auth.entra-id",
+        "adapter_version": "1.0.0",
+        "authenticator_kind": "oidc",
+        "provider_policy": {
+            "digest_contract": AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
+            "binding_digest": digest('f')
+        },
+        "capability_ids": ["token-validation"],
+        "credential_paths": [{
+            "path_id": "authenticator-path:fixture-entra-bearer",
+            "path_version": 1,
+            "verifier": {
+                "verifier_id": "authenticator-verifier:fixture-entra-bearer",
+                "verifier_version": 1,
+                "issuer_binding_digest": digest('1'),
+                "audience_set_binding_digest": digest('2'),
+                "accepted_algorithm_ids": ["rs256"],
+                "required_claim_ids": ["aud", "exp", "iat", "iss", "nbf", "oid", "sub"],
+                "provider_subject_claim_id": "oid",
+                "key_source_kind": "jwt-jwks",
+                "key_source_binding_digest": digest('3'),
+                "expiration_required": true,
+                "not_before_required": true,
+                "issued_at_required": true,
+                "nonce_required": false,
+                "clock_skew_limit_id": AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID,
+                "maximum_clock_skew_seconds": maximum_clock_skew_seconds,
+                "redirects_allowed": false
+            },
+            "credential_profile": {
+                "profile_id": "credential-profile:fixture-entra-bearer",
+                "profile_version": 1,
+                "token_profile": "jwt-access-token",
+                "carrier": "authorization-bearer",
+                "proof_binding": "bearer",
+                "replay": {
+                    "credential_reuse": "reusable-until-expiry",
+                    "credential_lifetime_limit_id": AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID,
+                    "maximum_credential_lifetime_seconds": maximum_lifetime_seconds,
+                    "sender_constraint": "none",
+                    "presentation_replay_defense": "none",
+                    "nonce_binding": "none",
+                    "replay_store_binding_digest": null
+                }
+            },
+            "cache_partition": {
+                "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                "binding_digest": digest('4')
+            },
+            "protocol_binding": {
+                "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                "binding_digest": digest('5')
+            },
+            "retained_consumer_ids": ["runtime-consumer:fixture-entra-bearer"]
+        }],
+        "ownership": {
+            "single_runtime_owner": true,
+            "ambient_reconfiguration_allowed": false
+        }
+    });
+    let mut browser_path = document_value["credential_paths"][0].clone();
+    browser_path["path_id"] = serde_json::json!("authenticator-path:fixture-entra-browser");
+    browser_path["verifier"]["verifier_id"] =
+        serde_json::json!("authenticator-verifier:fixture-entra-browser");
+    browser_path["verifier"]["required_claim_ids"] =
+        serde_json::json!(["aud", "exp", "iat", "iss", "nbf", "nonce", "oid", "sub"]);
+    browser_path["verifier"]["nonce_required"] = serde_json::json!(true);
+    browser_path["credential_profile"]["profile_id"] =
+        serde_json::json!("credential-profile:fixture-entra-browser");
+    browser_path["credential_profile"]["token_profile"] = serde_json::json!("oidc-id-token");
+    browser_path["credential_profile"]["carrier"] = serde_json::json!("oauth-callback");
+    browser_path["credential_profile"]["proof_binding"] = serde_json::json!("pkce-s256");
+    browser_path["credential_profile"]["replay"] = serde_json::json!({
+        "credential_reuse": "single-use",
+        "credential_lifetime_limit_id": null,
+        "maximum_credential_lifetime_seconds": null,
+        "sender_constraint": "none",
+        "presentation_replay_defense": "single-use-state",
+        "nonce_binding": "oidc-login",
+        "replay_store_binding_digest": digest('6')
+    });
+    browser_path["cache_partition"]["binding_digest"] = serde_json::json!(digest('7'));
+    browser_path["protocol_binding"]["binding_digest"] = serde_json::json!(digest('8'));
+    browser_path["retained_consumer_ids"] =
+        serde_json::json!(["runtime-consumer:fixture-entra-browser"]);
+    document_value["credential_paths"]
+        .as_array_mut()
+        .expect("test authenticator paths")
+        .push(browser_path);
+
+    fixture_verified_authenticator_runtime_binding(document_value)
+}
+
+#[cfg(test)]
+fn fixture_verified_authenticator_runtime_binding(
+    document_value: Value,
+) -> VerifiedAuthenticatorRuntimeBinding {
+    let raw_bytes = serde_json::to_vec(&document_value)
+        .expect("test authenticator runtime binding must serialize");
+    let reference = ContentReferenceBinding {
+        document_id: "authenticator-runtime-binding:fixture-entra".into(),
+        document_version: 1,
+        content_digest: raw_digest(&raw_bytes),
+        artifact_locator: "catalog/security-contracts/v1/authenticator-runtime-binding.test.json"
+            .into(),
+    };
+    let document = serde_json::from_value::<AuthenticatorRuntimeBindingDocument>(document_value)
+        .expect("test authenticator runtime binding must be typed");
+    document
+        .validate()
+        .expect("test authenticator runtime binding must be semantically valid");
+    let verified = VerifiedAuthenticatorRuntimeBinding {
+        reference,
+        raw_bytes: raw_bytes.into_boxed_slice(),
+        document,
+    };
+    verified
+        .verify_integrity()
+        .expect("test authenticator runtime-binding exact bytes must verify");
+    verified
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3254,6 +4397,10 @@ pub(crate) struct SecurityContractContext {
     /// current provider lease that satisfied the receipt-bound D/P/R/I chain.
     verified_approved_secret_provider_guard:
         Option<runtime_admission::VerifiedApprovedSecretProviderRuntimeWitness>,
+    /// Exact active security-limit document selected by the deployment root.
+    /// Runtime owners receive only opaque policies resolved from this retained
+    /// authority and the verified provider D document.
+    verified_security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     /// Lossless, non-authoritative projection retained for independent
@@ -3302,6 +4449,7 @@ struct PreparedSecurityContract {
     documents: BTreeMap<String, Value>,
     raw_document_bytes: BTreeMap<String, Vec<u8>>,
     reference_document_digests: BTreeMap<String, String>,
+    verified_security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
     active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     provider_registry_applicability: ActiveProviderRegistryApplicabilityClaim,
     conformance_registry_lineage: Option<ValidatedConformanceRegistryLineage>,
@@ -3320,6 +4468,94 @@ fn production_migration_runtime_render_admission_is_implemented() -> bool {
 impl SecurityContractContext {
     pub(crate) fn is_production(&self) -> bool {
         self.profile.security_profile.is_production()
+    }
+
+    /// Resolve the one active Entra bearer path against the exact retained
+    /// security-limit authority. Resolution is intentionally lazy so profiles
+    /// that select no Entra authenticator do not need synthetic OIDC limits.
+    pub(crate) fn resolved_entra_bearer_limits(
+        &self,
+    ) -> Result<Arc<ResolvedAuthenticatorBearerLimits>, String> {
+        self.verified_security_limit_profile.verify_integrity()?;
+        let candidates = self
+            .active_providers
+            .values()
+            .filter(|provider| {
+                provider.kind == "oidc"
+                    && provider.capability_descriptor.adapter_kind == "auth.entra-id"
+            })
+            .collect::<Vec<_>>();
+        let provider = match candidates.as_slice() {
+            [provider] => *provider,
+            [] => {
+                return Err(
+                    "no active Entra OIDC provider has an exact authenticator runtime binding"
+                        .into(),
+                );
+            }
+            _ => {
+                return Err(
+                    "active Entra OIDC provider selection is ambiguous for bearer limits".into(),
+                );
+            }
+        };
+        let runtime_binding = provider
+            .verified_authenticator_runtime_binding()
+            .ok_or_else(|| {
+                "active Entra OIDC provider has no exact authenticator runtime binding".to_string()
+            })?;
+        ResolvedAuthenticatorBearerLimits::seal(
+            Arc::clone(&self.verified_security_limit_profile),
+            Arc::clone(runtime_binding),
+            &provider.provider_id,
+        )
+    }
+
+    /// Resolve browser ID-token clock skew independently from bearer lifetime
+    /// policy. A deployment without a browser path fails only this accessor.
+    pub(crate) fn resolved_entra_browser_limits(
+        &self,
+    ) -> Result<Arc<ResolvedAuthenticatorBrowserLimits>, String> {
+        self.verified_security_limit_profile.verify_integrity()?;
+        let candidates = self
+            .active_providers
+            .values()
+            .filter(|provider| {
+                provider.kind == "oidc"
+                    && provider.capability_descriptor.adapter_kind == "auth.entra-id"
+            })
+            .collect::<Vec<_>>();
+        let provider = match candidates.as_slice() {
+            [provider] => *provider,
+            [] => {
+                return Err(
+                    "no active Entra OIDC provider has an exact authenticator runtime binding"
+                        .into(),
+                )
+            }
+            _ => {
+                return Err(
+                    "active Entra OIDC provider selection is ambiguous for browser limits".into(),
+                )
+            }
+        };
+        let runtime_binding = provider
+            .verified_authenticator_runtime_binding()
+            .ok_or_else(|| {
+                "active Entra OIDC provider has no exact authenticator runtime binding".to_string()
+            })?;
+        ResolvedAuthenticatorBrowserLimits::seal(
+            Arc::clone(&self.verified_security_limit_profile),
+            Arc::clone(runtime_binding),
+            &provider.provider_id,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verifies_security_limit_profile_integrity(&self) -> bool {
+        self.verified_security_limit_profile
+            .verify_integrity()
+            .is_ok()
     }
 
     /// Resolve the single provider and namespace that admitted one
@@ -4263,6 +5499,14 @@ fn prepare_startup_security_contract(
             &manifest.document,
         )?;
     }
+    let verified_security_limit_profile = Arc::new(verify_security_limit_profile(
+        &profile.security_limit_profile_ref,
+        &profile,
+        now,
+        &documents,
+        &raw_document_bytes,
+        &reference_document_digests,
+    )?);
 
     Ok(PreparedSecurityContract {
         profile,
@@ -4273,6 +5517,7 @@ fn prepare_startup_security_contract(
         documents,
         raw_document_bytes,
         reference_document_digests,
+        verified_security_limit_profile,
         active_providers,
         provider_registry_applicability,
         conformance_registry_lineage,
@@ -4994,6 +6239,7 @@ fn finalize_startup_security_contract(
         verified_secure_cookie_guard: None,
         verified_https_public_urls_guard: None,
         verified_approved_secret_provider_guard: None,
+        verified_security_limit_profile: prepared.verified_security_limit_profile,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
         request_read_registry,
@@ -5003,6 +6249,9 @@ fn finalize_startup_security_contract(
 fn security_limit_applicability_claim(
     prepared: &PreparedSecurityContract,
 ) -> Result<SecurityLimitApplicabilityClaim, String> {
+    prepared
+        .verified_security_limit_profile
+        .verify_integrity()?;
     let reference = &prepared.profile.security_limit_profile_ref;
     let document = prepared
         .documents
@@ -5026,6 +6275,9 @@ fn security_limit_applicability_claim(
             != Some(reference.document_id.as_str())
         || document.get("document_version").and_then(Value::as_u64)
             != Some(reference.document_version)
+        || &prepared.verified_security_limit_profile.reference != reference
+        || prepared.verified_security_limit_profile.raw_bytes.as_ref() != raw_bytes.as_slice()
+        || &prepared.verified_security_limit_profile.document != document
     {
         return Err(
             "security-limit applicability claim differs from the exact profile-selected artifact"
@@ -5039,6 +6291,36 @@ fn security_limit_applicability_claim(
         artifact_locator: reference.artifact_locator.clone(),
         profile_version: required_u64(document, "profile_version", "security-limit profile")?,
     })
+}
+
+fn verify_security_limit_profile(
+    reference: &VersionedContentReference,
+    profile: &DeploymentSecurityProfile,
+    admitted_at: DateTime<Utc>,
+    documents: &BTreeMap<String, Value>,
+    raw_document_bytes: &BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
+) -> Result<VerifiedSecurityLimitProfile, String> {
+    let document = documents
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "security-limit profile reference did not resolve to JSON".to_string())?;
+    let raw_bytes = raw_document_bytes
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "security-limit profile has no exact raw bytes".to_string())?;
+    let traversed_digest = reference_document_digests
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "security-limit profile has no verified traversal digest".to_string())?;
+    if traversed_digest != &reference.content_digest {
+        return Err(
+            "security-limit profile traversal digest differs from the selected reference".into(),
+        );
+    }
+    VerifiedSecurityLimitProfile::seal(
+        reference.clone(),
+        raw_bytes.clone(),
+        document,
+        SecurityLimitDeploymentSelection::from_profile(profile, admitted_at),
+    )
 }
 
 fn verify_current_production_root_binding(
@@ -11079,6 +12361,7 @@ mod tests {
             documents: prepared.documents.clone(),
             raw_document_bytes: prepared.raw_document_bytes.clone(),
             reference_document_digests: prepared.reference_document_digests.clone(),
+            verified_security_limit_profile: Arc::clone(&prepared.verified_security_limit_profile),
             active_providers: prepared.active_providers.clone(),
             provider_registry_applicability: prepared.provider_registry_applicability.clone(),
             conformance_registry_lineage: prepared.conformance_registry_lineage.clone(),
@@ -11260,6 +12543,7 @@ mod tests {
             profile["deployment_id"] = json!(DEPLOYMENT_ID);
             profile["applicability"]["deployment_ids"] = json!([DEPLOYMENT_ID]);
             profile["enabled_features"] = json!([
+                "authenticator-runtime-admission",
                 "repository-conformance",
                 "static-dry-run",
                 "session-lookup-admission"
@@ -12836,6 +14120,7 @@ mod tests {
             &context.conformance_state,
             ConformanceState::NonProduction
         ));
+        assert!(context.verifies_security_limit_profile_integrity());
         assert!(context
             .validate_serving_checkpoint_freshness(fixed_now())
             .is_ok());
@@ -12864,7 +14149,7 @@ mod tests {
         assert_eq!(claim.document_version, reference.document_version);
         assert_eq!(claim.content_digest, reference.content_digest);
         assert_eq!(claim.artifact_locator, reference.artifact_locator);
-        assert_eq!(claim.profile_version, 1);
+        assert_eq!(claim.profile_version, 2);
 
         prepared
             .raw_document_bytes
@@ -12883,10 +14168,312 @@ mod tests {
         prepared
             .documents
             .get_mut(&reference.artifact_locator)
-            .unwrap()["profile_version"] = json!(2);
+            .unwrap()["profile_version"] = json!(3);
         assert!(security_limit_applicability_claim(&prepared)
             .unwrap_err()
             .contains("exact profile-selected artifact"));
+    }
+
+    fn resolve_fixture_bearer_limits(
+        document: Value,
+        d_clock_skew_seconds: u64,
+        d_maximum_lifetime_seconds: u64,
+    ) -> Result<Arc<ResolvedAuthenticatorBearerLimits>, String> {
+        let profile = Arc::new(fixture_verified_security_limit_profile(document));
+        let binding = Arc::new(fixture_authenticator_runtime_binding(
+            d_clock_skew_seconds,
+            d_maximum_lifetime_seconds,
+        ));
+        ResolvedAuthenticatorBearerLimits::seal(profile, binding, "provider:fixture-entra")
+    }
+
+    fn resolve_fixture_browser_limits(
+        binding_document: Value,
+        profile_clock_skew_seconds: u64,
+    ) -> Result<Arc<ResolvedAuthenticatorBrowserLimits>, String> {
+        ResolvedAuthenticatorBrowserLimits::seal(
+            Arc::new(fixture_security_limit_profile(
+                profile_clock_skew_seconds,
+                3_600,
+            )),
+            Arc::new(fixture_verified_authenticator_runtime_binding(
+                binding_document,
+            )),
+            "provider:fixture-entra",
+        )
+    }
+
+    fn canonical_authenticator_limit_document() -> Value {
+        fixture_security_limit_profile(60, 3_600).document.clone()
+    }
+
+    fn authenticator_limit_index(document: &Value, limit_id: &str) -> usize {
+        document["limits"]
+            .as_array()
+            .expect("test security-limit rows")
+            .iter()
+            .position(|limit| limit["limit_id"] == limit_id)
+            .expect("test authenticator limit id")
+    }
+
+    #[test]
+    fn authenticator_bearer_limits_resolve_exact_profile_and_d_values() {
+        let resolved = ResolvedAuthenticatorBearerLimits::fixture(60, 3_600);
+        assert_eq!(
+            resolved.clock_skew_limit_id(),
+            AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID
+        );
+        assert_eq!(resolved.maximum_clock_skew_seconds(), 60);
+        assert_eq!(
+            resolved.credential_lifetime_limit_id(),
+            AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID
+        );
+        assert_eq!(resolved.maximum_credential_lifetime_seconds(), 3_600);
+        assert_eq!(resolved.provider_id(), "provider:fixture-entra");
+        assert_eq!(
+            resolved.path_id(),
+            "authenticator-path:fixture-entra-bearer"
+        );
+        assert!(resolved
+            .security_limit_profile_content_digest()
+            .starts_with("sha256:"));
+        assert!(resolved.remeasures_exact_values());
+    }
+
+    #[test]
+    fn authenticator_browser_limits_resolve_only_clock_skew() {
+        let resolved = ResolvedAuthenticatorBrowserLimits::fixture(60);
+        assert_eq!(
+            resolved.clock_skew_limit_id(),
+            AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID
+        );
+        assert_eq!(resolved.maximum_clock_skew_seconds(), 60);
+        assert_eq!(resolved.provider_id(), "provider:fixture-entra");
+        assert_eq!(
+            resolved.path_id(),
+            "authenticator-path:fixture-entra-browser"
+        );
+        assert!(resolved.remeasures_exact_values());
+    }
+
+    #[test]
+    fn authenticator_browser_limit_resolution_is_lazy_and_exact() {
+        let binding = fixture_authenticator_runtime_binding(60, 3_600);
+        let mut bearer_only: Value = serde_json::from_slice(&binding.raw_bytes).unwrap();
+        bearer_only["credential_paths"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|path| path["credential_profile"]["token_profile"] != "oidc-id-token");
+        assert!(resolve_fixture_browser_limits(bearer_only, 60)
+            .unwrap_err()
+            .contains("omits its browser ID-token"));
+
+        let mut wrong_id: Value = serde_json::from_slice(&binding.raw_bytes).unwrap();
+        let browser = wrong_id["credential_paths"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|path| path["credential_profile"]["token_profile"] == "oidc-id-token")
+            .unwrap();
+        browser["verifier"]["clock_skew_limit_id"] = json!("limit:wrong-browser-clock-skew");
+        assert!(resolve_fixture_browser_limits(wrong_id, 60)
+            .unwrap_err()
+            .contains("canonical clock-skew"));
+
+        let mismatched_binding = fixture_authenticator_runtime_binding(61, 3_600);
+        let mismatched: Value = serde_json::from_slice(&mismatched_binding.raw_bytes).unwrap();
+        assert!(resolve_fixture_browser_limits(mismatched, 60)
+            .unwrap_err()
+            .contains("D clock-skew maximum differs"));
+    }
+
+    #[test]
+    fn authenticator_bearer_limit_resolution_rejects_missing_and_duplicate_rows() {
+        let mut missing = canonical_authenticator_limit_document();
+        missing["limits"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|limit| limit["limit_id"] != AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        assert!(resolve_fixture_bearer_limits(missing, 60, 3_600)
+            .unwrap_err()
+            .contains("omits required authenticator limit"));
+
+        let mut duplicate = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&duplicate, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        let repeated = duplicate["limits"][clock_index].clone();
+        duplicate["limits"].as_array_mut().unwrap().push(repeated);
+        assert!(resolve_fixture_bearer_limits(duplicate, 60, 3_600)
+            .unwrap_err()
+            .contains("duplicates authenticator limit"));
+    }
+
+    #[test]
+    fn authenticator_bearer_limit_resolution_rejects_fractional_and_wrong_ttl_shapes() {
+        let mut fractional = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&fractional, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        fractional["limits"][clock_index]["selected_value"] = json!(60.5);
+        assert!(resolve_fixture_bearer_limits(fractional, 60, 3_600)
+            .unwrap_err()
+            .contains("exact nonnegative integer"));
+
+        let mut wrong_unit = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&wrong_unit, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        wrong_unit["limits"][clock_index]["unit"] = json!("items");
+        assert!(resolve_fixture_bearer_limits(wrong_unit, 60, 3_600)
+            .unwrap_err()
+            .contains("category ttl and unit seconds"));
+
+        let mut wrong_category = canonical_authenticator_limit_document();
+        let clock_index =
+            authenticator_limit_index(&wrong_category, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        wrong_category["limits"][clock_index]["category"] = json!("rate");
+        assert!(resolve_fixture_bearer_limits(wrong_category, 60, 3_600)
+            .unwrap_err()
+            .contains("category ttl and unit seconds"));
+    }
+
+    #[test]
+    fn authenticator_limit_resolution_rejects_invalid_published_defaults() {
+        let mut fractional = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&fractional, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        fractional["limits"][clock_index]["published_default"] = json!(60.5);
+        assert!(resolve_fixture_bearer_limits(fractional, 60, 3_600)
+            .unwrap_err()
+            .contains("published default must be an exact nonnegative integer"));
+
+        let mut outside_bounds = canonical_authenticator_limit_document();
+        let clock_index =
+            authenticator_limit_index(&outside_bounds, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        outside_bounds["limits"][clock_index]["published_default"] = json!(301);
+        assert!(resolve_fixture_bearer_limits(outside_bounds, 60, 3_600)
+            .unwrap_err()
+            .contains("published default 301 is outside its exact hard bounds"));
+    }
+
+    #[test]
+    fn authenticator_bearer_limit_resolution_rejects_bounds_and_inactive_rows() {
+        let mut out_of_bounds = canonical_authenticator_limit_document();
+        let clock_index =
+            authenticator_limit_index(&out_of_bounds, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        out_of_bounds["limits"][clock_index]["hard_bounds"]["maximum"] = json!(59);
+        assert!(resolve_fixture_bearer_limits(out_of_bounds, 60, 3_600)
+            .unwrap_err()
+            .contains("outside its exact hard bounds"));
+
+        let mut inactive = canonical_authenticator_limit_document();
+        let lifetime_index =
+            authenticator_limit_index(&inactive, AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID);
+        inactive["limits"][lifetime_index]["lifecycle"] = json!("retired");
+        assert!(resolve_fixture_bearer_limits(inactive, 60, 3_600)
+            .unwrap_err()
+            .contains("must be active and fully enforced"));
+    }
+
+    #[test]
+    fn authenticator_bearer_limit_resolution_applies_one_tightening_override() {
+        let mut document = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&document, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        document["limits"][clock_index]["overrides"] = json!([{
+            "override_id": "override:fixture-entra-clock-skew",
+            "selected_value": 30,
+            "scope_dimensions": [
+                {"dimension": "deployment_id", "value": "deployment:fixture-authenticator"},
+                {"dimension": "provider_id", "value": "provider:fixture-entra"},
+                {"dimension": "trust_domain_id", "value": "trust-domain:fixture-authenticator"}
+            ],
+            "tightens_only": true,
+            "reason": "Test a scoped tighter maximum."
+        }]);
+        let resolved = resolve_fixture_bearer_limits(document, 30, 3_600)
+            .expect("one exact matching override must tighten the runtime maximum");
+        assert_eq!(resolved.maximum_clock_skew_seconds(), 30);
+        assert!(resolved.remeasures_exact_values());
+    }
+
+    #[test]
+    fn authenticator_bearer_limit_resolution_rejects_ambiguous_or_widening_overrides() {
+        let matching_override = |override_id: &str, selected_value: u64| {
+            json!({
+                "override_id": override_id,
+                "selected_value": selected_value,
+                "scope_dimensions": [
+                    {"dimension": "deployment_id", "value": "deployment:fixture-authenticator"},
+                    {"dimension": "provider_id", "value": "provider:fixture-entra"},
+                    {"dimension": "trust_domain_id", "value": "trust-domain:fixture-authenticator"}
+                ],
+                "tightens_only": true,
+                "reason": "Test override."
+            })
+        };
+
+        let mut ambiguous = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&ambiguous, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        ambiguous["limits"][clock_index]["overrides"] = Value::Array(vec![
+            matching_override("override:fixture-entra-clock-skew-a", 30),
+            matching_override("override:fixture-entra-clock-skew-b", 20),
+        ]);
+        assert!(resolve_fixture_bearer_limits(ambiguous, 30, 3_600)
+            .unwrap_err()
+            .contains("ambiguous applicable overrides"));
+
+        let mut widening = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&widening, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        widening["limits"][clock_index]["overrides"] = Value::Array(vec![matching_override(
+            "override:fixture-entra-clock-skew-wider",
+            61,
+        )]);
+        assert!(resolve_fixture_bearer_limits(widening, 61, 3_600)
+            .unwrap_err()
+            .contains("does not strictly tighten"));
+
+        let mut equal = canonical_authenticator_limit_document();
+        let clock_index = authenticator_limit_index(&equal, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID);
+        equal["limits"][clock_index]["overrides"] = Value::Array(vec![matching_override(
+            "override:fixture-entra-clock-skew-equal",
+            60,
+        )]);
+        assert!(resolve_fixture_bearer_limits(equal, 60, 3_600)
+            .unwrap_err()
+            .contains("does not strictly tighten"));
+    }
+
+    #[test]
+    fn authenticator_bearer_limit_resolution_rejects_d_value_mismatch() {
+        let document = canonical_authenticator_limit_document();
+        assert!(resolve_fixture_bearer_limits(document.clone(), 61, 3_600)
+            .unwrap_err()
+            .contains("D clock-skew maximum differs"));
+        assert!(resolve_fixture_bearer_limits(document, 60, 3_601)
+            .unwrap_err()
+            .contains("D credential-lifetime maximum differs"));
+    }
+
+    #[test]
+    fn verified_security_limit_profile_detects_exact_byte_and_typed_document_drift() {
+        let mut exact = fixture_security_limit_profile(60, 3_600);
+        assert!(exact.verify_integrity().is_ok());
+        exact.raw_bytes[0] = b'[';
+        assert!(exact
+            .verify_integrity()
+            .unwrap_err()
+            .contains("exact digest"));
+
+        let mut typed = fixture_security_limit_profile(60, 3_600);
+        typed.document["profile_version"] = json!(999);
+        assert!(typed
+            .verify_integrity()
+            .unwrap_err()
+            .contains("sealed typed document"));
+    }
+
+    #[test]
+    fn nonproduction_verified_profile_preserves_implementation_scope_admission() {
+        let document: Value = serde_json::from_str(include_str!(
+            "../../../catalog/security-contracts/v1/security-limit-profile.implementation.json"
+        ))
+        .unwrap();
+        let verified = fixture_verified_security_limit_profile(document);
+        assert!(verified.verify_integrity().is_ok());
     }
 
     #[tokio::test]
@@ -13073,6 +14660,7 @@ mod tests {
             documents: documents.clone(),
             raw_document_bytes: document_bytes.clone(),
             reference_document_digests: reference_digests.clone(),
+            verified_security_limit_profile: Arc::new(fixture_security_limit_profile(60, 3_600)),
             active_providers: BTreeMap::new(),
             provider_registry_applicability: empty_provider_registry_applicability(&profile),
             conformance_registry_lineage: Some(lineage),
@@ -13173,6 +14761,7 @@ mod tests {
             documents: documents.clone(),
             raw_document_bytes: document_bytes.clone(),
             reference_document_digests: reference_digests,
+            verified_security_limit_profile: Arc::new(fixture_security_limit_profile(60, 3_600)),
             active_providers: BTreeMap::new(),
             provider_registry_applicability: empty_provider_registry_applicability(&profile),
             conformance_registry_lineage: None,

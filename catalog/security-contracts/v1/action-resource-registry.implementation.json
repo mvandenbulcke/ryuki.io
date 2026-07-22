@@ -23,7 +23,7 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:93e3fce6c70fdf75797bc70119f188221bab8360ff2c74504a9132966b6a235f",
+        "content_digest": "sha256:d478d31b70ae48727395a17344694a7c3c4341c64353cb67dc85d47185e59e15",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
@@ -89,7 +89,7 @@
       {
         "document_id": "source:ryuki-api-entra-auth",
         "document_version": 1,
-        "content_digest": "sha256:09f0c49ee289a26a9c592a71e88d9d0c4fe922159385e457bf1e8b15665de9ab",
+        "content_digest": "sha256:9c166a70acf32a599d7d6f8735a1fe4f93e9c65384d9f499bad110064c2b6f52",
         "artifact_locator": "sources/ryuki-api/src/entra_auth.rs"
       },
       {
@@ -101,7 +101,7 @@
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:e15480856e0cf0b74ce33908f6ec760bfc7939dab6f6414db6904d4e214f6c74",
+        "content_digest": "sha256:b0665db3747a0f701658af2da117ec5c89cb8aab5aff10910a27de743369699d",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {

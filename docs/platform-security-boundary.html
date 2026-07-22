@@ -374,6 +374,7 @@ authentication:
 <ul>
 <li>A deployment declares its control-plane topology. Multi-region active/active privileged mutation is prohibited until a reviewed design provides one monotonic authority epoch, single-writer ownership, strongly consistent replay/idempotency/approval state, and stale-region grant refusal.</li>
 <li>Scheduler leadership, signing authority, agent leases, approvals, provider calls, and failover transitions carry the authority epoch. A fenced or old primary cannot mint new work, consume approvals, accept results, or rejoin as writer without an explicit reconciliation ceremony.</li>
+<li>The repository implementation now provides the local site-health portion of that fence: every <code>LiveApply</code>/<code>LiveDestroy</code> grant stores the exact epoch of an active, fresh <code>healthy/up/up</code> site plus fresh VMware observation, and the database rechecks it at persistence, lease, acknowledgement, renewal, and first result acceptance. A lost epoch retains signed result evidence but forces reconciliation. This is deliberately not yet the distributed control-plane epoch above; signing that authority into the agent protocol and proving multi-replica failover remain SB-3/SB-8 work.</li>
 <li>An uncertain provider call is never blindly retried after leader or region loss. It enters a provider-specific reconciliation state that proves outcome before any compensation or redispatch.</li>
 <li>Time synchronization is a security dependency whose maximum tolerated skew is a registered security-limit id, with independent monitoring and a tested recovery path. Wall-clock rollback must not revive expired credentials, grants, leases, replay windows, or step-up.</li>
 </ul>
@@ -1011,7 +1012,7 @@ authentication:
 <li><a href="https://openid.net/wg/sharedsignals/specifications/">OpenID Shared Signals specifications</a></li>
 <li><a href="https://slsa.dev/spec/v1.2/">SLSA specification 1.2</a></li>
 </ul>
-<div class="page-meta">Last updated 2026-07-20 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture/platform-security-boundary.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/architecture.html">&larr; Architecture</a><a href="/configuration.html">Configuration &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-21 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture/platform-security-boundary.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/architecture.html">&larr; Architecture</a><a href="/configuration.html">Configuration &rarr;</a></nav>
 </main>
   </div>
   <footer class="site-footer">

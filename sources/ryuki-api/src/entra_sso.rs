@@ -74,6 +74,7 @@ use uuid::Uuid;
 use crate::oidc_callback::{
     OidcCallbackQuery, OidcIdTokenValidator, ReqwestTokenExchanger, TokenExchanger, TokenRequest,
 };
+use crate::security_contracts::ResolvedAuthenticatorBrowserLimits;
 
 /// Entra ID app roles are always issued in the `roles` claim (same claim the
 /// bearer-token validator's `EntraClaims` consumes).
@@ -121,6 +122,7 @@ pub struct EntraSsoDeps {
     redirect_uri: String,
     authorize_endpoint: String,
     issuer: String,
+    browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
     session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
     cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
@@ -156,13 +158,14 @@ impl EntraSsoDeps {
         let cookie_runtime =
             crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, false)
                 .expect("test config must construct cookie runtime");
+        let browser_limits = Some(ResolvedAuthenticatorBrowserLimits::fixture(leeway_secs));
         Self::build_with_trusted_proxies(
             mode_is_entra,
             tenant_id,
             client_id,
             authority,
             redirect_uri,
-            leeway_secs,
+            browser_limits,
             session_credentials,
             cookie_runtime,
             Vec::new(),
@@ -176,7 +179,7 @@ impl EntraSsoDeps {
         client_id: &str,
         authority: &str,
         redirect_uri: &str,
-        leeway_secs: u64,
+        browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
         session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
         cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
         trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
@@ -190,7 +193,10 @@ impl EntraSsoDeps {
             endpoints.jwks,
             endpoints.issuer.clone(),
             client_id.to_string(),
-            leeway_secs,
+            browser_limits
+                .as_deref()
+                .map(ResolvedAuthenticatorBrowserLimits::maximum_clock_skew_seconds)
+                .unwrap_or(0),
         ));
         Arc::new(Self {
             mode_is_entra,
@@ -199,6 +205,7 @@ impl EntraSsoDeps {
             redirect_uri: redirect_uri.to_string(),
             authorize_endpoint: endpoints.authorize,
             issuer: endpoints.issuer,
+            browser_limits,
             session_credentials,
             cookie_runtime,
             trusted_proxies,
@@ -213,6 +220,7 @@ impl EntraSsoDeps {
     /// never dereferenced.
     pub fn from_app_config(
         cfg: &ryuki_core::config::RyukiConfig,
+        browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
         session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
         cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     ) -> Arc<Self> {
@@ -232,7 +240,7 @@ impl EntraSsoDeps {
             &cfg.entra_client_id,
             &cfg.entra_authority,
             &cfg.entra_redirect_uri,
-            cfg.entra_leeway_secs,
+            browser_limits,
             session_credentials,
             cookie_runtime,
             trusted_proxies,
@@ -246,6 +254,17 @@ impl EntraSsoDeps {
         Arc::ptr_eq(&self.session_credentials, runtime)
     }
 
+    pub(crate) fn retains_browser_limits(
+        &self,
+        limits: &Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+    ) -> bool {
+        match (&self.browser_limits, limits) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn retains_cookie_runtime(
         &self,
         runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
@@ -257,7 +276,10 @@ impl EntraSsoDeps {
         // All three are load-bearing: the authorize/token URLs embed the tenant,
         // so an empty tenant yields a malformed IdP URL. The gate must require
         // everything the ENTRA_SSO_NOT_CONFIGURED message claims it does.
-        !self.tenant_id.is_empty() && !self.client_id.is_empty() && !self.redirect_uri.is_empty()
+        !self.tenant_id.is_empty()
+            && !self.client_id.is_empty()
+            && !self.redirect_uri.is_empty()
+            && self.browser_limits.is_some()
     }
 }
 

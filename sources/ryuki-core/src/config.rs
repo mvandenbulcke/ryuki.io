@@ -1691,11 +1691,14 @@ pub struct RyukiConfig {
     /// maximum 24h; minimum 1s). Validated even before EntraId mode is enabled.
     #[serde(default = "default_entra_jwks_ttl_secs")]
     pub entra_jwks_ttl_secs: u64,
-    /// Clock-skew leeway in seconds applied to exp/nbf during Entra token
-    /// validation (default 60s; maximum 300s). Validated even before EntraId
-    /// mode is enabled.
-    #[serde(default = "default_entra_leeway_secs")]
-    pub entra_leeway_secs: u64,
+    /// Retired configuration tombstone for `RYUKI_ENTRA_LEEWAY_SECS`.
+    ///
+    /// Authenticator clock skew is resolved from the authenticated
+    /// `SecurityLimitProfile`; retaining this field as an always-rejected
+    /// option makes legacy environment/file input fail closed instead of being
+    /// silently ignored by serde during the non-overlap cutover.
+    #[serde(default)]
+    pub entra_leeway_secs: Option<u64>,
     #[serde(default = "default_platform_name")]
     pub platform_name: String,
     #[serde(default = "default_platform_url")]
@@ -1760,16 +1763,8 @@ fn default_entra_authority() -> String {
 /// withdrawn Entra key. Longer trust generations require a code-reviewed
 /// policy change rather than an unconstrained runtime knob.
 const MAX_ENTRA_JWKS_TTL_SECS: u64 = 86_400;
-/// Five minutes accommodates substantial clock skew without turning token
-/// expiry/not-before validation into a configurable bypass.
-const MAX_ENTRA_LEEWAY_SECS: u64 = 300;
-
 fn default_entra_jwks_ttl_secs() -> u64 {
     MAX_ENTRA_JWKS_TTL_SECS
-}
-
-fn default_entra_leeway_secs() -> u64 {
-    60
 }
 
 fn default_platform_name() -> String {
@@ -1793,7 +1788,7 @@ impl Default for RyukiConfig {
             entra_authority: default_entra_authority(),
             entra_redirect_uri: String::new(),
             entra_jwks_ttl_secs: default_entra_jwks_ttl_secs(),
-            entra_leeway_secs: default_entra_leeway_secs(),
+            entra_leeway_secs: None,
             platform_name: default_platform_name(),
             platform_url: default_platform_url(),
             database_provider: DatabaseProvider::default(),
@@ -1988,10 +1983,11 @@ impl RyukiConfig {
                 "entra_jwks_ttl_secs must not exceed {MAX_ENTRA_JWKS_TTL_SECS}"
             ));
         }
-        if self.entra_leeway_secs > MAX_ENTRA_LEEWAY_SECS {
-            errors.push(format!(
-                "entra_leeway_secs must not exceed {MAX_ENTRA_LEEWAY_SECS}"
-            ));
+        if self.entra_leeway_secs.is_some() {
+            errors.push(
+                "entra_leeway_secs is retired; remove RYUKI_ENTRA_LEEWAY_SECS and resolve authenticator clock skew from the active security-limit profile"
+                    .into(),
+            );
         }
 
         if self.auth_mode == AuthMode::Local && self.local_auth.users.is_empty() {
@@ -2364,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_entra_jwks_ttl_and_token_leeway_security_bounds() {
+    fn test_entra_jwks_ttl_security_bounds() {
         for ttl in [1, MAX_ENTRA_JWKS_TTL_SECS] {
             let config = RyukiConfig {
                 entra_jwks_ttl_secs: ttl,
@@ -2391,22 +2387,12 @@ mod tests {
                 "unsafe JWKS TTL must fail validation: {ttl}"
             );
         }
+    }
 
-        for leeway in [0, MAX_ENTRA_LEEWAY_SECS] {
-            let config = RyukiConfig {
-                entra_leeway_secs: leeway,
-                ..Default::default()
-            };
-            assert!(
-                !config
-                    .validate()
-                    .iter()
-                    .any(|error| error.contains("entra_leeway_secs")),
-                "admitted token leeway boundary must validate: {leeway}"
-            );
-        }
+    #[test]
+    fn test_retired_entra_leeway_input_is_rejected() {
         let config = RyukiConfig {
-            entra_leeway_secs: MAX_ENTRA_LEEWAY_SECS + 1,
+            entra_leeway_secs: Some(60),
             ..Default::default()
         };
         assert!(
@@ -2414,7 +2400,23 @@ mod tests {
                 .validate()
                 .iter()
                 .any(|error| error.contains("entra_leeway_secs")),
-            "token leeway above the hard bound must fail validation"
+            "legacy clock-skew input must fail rather than compete with the security-limit profile"
+        );
+
+        let parsed: RyukiConfig = Figment::new()
+            .merge(figment::providers::Serialized::defaults(
+                RyukiConfig::default(),
+            ))
+            .merge(Toml::string("entra_leeway_secs = 60"))
+            .extract()
+            .expect("the retired file key must remain detectable during the cutover");
+        assert_eq!(parsed.entra_leeway_secs, Some(60));
+        assert!(
+            parsed
+                .validate()
+                .iter()
+                .any(|error| error.contains("entra_leeway_secs")),
+            "legacy file input must fail instead of becoming an ignored unknown field"
         );
     }
 

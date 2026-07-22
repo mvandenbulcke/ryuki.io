@@ -107,7 +107,7 @@ fn resolve_auth_metadata(header: Option<&str>, provider_mode: &'static str) -> A
 async fn resolve_request_session(
     auth_mode: AuthMode,
     auth_header: Option<&str>,
-    validator: &EntraTokenValidator,
+    validator: Option<&EntraTokenValidator>,
 ) -> (
     AuthSession,
     Option<&'static str>,
@@ -131,19 +131,27 @@ async fn resolve_request_session(
         // EntraId: a real bearer token is cryptographically validated by the
         // injected validator (RS256 + iss/aud/exp/nbf + JWKS). A missing header
         // or any failure path is unverified_entra().
-        AuthMode::EntraId => match auth_header {
-            Some(h) => {
-                let outcome = validator.validate_with_reason(h).await;
-                (
-                    outcome.session,
-                    outcome.failure_reason,
-                    outcome.request_read_credential,
-                    outcome.external_subject,
-                )
-            }
+        AuthMode::EntraId => match validator {
+            Some(validator) => match auth_header {
+                Some(h) => {
+                    let outcome = validator.validate_with_reason(h).await;
+                    (
+                        outcome.session,
+                        outcome.failure_reason,
+                        outcome.request_read_credential,
+                        outcome.external_subject,
+                    )
+                }
+                None => (
+                    AuthSession::unverified_entra(),
+                    Some("missing-bearer"),
+                    None,
+                    None,
+                ),
+            },
             None => (
                 AuthSession::unverified_entra(),
-                Some("missing-bearer"),
+                Some("unbound-verifier"),
                 None,
                 None,
             ),
@@ -160,7 +168,7 @@ async fn auth_session_for_request(
     auth_header: Option<&str>,
     validator: &EntraTokenValidator,
 ) -> AuthSession {
-    resolve_request_session(auth_mode, auth_header, validator)
+    resolve_request_session(auth_mode, auth_header, Some(validator))
         .await
         .0
 }
@@ -2095,11 +2103,12 @@ async fn auth_middleware(
                     (session, Some(source), None, authority, request_read)
                 }
                 None => {
+                    let entra_bearer_validator = authenticator_runtime.entra_bearer_validator();
                     let (validated, reason, direct_credential, external_subject) =
                         resolve_request_session(
                             auth_mode.clone(),
                             auth_header,
-                            &authenticator_runtime.entra_bearer_validator(),
+                            entra_bearer_validator.as_deref(),
                         )
                         .await;
                     if auth_mode == AuthMode::EntraId
@@ -3584,10 +3593,41 @@ async fn main() {
             eprintln!("API cookie runtime binding failed: {error}");
             std::process::exit(1);
         });
+    let authenticator_bearer_limits_identity = if app_config.auth_mode == AuthMode::EntraId {
+        Some(
+            security_contract
+                .resolved_entra_bearer_limits()
+                .unwrap_or_else(|error| {
+                    eprintln!("Entra bearer-limit authority admission failed: {error}");
+                    std::process::exit(1);
+                }),
+        )
+    } else {
+        None
+    };
+    let authenticator_browser_limits_identity =
+        if app_config.auth_mode == AuthMode::EntraId && !app_config.entra_redirect_uri.is_empty() {
+            Some(
+                security_contract
+                    .resolved_entra_browser_limits()
+                    .unwrap_or_else(|error| {
+                        eprintln!("Entra browser-limit authority admission failed: {error}");
+                        std::process::exit(1);
+                    }),
+            )
+        } else {
+            None
+        };
     let api_authenticator_runtime =
         authenticator_runtime::ApiAuthenticatorRuntime::from_admitted_config(
             &app_config,
             Arc::clone(&api_cookie_runtime),
+            authenticator_bearer_limits_identity
+                .as_ref()
+                .map(Arc::clone),
+            authenticator_browser_limits_identity
+                .as_ref()
+                .map(Arc::clone),
             security_contract.is_production(),
         )
         .unwrap_or_else(|error| {
@@ -3697,6 +3737,10 @@ async fn main() {
         || !api_authenticator_runtime_identity
             .retains_operational_observation(&authenticator_observation_identity)
         || !api_authenticator_runtime_identity
+            .retains_authenticator_bearer_limits(&authenticator_bearer_limits_identity)
+        || !api_authenticator_runtime_identity
+            .retains_authenticator_browser_limits(&authenticator_browser_limits_identity)
+        || !api_authenticator_runtime_identity
             .retains_entra_bearer_validator(&entra_bearer_validator_identity)
         || !api_authenticator_runtime_identity
             .retains_entra_bearer_observation(&entra_bearer_observation_identity)
@@ -3720,6 +3764,8 @@ async fn main() {
         || !entra_sso_dependencies_identity
             .retains_session_credentials(&derived_session_credentials_identity)
         || !entra_sso_dependencies_identity.retains_cookie_runtime(&api_cookie_runtime_identity)
+        || !entra_sso_dependencies_identity
+            .retains_browser_limits(&authenticator_browser_limits_identity)
         || !api_authenticator_runtime_identity
             .retains_local_login_throttle(&local_login_throttle_identity)
     {
@@ -5638,7 +5684,7 @@ mod tests {
             "test-client",
             "https://login.microsoftonline.com",
             86_400,
-            60,
+            crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(60, 3_600),
         )
     }
 
@@ -5668,6 +5714,24 @@ mod tests {
         assert_eq!(session.provider_mode, "entra-id-unverified");
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);
+    }
+
+    #[tokio::test]
+    async fn test_entra_auth_mode_without_bound_validator_stays_unverified() {
+        let (session, failure_reason, direct_credential, external_subject) =
+            resolve_request_session(
+                AuthMode::EntraId,
+                Some("Bearer header.payload.signature"),
+                None,
+            )
+            .await;
+
+        assert_eq!(session.provider_mode, "entra-id-unverified");
+        assert!(session.roles.is_empty());
+        assert!(!session.token_valid);
+        assert_eq!(failure_reason, Some("unbound-verifier"));
+        assert!(direct_credential.is_none());
+        assert!(external_subject.is_none());
     }
 
     const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
