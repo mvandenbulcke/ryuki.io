@@ -28,6 +28,16 @@ pub const AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-cache-partition-v1";
 pub const AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-protocol-binding-v1";
+pub const AUTHENTICATOR_BROWSER_STATE_RELATION_V3: &str = "oidc_login_states_v3";
+pub const AUTHENTICATOR_BROWSER_STATE_CONTRACT_SETTING: &str = "ryuki.oidc_login_state_contract";
+pub const AUTHENTICATOR_BROWSER_STATE_CONTRACT_VERSION: u64 = 3;
+pub const AUTHENTICATOR_BROWSER_STATE_CONSUME_OPERATION: &str = "delete-returning";
+pub const AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS: u64 = 600;
+pub const AUTHENTICATOR_BROWSER_PKCE_METHOD_S256: &str = "s256";
+pub const AUTHENTICATOR_DERIVED_SESSION_RELATION: &str = "sessions";
+pub const AUTHENTICATOR_DERIVED_SESSION_CREDENTIAL_FORMAT: &str = "opaque-random-256-bit";
+pub const AUTHENTICATOR_DERIVED_SESSION_VERIFIER_ALGORITHM: &str = "hmac-sha256";
+pub const AUTHENTICATOR_DERIVED_SESSION_VERIFIER_COLUMN_V3: &str = "session_bearer_verifier_v3";
 pub const POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT: &str =
     "ryuki-postgresql-database-identity-v1";
 pub const POSTGRESQL_PROVIDER_ROUTE_BINDING_DIGEST_CONTRACT: &str =
@@ -814,6 +824,306 @@ pub struct AuthenticatorRuntimePathProjection {
     pub retained_consumer_ids: Vec<String>,
 }
 
+/// Closed semantic role of one retained OIDC credential path.
+///
+/// The role is repeated in the cache and protocol preimages so a coordinated
+/// bearer/browser relabel cannot preserve either digest.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorRuntimePathRole {
+    DirectBearer,
+    BrowserDerivedSession,
+}
+
+/// Identity leaves shared by the cache-partition and carrier-protocol
+/// preimages. Values are non-secret and bind one exact provider configuration,
+/// verifier allocation, and credential path.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorRuntimePathIdentityProjection {
+    pub provider_id: String,
+    pub provider_configuration_version: u64,
+    pub provider_configuration_payload_digest: String,
+    pub path_role: AuthenticatorRuntimePathRole,
+    pub path_id: String,
+    pub path_version: u64,
+    pub verifier_id: String,
+    pub verifier_version: u64,
+    pub token_profile: String,
+    pub issuer_binding_digest: String,
+    pub audience_set_binding_digest: String,
+    pub key_source_kind: AuthenticatorKeySourceKind,
+    pub key_source_binding_digest: String,
+}
+
+/// Closed kinds of retained cache allocations that an OIDC path may own.
+/// Variant order deliberately matches canonical serialized-name order.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorCacheKind {
+    BrowserLoginState,
+    DerivedSessionCredential,
+    JwksKeySet,
+    NonceReplay,
+    OidcDiscoveryDocument,
+    TokenIntrospection,
+}
+
+/// Exact retained cache allocation inventory for one authenticator path.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorCachePartitionProjection {
+    pub path_identity: AuthenticatorRuntimePathIdentityProjection,
+    pub cache_owner_id: String,
+    pub cache_partition_id: String,
+    pub cache_kinds: Vec<AuthenticatorCacheKind>,
+    pub retained_consumer_ids: Vec<String>,
+}
+
+/// Typed, one-use OIDC browser-state authority. These constants describe the
+/// post-cutover v3 relation and prevent an old writer/consumer from being
+/// represented as equivalent live state custody.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorBrowserStateAuthorityProjection {
+    pub state_authority_id: String,
+    pub state_authority_version: u64,
+    pub relation_name: String,
+    pub writer_contract_setting: String,
+    pub writer_contract_version: u64,
+    pub consume_operation: String,
+    pub state_lifetime_limit_id: String,
+    pub maximum_state_lifetime_seconds: u64,
+    pub pkce_method: String,
+    pub nonce_required: bool,
+    pub browser_binding_required: bool,
+    pub exact_origin_match_required: bool,
+}
+
+/// Closed token-endpoint client authentication modes admitted by the browser
+/// exchange authority. Secret values are never projected.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorBrowserClientAuthentication {
+    None,
+    ClientSecretPost,
+}
+
+/// Typed browser authorization-code exchange and provider-token custody.
+/// Endpoint, redirect, client, and scope values remain value-free, separately
+/// domain-bound SHA-256 digests.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorBrowserExchangeAuthorityProjection {
+    pub exchange_authority_id: String,
+    pub exchange_authority_version: u64,
+    pub authorization_endpoint_binding_digest: String,
+    pub token_endpoint_binding_digest: String,
+    pub redirect_uri_binding_digest: String,
+    pub client_id_binding_digest: String,
+    pub scopes_binding_digest: String,
+    pub client_authentication: AuthenticatorBrowserClientAuthentication,
+    pub client_credential_present: bool,
+    pub connect_timeout_milliseconds: u64,
+    pub request_timeout_milliseconds: u64,
+    pub response_maximum_bytes: u64,
+    pub https_required: bool,
+    pub redirects_allowed: bool,
+    pub ambient_proxy_allowed: bool,
+    pub pkce_verifier_sent: bool,
+    pub id_token_required: bool,
+    pub provider_tokens_persisted: bool,
+    pub provider_tokens_exposed: bool,
+}
+
+/// Typed server-side credential authority for a browser-derived session.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorDerivedSessionAuthorityProjection {
+    pub session_authority_id: String,
+    pub session_authority_version: u64,
+    pub relation_name: String,
+    pub credential_format: String,
+    pub credential_verifier_algorithm: String,
+    pub credential_key_identity_digest: String,
+    pub verifier_column_name: String,
+    pub session_maximum_age_limit_id: String,
+    pub maximum_session_age_seconds: u64,
+    pub federated_authority_staleness_limit_id: String,
+    pub maximum_federated_authority_staleness_seconds: u64,
+    pub exact_origin_copy_required: bool,
+    pub cookie_policy_binding_digest: String,
+}
+
+/// Exact retained carrier/replay protocol for one authenticator path.
+/// Browser-only authorities must be explicit `null` for direct bearer paths
+/// and present together for browser-derived-session paths.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorProtocolBindingProjection {
+    pub path_identity: AuthenticatorRuntimePathIdentityProjection,
+    pub carrier: AuthenticatorCredentialCarrier,
+    pub proof_binding: AuthenticatorProofBinding,
+    pub replay: AuthenticatorReplayRuntimeProjection,
+    #[serde(deserialize_with = "deserialize_explicit_option")]
+    pub browser_exchange_authority: Option<AuthenticatorBrowserExchangeAuthorityProjection>,
+    #[serde(deserialize_with = "deserialize_explicit_option")]
+    pub browser_state_authority: Option<AuthenticatorBrowserStateAuthorityProjection>,
+    #[serde(deserialize_with = "deserialize_explicit_option")]
+    pub derived_session_authority: Option<AuthenticatorDerivedSessionAuthorityProjection>,
+}
+
+#[derive(Serialize)]
+struct AuthenticatorCachePartitionBindingDigestProjection<'a> {
+    digest_contract: &'static str,
+    cache_partition: &'a AuthenticatorCachePartitionProjection,
+}
+
+#[derive(Serialize)]
+struct AuthenticatorProtocolBindingDigestProjection<'a> {
+    digest_contract: &'static str,
+    protocol_binding: &'a AuthenticatorProtocolBindingProjection,
+}
+
+/// Encode one validated cache allocation using `ryuki-canonical-json-v1`.
+pub fn authenticator_cache_partition_binding_canonical_bytes(
+    cache_partition: &AuthenticatorCachePartitionProjection,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_authenticator_cache_partition_projection(cache_partition)?;
+    canonical_projection_bytes(AuthenticatorCachePartitionBindingDigestProjection {
+        digest_contract: AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT,
+        cache_partition,
+    })
+}
+
+/// Digest the exact retained cache allocation. The digest is independently
+/// separated from the provider and verifier authority digests in its preimage.
+pub fn authenticator_cache_partition_binding_digest(
+    cache_partition: &AuthenticatorCachePartitionProjection,
+) -> Result<String, RuntimeGuardDigestError> {
+    let digest = digest_canonical_bytes(authenticator_cache_partition_binding_canonical_bytes(
+        cache_partition,
+    )?)?;
+    reject_authenticator_path_identity_digest_collision(&digest, &cache_partition.path_identity)?;
+    Ok(digest)
+}
+
+/// Encode one validated carrier protocol using `ryuki-canonical-json-v1`.
+pub fn authenticator_protocol_binding_canonical_bytes(
+    protocol_binding: &AuthenticatorProtocolBindingProjection,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_authenticator_protocol_binding_projection(protocol_binding)?;
+    canonical_projection_bytes(AuthenticatorProtocolBindingDigestProjection {
+        digest_contract: AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT,
+        protocol_binding,
+    })
+}
+
+/// Digest the exact retained carrier protocol, independently separated from
+/// provider, verifier, replay, derived-session key, and cookie authorities.
+pub fn authenticator_protocol_binding_digest(
+    protocol_binding: &AuthenticatorProtocolBindingProjection,
+) -> Result<String, RuntimeGuardDigestError> {
+    let digest = digest_canonical_bytes(authenticator_protocol_binding_canonical_bytes(
+        protocol_binding,
+    )?)?;
+    reject_authenticator_path_identity_digest_collision(&digest, &protocol_binding.path_identity)?;
+    if protocol_binding
+        .replay
+        .replay_store_binding_digest
+        .as_ref()
+        .is_some_and(|candidate| candidate == &digest)
+        || protocol_binding
+            .derived_session_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                authority.credential_key_identity_digest == digest
+                    || authority.cookie_policy_binding_digest == digest
+            })
+        || protocol_binding
+            .browser_exchange_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                [
+                    &authority.authorization_endpoint_binding_digest,
+                    &authority.token_endpoint_binding_digest,
+                    &authority.redirect_uri_binding_digest,
+                    &authority.client_id_binding_digest,
+                    &authority.scopes_binding_digest,
+                ]
+                .contains(&&digest)
+            })
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator protocol/key authority digest separation",
+        ));
+    }
+    Ok(digest)
+}
+
+/// Reconcile both canonical preimages with one exact path in a validated R
+/// projection. A live measurer must perform this check for every retained path
+/// before treating either opaque digest in R as observed runtime evidence.
+pub fn validate_authenticator_runtime_path_preimages(
+    runtime_binding: &AuthenticatorRuntimeBindingProjection,
+    cache_partition: &AuthenticatorCachePartitionProjection,
+    protocol_binding: &AuthenticatorProtocolBindingProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    validate_authenticator_runtime_binding_projection(runtime_binding)?;
+    validate_authenticator_cache_partition_projection(cache_partition)?;
+    validate_authenticator_protocol_binding_projection(protocol_binding)?;
+
+    let identity = &cache_partition.path_identity;
+    let Some(path) = runtime_binding
+        .credential_paths
+        .iter()
+        .find(|path| path.path_id == identity.path_id)
+    else {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator preimage path identity",
+        ));
+    };
+    let expected_role = match path.credential_profile.token_profile.as_str() {
+        "jwt-access-token" => AuthenticatorRuntimePathRole::DirectBearer,
+        "oidc-id-token" => AuthenticatorRuntimePathRole::BrowserDerivedSession,
+        _ => {
+            return Err(RuntimeGuardDigestError::InvalidProjection(
+                "authenticator preimage path role",
+            ));
+        }
+    };
+    let cache_digest = authenticator_cache_partition_binding_digest(cache_partition)?;
+    let protocol_digest = authenticator_protocol_binding_digest(protocol_binding)?;
+
+    if cache_partition.path_identity != protocol_binding.path_identity
+        || identity.provider_id != runtime_binding.provider.provider_id
+        || identity.provider_configuration_version != runtime_binding.provider.configuration_version
+        || identity.provider_configuration_payload_digest
+            != runtime_binding.provider.configuration_payload_digest
+        || identity.path_role != expected_role
+        || identity.path_version != path.path_version
+        || identity.verifier_id != path.verifier.verifier_id
+        || identity.verifier_version != path.verifier.verifier_version
+        || identity.token_profile != path.credential_profile.token_profile
+        || identity.issuer_binding_digest != path.verifier.issuer_binding_digest
+        || identity.audience_set_binding_digest != path.verifier.audience_set_binding_digest
+        || identity.key_source_kind != path.verifier.key_source_kind
+        || identity.key_source_binding_digest != path.verifier.key_source_binding_digest
+        || cache_partition.retained_consumer_ids != path.retained_consumer_ids
+        || protocol_binding.carrier != path.credential_profile.carrier
+        || protocol_binding.proof_binding != path.credential_profile.proof_binding
+        || protocol_binding.replay != path.credential_profile.replay
+        || cache_digest != path.cache_partition_binding_digest
+        || protocol_digest != path.protocol_binding_digest
+        || cache_digest == protocol_digest
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator runtime path/preimage reconciliation",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthenticatorRuntimeBindingDocumentReference {
@@ -1452,6 +1762,315 @@ fn validate_postgresql_migration_inventory_projection(
     Ok(())
 }
 
+fn validate_authenticator_runtime_path_identity_projection(
+    identity: &AuthenticatorRuntimePathIdentityProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    let binding_digests = [
+        identity.provider_configuration_payload_digest.as_str(),
+        identity.issuer_binding_digest.as_str(),
+        identity.audience_set_binding_digest.as_str(),
+        identity.key_source_binding_digest.as_str(),
+    ];
+    let distinct_binding_digests = binding_digests
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .len()
+        == binding_digests.len();
+    let role_token_profile_matches = matches!(
+        (identity.path_role, identity.token_profile.as_str()),
+        (
+            AuthenticatorRuntimePathRole::DirectBearer,
+            "jwt-access-token"
+        ) | (
+            AuthenticatorRuntimePathRole::BrowserDerivedSession,
+            "oidc-id-token"
+        )
+    );
+
+    if !valid_canonical_scoped_id(&identity.provider_id, "provider:")
+        || identity.provider_configuration_version == 0
+        || !valid_sha256_digest(&identity.provider_configuration_payload_digest)
+        || !valid_canonical_scoped_id(&identity.path_id, "authenticator-path:")
+        || identity.path_version == 0
+        || !valid_canonical_scoped_id(&identity.verifier_id, "authenticator-verifier:")
+        || identity.verifier_version == 0
+        || !role_token_profile_matches
+        || !valid_sha256_digest(&identity.issuer_binding_digest)
+        || !valid_sha256_digest(&identity.audience_set_binding_digest)
+        || identity.key_source_kind != AuthenticatorKeySourceKind::JwtJwks
+        || !valid_sha256_digest(&identity.key_source_binding_digest)
+        || !distinct_binding_digests
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator runtime path identity",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_authenticator_path_identity_digest_collision(
+    digest: &str,
+    identity: &AuthenticatorRuntimePathIdentityProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    if [
+        identity.provider_configuration_payload_digest.as_str(),
+        identity.issuer_binding_digest.as_str(),
+        identity.audience_set_binding_digest.as_str(),
+        identity.key_source_binding_digest.as_str(),
+    ]
+    .contains(&digest)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator cache/protocol authority digest separation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authenticator_cache_partition_projection(
+    cache_partition: &AuthenticatorCachePartitionProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    validate_authenticator_runtime_path_identity_projection(&cache_partition.path_identity)?;
+
+    let kinds_are_sorted = !cache_partition.cache_kinds.is_empty()
+        && cache_partition.cache_kinds.len() <= 16
+        && cache_partition
+            .cache_kinds
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]);
+    let has_kind = |required| cache_partition.cache_kinds.binary_search(&required).is_ok();
+    let role_cache_inventory_matches = match cache_partition.path_identity.path_role {
+        AuthenticatorRuntimePathRole::DirectBearer => {
+            has_kind(AuthenticatorCacheKind::JwksKeySet)
+                && !has_kind(AuthenticatorCacheKind::BrowserLoginState)
+                && !has_kind(AuthenticatorCacheKind::DerivedSessionCredential)
+                && !has_kind(AuthenticatorCacheKind::NonceReplay)
+                && !has_kind(AuthenticatorCacheKind::TokenIntrospection)
+        }
+        AuthenticatorRuntimePathRole::BrowserDerivedSession => {
+            has_kind(AuthenticatorCacheKind::BrowserLoginState)
+                && has_kind(AuthenticatorCacheKind::DerivedSessionCredential)
+                && has_kind(AuthenticatorCacheKind::JwksKeySet)
+                && has_kind(AuthenticatorCacheKind::NonceReplay)
+                && !has_kind(AuthenticatorCacheKind::TokenIntrospection)
+        }
+    };
+
+    if !valid_canonical_scoped_id(
+        &cache_partition.cache_owner_id,
+        "authenticator-cache-owner:",
+    ) || !valid_canonical_scoped_id(
+        &cache_partition.cache_partition_id,
+        "authenticator-cache-partition:",
+    ) || cache_partition.cache_owner_id == cache_partition.cache_partition_id
+        || !kinds_are_sorted
+        || !role_cache_inventory_matches
+        || cache_partition.retained_consumer_ids.len() > 128
+        || !strictly_sorted_unique_strings(&cache_partition.retained_consumer_ids)
+        || !cache_partition
+            .retained_consumer_ids
+            .iter()
+            .all(|consumer| valid_canonical_scoped_id(consumer, "runtime-consumer:"))
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator cache partition binding",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authenticator_browser_state_authority_projection(
+    authority: &AuthenticatorBrowserStateAuthorityProjection,
+) -> bool {
+    valid_canonical_scoped_id(
+        &authority.state_authority_id,
+        "authenticator-state-authority:",
+    ) && authority.state_authority_version > 0
+        && authority.relation_name == AUTHENTICATOR_BROWSER_STATE_RELATION_V3
+        && authority.writer_contract_setting == AUTHENTICATOR_BROWSER_STATE_CONTRACT_SETTING
+        && authority.writer_contract_version == AUTHENTICATOR_BROWSER_STATE_CONTRACT_VERSION
+        && authority.consume_operation == AUTHENTICATOR_BROWSER_STATE_CONSUME_OPERATION
+        && valid_canonical_scoped_id(&authority.state_lifetime_limit_id, "limit:")
+        && authority.maximum_state_lifetime_seconds
+            == AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS
+        && authority.pkce_method == AUTHENTICATOR_BROWSER_PKCE_METHOD_S256
+        && authority.nonce_required
+        && authority.browser_binding_required
+        && authority.exact_origin_match_required
+}
+
+fn validate_authenticator_browser_exchange_authority_projection(
+    authority: &AuthenticatorBrowserExchangeAuthorityProjection,
+) -> bool {
+    let binding_digests = [
+        authority.authorization_endpoint_binding_digest.as_str(),
+        authority.token_endpoint_binding_digest.as_str(),
+        authority.redirect_uri_binding_digest.as_str(),
+        authority.client_id_binding_digest.as_str(),
+        authority.scopes_binding_digest.as_str(),
+    ];
+    let client_authentication_matches = matches!(
+        (
+            authority.client_authentication,
+            authority.client_credential_present
+        ),
+        (AuthenticatorBrowserClientAuthentication::None, false)
+            | (
+                AuthenticatorBrowserClientAuthentication::ClientSecretPost,
+                true
+            )
+    );
+
+    valid_canonical_scoped_id(
+        &authority.exchange_authority_id,
+        "authenticator-exchange-authority:",
+    ) && authority.exchange_authority_version > 0
+        && binding_digests
+            .iter()
+            .all(|digest| valid_sha256_digest(digest))
+        && binding_digests
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len()
+            == binding_digests.len()
+        && client_authentication_matches
+        && authority.connect_timeout_milliseconds > 0
+        && authority.request_timeout_milliseconds >= authority.connect_timeout_milliseconds
+        && authority.response_maximum_bytes > 0
+        && authority.https_required
+        && !authority.redirects_allowed
+        && !authority.ambient_proxy_allowed
+        && authority.pkce_verifier_sent
+        && authority.id_token_required
+        && !authority.provider_tokens_persisted
+        && !authority.provider_tokens_exposed
+}
+
+fn validate_authenticator_derived_session_authority_projection(
+    authority: &AuthenticatorDerivedSessionAuthorityProjection,
+) -> bool {
+    valid_canonical_scoped_id(
+        &authority.session_authority_id,
+        "authenticator-session-authority:",
+    ) && authority.session_authority_version > 0
+        && authority.relation_name == AUTHENTICATOR_DERIVED_SESSION_RELATION
+        && authority.credential_format == AUTHENTICATOR_DERIVED_SESSION_CREDENTIAL_FORMAT
+        && authority.credential_verifier_algorithm
+            == AUTHENTICATOR_DERIVED_SESSION_VERIFIER_ALGORITHM
+        && valid_sha256_digest(&authority.credential_key_identity_digest)
+        && authority.verifier_column_name == AUTHENTICATOR_DERIVED_SESSION_VERIFIER_COLUMN_V3
+        && valid_canonical_scoped_id(&authority.session_maximum_age_limit_id, "limit:")
+        && authority.maximum_session_age_seconds > 0
+        && valid_canonical_scoped_id(&authority.federated_authority_staleness_limit_id, "limit:")
+        && authority.session_maximum_age_limit_id
+            != authority.federated_authority_staleness_limit_id
+        && authority.maximum_federated_authority_staleness_seconds > 0
+        && authority.maximum_federated_authority_staleness_seconds
+            <= authority.maximum_session_age_seconds
+        && authority.exact_origin_copy_required
+        && valid_sha256_digest(&authority.cookie_policy_binding_digest)
+        && authority.credential_key_identity_digest != authority.cookie_policy_binding_digest
+}
+
+fn validate_authenticator_protocol_binding_projection(
+    protocol: &AuthenticatorProtocolBindingProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    validate_authenticator_runtime_path_identity_projection(&protocol.path_identity)?;
+    let replay = &protocol.replay;
+    let replay_store_valid = replay
+        .replay_store_binding_digest
+        .as_deref()
+        .is_none_or(valid_sha256_digest);
+    let mut authority_digests = vec![
+        protocol
+            .path_identity
+            .provider_configuration_payload_digest
+            .as_str(),
+        protocol.path_identity.issuer_binding_digest.as_str(),
+        protocol.path_identity.audience_set_binding_digest.as_str(),
+        protocol.path_identity.key_source_binding_digest.as_str(),
+    ];
+    if let Some(replay_store) = replay.replay_store_binding_digest.as_deref() {
+        authority_digests.push(replay_store);
+    }
+    if let Some(exchange) = protocol.browser_exchange_authority.as_ref() {
+        authority_digests.extend([
+            exchange.authorization_endpoint_binding_digest.as_str(),
+            exchange.token_endpoint_binding_digest.as_str(),
+            exchange.redirect_uri_binding_digest.as_str(),
+            exchange.client_id_binding_digest.as_str(),
+            exchange.scopes_binding_digest.as_str(),
+        ]);
+    }
+    if let Some(session) = protocol.derived_session_authority.as_ref() {
+        authority_digests.extend([
+            session.credential_key_identity_digest.as_str(),
+            session.cookie_policy_binding_digest.as_str(),
+        ]);
+    }
+    let authority_digests_are_domain_separated = authority_digests
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .len()
+        == authority_digests.len();
+    let direct_bearer = protocol.path_identity.path_role
+        == AuthenticatorRuntimePathRole::DirectBearer
+        && protocol.carrier == AuthenticatorCredentialCarrier::AuthorizationBearer
+        && protocol.proof_binding == AuthenticatorProofBinding::Bearer
+        && replay.credential_reuse == AuthenticatorCredentialReuse::ReusableUntilExpiry
+        && replay
+            .credential_lifetime_limit_id
+            .as_deref()
+            .is_some_and(|limit_id| valid_canonical_scoped_id(limit_id, "limit:"))
+        && replay
+            .maximum_credential_lifetime_seconds
+            .is_some_and(|seconds| seconds > 0)
+        && replay.sender_constraint == AuthenticatorSenderConstraint::None
+        && replay.presentation_replay_defense == AuthenticatorPresentationReplayDefense::None
+        && replay.nonce_binding == AuthenticatorNonceBinding::None
+        && replay.replay_store_binding_digest.is_none()
+        && protocol.browser_exchange_authority.is_none()
+        && protocol.browser_state_authority.is_none()
+        && protocol.derived_session_authority.is_none();
+    let browser_derived_session = protocol.path_identity.path_role
+        == AuthenticatorRuntimePathRole::BrowserDerivedSession
+        && protocol.carrier == AuthenticatorCredentialCarrier::OauthCallback
+        && protocol.proof_binding == AuthenticatorProofBinding::PkceS256
+        && replay.credential_reuse == AuthenticatorCredentialReuse::SingleUse
+        && replay.credential_lifetime_limit_id.is_none()
+        && replay.maximum_credential_lifetime_seconds.is_none()
+        && replay.sender_constraint == AuthenticatorSenderConstraint::None
+        && replay.presentation_replay_defense
+            == AuthenticatorPresentationReplayDefense::SingleUseState
+        && replay.nonce_binding == AuthenticatorNonceBinding::OidcLogin
+        && replay.replay_store_binding_digest.is_some()
+        && protocol
+            .browser_exchange_authority
+            .as_ref()
+            .is_some_and(validate_authenticator_browser_exchange_authority_projection)
+        && protocol
+            .browser_state_authority
+            .as_ref()
+            .is_some_and(validate_authenticator_browser_state_authority_projection)
+        && protocol
+            .derived_session_authority
+            .as_ref()
+            .is_some_and(validate_authenticator_derived_session_authority_projection);
+
+    if !replay_store_valid
+        || !authority_digests_are_domain_separated
+        || !(direct_bearer || browser_derived_session)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator protocol binding",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_authenticator_runtime_binding_projection(
     binding: &AuthenticatorRuntimeBindingProjection,
 ) -> Result<(), RuntimeGuardDigestError> {
@@ -1478,6 +2097,10 @@ fn validate_authenticator_runtime_binding_projection(
         || binding.capability_ids.is_empty()
         || binding.capability_ids.len() > 128
         || !valid_sorted_authenticator_identifiers(&binding.capability_ids)
+        || !binding
+            .capability_ids
+            .iter()
+            .all(|capability| matches!(capability.as_str(), "browser-sso" | "token-validation"))
         || binding.credential_paths.is_empty()
         || binding.credential_paths.len() > 32
         || !binding
@@ -1497,6 +2120,9 @@ fn validate_authenticator_runtime_binding_projection(
     let mut resolution_tuples = HashSet::new();
     let mut consumer_ids = HashSet::new();
     let mut cache_partition_digests = HashSet::new();
+    let mut protocol_binding_digests = HashSet::new();
+    let mut direct_bearer_path_count = 0_u8;
+    let mut browser_derived_session_path_count = 0_u8;
     for path in &binding.credential_paths {
         let verifier = &path.verifier;
         let profile = &path.credential_profile;
@@ -1537,6 +2163,8 @@ fn validate_authenticator_runtime_binding_projection(
             && profile.replay.nonce_binding == AuthenticatorNonceBinding::OidcLogin
             && replay_store_present;
         let credential_profile_shape_valid = bearer_profile || browser_profile;
+        direct_bearer_path_count += u8::from(bearer_profile);
+        browser_derived_session_path_count += u8::from(browser_profile);
         let required_claim_shape_valid = authenticator_claim_flags_match(verifier)
             && verifier
                 .required_claim_ids
@@ -1596,6 +2224,8 @@ fn validate_authenticator_runtime_binding_projection(
             || !valid_sha256_digest(&path.cache_partition_binding_digest)
             || !cache_partition_digests.insert(path.cache_partition_binding_digest.as_str())
             || !valid_sha256_digest(&path.protocol_binding_digest)
+            || path.cache_partition_binding_digest == path.protocol_binding_digest
+            || !protocol_binding_digests.insert(path.protocol_binding_digest.as_str())
             || path.retained_consumer_ids.len() > 128
             || !strictly_sorted_unique_strings(&path.retained_consumer_ids)
             || !path
@@ -1615,6 +2245,23 @@ fn validate_authenticator_runtime_binding_projection(
                 "authenticator runtime binding path",
             ));
         }
+    }
+    let declares_token_validation = binding
+        .capability_ids
+        .binary_search_by(|capability| capability.as_str().cmp("token-validation"))
+        .is_ok();
+    let declares_browser_sso = binding
+        .capability_ids
+        .binary_search_by(|capability| capability.as_str().cmp("browser-sso"))
+        .is_ok();
+    if direct_bearer_path_count > 1
+        || browser_derived_session_path_count > 1
+        || declares_token_validation != (direct_bearer_path_count == 1)
+        || declares_browser_sso != (browser_derived_session_path_count == 1)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator capability/path completeness",
+        ));
     }
     Ok(())
 }
@@ -3206,6 +3853,208 @@ mod tests {
         }
     }
 
+    fn authenticator_path_identity(
+        role: AuthenticatorRuntimePathRole,
+    ) -> AuthenticatorRuntimePathIdentityProjection {
+        let (path, verifier, token_profile, audience, key_source) = match role {
+            AuthenticatorRuntimePathRole::DirectBearer => {
+                ("api-bearer", "api-bearer", "jwt-access-token", '3', '4')
+            }
+            AuthenticatorRuntimePathRole::BrowserDerivedSession => {
+                ("browser-sso", "browser-sso", "oidc-id-token", '5', '6')
+            }
+        };
+        AuthenticatorRuntimePathIdentityProjection {
+            provider_id: "provider:fixture-oidc".into(),
+            provider_configuration_version: 7,
+            provider_configuration_payload_digest: fixture_digest('1'),
+            path_role: role,
+            path_id: format!("authenticator-path:{path}"),
+            path_version: 3,
+            verifier_id: format!("authenticator-verifier:fixture-oidc-{verifier}"),
+            verifier_version: 2,
+            token_profile: token_profile.into(),
+            issuer_binding_digest: fixture_digest('2'),
+            audience_set_binding_digest: fixture_digest(audience),
+            key_source_kind: AuthenticatorKeySourceKind::JwtJwks,
+            key_source_binding_digest: fixture_digest(key_source),
+        }
+    }
+
+    fn authenticator_cache_partition(
+        role: AuthenticatorRuntimePathRole,
+    ) -> AuthenticatorCachePartitionProjection {
+        let (suffix, cache_kinds, consumer) = match role {
+            AuthenticatorRuntimePathRole::DirectBearer => (
+                "api-bearer",
+                vec![AuthenticatorCacheKind::JwksKeySet],
+                "runtime-consumer:entra-bearer-request-admission",
+            ),
+            AuthenticatorRuntimePathRole::BrowserDerivedSession => (
+                "browser-sso",
+                vec![
+                    AuthenticatorCacheKind::BrowserLoginState,
+                    AuthenticatorCacheKind::DerivedSessionCredential,
+                    AuthenticatorCacheKind::JwksKeySet,
+                    AuthenticatorCacheKind::NonceReplay,
+                ],
+                "runtime-consumer:entra-browser-sso",
+            ),
+        };
+        AuthenticatorCachePartitionProjection {
+            path_identity: authenticator_path_identity(role),
+            cache_owner_id: format!("authenticator-cache-owner:{suffix}"),
+            cache_partition_id: format!("authenticator-cache-partition:{suffix}"),
+            cache_kinds,
+            retained_consumer_ids: vec![consumer.into()],
+        }
+    }
+
+    fn authenticator_protocol_binding(
+        role: AuthenticatorRuntimePathRole,
+    ) -> AuthenticatorProtocolBindingProjection {
+        match role {
+            AuthenticatorRuntimePathRole::DirectBearer => AuthenticatorProtocolBindingProjection {
+                path_identity: authenticator_path_identity(role),
+                carrier: AuthenticatorCredentialCarrier::AuthorizationBearer,
+                proof_binding: AuthenticatorProofBinding::Bearer,
+                replay: AuthenticatorReplayRuntimeProjection {
+                    credential_reuse: AuthenticatorCredentialReuse::ReusableUntilExpiry,
+                    credential_lifetime_limit_id: Some(
+                        "limit:authenticator.oidc-access-token-lifetime".into(),
+                    ),
+                    maximum_credential_lifetime_seconds: Some(3_600),
+                    sender_constraint: AuthenticatorSenderConstraint::None,
+                    presentation_replay_defense: AuthenticatorPresentationReplayDefense::None,
+                    nonce_binding: AuthenticatorNonceBinding::None,
+                    replay_store_binding_digest: None,
+                },
+                browser_exchange_authority: None,
+                browser_state_authority: None,
+                derived_session_authority: None,
+            },
+            AuthenticatorRuntimePathRole::BrowserDerivedSession => {
+                AuthenticatorProtocolBindingProjection {
+                    path_identity: authenticator_path_identity(role),
+                    carrier: AuthenticatorCredentialCarrier::OauthCallback,
+                    proof_binding: AuthenticatorProofBinding::PkceS256,
+                    replay: AuthenticatorReplayRuntimeProjection {
+                        credential_reuse: AuthenticatorCredentialReuse::SingleUse,
+                        credential_lifetime_limit_id: None,
+                        maximum_credential_lifetime_seconds: None,
+                        sender_constraint: AuthenticatorSenderConstraint::None,
+                        presentation_replay_defense:
+                            AuthenticatorPresentationReplayDefense::SingleUseState,
+                        nonce_binding: AuthenticatorNonceBinding::OidcLogin,
+                        replay_store_binding_digest: Some(fixture_digest('7')),
+                    },
+                    browser_exchange_authority: Some(
+                        AuthenticatorBrowserExchangeAuthorityProjection {
+                            exchange_authority_id: "authenticator-exchange-authority:oidc-browser"
+                                .into(),
+                            exchange_authority_version: 2,
+                            authorization_endpoint_binding_digest: fixture_digest('a'),
+                            token_endpoint_binding_digest: fixture_digest('b'),
+                            redirect_uri_binding_digest: fixture_digest('c'),
+                            client_id_binding_digest: fixture_digest('d'),
+                            scopes_binding_digest: fixture_digest('e'),
+                            client_authentication:
+                                AuthenticatorBrowserClientAuthentication::ClientSecretPost,
+                            client_credential_present: true,
+                            connect_timeout_milliseconds: 2_000,
+                            request_timeout_milliseconds: 10_000,
+                            response_maximum_bytes: 1_048_576,
+                            https_required: true,
+                            redirects_allowed: false,
+                            ambient_proxy_allowed: false,
+                            pkce_verifier_sent: true,
+                            id_token_required: true,
+                            provider_tokens_persisted: false,
+                            provider_tokens_exposed: false,
+                        },
+                    ),
+                    browser_state_authority: Some(AuthenticatorBrowserStateAuthorityProjection {
+                        state_authority_id: "authenticator-state-authority:oidc-login-state".into(),
+                        state_authority_version: 3,
+                        relation_name: "oidc_login_states_v3".into(),
+                        writer_contract_setting: "ryuki.oidc_login_state_contract".into(),
+                        writer_contract_version: 3,
+                        consume_operation: "delete-returning".into(),
+                        state_lifetime_limit_id: "limit:authenticator.browser-state-lifetime"
+                            .into(),
+                        maximum_state_lifetime_seconds: 600,
+                        pkce_method: "s256".into(),
+                        nonce_required: true,
+                        browser_binding_required: true,
+                        exact_origin_match_required: true,
+                    }),
+                    derived_session_authority: Some(
+                        AuthenticatorDerivedSessionAuthorityProjection {
+                            session_authority_id: "authenticator-session-authority:browser-session"
+                                .into(),
+                            session_authority_version: 3,
+                            relation_name: "sessions".into(),
+                            credential_format: "opaque-random-256-bit".into(),
+                            credential_verifier_algorithm: "hmac-sha256".into(),
+                            credential_key_identity_digest: fixture_digest('8'),
+                            verifier_column_name: "session_bearer_verifier_v3".into(),
+                            session_maximum_age_limit_id:
+                                "limit:authenticator.browser-session-maximum-age".into(),
+                            maximum_session_age_seconds: 28_800,
+                            federated_authority_staleness_limit_id:
+                                "limit:authenticator.federated-authority-staleness".into(),
+                            maximum_federated_authority_staleness_seconds: 900,
+                            exact_origin_copy_required: true,
+                            cookie_policy_binding_digest: fixture_digest('9'),
+                        },
+                    ),
+                }
+            }
+        }
+    }
+
+    fn authenticator_runtime_path_preimages(
+        binding: &AuthenticatorRuntimeBindingProjection,
+        path_index: usize,
+        role: AuthenticatorRuntimePathRole,
+    ) -> (
+        AuthenticatorCachePartitionProjection,
+        AuthenticatorProtocolBindingProjection,
+    ) {
+        let path = &binding.credential_paths[path_index];
+        let identity = AuthenticatorRuntimePathIdentityProjection {
+            provider_id: binding.provider.provider_id.clone(),
+            provider_configuration_version: binding.provider.configuration_version,
+            provider_configuration_payload_digest: binding
+                .provider
+                .configuration_payload_digest
+                .clone(),
+            path_role: role,
+            path_id: path.path_id.clone(),
+            path_version: path.path_version,
+            verifier_id: path.verifier.verifier_id.clone(),
+            verifier_version: path.verifier.verifier_version,
+            token_profile: path.credential_profile.token_profile.clone(),
+            issuer_binding_digest: path.verifier.issuer_binding_digest.clone(),
+            audience_set_binding_digest: path.verifier.audience_set_binding_digest.clone(),
+            key_source_kind: path.verifier.key_source_kind,
+            key_source_binding_digest: path.verifier.key_source_binding_digest.clone(),
+        };
+        let mut cache = authenticator_cache_partition(role);
+        cache.path_identity = identity.clone();
+        cache.retained_consumer_ids = path.retained_consumer_ids.clone();
+        let mut protocol = authenticator_protocol_binding(role);
+        protocol.path_identity = identity;
+        protocol.carrier = path.credential_profile.carrier;
+        protocol.proof_binding = path.credential_profile.proof_binding;
+        protocol.replay = path.credential_profile.replay.clone();
+        if let Some(session) = protocol.derived_session_authority.as_mut() {
+            session.credential_key_identity_digest = fixture_digest('f');
+            session.cookie_policy_binding_digest = fixture_digest('6');
+        }
+        (cache, protocol)
+    }
+
     fn all_authenticator_classes() -> Vec<ExpectedAuthenticatorBinding> {
         [
             (
@@ -4200,6 +5049,941 @@ mod tests {
     }
 
     #[test]
+    fn authenticator_cache_partition_has_an_independent_canonical_golden() {
+        let cache = authenticator_cache_partition(AuthenticatorRuntimePathRole::DirectBearer);
+        assert_independent_canonical_golden(
+            authenticator_cache_partition_binding_canonical_bytes(&cache).unwrap(),
+            json!({
+                "digest_contract": "ryuki-authenticator-cache-partition-v1",
+                "cache_partition": {
+                    "path_identity": {
+                        "provider_id": "provider:fixture-oidc",
+                        "provider_configuration_version": 7,
+                        "provider_configuration_payload_digest": fixture_digest('1'),
+                        "path_role": "direct-bearer",
+                        "path_id": "authenticator-path:api-bearer",
+                        "path_version": 3,
+                        "verifier_id": "authenticator-verifier:fixture-oidc-api-bearer",
+                        "verifier_version": 2,
+                        "token_profile": "jwt-access-token",
+                        "issuer_binding_digest": fixture_digest('2'),
+                        "audience_set_binding_digest": fixture_digest('3'),
+                        "key_source_kind": "jwt-jwks",
+                        "key_source_binding_digest": fixture_digest('4')
+                    },
+                    "cache_owner_id": "authenticator-cache-owner:api-bearer",
+                    "cache_partition_id": "authenticator-cache-partition:api-bearer",
+                    "cache_kinds": ["jwks-key-set"],
+                    "retained_consumer_ids": [
+                        "runtime-consumer:entra-bearer-request-admission"
+                    ]
+                }
+            }),
+        );
+
+        let digest = authenticator_cache_partition_binding_digest(&cache).unwrap();
+        assert!(
+            ![
+                &cache.path_identity.provider_configuration_payload_digest,
+                &cache.path_identity.issuer_binding_digest,
+                &cache.path_identity.audience_set_binding_digest,
+                &cache.path_identity.key_source_binding_digest,
+            ]
+            .contains(&&digest)
+        );
+    }
+
+    #[test]
+    fn authenticator_protocol_has_an_independent_browser_canonical_golden() {
+        let protocol =
+            authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession);
+        assert_independent_canonical_golden(
+            authenticator_protocol_binding_canonical_bytes(&protocol).unwrap(),
+            json!({
+                "digest_contract": "ryuki-authenticator-protocol-binding-v1",
+                "protocol_binding": {
+                    "path_identity": {
+                        "provider_id": "provider:fixture-oidc",
+                        "provider_configuration_version": 7,
+                        "provider_configuration_payload_digest": fixture_digest('1'),
+                        "path_role": "browser-derived-session",
+                        "path_id": "authenticator-path:browser-sso",
+                        "path_version": 3,
+                        "verifier_id": "authenticator-verifier:fixture-oidc-browser-sso",
+                        "verifier_version": 2,
+                        "token_profile": "oidc-id-token",
+                        "issuer_binding_digest": fixture_digest('2'),
+                        "audience_set_binding_digest": fixture_digest('5'),
+                        "key_source_kind": "jwt-jwks",
+                        "key_source_binding_digest": fixture_digest('6')
+                    },
+                    "carrier": "oauth-callback",
+                    "proof_binding": "pkce-s256",
+                    "replay": {
+                        "credential_reuse": "single-use",
+                        "credential_lifetime_limit_id": null,
+                        "maximum_credential_lifetime_seconds": null,
+                        "sender_constraint": "none",
+                        "presentation_replay_defense": "single-use-state",
+                        "nonce_binding": "oidc-login",
+                        "replay_store_binding_digest": fixture_digest('7')
+                    },
+                    "browser_exchange_authority": {
+                        "exchange_authority_id":
+                            "authenticator-exchange-authority:oidc-browser",
+                        "exchange_authority_version": 2,
+                        "authorization_endpoint_binding_digest": fixture_digest('a'),
+                        "token_endpoint_binding_digest": fixture_digest('b'),
+                        "redirect_uri_binding_digest": fixture_digest('c'),
+                        "client_id_binding_digest": fixture_digest('d'),
+                        "scopes_binding_digest": fixture_digest('e'),
+                        "client_authentication": "client-secret-post",
+                        "client_credential_present": true,
+                        "connect_timeout_milliseconds": 2000,
+                        "request_timeout_milliseconds": 10000,
+                        "response_maximum_bytes": 1048576,
+                        "https_required": true,
+                        "redirects_allowed": false,
+                        "ambient_proxy_allowed": false,
+                        "pkce_verifier_sent": true,
+                        "id_token_required": true,
+                        "provider_tokens_persisted": false,
+                        "provider_tokens_exposed": false
+                    },
+                    "browser_state_authority": {
+                        "state_authority_id":
+                            "authenticator-state-authority:oidc-login-state",
+                        "state_authority_version": 3,
+                        "relation_name": "oidc_login_states_v3",
+                        "writer_contract_setting": "ryuki.oidc_login_state_contract",
+                        "writer_contract_version": 3,
+                        "consume_operation": "delete-returning",
+                        "state_lifetime_limit_id":
+                            "limit:authenticator.browser-state-lifetime",
+                        "maximum_state_lifetime_seconds": 600,
+                        "pkce_method": "s256",
+                        "nonce_required": true,
+                        "browser_binding_required": true,
+                        "exact_origin_match_required": true
+                    },
+                    "derived_session_authority": {
+                        "session_authority_id":
+                            "authenticator-session-authority:browser-session",
+                        "session_authority_version": 3,
+                        "relation_name": "sessions",
+                        "credential_format": "opaque-random-256-bit",
+                        "credential_verifier_algorithm": "hmac-sha256",
+                        "credential_key_identity_digest": fixture_digest('8'),
+                        "verifier_column_name": "session_bearer_verifier_v3",
+                        "session_maximum_age_limit_id":
+                            "limit:authenticator.browser-session-maximum-age",
+                        "maximum_session_age_seconds": 28800,
+                        "federated_authority_staleness_limit_id":
+                            "limit:authenticator.federated-authority-staleness",
+                        "maximum_federated_authority_staleness_seconds": 900,
+                        "exact_origin_copy_required": true,
+                        "cookie_policy_binding_digest": fixture_digest('9')
+                    }
+                }
+            }),
+        );
+
+        let digest = authenticator_protocol_binding_digest(&protocol).unwrap();
+        let exchange = protocol.browser_exchange_authority.as_ref().unwrap();
+        let session = protocol.derived_session_authority.as_ref().unwrap();
+        assert!(
+            ![
+                &protocol.path_identity.provider_configuration_payload_digest,
+                &protocol.path_identity.issuer_binding_digest,
+                &protocol.path_identity.audience_set_binding_digest,
+                &protocol.path_identity.key_source_binding_digest,
+                protocol
+                    .replay
+                    .replay_store_binding_digest
+                    .as_ref()
+                    .unwrap(),
+                &exchange.authorization_endpoint_binding_digest,
+                &exchange.token_endpoint_binding_digest,
+                &exchange.redirect_uri_binding_digest,
+                &exchange.client_id_binding_digest,
+                &exchange.scopes_binding_digest,
+                &session.credential_key_identity_digest,
+                &session.cookie_policy_binding_digest,
+            ]
+            .contains(&&digest)
+        );
+    }
+
+    #[test]
+    fn authenticator_cache_and_protocol_digests_bind_every_nonconstant_leaf() {
+        let cache = authenticator_cache_partition(AuthenticatorRuntimePathRole::DirectBearer);
+        let cache_digest = authenticator_cache_partition_binding_digest(&cache).unwrap();
+        macro_rules! assert_cache_leaf_bound {
+            ($label:literal, $mutate:expr) => {{
+                let mut candidate = cache.clone();
+                ($mutate)(&mut candidate);
+                assert_ne!(
+                    authenticator_cache_partition_binding_digest(&candidate).unwrap_or_else(
+                        |error| panic!("valid {} mutation rejected: {error}", $label)
+                    ),
+                    cache_digest,
+                    "{} mutation must change the cache binding digest",
+                    $label
+                );
+            }};
+        }
+        assert_cache_leaf_bound!(
+            "provider_id",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.provider_id = "provider:fixture-oidc-next".into();
+            }
+        );
+        assert_cache_leaf_bound!(
+            "provider_configuration_version",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.provider_configuration_version += 1;
+            }
+        );
+        assert_cache_leaf_bound!(
+            "provider_configuration_payload_digest",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate
+                    .path_identity
+                    .provider_configuration_payload_digest = fixture_digest('f');
+            }
+        );
+        assert_cache_leaf_bound!(
+            "path_id",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.path_id = "authenticator-path:api-bearer-next".into();
+            }
+        );
+        assert_cache_leaf_bound!(
+            "path_version",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.path_version += 1;
+            }
+        );
+        assert_cache_leaf_bound!(
+            "verifier_id",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.verifier_id =
+                    "authenticator-verifier:fixture-oidc-api-bearer-next".into();
+            }
+        );
+        assert_cache_leaf_bound!(
+            "verifier_version",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.verifier_version += 1;
+            }
+        );
+        assert_cache_leaf_bound!(
+            "issuer_binding_digest",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.issuer_binding_digest = fixture_digest('f');
+            }
+        );
+        assert_cache_leaf_bound!(
+            "audience_set_binding_digest",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.audience_set_binding_digest = fixture_digest('f');
+            }
+        );
+        assert_cache_leaf_bound!(
+            "key_source_binding_digest",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.path_identity.key_source_binding_digest = fixture_digest('f');
+            }
+        );
+        assert_cache_leaf_bound!(
+            "cache_owner_id",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.cache_owner_id = "authenticator-cache-owner:api-bearer-next".into();
+            }
+        );
+        assert_cache_leaf_bound!(
+            "cache_partition_id",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.cache_partition_id =
+                    "authenticator-cache-partition:api-bearer-next".into();
+            }
+        );
+        assert_cache_leaf_bound!(
+            "cache_kinds",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate
+                    .cache_kinds
+                    .push(AuthenticatorCacheKind::OidcDiscoveryDocument);
+            }
+        );
+        assert_cache_leaf_bound!(
+            "retained_consumer_ids",
+            |candidate: &mut AuthenticatorCachePartitionProjection| {
+                candidate.retained_consumer_ids =
+                    vec!["runtime-consumer:entra-bearer-request-admission-next".into()];
+            }
+        );
+
+        let protocol =
+            authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession);
+        let protocol_digest = authenticator_protocol_binding_digest(&protocol).unwrap();
+        macro_rules! assert_protocol_leaf_bound {
+            ($label:literal, $mutate:expr) => {{
+                let mut candidate = protocol.clone();
+                ($mutate)(&mut candidate);
+                assert_ne!(
+                    authenticator_protocol_binding_digest(&candidate).unwrap_or_else(
+                        |error| panic!("valid {} mutation rejected: {error}", $label)
+                    ),
+                    protocol_digest,
+                    "{} mutation must change the protocol binding digest",
+                    $label
+                );
+            }};
+        }
+        assert_protocol_leaf_bound!(
+            "provider_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.provider_id = "provider:fixture-oidc-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "provider_configuration_version",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.provider_configuration_version += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "provider_configuration_payload_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .path_identity
+                    .provider_configuration_payload_digest = fixture_digest('f');
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "path_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.path_id = "authenticator-path:browser-sso-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "path_version",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.path_version += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "verifier_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.verifier_id =
+                    "authenticator-verifier:fixture-oidc-browser-sso-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "verifier_version",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.verifier_version += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "issuer_binding_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.issuer_binding_digest = fixture_digest('f');
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "audience_set_binding_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.audience_set_binding_digest = fixture_digest('f');
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "key_source_binding_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.path_identity.key_source_binding_digest = fixture_digest('f');
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "replay_store_binding_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate.replay.replay_store_binding_digest = Some(fixture_digest('f'));
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "exchange_authority_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_exchange_authority
+                    .as_mut()
+                    .unwrap()
+                    .exchange_authority_id =
+                    "authenticator-exchange-authority:oidc-browser-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "exchange_authority_version",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_exchange_authority
+                    .as_mut()
+                    .unwrap()
+                    .exchange_authority_version += 1;
+            }
+        );
+        for (label, field) in [
+            ("authorization_endpoint_binding_digest", 0_u8),
+            ("token_endpoint_binding_digest", 1),
+            ("redirect_uri_binding_digest", 2),
+            ("client_id_binding_digest", 3),
+            ("scopes_binding_digest", 4),
+        ] {
+            let mut candidate = protocol.clone();
+            let exchange = candidate.browser_exchange_authority.as_mut().unwrap();
+            match field {
+                0 => exchange.authorization_endpoint_binding_digest = fixture_digest('f'),
+                1 => exchange.token_endpoint_binding_digest = fixture_digest('f'),
+                2 => exchange.redirect_uri_binding_digest = fixture_digest('f'),
+                3 => exchange.client_id_binding_digest = fixture_digest('f'),
+                4 => exchange.scopes_binding_digest = fixture_digest('f'),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                authenticator_protocol_binding_digest(&candidate).unwrap(),
+                protocol_digest,
+                "{label} mutation must change the protocol binding digest"
+            );
+        }
+        assert_protocol_leaf_bound!(
+            "client_authentication",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                let exchange = candidate.browser_exchange_authority.as_mut().unwrap();
+                exchange.client_authentication = AuthenticatorBrowserClientAuthentication::None;
+                exchange.client_credential_present = false;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "connect_timeout_milliseconds",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_exchange_authority
+                    .as_mut()
+                    .unwrap()
+                    .connect_timeout_milliseconds += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "request_timeout_milliseconds",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_exchange_authority
+                    .as_mut()
+                    .unwrap()
+                    .request_timeout_milliseconds += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "response_maximum_bytes",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_exchange_authority
+                    .as_mut()
+                    .unwrap()
+                    .response_maximum_bytes += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "state_authority_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_state_authority
+                    .as_mut()
+                    .unwrap()
+                    .state_authority_id =
+                    "authenticator-state-authority:oidc-login-state-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "state_authority_version",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_state_authority
+                    .as_mut()
+                    .unwrap()
+                    .state_authority_version += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "state_lifetime_limit_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .browser_state_authority
+                    .as_mut()
+                    .unwrap()
+                    .state_lifetime_limit_id =
+                    "limit:authenticator.browser-state-lifetime-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "session_authority_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .session_authority_id =
+                    "authenticator-session-authority:browser-session-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "session_authority_version",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .session_authority_version += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "credential_key_identity_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .credential_key_identity_digest = fixture_digest('f');
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "session_maximum_age_limit_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .session_maximum_age_limit_id =
+                    "limit:authenticator.browser-session-maximum-age-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "maximum_session_age_seconds",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .maximum_session_age_seconds += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "federated_authority_staleness_limit_id",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .federated_authority_staleness_limit_id =
+                    "limit:authenticator.federated-authority-staleness-next".into();
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "maximum_federated_authority_staleness_seconds",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .maximum_federated_authority_staleness_seconds += 1;
+            }
+        );
+        assert_protocol_leaf_bound!(
+            "cookie_policy_binding_digest",
+            |candidate: &mut AuthenticatorProtocolBindingProjection| {
+                candidate
+                    .derived_session_authority
+                    .as_mut()
+                    .unwrap()
+                    .cookie_policy_binding_digest = fixture_digest('f');
+            }
+        );
+
+        let direct = authenticator_protocol_binding(AuthenticatorRuntimePathRole::DirectBearer);
+        let direct_digest = authenticator_protocol_binding_digest(&direct).unwrap();
+        let mut lifetime_limit_drift = direct.clone();
+        lifetime_limit_drift.replay.credential_lifetime_limit_id =
+            Some("limit:authenticator.oidc-access-token-lifetime-next".into());
+        assert_ne!(
+            authenticator_protocol_binding_digest(&lifetime_limit_drift).unwrap(),
+            direct_digest
+        );
+        let mut lifetime_drift = direct;
+        lifetime_drift.replay.maximum_credential_lifetime_seconds = Some(3_601);
+        assert_ne!(
+            authenticator_protocol_binding_digest(&lifetime_drift).unwrap(),
+            direct_digest
+        );
+    }
+
+    #[test]
+    fn authenticator_runtime_paths_reconcile_exact_typed_preimages() {
+        for (path_index, role) in [
+            (0, AuthenticatorRuntimePathRole::DirectBearer),
+            (1, AuthenticatorRuntimePathRole::BrowserDerivedSession),
+        ] {
+            let mut binding = authenticator_runtime_binding(
+                "provider:fixture-oidc",
+                ProductionAuthenticatorKind::Oidc,
+            );
+            let (cache, protocol) =
+                authenticator_runtime_path_preimages(&binding, path_index, role);
+            binding.credential_paths[path_index].cache_partition_binding_digest =
+                authenticator_cache_partition_binding_digest(&cache).unwrap();
+            binding.credential_paths[path_index].protocol_binding_digest =
+                authenticator_protocol_binding_digest(&protocol).unwrap();
+            validate_authenticator_runtime_path_preimages(&binding, &cache, &protocol).unwrap();
+
+            let mut provider_substitution = cache.clone();
+            provider_substitution
+                .path_identity
+                .provider_configuration_version += 1;
+            binding.credential_paths[path_index].cache_partition_binding_digest =
+                authenticator_cache_partition_binding_digest(&provider_substitution).unwrap();
+            assert!(
+                validate_authenticator_runtime_path_preimages(
+                    &binding,
+                    &provider_substitution,
+                    &protocol,
+                )
+                .is_err(),
+                "{role:?} provider substitution must fail reconciliation"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticator_cache_and_protocol_reject_malformed_and_role_confused_preimages() {
+        let direct_cache =
+            authenticator_cache_partition(AuthenticatorRuntimePathRole::DirectBearer);
+        let mut malformed_caches = Vec::new();
+        let mut candidate = direct_cache.clone();
+        candidate.path_identity.provider_id = "deployment:fixture".into();
+        malformed_caches.push(("provider namespace", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.path_identity.provider_configuration_version = 0;
+        malformed_caches.push(("provider version", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate
+            .path_identity
+            .provider_configuration_payload_digest = "sha256:invalid".into();
+        malformed_caches.push(("provider digest", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.path_identity.issuer_binding_digest =
+            candidate.path_identity.audience_set_binding_digest.clone();
+        malformed_caches.push(("authority digest collision", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.path_identity.path_role = AuthenticatorRuntimePathRole::BrowserDerivedSession;
+        malformed_caches.push(("path role/token profile confusion", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.path_identity.token_profile = "oidc-id-token".into();
+        malformed_caches.push(("token profile/role confusion", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.path_identity.key_source_kind =
+            AuthenticatorKeySourceKind::AuthenticatedIntrospection;
+        malformed_caches.push(("key source confusion", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.cache_owner_id = "runtime-owner:fixture".into();
+        malformed_caches.push(("cache owner namespace", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.cache_partition_id = candidate.cache_owner_id.clone();
+        malformed_caches.push(("cache owner/partition substitution", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.cache_kinds.clear();
+        malformed_caches.push(("empty cache inventory", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.cache_kinds = vec![
+            AuthenticatorCacheKind::OidcDiscoveryDocument,
+            AuthenticatorCacheKind::JwksKeySet,
+        ];
+        malformed_caches.push(("unsorted cache inventory", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.cache_kinds = vec![
+            AuthenticatorCacheKind::JwksKeySet,
+            AuthenticatorCacheKind::JwksKeySet,
+        ];
+        malformed_caches.push(("duplicate cache inventory", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate
+            .cache_kinds
+            .insert(0, AuthenticatorCacheKind::BrowserLoginState);
+        malformed_caches.push(("browser cache on bearer path", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.retained_consumer_ids.clear();
+        malformed_caches.push(("empty consumer inventory", candidate));
+        let mut candidate = direct_cache.clone();
+        candidate.retained_consumer_ids = vec![
+            "runtime-consumer:zeta".into(),
+            "runtime-consumer:alpha".into(),
+        ];
+        malformed_caches.push(("unsorted consumer inventory", candidate));
+        for (label, candidate) in malformed_caches {
+            assert!(
+                authenticator_cache_partition_binding_digest(&candidate).is_err(),
+                "malformed {label} cache preimage must fail closed"
+            );
+        }
+
+        let browser =
+            authenticator_protocol_binding(AuthenticatorRuntimePathRole::BrowserDerivedSession);
+        let mut direct = authenticator_protocol_binding(AuthenticatorRuntimePathRole::DirectBearer);
+        direct.browser_exchange_authority = browser.browser_exchange_authority.clone();
+        assert!(authenticator_protocol_binding_digest(&direct).is_err());
+        let mut direct = authenticator_protocol_binding(AuthenticatorRuntimePathRole::DirectBearer);
+        direct.browser_state_authority = browser.browser_state_authority.clone();
+        assert!(authenticator_protocol_binding_digest(&direct).is_err());
+        let mut direct = authenticator_protocol_binding(AuthenticatorRuntimePathRole::DirectBearer);
+        direct.derived_session_authority = browser.derived_session_authority.clone();
+        assert!(authenticator_protocol_binding_digest(&direct).is_err());
+
+        for missing_arm in ["exchange", "state", "session"] {
+            let mut candidate = browser.clone();
+            match missing_arm {
+                "exchange" => candidate.browser_exchange_authority = None,
+                "state" => candidate.browser_state_authority = None,
+                "session" => candidate.derived_session_authority = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                authenticator_protocol_binding_digest(&candidate).is_err(),
+                "browser protocol without {missing_arm} authority must fail closed"
+            );
+        }
+
+        let invalid_leaf_mutations = [
+            ("/path_identity/path_role", json!("direct-bearer")),
+            ("/path_identity/token_profile", json!("jwt-access-token")),
+            (
+                "/path_identity/key_source_kind",
+                json!("authenticated-introspection"),
+            ),
+            ("/carrier", json!("authorization-bearer")),
+            ("/proof_binding", json!("bearer")),
+            ("/replay/credential_reuse", json!("reusable-until-expiry")),
+            (
+                "/replay/credential_lifetime_limit_id",
+                json!("limit:fixture"),
+            ),
+            ("/replay/maximum_credential_lifetime_seconds", json!(3600)),
+            ("/replay/sender_constraint", json!("dpop")),
+            ("/replay/presentation_replay_defense", json!("none")),
+            ("/replay/nonce_binding", json!("none")),
+            ("/replay/replay_store_binding_digest", Value::Null),
+            (
+                "/replay/replay_store_binding_digest",
+                json!(fixture_digest('1')),
+            ),
+            (
+                "/browser_exchange_authority/exchange_authority_id",
+                json!("runtime-owner:fixture"),
+            ),
+            (
+                "/browser_exchange_authority/exchange_authority_version",
+                json!(0),
+            ),
+            (
+                "/browser_exchange_authority/authorization_endpoint_binding_digest",
+                json!("sha256:invalid"),
+            ),
+            (
+                "/browser_exchange_authority/token_endpoint_binding_digest",
+                json!(fixture_digest('a')),
+            ),
+            (
+                "/browser_exchange_authority/token_endpoint_binding_digest",
+                json!(fixture_digest('2')),
+            ),
+            (
+                "/browser_exchange_authority/client_authentication",
+                json!("none"),
+            ),
+            (
+                "/browser_exchange_authority/client_credential_present",
+                json!(false),
+            ),
+            (
+                "/browser_exchange_authority/connect_timeout_milliseconds",
+                json!(0),
+            ),
+            (
+                "/browser_exchange_authority/request_timeout_milliseconds",
+                json!(1000),
+            ),
+            (
+                "/browser_exchange_authority/response_maximum_bytes",
+                json!(0),
+            ),
+            ("/browser_exchange_authority/https_required", json!(false)),
+            ("/browser_exchange_authority/redirects_allowed", json!(true)),
+            (
+                "/browser_exchange_authority/ambient_proxy_allowed",
+                json!(true),
+            ),
+            (
+                "/browser_exchange_authority/pkce_verifier_sent",
+                json!(false),
+            ),
+            (
+                "/browser_exchange_authority/id_token_required",
+                json!(false),
+            ),
+            (
+                "/browser_exchange_authority/provider_tokens_persisted",
+                json!(true),
+            ),
+            (
+                "/browser_exchange_authority/provider_tokens_exposed",
+                json!(true),
+            ),
+            (
+                "/browser_state_authority/state_authority_id",
+                json!("runtime-owner:fixture"),
+            ),
+            ("/browser_state_authority/state_authority_version", json!(0)),
+            (
+                "/browser_state_authority/relation_name",
+                json!("oidc_login_states"),
+            ),
+            (
+                "/browser_state_authority/writer_contract_setting",
+                json!("ryuki.oidc_login_state_contract_v2"),
+            ),
+            ("/browser_state_authority/writer_contract_version", json!(2)),
+            (
+                "/browser_state_authority/consume_operation",
+                json!("select-delete"),
+            ),
+            (
+                "/browser_state_authority/state_lifetime_limit_id",
+                json!("runtime-limit:fixture"),
+            ),
+            (
+                "/browser_state_authority/maximum_state_lifetime_seconds",
+                json!(599),
+            ),
+            ("/browser_state_authority/pkce_method", json!("plain")),
+            ("/browser_state_authority/nonce_required", json!(false)),
+            (
+                "/browser_state_authority/browser_binding_required",
+                json!(false),
+            ),
+            (
+                "/browser_state_authority/exact_origin_match_required",
+                json!(false),
+            ),
+            (
+                "/derived_session_authority/session_authority_id",
+                json!("runtime-owner:fixture"),
+            ),
+            (
+                "/derived_session_authority/session_authority_version",
+                json!(0),
+            ),
+            (
+                "/derived_session_authority/relation_name",
+                json!("auth_sessions"),
+            ),
+            (
+                "/derived_session_authority/credential_format",
+                json!("bearer-token"),
+            ),
+            (
+                "/derived_session_authority/credential_verifier_algorithm",
+                json!("sha256"),
+            ),
+            (
+                "/derived_session_authority/credential_key_identity_digest",
+                json!("sha256:invalid"),
+            ),
+            (
+                "/derived_session_authority/credential_key_identity_digest",
+                json!(fixture_digest('7')),
+            ),
+            (
+                "/derived_session_authority/verifier_column_name",
+                json!("bearer_verifier"),
+            ),
+            (
+                "/derived_session_authority/session_maximum_age_limit_id",
+                json!("runtime-limit:fixture"),
+            ),
+            (
+                "/derived_session_authority/maximum_session_age_seconds",
+                json!(0),
+            ),
+            (
+                "/derived_session_authority/federated_authority_staleness_limit_id",
+                json!("limit:authenticator.browser-session-maximum-age"),
+            ),
+            (
+                "/derived_session_authority/maximum_federated_authority_staleness_seconds",
+                json!(28801),
+            ),
+            (
+                "/derived_session_authority/exact_origin_copy_required",
+                json!(false),
+            ),
+            (
+                "/derived_session_authority/cookie_policy_binding_digest",
+                json!(fixture_digest('8')),
+            ),
+        ];
+        for (pointer, mutation) in invalid_leaf_mutations {
+            let mut raw = serde_json::to_value(&browser).unwrap();
+            *raw.pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing test pointer {pointer}")) = mutation;
+            if let Ok(candidate) =
+                serde_json::from_value::<AuthenticatorProtocolBindingProjection>(raw)
+            {
+                assert!(
+                    authenticator_protocol_binding_digest(&candidate).is_err(),
+                    "invalid {pointer} mutation must fail closed"
+                );
+            }
+        }
+
+        for required_arm in [
+            "browser_exchange_authority",
+            "browser_state_authority",
+            "derived_session_authority",
+        ] {
+            let mut raw = serde_json::to_value(&browser).unwrap();
+            raw.as_object_mut().unwrap().remove(required_arm);
+            assert!(
+                serde_json::from_value::<AuthenticatorProtocolBindingProjection>(raw).is_err(),
+                "omitting explicit {required_arm} must fail closed"
+            );
+        }
+
+        let mut unknown_cache = serde_json::to_value(&direct_cache).unwrap();
+        unknown_cache
+            .as_object_mut()
+            .unwrap()
+            .insert("fallback_partition".into(), json!(true));
+        assert!(
+            serde_json::from_value::<AuthenticatorCachePartitionProjection>(unknown_cache).is_err()
+        );
+        let mut unknown_protocol = serde_json::to_value(browser).unwrap();
+        unknown_protocol
+            .as_object_mut()
+            .unwrap()
+            .insert("fallback_protocol".into(), json!(true));
+        assert!(
+            serde_json::from_value::<AuthenticatorProtocolBindingProjection>(unknown_protocol)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn authenticator_runtime_binding_has_an_independent_golden_and_leaf_drift() {
         let binding = authenticator_runtime_binding(
             "provider:fixture-oidc",
@@ -4406,6 +6190,20 @@ mod tests {
                 .clone();
         assert!(authenticator_runtime_binding_digest(&duplicate_cache_partition).is_err());
 
+        let mut duplicate_protocol_binding = binding.clone();
+        duplicate_protocol_binding.credential_paths[1].protocol_binding_digest =
+            duplicate_protocol_binding.credential_paths[0]
+                .protocol_binding_digest
+                .clone();
+        assert!(authenticator_runtime_binding_digest(&duplicate_protocol_binding).is_err());
+
+        let mut cache_protocol_collision = binding.clone();
+        cache_protocol_collision.credential_paths[0].protocol_binding_digest =
+            cache_protocol_collision.credential_paths[0]
+                .cache_partition_binding_digest
+                .clone();
+        assert!(authenticator_runtime_binding_digest(&cache_protocol_collision).is_err());
+
         let mut unsupported_kind = binding.clone();
         unsupported_kind.authenticator_kind = ProductionAuthenticatorKind::Passkey;
         assert!(authenticator_runtime_binding_digest(&unsupported_kind).is_err());
@@ -4413,6 +6211,11 @@ mod tests {
         let mut empty_capabilities = binding.clone();
         empty_capabilities.capability_ids.clear();
         assert!(authenticator_runtime_binding_digest(&empty_capabilities).is_err());
+
+        let mut unsupported_capability = binding.clone();
+        unsupported_capability.capability_ids =
+            vec!["password-auth".into(), "token-validation".into()];
+        assert!(authenticator_runtime_binding_digest(&unsupported_capability).is_err());
 
         let mut unimplemented_dpop = binding.clone();
         unimplemented_dpop.credential_paths[0]
@@ -4438,16 +6241,20 @@ mod tests {
 
         let mut bearer_only = binding.clone();
         bearer_only.credential_paths.truncate(1);
-        let bearer_only_digest = authenticator_runtime_binding_digest(&bearer_only).unwrap();
-        let mut approved_variant_change = bearer_only.clone();
-        approved_variant_change.credential_paths[0].verifier =
+        assert!(
+            authenticator_runtime_binding_digest(&bearer_only).is_err(),
+            "browser-sso capability without a browser path must fail closed"
+        );
+        bearer_only.capability_ids = vec!["token-validation".into()];
+        assert!(authenticator_runtime_binding_digest(&bearer_only).is_ok());
+        let mut coordinated_relabel = bearer_only.clone();
+        coordinated_relabel.credential_paths[0].verifier =
             binding.credential_paths[1].verifier.clone();
-        approved_variant_change.credential_paths[0].credential_profile =
+        coordinated_relabel.credential_paths[0].credential_profile =
             binding.credential_paths[1].credential_profile.clone();
-        assert_ne!(
-            authenticator_runtime_binding_digest(&approved_variant_change).unwrap(),
-            bearer_only_digest,
-            "a coordinated switch to another valid admission variant must change R"
+        assert!(
+            authenticator_runtime_binding_digest(&coordinated_relabel).is_err(),
+            "a coordinated bearer/browser relabel under the bearer capability must fail closed"
         );
 
         let mut digest_collision = binding.clone();
