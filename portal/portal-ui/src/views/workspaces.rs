@@ -3911,6 +3911,25 @@ fn token_status(token: &AdminTokenSummary) -> (&'static str, &'static str) {
     }
 }
 
+fn token_create_form_ready(name: &str, roles: &[String]) -> bool {
+    !name.trim().is_empty() && !roles.is_empty()
+}
+
+#[cfg(test)]
+mod credential_admin_tests {
+    use super::token_create_form_ready;
+
+    #[test]
+    fn token_creation_requires_name_and_roles_but_not_caller_supplied_identity() {
+        assert!(token_create_form_ready(
+            "ci-deployer",
+            &["VMwareOperator".to_string()]
+        ));
+        assert!(!token_create_form_ready("", &["Auditor".to_string()]));
+        assert!(!token_create_form_ready("ci-deployer", &[]));
+    }
+}
+
 /// Extracts a user-facing message from a server function error, falling back
 /// to a generic label. Server function transport noise is never surfaced raw.
 fn server_error_message(error: &ServerFnError, fallback: &str) -> String {
@@ -3935,7 +3954,6 @@ fn TokenAdministrationDetail() -> impl IntoView {
 
     // Create-form state.
     let name = RwSignal::new(String::new());
-    let owner = RwSignal::new(String::new());
     let roles = RwSignal::new(Vec::<String>::new());
     let site_scope = RwSignal::new(String::new());
     let environment_scope = RwSignal::new(String::new());
@@ -3961,7 +3979,6 @@ fn TokenAdministrationDetail() -> impl IntoView {
                     feedback.set("Token created — copy the secret now".to_string());
                     feedback_class.set("badge good");
                     name.set(String::new());
-                    owner.set(String::new());
                     roles.set(Vec::new());
                     site_scope.set(String::new());
                     environment_scope.set(String::new());
@@ -4096,7 +4113,7 @@ fn TokenAdministrationDetail() -> impl IntoView {
                                             <thead>
                                                 <tr>
                                                     <th>"Name"</th>
-                                                    <th>"Owner"</th>
+                                                    <th>"Issuing principal"</th>
                                                     <th>"Roles"</th>
                                                     <th>"Scopes"</th>
                                                     <th>"Last used"</th>
@@ -4131,7 +4148,7 @@ fn TokenAdministrationDetail() -> impl IntoView {
                                                                 <td>
                                                                     <strong>{token.name.clone()}</strong>
                                                                 </td>
-                                                                <td>{token.owner_principal.clone()}</td>
+                                                                <td>{scope_label(&token.issuing_principal_id)}</td>
                                                                 <td>{roles_label}</td>
                                                                 <td>{scopes_label}</td>
                                                                 <td>{timestamp_label(&token.last_used_at)}</td>
@@ -4171,13 +4188,9 @@ fn TokenAdministrationDetail() -> impl IntoView {
                                             prop:value=move || name.get()
                                             on:input=move |ev| name.set(event_target_value(&ev))
                                         />
-                                        <input
-                                            type="text"
-                                            class="settings-input"
-                                            placeholder="Owner principal (e.g. svc:ci-pipeline)"
-                                            prop:value=move || owner.get()
-                                            on:input=move |ev| owner.set(event_target_value(&ev))
-                                        />
+                                        <span class="table-note">
+                                            "The API binds the issuing principal from your verified session."
+                                        </span>
                                         <span class="table-note">"Roles (select at least one)"</span>
                                         <div class="role-multiselect" aria-label="Token roles">
                                             {ALL_APP_ROLES
@@ -4238,9 +4251,7 @@ fn TokenAdministrationDetail() -> impl IntoView {
                                             <button
                                                 class="btn btn-primary"
                                                 disabled=move || {
-                                                    name.get().trim().is_empty()
-                                                        || owner.get().trim().is_empty()
-                                                        || roles.get().is_empty()
+                                                    !token_create_form_ready(&name.get(), &roles.get())
                                                 }
                                                 on:click=move |_| {
                                                     let optional = |value: String| {
@@ -4250,7 +4261,6 @@ fn TokenAdministrationDetail() -> impl IntoView {
                                                     create_action
                                                         .dispatch(CreateTokenPayload {
                                                             name: name.get().trim().to_string(),
-                                                            owner_principal: owner.get().trim().to_string(),
                                                             roles: roles.get(),
                                                             site_scope: optional(site_scope.get()),
                                                             environment_scope: optional(environment_scope.get()),
@@ -4359,10 +4369,10 @@ fn SessionAdministrationDetail() -> impl IntoView {
                                         <table class="dense-table">
                                             <thead>
                                                 <tr>
-                                                    <th>"User"</th>
+                                                    <th>"Principal"</th>
                                                     <th>"Display name"</th>
                                                     <th>"Roles"</th>
-                                                    <th>"Provider"</th>
+                                                    <th>"Provider ID"</th>
                                                     <th>"Expires"</th>
                                                     <th>"Action"</th>
                                                 </tr>
@@ -4381,11 +4391,11 @@ fn SessionAdministrationDetail() -> impl IntoView {
                                                         view! {
                                                             <tr>
                                                                 <td>
-                                                                    <strong>{session.user_id.clone()}</strong>
+                                                                    <strong>{session.principal_id.clone()}</strong>
                                                                 </td>
                                                                 <td>{session.display_name.clone()}</td>
                                                                 <td>{roles_label}</td>
-                                                                <td>{scope_label(&session.provider)}</td>
+                                                                <td>{session.provider_id.clone()}</td>
                                                                 <td>{timestamp_label(&session.expires_at)}</td>
                                                                 <td>
                                                                     <button

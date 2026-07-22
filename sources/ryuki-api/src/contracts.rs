@@ -18773,7 +18773,7 @@ fn token_row_to_json(row: TokenListRow) -> Value {
     })
 }
 
-/// GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/owner/expiry
+/// GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/issuer/expiry
 /// before revoking). Mirrors `admin_tokens_list`'s secret-safe projection via the
 /// shared `token_row_to_json`. `WHERE id = $1` only (NO `revoked_at` filter), so a
 /// revoked token is still readable like the list; a genuinely-absent id is 404.
@@ -99877,25 +99877,49 @@ mod admin_tokens_sessions_pagination_db_tests {
             return;
         };
         let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let owner = format!("pg-token-owner-{suffix}");
+        let subject = format!("pg-token-subject-{suffix}");
+        let (issuer, binding) = seed_session_authority(pool, &subject).await;
+        let mut token_tx = pool.begin().await.expect("begin pagination token seed");
+        crate::human_authority::prepare_writer_tx(
+            &mut token_tx,
+            "static-dry-run",
+            &issuer,
+            &subject,
+        )
+        .await
+        .expect("prepare pagination token writer");
         let mut ids: Vec<Uuid> = Vec::new();
-        // 5 tokens owned by this test's unique owner, so the pre-existing table
-        // contents (if any) never affect the page-slicing assertions below —
-        // only the delta between two calls does.
+        // Five uniquely named tokens share one exact issuer binding. The API,
+        // not the request body, owns every principal/key/link field.
         for i in 0..5 {
             let id: Uuid = sqlx::query_scalar(
-                "INSERT INTO api_tokens (name, owner_principal, token_hash, roles, token_valid) \
-                 VALUES ($1, $2, $3, $4, FALSE) RETURNING id",
+                "INSERT INTO api_tokens \
+                 (name, token_hash, roles, token_valid, expires_at, \
+                  issuing_principal_id, issuing_principal_lifecycle_version, \
+                  issuing_principal_authority_version, principal_key_id, \
+                  principal_key_version, principal_link_id, principal_link_version) \
+                 VALUES ($1, $2, $3, FALSE, NOW() + INTERVAL '1 hour', \
+                         $4, $5, $6, $7, $8, $9, $10) RETURNING id",
             )
             .bind(format!("pg-token-{suffix}-{i}"))
-            .bind(&owner)
             .bind(format!("hash-{suffix}-{i}"))
             .bind(vec!["PlatformAdmin".to_string()])
-            .fetch_one(pool)
+            .bind(binding.principal_id.into_uuid())
+            .bind(binding.principal_lifecycle_version)
+            .bind(binding.principal_authority_version)
+            .bind(binding.principal_key_id)
+            .bind(binding.principal_key_version)
+            .bind(binding.principal_link_id)
+            .bind(binding.principal_link_version)
+            .fetch_one(&mut *token_tx)
             .await
             .expect("seed api_token");
             ids.push(id);
         }
+        token_tx
+            .commit()
+            .await
+            .expect("commit pagination token seed");
 
         let total_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens")
             .fetch_one(pool)
@@ -99986,26 +100010,48 @@ mod admin_tokens_sessions_pagination_db_tests {
             return;
         };
         let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let owner = format!("pg-tie-owner-{suffix}");
+        let subject = format!("pg-tie-subject-{suffix}");
+        let (issuer, binding) = seed_session_authority(pool, &subject).await;
+        let mut token_tx = pool.begin().await.expect("begin tied token seed");
+        crate::human_authority::prepare_writer_tx(
+            &mut token_tx,
+            "static-dry-run",
+            &issuer,
+            &subject,
+        )
+        .await
+        .expect("prepare tied token writer");
         let mut ids: Vec<Uuid> = Vec::new();
         for i in 0..5 {
             let id: Uuid = sqlx::query_scalar(
                 "INSERT INTO api_tokens \
-                 (name, owner_principal, token_hash, roles, token_valid, created_at) \
-                 VALUES ($1, $2, $3, $4, FALSE, $5::timestamptz) RETURNING id",
+                 (name, token_hash, roles, token_valid, created_at, expires_at, \
+                  issuing_principal_id, issuing_principal_lifecycle_version, \
+                  issuing_principal_authority_version, principal_key_id, \
+                  principal_key_version, principal_link_id, principal_link_version) \
+                 VALUES ($1, $2, $3, FALSE, $4::timestamptz, \
+                         $4::timestamptz + INTERVAL '1 hour', \
+                         $5, $6, $7, $8, $9, $10, $11) RETURNING id",
             )
             .bind(format!("pg-tie-{suffix}-{i}"))
-            .bind(&owner)
             .bind(format!("hash-tie-{suffix}-{i}"))
             .bind(vec!["PlatformAdmin".to_string()])
             // Identical created_at across all five rows -> forces the tie the
             // id tie-breaker must resolve deterministically.
             .bind("2999-01-01T00:00:00Z")
-            .fetch_one(pool)
+            .bind(binding.principal_id.into_uuid())
+            .bind(binding.principal_lifecycle_version)
+            .bind(binding.principal_authority_version)
+            .bind(binding.principal_key_id)
+            .bind(binding.principal_key_version)
+            .bind(binding.principal_link_id)
+            .bind(binding.principal_link_version)
+            .fetch_one(&mut *token_tx)
             .await
             .expect("seed tied api_token");
             ids.push(id);
         }
+        token_tx.commit().await.expect("commit tied token seed");
 
         let ids_of = |v: &Value| -> Vec<String> {
             v["tokens"]

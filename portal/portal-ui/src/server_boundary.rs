@@ -2080,14 +2080,8 @@ pub async fn create_admin_token(
     if !upstream.live() {
         return reject_static_preview_token_create(&payload);
     }
-    let body = serde_json::json!({
-        "name": payload.name,
-        "owner_principal": payload.owner_principal,
-        "roles": payload.roles,
-        "site_scope": payload.site_scope,
-        "environment_scope": payload.environment_scope,
-        "expires_at": payload.expires_at,
-    });
+    let body = serde_json::to_value(&payload)
+        .map_err(|_| ServerFnError::new("token create request was malformed"))?;
     let session_id = session_id_from_request().await;
     let response = upstream
         .post(path, Some(&body), session_id.as_deref())
@@ -5629,7 +5623,6 @@ mod tests {
     fn create_admin_token_refuses_static_preview_persistence() {
         let payload = CreateTokenPayload {
             name: "ci-deployer".to_string(),
-            owner_principal: "svc:ci".to_string(),
             roles: vec!["VMwareOperator".to_string()],
             site_scope: None,
             environment_scope: None,

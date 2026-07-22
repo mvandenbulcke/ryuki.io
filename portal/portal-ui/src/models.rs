@@ -3414,7 +3414,7 @@ pub struct AdminTokenSummary {
     pub id: String,
     pub name: String,
     #[serde(default)]
-    pub owner_principal: String,
+    pub issuing_principal_id: Option<String>,
     #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
@@ -3435,9 +3435,9 @@ pub struct AdminTokenSummary {
 
 /// Create-token request body for `POST /api/admin/tokens`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTokenPayload {
     pub name: String,
-    pub owner_principal: String,
     pub roles: Vec<String>,
     pub site_scope: Option<String>,
     pub environment_scope: Option<String>,
@@ -3457,14 +3457,12 @@ pub struct CreateTokenResult {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub struct AdminSessionSummary {
     pub id: String,
-    #[serde(default)]
-    pub user_id: String,
+    pub principal_id: String,
     #[serde(default)]
     pub display_name: String,
     #[serde(default)]
     pub roles: Vec<String>,
-    #[serde(default)]
-    pub provider: Option<String>,
+    pub provider_id: String,
     #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
@@ -3534,7 +3532,7 @@ pub fn admin_token_summary_fallbacks() -> Vec<AdminTokenSummary> {
         AdminTokenSummary {
             id: "00000000-0000-4000-8000-000000000001".to_string(),
             name: "ci-deployer (preview)".to_string(),
-            owner_principal: "svc:ci-pipeline".to_string(),
+            issuing_principal_id: Some("00000000-0000-4000-8000-0000000000f1".to_string()),
             roles: vec!["VMwareOperator".to_string()],
             site_scope: Some("DEBER".to_string()),
             environment_scope: Some("staging".to_string()),
@@ -3547,7 +3545,7 @@ pub fn admin_token_summary_fallbacks() -> Vec<AdminTokenSummary> {
         AdminTokenSummary {
             id: "00000000-0000-4000-8000-000000000002".to_string(),
             name: "audit-export (preview)".to_string(),
-            owner_principal: "svc:audit-export".to_string(),
+            issuing_principal_id: Some("00000000-0000-4000-8000-0000000000f2".to_string()),
             roles: vec!["Auditor".to_string()],
             site_scope: None,
             environment_scope: None,
@@ -3564,10 +3562,10 @@ pub fn admin_token_summary_fallbacks() -> Vec<AdminTokenSummary> {
 pub fn admin_session_summary_fallbacks() -> Vec<AdminSessionSummary> {
     vec![AdminSessionSummary {
         id: "00000000-0000-4000-8000-0000000000a1".to_string(),
-        user_id: "admin".to_string(),
+        principal_id: "00000000-0000-4000-8000-0000000000f1".to_string(),
         display_name: "Platform Admin (preview)".to_string(),
         roles: vec!["PlatformAdmin".to_string()],
-        provider: Some("local".to_string()),
+        provider_id: "static-dry-run".to_string(),
         created_at: Some("2026-06-13T08:00:00Z".to_string()),
         expires_at: Some("2026-06-14T08:00:00Z".to_string()),
     }]
@@ -4676,7 +4674,7 @@ mod tests {
             "tokens": [{
                 "id": "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b",
                 "name": "ci-runner",
-                "owner_principal": "platform-engineer",
+                "issuing_principal_id": "8f83b8a0-bb3c-4a21-b579-1317d78f10e0",
                 "roles": ["Auditor"],
                 "site_scope": null,
                 "environment_scope": null,
@@ -4692,6 +4690,10 @@ mod tests {
         let rows = list.into_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "ci-runner");
+        assert_eq!(
+            rows[0].issuing_principal_id.as_deref(),
+            Some("8f83b8a0-bb3c-4a21-b579-1317d78f10e0")
+        );
         assert!(rows[0].token_valid);
 
         // A bare array (pre-envelope shape) still decodes.
@@ -4711,10 +4713,10 @@ mod tests {
             "offset": 0,
             "sessions": [{
                 "id": "b9de6b94-68a5-4407-a1fe-de24e7aecb30",
-                "user_id": "platform-engineer",
+                "principal_id": "8f83b8a0-bb3c-4a21-b579-1317d78f10e0",
                 "display_name": "Platform Engineer",
                 "roles": ["PlatformAdmin", "VMwareOperator"],
-                "provider": "static-dry-run",
+                "provider_id": "entra-primary",
                 "created_at": "2026-07-09T20:10:18.209024Z",
                 "expires_at": "2026-07-10T20:10:18.209024Z"
             }]
@@ -4723,11 +4725,12 @@ mod tests {
             serde_json::from_str(enveloped).expect("enveloped session list must decode");
         let rows = list.into_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].user_id, "platform-engineer");
+        assert_eq!(rows[0].principal_id, "8f83b8a0-bb3c-4a21-b579-1317d78f10e0");
+        assert_eq!(rows[0].provider_id, "entra-primary");
         assert_eq!(rows[0].roles, vec!["PlatformAdmin", "VMwareOperator"]);
 
         // A bare array (pre-envelope shape) still decodes.
-        let bare = r#"[{"id": "s-1"}]"#;
+        let bare = r#"[{"id":"s-1","principal_id":"8f83b8a0-bb3c-4a21-b579-1317d78f10e0","provider_id":"entra-primary"}]"#;
         let list: ApiAdminSessionList =
             serde_json::from_str(bare).expect("bare session list must decode");
         assert_eq!(list.into_rows().len(), 1);
@@ -4788,12 +4791,15 @@ mod tests {
     #[test]
     fn admin_token_summary_decodes_without_hash_field() {
         // GET /api/admin/tokens element: hash redacted (omitted entirely).
-        let body = r#"{"id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","name":"ci-deployer","owner_principal":"svc:ci","roles":["VMwareOperator"],"site_scope":"DEBER","environment_scope":null,"token_valid":false,"created_at":"2026-06-13T10:00:00Z","expires_at":null,"last_used_at":null,"revoked_at":null}"#;
+        let body = r#"{"id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","name":"ci-deployer","issuing_principal_id":"8f83b8a0-bb3c-4a21-b579-1317d78f10e0","roles":["VMwareOperator"],"site_scope":"DEBER","environment_scope":null,"token_valid":false,"created_at":"2026-06-13T10:00:00Z","expires_at":null,"last_used_at":null,"revoked_at":null}"#;
         let token: AdminTokenSummary = serde_json::from_str(body).expect("token row must decode");
 
         assert_eq!(token.id, "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b");
         assert_eq!(token.name, "ci-deployer");
-        assert_eq!(token.owner_principal, "svc:ci");
+        assert_eq!(
+            token.issuing_principal_id.as_deref(),
+            Some("8f83b8a0-bb3c-4a21-b579-1317d78f10e0")
+        );
         assert_eq!(token.roles, vec!["VMwareOperator".to_string()]);
         assert_eq!(token.site_scope.as_deref(), Some("DEBER"));
         assert!(!token.token_valid);
@@ -4830,14 +4836,95 @@ mod tests {
     }
 
     #[test]
+    fn create_token_payload_has_no_caller_controlled_identity() {
+        let payload = CreateTokenPayload {
+            name: "ci-deployer".to_string(),
+            roles: vec!["VMwareOperator".to_string()],
+            site_scope: None,
+            environment_scope: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&payload).expect("create payload serializes");
+        let keys = value
+            .as_object()
+            .expect("create payload is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "environment_scope",
+                "expires_at",
+                "name",
+                "roles",
+                "site_scope",
+            ])
+        );
+        assert!(value.get("owner_principal").is_none());
+
+        let legacy = serde_json::json!({
+            "name": "ci-deployer",
+            "owner_principal": "provider-subject",
+            "roles": ["VMwareOperator"],
+            "site_scope": null,
+            "environment_scope": null,
+            "expires_at": null,
+        });
+        assert!(serde_json::from_value::<CreateTokenPayload>(legacy).is_err());
+    }
+
+    #[test]
+    fn token_create_response_decodes_opaque_issuer_and_drops_secret() {
+        let body = serde_json::json!({
+            "id": "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b",
+            "name": "ci-deployer",
+            "issuing_principal_id": "8f83b8a0-bb3c-4a21-b579-1317d78f10e0",
+            "roles": ["VMwareOperator"],
+            "site_scope": null,
+            "environment_scope": null,
+            "token_valid": true,
+            "created_at": "2026-07-09T20:00:00Z",
+            "expires_at": "2026-07-10T20:00:00Z",
+            "token": format!("{}{}", "ryk_", "generated-at-runtime"),
+        });
+        let metadata: AdminTokenSummary =
+            serde_json::from_value(body).expect("create response metadata decodes");
+        assert_eq!(
+            metadata.issuing_principal_id.as_deref(),
+            Some("8f83b8a0-bb3c-4a21-b579-1317d78f10e0")
+        );
+        let reserialized = serde_json::to_value(metadata).expect("metadata serializes");
+        assert!(reserialized.get("token").is_none());
+    }
+
+    #[test]
     fn admin_session_summary_decodes_active_session_row() {
-        let body = r#"{"id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","user_id":"admin","display_name":"Admin","roles":["PlatformAdmin"],"provider":"local","created_at":"2026-06-13T10:00:00Z","expires_at":"2026-06-14T10:00:00Z"}"#;
+        let body = r#"{"id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","principal_id":"8f83b8a0-bb3c-4a21-b579-1317d78f10e0","display_name":"Admin","roles":["PlatformAdmin"],"provider_id":"local-primary","created_at":"2026-06-13T10:00:00Z","expires_at":"2026-06-14T10:00:00Z"}"#;
         let session: AdminSessionSummary =
             serde_json::from_str(body).expect("session row must decode");
 
-        assert_eq!(session.user_id, "admin");
-        assert_eq!(session.provider.as_deref(), Some("local"));
+        assert_eq!(session.principal_id, "8f83b8a0-bb3c-4a21-b579-1317d78f10e0");
+        assert_eq!(session.provider_id, "local-primary");
         assert_eq!(session.roles, vec!["PlatformAdmin".to_string()]);
+    }
+
+    #[test]
+    fn legacy_admin_identity_keys_do_not_populate_opaque_identity_fields() {
+        let token: AdminTokenSummary = serde_json::from_value(serde_json::json!({
+            "id": "legacy-token",
+            "name": "legacy",
+            "owner_principal": "provider-subject",
+        }))
+        .expect("legacy token metadata remains renderable");
+        assert_eq!(token.issuing_principal_id, None);
+
+        let legacy_session = serde_json::from_value::<AdminSessionSummary>(serde_json::json!({
+            "id": "legacy-session",
+            "user_id": "provider-subject",
+            "provider": "legacy-provider",
+        }));
+        assert!(legacy_session.is_err());
     }
 
     #[test]

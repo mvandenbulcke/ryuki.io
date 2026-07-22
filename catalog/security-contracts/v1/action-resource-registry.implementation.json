@@ -35,7 +35,7 @@
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:300cc99b3b79392b4ede1fd5ecece89d9283dae35e2d9f8293e2c3f729481546",
+        "content_digest": "sha256:f5d914c80bb72e6414d26c02dc6cf329000c26df16066c6c28efdb64a3e8ea65",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
