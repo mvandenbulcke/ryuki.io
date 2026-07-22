@@ -58,13 +58,15 @@ const _: () = assert!(
     "an admitted handler must always be able to seal a maximum-size response"
 );
 
-/// Migration 162's trigger admits idempotency INSERT/UPDATE statements only
+/// Migration 200's trigger admits idempotency INSERT/UPDATE statements only
 /// from the writer contract that both holds the matching principal advisory
-/// lock and marks the transaction locally. This prevents a pre-budget replica
-/// from writing unaccounted records if a deployment accidentally overlaps
-/// versions. The production deployment still uses a non-overlapping Recreate
-/// cutover because the pre-162 middleware failed open on a rejected DB claim.
-const IDEMPOTENCY_WRITER_CONTRACT_VERSION: &str = "2";
+/// lock and marks the transaction locally. Contract v3 also proves that the
+/// binary knows about the opaque-principal namespace cutover fence. This
+/// prevents a pre-budget or pre-cutover replica from writing unaccounted
+/// records if a deployment accidentally overlaps versions. The production
+/// deployment still uses a non-overlapping Recreate cutover because the
+/// pre-162 middleware failed open on a rejected DB claim.
+const IDEMPOTENCY_WRITER_CONTRACT_VERSION: &str = "3";
 
 async fn lock_idempotency_principal_and_mark_writer(
     tx: &mut Transaction<'_, Postgres>,
@@ -988,10 +990,40 @@ mod tests {
 
     #[test]
     fn production_principal_budget_reserves_the_full_response_capture_cap() {
-        assert_eq!(IDEMPOTENCY_WRITER_CONTRACT_VERSION, "2");
+        assert_eq!(IDEMPOTENCY_WRITER_CONTRACT_VERSION, "3");
         assert_eq!(
             PRINCIPAL_BUDGET.in_flight_response_reservation, MAX_IDEMPOTENT_BODY as i64,
             "an admitted handler must always be able to seal a maximum-size response"
+        );
+    }
+
+    #[test]
+    fn opaque_principal_cutover_fences_the_legacy_replay_window() {
+        let principal_cutover = include_str!("../../../migrations/199_principal_registry.sql");
+        let replay_fence =
+            include_str!("../../../migrations/200_principal_idempotency_cutover_fence.sql");
+
+        assert!(
+            principal_cutover.contains("TRUNCATE TABLE idempotency_records;"),
+            "the compatibility proof must track migration 199's destructive namespace cutover"
+        );
+        assert!(replay_fence.contains("LOCK TABLE idempotency_records IN ACCESS EXCLUSIVE MODE"));
+        assert!(replay_fence.contains("in-flight idempotency claims must be drained or reconciled"));
+        assert!(replay_fence.contains("LEFT JOIN principals AS principal"));
+        assert!(replay_fence.contains("migration.version = 199"));
+        assert!(replay_fence.contains("migration.success"));
+        assert!(replay_fence.contains("fresh-install-v1"));
+        assert!(replay_fence.contains("make_interval(secs => 86700)"));
+        assert!(replay_fence.contains("idempotency_principal_cutover_state"));
+        assert!(replay_fence.contains("idempotency_principal_cutover_state_shape_check"));
+        assert!(replay_fence.contains("pg_get_userbyid(ledger.relowner) = current_user"));
+        assert!(replay_fence.contains("IS DISTINCT FROM '3'"));
+        assert!(replay_fence.contains("held.mode = 'ExclusiveLock'"));
+        assert!(replay_fence.contains("BEFORE INSERT OR UPDATE OR DELETE ON idempotency_records"));
+        assert!(replay_fence.contains("idempotency_records_principal_namespace"));
+        assert!(replay_fence.contains("ENABLE ALWAYS TRIGGER idempotency_records_writer_contract"));
+        assert!(
+            replay_fence.contains("CONSTRAINT = 'idempotency_principal_namespace_cutover_fence'")
         );
     }
 
@@ -1241,8 +1273,8 @@ mod db_tests {
             .await
             .ok();
 
-        // The pre-162 statement shape has neither the transaction-local v2
-        // marker nor the principal advisory lock. Migration 162 must reject it
+        // The pre-200 statement shape has neither the transaction-local v3
+        // marker nor the principal advisory lock. Migration 200 must reject it
         // at the table boundary even while this principal is below quota.
         let legacy_insert = sqlx::query(
             "INSERT INTO idempotency_records (user_scope, key, fingerprint, claim_id) \
@@ -1275,7 +1307,7 @@ mod db_tests {
             },
         )
         .await
-        .expect("contract-v2 claim transaction is admitted");
+        .expect("contract-v3 claim transaction is admitted");
         assert_eq!(outcome, ClaimOutcome::Claimed);
 
         let legacy_update = sqlx::query(
@@ -1298,7 +1330,7 @@ mod db_tests {
 
         seal_claim_response(pool, test_principal(user), key, "current-claim", 200, "{}")
             .await
-            .expect("contract-v2 finalizer holds the same principal fence");
+            .expect("contract-v3 finalizer holds the same principal fence");
         let sealed: (Option<i32>, Option<String>) = sqlx::query_as(
             "SELECT response_status, response_body FROM idempotency_records \
              WHERE user_scope = $1 AND key = $2",

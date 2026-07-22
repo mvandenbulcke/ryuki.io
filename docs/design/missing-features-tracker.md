@@ -60,12 +60,20 @@ before loading the full record. SB-2 remains open because collection reads,
 mutations, remaining resources, machine actors, multi-tenant scope, and the
 production registry/provider rollout have not yet converged on this boundary.
 
-SB-1 now has an identity-epoch slice in migration 165 and an explicit
-interactive-human assignment slice in migration 182. Local, OIDC, and Entra
-carriers require a versioned provider/issuer/subject role and site/environment
-assignment; Unknown/Revoked deny, Global is explicit, asserted authority is
-intersected, and assignment updates delete older sessions. Direct Entra bearer
-traffic uses the same database boundary. Local credential/role changes,
+SB-1 now has an identity-epoch slice in migration 165, an explicit
+interactive-human assignment slice in migration 182, and the provider-neutral
+opaque principal/key/link registry cutover in migration 199. Local, OIDC, and
+Entra carriers resolve an exact provider/issuer/subject key to a random internal
+`principal_id`; display/provider subjects no longer define ownership,
+idempotency, session, or request-read authority. Unknown/Revoked deny, Global
+is explicit, asserted authority is intersected, and principal/key/link or
+assignment changes delete older sessions and replay state. Migration 200 lets
+a durably identified pristine install serve immediately, while an upgrade keeps
+the destructive legacy replay-namespace cutover fail closed for at least its
+complete 24-hour window after the mandatory pre-migration traffic drain,
+attests the exact database
+trigger at startup, and fences pre-v3 idempotency writers. Direct Entra
+bearer traffic uses the same database boundary. Local credential/role changes,
 federated callback role changes, and delivered monotonic lifecycle events also
 invalidate older persisted sessions; non-local sessions fail closed after the
 bounded authority-freshness interval.

@@ -47,6 +47,10 @@ const MAX_MIGRATION_LOCK_TIMEOUT_SECS: u64 = 300;
 const MIGRATION_CONNECTION_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const REVIEWED_PRODUCTION_MIGRATION_STATEMENT_TIMEOUT_SECS: u64 = 180;
 const REVIEWED_PRODUCTION_MIGRATION_LOCK_TIMEOUT_SECS: u64 = 30;
+const IDEMPOTENCY_CUTOVER_INSTALL_MODE_GUC: &str =
+    "ryuki.idempotency_principal_cutover_install_mode";
+const IDEMPOTENCY_CUTOVER_FRESH_INSTALL_MODE: &str = "fresh-install-v1";
+const IDEMPOTENCY_CUTOVER_UPGRADE_MODE: &str = "upgrade-v1";
 
 /// Selects who owns schema mutation during process startup.
 ///
@@ -526,6 +530,7 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("golden_images", true, true, true),
     TablePolicy::new("hardware_assets", true, true, true),
     TablePolicy::new("health_checks", true, true, true),
+    TablePolicy::new("idempotency_principal_cutover_state", false, false, false),
     TablePolicy::new("idempotency_records", true, true, true),
     TablePolicy::new("immutability_checks", true, true, true),
     TablePolicy::new("inbound_webhook_receipts", true, true, true),
@@ -3259,6 +3264,507 @@ async fn attest_application_routine_acl(
     Ok(())
 }
 
+/// Prove the complete database boundary for the opaque-principal idempotency
+/// cutover. The ledger checksum alone cannot detect an owner replacing or
+/// disabling the trigger after migration, so every strict serving connection
+/// and migration postflight re-attests the exact table, state row, function,
+/// trigger, ownership, and direct-call ACL shape. The fresh/upgrade value is
+/// trusted migration-owner evidence; this protects the serving-role boundary,
+/// not a database whose isolated schema-migration authority is compromised.
+async fn attest_idempotency_writer_contract(
+    connection: &mut PgConnection,
+    application_role: &str,
+    migration_role: &str,
+) -> Result<(), sqlx::Error> {
+    let exact: bool = sqlx::query_scalar(
+        r#"
+        WITH app AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1::name
+        ),
+        migration AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $2::name
+        ),
+        login AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = session_user
+        ),
+        record_table AS (
+            SELECT class.oid, class.relowner
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND class.relname = 'idempotency_records'
+              AND class.relkind = 'r'
+              AND class.relpersistence = 'p'
+              AND NOT class.relispartition
+              AND NOT class.relrowsecurity
+              AND NOT class.relforcerowsecurity
+        ),
+        state_table AS (
+            SELECT class.oid, class.relowner
+            FROM pg_catalog.pg_class AS class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND class.relname = 'idempotency_principal_cutover_state'
+              AND class.relkind = 'r'
+              AND class.relpersistence = 'p'
+              AND NOT class.relispartition
+              AND NOT class.relrowsecurity
+              AND NOT class.relforcerowsecurity
+        ),
+        expected_record_columns(
+            name,
+            type_name,
+            not_null,
+            generated,
+            normalized_expression
+        ) AS (
+            VALUES
+                ('user_scope'::text, 'text'::text, TRUE, ''::text, NULL::text),
+                ('key'::text, 'text'::text, TRUE, ''::text, NULL::text),
+                ('fingerprint'::text, 'text'::text, TRUE, ''::text, NULL::text),
+                ('claim_id'::text, 'text'::text, TRUE, ''::text, NULL::text),
+                ('response_status'::text, 'integer'::text, FALSE, ''::text, NULL::text),
+                ('response_body'::text, 'text'::text, FALSE, ''::text, NULL::text),
+                (
+                    'created_at'::text,
+                    'timestamp with time zone'::text,
+                    TRUE,
+                    ''::text,
+                    'now()'::text
+                ),
+                (
+                    'response_bytes'::text,
+                    'bigint'::text,
+                    FALSE,
+                    's'::text,
+                    'COALESCE(octet_length(response_body),0)::bigint'::text
+                )
+        ),
+        matching_record_columns AS (
+            SELECT expected.name
+            FROM expected_record_columns AS expected
+            CROSS JOIN record_table
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = record_table.oid
+             AND attribute.attname = expected.name
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS expression
+              ON expression.adrelid = attribute.attrelid
+             AND expression.adnum = attribute.attnum
+            WHERE pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) =
+                      expected.type_name
+              AND attribute.attnotnull = expected.not_null
+              AND attribute.attgenerated::text = expected.generated
+              AND attribute.attidentity = ''
+              AND (
+                   (
+                       expected.normalized_expression IS NULL
+                       AND expression.oid IS NULL
+                   )
+                   OR pg_catalog.regexp_replace(
+                          pg_catalog.pg_get_expr(
+                              expression.adbin,
+                              expression.adrelid
+                          ),
+                          '[[:space:]]',
+                          '',
+                          'g'
+                      ) = expected.normalized_expression
+              )
+        ),
+        expected_state_columns(name, type_name, not_null, normalized_expression) AS (
+            VALUES
+                ('singleton'::text, 'boolean'::text, TRUE, 'true'::text),
+                ('requires_fence'::text, 'boolean'::text, TRUE, NULL::text),
+                (
+                    'fence_until'::text,
+                    'timestamp with time zone'::text,
+                    FALSE,
+                    NULL::text
+                ),
+                (
+                    'established_at'::text,
+                    'timestamp with time zone'::text,
+                    TRUE,
+                    'clock_timestamp()'::text
+                )
+        ),
+        matching_state_columns AS (
+            SELECT expected.name
+            FROM expected_state_columns AS expected
+            CROSS JOIN state_table
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = state_table.oid
+             AND attribute.attname = expected.name
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS expression
+              ON expression.adrelid = attribute.attrelid
+             AND expression.adnum = attribute.attnum
+            WHERE pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) =
+                      expected.type_name
+              AND attribute.attnotnull = expected.not_null
+              AND attribute.attgenerated = ''
+              AND attribute.attidentity = ''
+              AND (
+                   (
+                       expected.normalized_expression IS NULL
+                       AND expression.oid IS NULL
+                   )
+                   OR pg_catalog.regexp_replace(
+                          pg_catalog.pg_get_expr(
+                              expression.adbin,
+                              expression.adrelid
+                          ),
+                          '[[:space:]]',
+                          '',
+                          'g'
+                      ) = expected.normalized_expression
+              )
+        ),
+        matching_primary_key AS (
+            SELECT constraint_catalog.oid
+            FROM record_table
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = record_table.oid
+             AND constraint_catalog.conname = 'idempotency_records_pkey'
+             AND constraint_catalog.contype = 'p'
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indexrelid = constraint_catalog.conindid
+             AND index_catalog.indrelid = record_table.oid
+            WHERE constraint_catalog.conkey = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = record_table.oid
+                          AND attribute.attname = 'user_scope'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    ),
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = record_table.oid
+                          AND attribute.attname = 'key'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    )
+                  ]::smallint[]
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND index_catalog.indisunique
+              AND index_catalog.indisprimary
+              AND index_catalog.indisvalid
+              AND index_catalog.indisready
+              AND index_catalog.indimmediate
+              AND index_catalog.indnkeyatts = 2
+              AND index_catalog.indnatts = 2
+              AND index_catalog.indpred IS NULL
+              AND index_catalog.indexprs IS NULL
+        ),
+        matching_retention_index AS (
+            SELECT index_class.oid
+            FROM record_table
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indrelid = record_table.oid
+            JOIN pg_catalog.pg_class AS index_class
+              ON index_class.oid = index_catalog.indexrelid
+            JOIN pg_catalog.pg_namespace AS index_namespace
+              ON index_namespace.oid = index_class.relnamespace
+            WHERE index_namespace.nspname = 'public'
+              AND index_class.relname = 'idx_idempotency_records_created_at'
+              AND index_class.relkind = 'i'
+              AND index_class.relpersistence = 'p'
+              AND NOT index_catalog.indisunique
+              AND NOT index_catalog.indisprimary
+              AND NOT index_catalog.indisexclusion
+              AND index_catalog.indisvalid
+              AND index_catalog.indisready
+              AND index_catalog.indimmediate
+              AND index_catalog.indnkeyatts = 1
+              AND index_catalog.indnatts = 1
+              AND index_catalog.indkey::text = (
+                    SELECT attribute.attnum::text
+                    FROM pg_catalog.pg_attribute AS attribute
+                    WHERE attribute.attrelid = record_table.oid
+                      AND attribute.attname = 'created_at'
+                      AND attribute.attnum > 0
+                      AND NOT attribute.attisdropped
+              )
+              AND index_catalog.indpred IS NULL
+              AND index_catalog.indexprs IS NULL
+        ),
+        matching_state_primary_key AS (
+            SELECT constraint_catalog.oid
+            FROM state_table
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = state_table.oid
+             AND constraint_catalog.conname =
+                    'idempotency_principal_cutover_state_pkey'
+             AND constraint_catalog.contype = 'p'
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indexrelid = constraint_catalog.conindid
+             AND index_catalog.indrelid = state_table.oid
+            WHERE constraint_catalog.conkey = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = state_table.oid
+                          AND attribute.attname = 'singleton'
+                          AND attribute.attnum > 0
+                          AND NOT attribute.attisdropped
+                    )
+                  ]::smallint[]
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND index_catalog.indisunique
+              AND index_catalog.indisprimary
+              AND index_catalog.indisvalid
+              AND index_catalog.indisready
+              AND index_catalog.indimmediate
+              AND index_catalog.indnkeyatts = 1
+              AND index_catalog.indnatts = 1
+              AND index_catalog.indpred IS NULL
+              AND index_catalog.indexprs IS NULL
+        ),
+        expected_state_checks(constraint_name, column_names, normalized_expression) AS (
+            VALUES
+                (
+                    'idempotency_principal_cutover_state_singleton_check'::text,
+                    ARRAY['singleton']::text[],
+                    'singleton'::text
+                ),
+                (
+                    'idempotency_principal_cutover_state_shape_check'::text,
+                    ARRAY['requires_fence', 'fence_until']::text[],
+                    'requires_fence=fence_untilISNOTNULL'::text
+                )
+        ),
+        resolved_state_checks AS (
+            SELECT expected.*,
+                   resolved.resolved_count,
+                   resolved.constraint_columns
+            FROM expected_state_checks AS expected
+            CROSS JOIN state_table
+            CROSS JOIN LATERAL (
+                SELECT COUNT(attribute.attnum)::integer AS resolved_count,
+                       COALESCE(
+                           pg_catalog.array_agg(
+                               attribute.attnum::smallint
+                               ORDER BY column_name.ordinality
+                           ),
+                           ARRAY[]::smallint[]
+                       ) AS constraint_columns
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS column_name(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = state_table.oid
+                 AND attribute.attname = column_name.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+        ),
+        matching_state_checks AS (
+            SELECT expected.constraint_name
+            FROM resolved_state_checks AS expected
+            CROSS JOIN state_table
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = state_table.oid
+             AND constraint_catalog.conname = expected.constraint_name
+            WHERE expected.resolved_count =
+                      pg_catalog.cardinality(expected.column_names)
+              AND constraint_catalog.contype = 'c'
+              AND constraint_catalog.conkey = expected.constraint_columns
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND NOT constraint_catalog.connoinherit
+              AND pg_catalog.regexp_replace(
+                      pg_catalog.pg_get_expr(
+                          constraint_catalog.conbin,
+                          constraint_catalog.conrelid
+                      ),
+                      '[[:space:]()]',
+                      '',
+                      'g'
+                  ) = expected.normalized_expression
+        ),
+        writer_function AS (
+            SELECT procedure.*, language.lanname
+            FROM pg_catalog.pg_proc AS procedure
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE procedure.oid = pg_catalog.to_regprocedure(
+                'public.enforce_idempotency_writer_contract()'
+            )
+        ),
+        matching_trigger AS (
+            SELECT trigger.oid
+            FROM record_table
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = record_table.oid
+             AND trigger.tgname = 'idempotency_records_writer_contract'
+            JOIN writer_function
+              ON writer_function.oid = trigger.tgfoid
+            WHERE trigger.tgtype = 31
+              AND trigger.tgenabled = 'A'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgparentid = 0
+              AND trigger.tgconstraint = 0
+              AND trigger.tgconstrrelid = 0
+              AND trigger.tgconstrindid = 0
+              AND NOT trigger.tgdeferrable
+              AND NOT trigger.tginitdeferred
+              AND trigger.tgnargs = 0
+              AND pg_catalog.octet_length(trigger.tgargs) = 0
+              AND trigger.tgattr::text = ''
+              AND trigger.tgqual IS NULL
+              AND trigger.tgoldtable IS NULL
+              AND trigger.tgnewtable IS NULL
+        ),
+        exact_state AS (
+            SELECT state.singleton
+            FROM public.idempotency_principal_cutover_state AS state
+            JOIN public._sqlx_migrations AS cutover
+              ON cutover.version = 199
+             AND cutover.success
+            WHERE state.singleton
+              AND (
+                   (
+                       state.requires_fence
+                       AND state.fence_until =
+                           cutover.installed_on + make_interval(secs => 86700)
+                   )
+                   OR (
+                       NOT state.requires_fence
+                       AND state.fence_until IS NULL
+                   )
+              )
+        )
+        SELECT COALESCE((
+            SELECT
+                (SELECT COUNT(*) FROM record_table) = 1
+                AND (SELECT COUNT(*) FROM state_table) = 1
+                AND (SELECT relowner FROM record_table) = migration.oid
+                AND (SELECT relowner FROM state_table) = migration.oid
+                AND (SELECT COUNT(*) FROM matching_record_columns) = 8
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_attribute AS attribute
+                     CROSS JOIN record_table
+                     WHERE attribute.attrelid = record_table.oid
+                       AND attribute.attnum > 0
+                       AND NOT attribute.attisdropped) = 8
+                AND (SELECT COUNT(*) FROM matching_state_columns) = 4
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_attribute AS attribute
+                     CROSS JOIN state_table
+                     WHERE attribute.attrelid = state_table.oid
+                       AND attribute.attnum > 0
+                       AND NOT attribute.attisdropped) = 4
+                AND (SELECT COUNT(*) FROM matching_primary_key) = 1
+                AND (SELECT COUNT(*) FROM matching_retention_index) = 1
+                AND (SELECT COUNT(*) FROM matching_state_primary_key) = 1
+                AND (SELECT COUNT(*) FROM matching_state_checks) = 2
+                AND (SELECT COUNT(*) FROM exact_state) = 1
+                AND (SELECT COUNT(*)
+                     FROM public.idempotency_principal_cutover_state) = 1
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_constraint AS constraint_catalog
+                     CROSS JOIN record_table
+                     WHERE constraint_catalog.conrelid = record_table.oid
+                       AND constraint_catalog.contype IN ('p', 'u', 'f', 'c', 'x')) = 1
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_constraint AS constraint_catalog
+                     CROSS JOIN state_table
+                     WHERE constraint_catalog.conrelid = state_table.oid
+                       AND constraint_catalog.contype IN ('p', 'u', 'f', 'c', 'x')) = 3
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_index AS index_catalog
+                     CROSS JOIN record_table
+                     WHERE index_catalog.indrelid = record_table.oid) = 2
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_index AS index_catalog
+                     CROSS JOIN state_table
+                     WHERE index_catalog.indrelid = state_table.oid) = 1
+                AND (SELECT COUNT(*) FROM writer_function) = 1
+                AND (SELECT COUNT(*) FROM matching_trigger) = 1
+                AND (SELECT COUNT(*)
+                     FROM pg_catalog.pg_trigger AS trigger
+                     CROSS JOIN record_table
+                     WHERE trigger.tgrelid = record_table.oid
+                       AND NOT trigger.tgisinternal) = 1
+                AND EXISTS (
+                    SELECT 1
+                    FROM writer_function AS procedure
+                    WHERE procedure.proowner = migration.oid
+                      AND procedure.prokind = 'f'
+                      AND procedure.prorettype = 'pg_catalog.trigger'::regtype
+                      AND NOT procedure.proretset
+                      AND procedure.pronargs = 0
+                      AND procedure.pronargdefaults = 0
+                      AND procedure.provariadic = 0
+                      AND procedure.proargnames IS NULL
+                      AND procedure.proargmodes IS NULL
+                      AND procedure.proallargtypes IS NULL
+                      AND NOT procedure.prosecdef
+                      AND NOT procedure.proleakproof
+                      AND NOT procedure.proisstrict
+                      AND procedure.provolatile = 'v'
+                      AND procedure.proparallel = 'u'
+                      AND procedure.proconfig IS NOT DISTINCT FROM
+                          ARRAY['search_path=pg_catalog, public']::text[]
+                      AND procedure.lanname = 'plpgsql'
+                      AND pg_catalog.encode(
+                              pg_catalog.sha256(
+                                  pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                              ),
+                              'hex'
+                          ) = '5a47f3edd363d06a09b740d5ea2cc1cd3656fe8c8086ff549600ec40c0708d03'
+                      AND NOT pg_catalog.has_function_privilege(
+                          app.oid, procedure.oid, 'EXECUTE'
+                      )
+                      AND NOT pg_catalog.has_function_privilege(
+                          login.oid, procedure.oid, 'EXECUTE'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.aclexplode(
+                              COALESCE(
+                                  procedure.proacl,
+                                  pg_catalog.acldefault('f', procedure.proowner)
+                              )
+                          ) AS acl
+                          WHERE acl.grantee <> migration.oid
+                             OR acl.privilege_type <> 'EXECUTE'
+                             OR acl.is_grantable
+                      )
+                )
+            FROM app
+            CROSS JOIN migration
+            CROSS JOIN login
+        ), FALSE)
+        "#,
+    )
+    .bind(application_role)
+    .bind(migration_role)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !exact {
+        return Err(role_protocol_error(
+            "idempotency writer contract table, state, trigger, function, owner, or ACL is not canonical",
+        ));
+    }
+    Ok(())
+}
+
 /// Prove that the four request resource-version invariants still target the
 /// reviewed trigger functions and fire even in replica sessions. This is a
 /// startup schema attestation, not just a privilege check: disabling a trigger,
@@ -5047,6 +5553,7 @@ async fn attest_application_connection(
             "application or login role can disable database trigger enforcement",
         ));
     }
+    attest_idempotency_writer_contract(connection, &contract.expected, &contract.forbidden).await?;
     attest_request_resource_version_triggers(connection).await?;
     attest_request_authority_version_binding_triggers(connection).await?;
     attest_live_site_execution_authority_chain(connection).await?;
@@ -5976,6 +6483,8 @@ async fn reconcile_application_privileges_in_transaction(
     sqlx::query("RESET ROLE").execute(&mut *connection).await?;
     attest_migration_connection(connection, contract).await?;
     attest_safe_default_privileges(connection, &contract.expected).await?;
+    attest_idempotency_writer_contract(connection, &contract.application, &contract.expected)
+        .await?;
     attest_application_routine_acl(connection, &contract.application).await?;
     attest_application_acl(connection, &contract.application).await
 }
@@ -6957,6 +7466,30 @@ async fn verify_atomic_migration_transaction_guard(
     Ok(())
 }
 
+async fn set_idempotency_cutover_install_mode(
+    connection: &mut PgConnection,
+    fresh_install: bool,
+    transaction_local: bool,
+) -> Result<(), sqlx::Error> {
+    let mode = if fresh_install {
+        IDEMPOTENCY_CUTOVER_FRESH_INSTALL_MODE
+    } else {
+        IDEMPOTENCY_CUTOVER_UPGRADE_MODE
+    };
+    let retained: String = sqlx::query_scalar("SELECT pg_catalog.set_config($1, $2, $3)")
+        .bind(IDEMPOTENCY_CUTOVER_INSTALL_MODE_GUC)
+        .bind(mode)
+        .bind(transaction_local)
+        .fetch_one(&mut *connection)
+        .await?;
+    if retained != mode {
+        return Err(role_protocol_error(
+            "idempotency principal cutover install mode was not retained",
+        ));
+    }
+    Ok(())
+}
+
 async fn apply_atomic_embedded_migrations(
     connection: &mut PgConnection,
     contract: &MigrationRoleContract,
@@ -6986,6 +7519,9 @@ async fn apply_atomic_embedded_migrations(
     }
 
     let transaction_guard = establish_atomic_migration_transaction_guard(connection)
+        .await
+        .map_err(|source| MigrationRunError::AtomicApply { version: 0, source })?;
+    set_idempotency_cutover_install_mode(connection, preflight_ledger.is_empty(), true)
         .await
         .map_err(|source| MigrationRunError::AtomicApply { version: 0, source })?;
 
@@ -7496,6 +8032,13 @@ async fn run_atomic_production_migration(
                         .into(),
                 ));
             }
+            attest_idempotency_writer_contract(
+                &mut transaction,
+                &role_contract.application,
+                &role_contract.expected,
+            )
+            .await
+            .map_err(MigrationRunError::Privileges)?;
             attest_application_acl(&mut transaction, &role_contract.application)
                 .await
                 .map_err(MigrationRunError::Privileges)?;
@@ -7779,6 +8322,33 @@ async fn apply_embedded_migrations_inner(
         let pool = build_migration_pool_inner(url, timeouts, role_contract.clone())
             .await
             .map_err(MigrationRunError::Connect)?;
+        let install_mode = async {
+            let mut connection = pool.acquire().await?;
+            // A pristine install has no public relations other than a possibly
+            // pre-created empty SQLx ledger. Any other durable relation makes
+            // the conservative upgrade fence mandatory.
+            let fresh_install: bool = sqlx::query_scalar(
+                r#"
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_class AS class
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = class.relnamespace
+                    WHERE namespace.nspname = 'public'
+                      AND class.relname <> '_sqlx_migrations'
+                      AND class.relkind IN ('r', 'p', 'f', 'S', 'v', 'm')
+                )
+                "#,
+            )
+            .fetch_one(&mut *connection)
+            .await?;
+            set_idempotency_cutover_install_mode(&mut connection, fresh_install, false).await
+        }
+        .await;
+        if let Err(error) = install_mode {
+            pool.close().await;
+            return Err(MigrationRunError::Connect(error));
+        }
         if let Err(error) = EMBEDDED_MIGRATOR.run(&pool).await {
             pool.close().await;
             return Err(MigrationRunError::Apply(error));
@@ -10107,7 +10677,7 @@ mod tests {
         super::apply_embedded_migrations_inner(
             &migration_url,
             MigrationTimeouts::default(),
-            Some(migration_contract),
+            Some(migration_contract.clone()),
         )
         .await
         .expect("strict migration postflight must reconcile and attest privileges");
@@ -10126,7 +10696,7 @@ mod tests {
                 acquire_timeout_secs: 30,
                 max_lifetime_secs: 300,
             },
-            Some(application_contract),
+            Some(application_contract.clone()),
             None,
         )
         .await
@@ -10162,6 +10732,442 @@ mod tests {
                 "ryuki_acquire_live_site_execution_epoch".to_owned(),
             ]
         );
+
+        // Migration 199 erased legacy subject-keyed replay rows because they
+        // cannot be translated into opaque principal UUIDs. Prove that the
+        // least-privilege application role remains fenced after the nominal
+        // 24 hours and through the conservative post-transaction margin,
+        // including DELETE, while the
+        // exact same v3 writer path succeeds immediately after the deadline.
+        // The dedicated strict fixture restores the canonical state before it
+        // tests a fresh connection's startup attestation.
+        let migration_pool = super::build_migration_pool_inner(
+            &migration_url,
+            MigrationTimeouts::default(),
+            Some(migration_contract.clone()),
+        )
+        .await
+        .expect("reconnect the strict migration role for cutover-time fixtures");
+        let original_cutover_time: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT installed_on FROM public._sqlx_migrations WHERE version = 199 AND success",
+        )
+        .fetch_one(&migration_pool)
+        .await
+        .expect("read migration 199 installation time");
+        let original_cutover_state: (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            "SELECT requires_fence, fence_until \
+                 FROM public.idempotency_principal_cutover_state WHERE singleton",
+        )
+        .fetch_one(&migration_pool)
+        .await
+        .expect("read canonical principal idempotency cutover state");
+        assert!(
+            !original_cutover_state.0 && original_cutover_state.1.is_none(),
+            "the disposable pristine strict-role install must persist no-fence evidence"
+        );
+
+        let principal_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO public.principals ( \
+                 principal_id, principal_kind, lifecycle_state, role_allowlist, \
+                 site_authority_mode, site_scope, environment_authority_mode, \
+                 environment_scope, created_by \
+             ) VALUES ( \
+                 $1, 'human', 'active', ARRAY['Requester']::text[], \
+                 'global', ARRAY[]::text[], 'global', ARRAY[]::text[], $2 \
+             )",
+        )
+        .bind(principal_id)
+        .bind(format!("strict-idempotency-cutover-{principal_id}"))
+        .execute(&migration_pool)
+        .await
+        .expect("create a real opaque principal for the strict cutover fixture");
+
+        let mut fresh_application_connection = pool
+            .acquire()
+            .await
+            .expect("acquire strict application connection for pristine-install proof");
+        sqlx::query("BEGIN")
+            .execute(&mut *fresh_application_connection)
+            .await
+            .expect("begin pristine-install idempotency fixture");
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                 pg_catalog.hashtextextended( \
+                     'ryuki:idempotency:principal:'::text || $1::uuid::text, 0 \
+                 ) \
+             )",
+        )
+        .bind(principal_id)
+        .execute(&mut *fresh_application_connection)
+        .await
+        .expect("take the pristine-install principal lock");
+        sqlx::query("SELECT pg_catalog.set_config('ryuki.idempotency_writer_contract', '3', true)")
+            .execute(&mut *fresh_application_connection)
+            .await
+            .expect("mark the pristine-install v3 writer contract");
+        sqlx::query(
+            "INSERT INTO public.idempotency_records \
+                 (user_scope, key, fingerprint, claim_id) \
+             VALUES ($1::uuid::text, $2, 'fresh-install-fingerprint', $3)",
+        )
+        .bind(principal_id)
+        .bind(format!("cutover-fresh-install-{principal_id}"))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&mut *fresh_application_connection)
+        .await
+        .expect("a pristine strict-role install must serve immediately");
+        sqlx::query("ROLLBACK")
+            .execute(&mut *fresh_application_connection)
+            .await
+            .expect("discard pristine-install idempotency fixture");
+        drop(fresh_application_connection);
+
+        let completed_key = format!("cutover-completed-{principal_id}");
+        let mut owner_fixture = migration_pool
+            .begin()
+            .await
+            .expect("begin owner cutover fixture");
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                 pg_catalog.hashtextextended( \
+                     'ryuki:idempotency:principal:'::text || $1::uuid::text, 0 \
+                 ) \
+             )",
+        )
+        .bind(principal_id)
+        .execute(&mut *owner_fixture)
+        .await
+        .expect("take the owner fixture principal lock");
+        sqlx::query(
+            "SELECT pg_catalog.set_config( \
+                 'ryuki.idempotency_writer_contract', '3', true \
+             )",
+        )
+        .execute(&mut *owner_fixture)
+        .await
+        .expect("mark the owner fixture v3 writer contract");
+        sqlx::query(
+            "INSERT INTO public.idempotency_records ( \
+                 user_scope, key, fingerprint, claim_id, response_status, response_body \
+             ) VALUES ($1::uuid::text, $2, 'completed-fingerprint', $3, 201, '{}')",
+        )
+        .bind(principal_id)
+        .bind(&completed_key)
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&mut *owner_fixture)
+        .await
+        .expect("the migration owner remains usable for exact fixture preparation");
+        owner_fixture
+            .commit()
+            .await
+            .expect("commit owner cutover fixture");
+
+        sqlx::query(
+            "WITH cutover AS ( \
+                 UPDATE public._sqlx_migrations \
+                 SET installed_on = \
+                     clock_timestamp() - interval '24 hours' \
+                 WHERE version = 199 AND success \
+                 RETURNING installed_on \
+             ) \
+             UPDATE public.idempotency_principal_cutover_state AS state \
+             SET requires_fence = TRUE, \
+                 fence_until = cutover.installed_on + make_interval(secs => 86700) \
+             FROM cutover WHERE state.singleton",
+        )
+        .execute(&migration_pool)
+        .await
+        .expect("activate the conservative cutover-margin fixture");
+
+        let mut application_connection = pool
+            .acquire()
+            .await
+            .expect("acquire strict application connection for active cutover");
+        sqlx::query("BEGIN")
+            .execute(&mut *application_connection)
+            .await
+            .expect("begin active cutover fixture");
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                 pg_catalog.hashtextextended( \
+                     'ryuki:idempotency:principal:'::text || $1::uuid::text, 0 \
+                 ) \
+             )",
+        )
+        .bind(principal_id)
+        .execute(&mut *application_connection)
+        .await
+        .expect("take the exact idempotency principal lock");
+        sqlx::query("SELECT pg_catalog.set_config('ryuki.idempotency_writer_contract', '3', true)")
+            .execute(&mut *application_connection)
+            .await
+            .expect("mark the v3 idempotency writer contract");
+        let active_cutover_error = sqlx::query(
+            "INSERT INTO public.idempotency_records \
+                 (user_scope, key, fingerprint, claim_id) \
+             VALUES ($1::uuid::text, $2, $3, $4)",
+        )
+        .bind(principal_id)
+        .bind(format!("cutover-active-{principal_id}"))
+        .bind("cutover-active-fingerprint")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&mut *application_connection)
+        .await
+        .expect_err("the strict application role must be fenced during cutover retention");
+        assert_eq!(
+            active_cutover_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("55000")
+        );
+        assert_eq!(
+            active_cutover_error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("idempotency_principal_namespace_cutover_fence")
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut *application_connection)
+            .await
+            .expect("discard active cutover fixture");
+
+        sqlx::query("BEGIN")
+            .execute(&mut *application_connection)
+            .await
+            .expect("begin shared-lock rejection fixture");
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock_shared( \
+                 pg_catalog.hashtextextended( \
+                     'ryuki:idempotency:principal:'::text || $1::uuid::text, 0 \
+                 ) \
+             )",
+        )
+        .bind(principal_id)
+        .execute(&mut *application_connection)
+        .await
+        .expect("take only the insufficient shared principal lock");
+        sqlx::query("SELECT pg_catalog.set_config('ryuki.idempotency_writer_contract', '3', true)")
+            .execute(&mut *application_connection)
+            .await
+            .expect("mark the shared-lock v3 writer contract");
+        let shared_lock_error = sqlx::query(
+            "INSERT INTO public.idempotency_records \
+                 (user_scope, key, fingerprint, claim_id) \
+             VALUES ($1::uuid::text, $2, 'shared-lock-fingerprint', $3)",
+        )
+        .bind(principal_id)
+        .bind(format!("cutover-shared-lock-{principal_id}"))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&mut *application_connection)
+        .await
+        .expect_err("a shared advisory lock must not satisfy principal serialization");
+        assert_eq!(
+            shared_lock_error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("idempotency_records_writer_contract")
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut *application_connection)
+            .await
+            .expect("discard shared-lock rejection fixture");
+
+        sqlx::query("BEGIN")
+            .execute(&mut *application_connection)
+            .await
+            .expect("begin active cutover DELETE fixture");
+        let active_delete_error = sqlx::query(
+            "DELETE FROM public.idempotency_records \
+             WHERE user_scope = $1::uuid::text AND key = $2",
+        )
+        .bind(principal_id)
+        .bind(&completed_key)
+        .execute(&mut *application_connection)
+        .await
+        .expect_err("completed replay evidence must not be deletable during the cutover");
+        assert_eq!(
+            active_delete_error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("idempotency_principal_namespace_cutover_fence")
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut *application_connection)
+            .await
+            .expect("discard active cutover DELETE fixture");
+
+        sqlx::query(
+            "WITH cutover AS ( \
+                 UPDATE public._sqlx_migrations \
+                 SET installed_on = \
+                     clock_timestamp() - interval '24 hours 5 minutes 1 second' \
+                 WHERE version = 199 AND success \
+                 RETURNING installed_on \
+             ) \
+             UPDATE public.idempotency_principal_cutover_state AS state \
+             SET requires_fence = TRUE, \
+                 fence_until = cutover.installed_on + make_interval(secs => 86700) \
+             FROM cutover WHERE state.singleton",
+        )
+        .execute(&migration_pool)
+        .await
+        .expect("expire the principal idempotency cutover fixture");
+        sqlx::query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *application_connection)
+            .await
+            .expect("begin expired cutover fixture");
+        let cutover_is_expired: bool = sqlx::query_scalar(
+            "SELECT fence_until < clock_timestamp() \
+             FROM public.idempotency_principal_cutover_state WHERE singleton",
+        )
+        .fetch_one(&mut *application_connection)
+        .await
+        .expect("pin the expired cutover snapshot");
+        assert!(cutover_is_expired);
+        let mut restore = migration_pool
+            .begin()
+            .await
+            .expect("begin canonical cutover-state restoration");
+        sqlx::query(
+            "UPDATE public._sqlx_migrations SET installed_on = $1 \
+             WHERE version = 199 AND success",
+        )
+        .bind(original_cutover_time)
+        .execute(&mut *restore)
+        .await
+        .expect("restore migration 199 installation time");
+        sqlx::query(
+            "UPDATE public.idempotency_principal_cutover_state \
+             SET requires_fence = $1, fence_until = $2 WHERE singleton",
+        )
+        .bind(original_cutover_state.0)
+        .bind(original_cutover_state.1)
+        .execute(&mut *restore)
+        .await
+        .expect("restore canonical principal idempotency cutover state");
+        restore
+            .commit()
+            .await
+            .expect("commit canonical cutover-state restoration");
+
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                 pg_catalog.hashtextextended( \
+                     'ryuki:idempotency:principal:'::text || $1::uuid::text, 0 \
+                 ) \
+             )",
+        )
+        .bind(principal_id)
+        .execute(&mut *application_connection)
+        .await
+        .expect("take the expired-window idempotency principal lock");
+        sqlx::query("SELECT pg_catalog.set_config('ryuki.idempotency_writer_contract', '3', true)")
+            .execute(&mut *application_connection)
+            .await
+            .expect("mark the expired-window v3 writer contract");
+        sqlx::query(
+            "INSERT INTO public.idempotency_records \
+                 (user_scope, key, fingerprint, claim_id) \
+             VALUES ($1::uuid::text, $2, $3, $4)",
+        )
+        .bind(principal_id)
+        .bind(format!("cutover-expired-{principal_id}"))
+        .bind("cutover-expired-fingerprint")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&mut *application_connection)
+        .await
+        .expect("the same application writer must be admitted after the replay window");
+
+        let expired_delete = sqlx::query(
+            "DELETE FROM public.idempotency_records \
+             WHERE user_scope = $1::uuid::text AND key = $2",
+        )
+        .bind(principal_id)
+        .bind(&completed_key)
+        .execute(&mut *application_connection)
+        .await
+        .expect("ordinary release and sweep DELETEs resume after the fence");
+        assert_eq!(expired_delete.rows_affected(), 1);
+
+        let missing_principal = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                 pg_catalog.hashtextextended( \
+                     'ryuki:idempotency:principal:'::text || $1::uuid::text, 0 \
+                 ) \
+             )",
+        )
+        .bind(missing_principal)
+        .execute(&mut *application_connection)
+        .await
+        .expect("take the missing-principal namespace lock");
+        let missing_principal_error = sqlx::query(
+            "INSERT INTO public.idempotency_records \
+                 (user_scope, key, fingerprint, claim_id) \
+             VALUES ($1::uuid::text, $2, 'missing-principal-fingerprint', $3)",
+        )
+        .bind(missing_principal)
+        .bind(format!("cutover-missing-principal-{missing_principal}"))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&mut *application_connection)
+        .await
+        .expect_err("a v3 writer cannot reintroduce a provider-subject namespace");
+        assert_eq!(
+            missing_principal_error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("idempotency_records_principal_namespace")
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut *application_connection)
+            .await
+            .expect("discard expired cutover fixture");
+        drop(application_connection);
+
+        sqlx::query(
+            "DELETE FROM public.idempotency_records \
+             WHERE user_scope = $1::uuid::text AND key = $2",
+        )
+        .bind(principal_id)
+        .bind(&completed_key)
+        .execute(&migration_pool)
+        .await
+        .expect("the owner can clean up the completed cutover fixture");
+
+        sqlx::query(
+            "ALTER TABLE public.idempotency_records \
+             DISABLE TRIGGER idempotency_records_writer_contract",
+        )
+        .execute(&migration_pool)
+        .await
+        .expect("introduce bounded trigger-state drift");
+        let drifted_pool = super::build_application_pool_inner(
+            &application_url,
+            super::ApplicationPoolSettings {
+                max_connections: 1,
+                min_connections: 1,
+                idle_timeout_secs: 60,
+                acquire_timeout_secs: 2,
+                max_lifetime_secs: 300,
+            },
+            Some(application_contract.clone()),
+            None,
+        )
+        .await;
+        sqlx::query(
+            "ALTER TABLE public.idempotency_records \
+             ENABLE ALWAYS TRIGGER idempotency_records_writer_contract",
+        )
+        .execute(&migration_pool)
+        .await
+        .expect("restore the canonical ALWAYS trigger state");
+        assert!(
+            drifted_pool.is_err(),
+            "strict startup must reject a disabled idempotency writer trigger"
+        );
+        migration_pool.close().await;
 
         for forbidden_sql in [
             "UPDATE public._sqlx_migrations SET success = success WHERE false",

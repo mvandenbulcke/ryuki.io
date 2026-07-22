@@ -77,7 +77,7 @@
       {
         "document_id": "source:ryuki-api-database-boundary",
         "document_version": 1,
-        "content_digest": "sha256:d385f251c0388af3683b737b95da06437414648af625226cae2af6084a7164f8",
+        "content_digest": "sha256:77eece414d06252d3b648cce95ddc24f38be16f594cd944bc12ea95dae6d753f",
         "artifact_locator": "sources/ryuki-api/src/database.rs"
       },
       {

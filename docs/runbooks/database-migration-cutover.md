@@ -71,6 +71,22 @@ single boundary whose acknowledgement may be uncertain. A release that cannot
 finish within this envelope needs a redesigned migration and fresh review, not
 a longer proof or an in-place timeout increase.
 
+Before the embedded inventory begins, the runner derives the principal-
+idempotency cutover install mode from the signed preflight ledger. Only a
+pristine database with no prior migration inventory receives
+`fresh-install-v1`; every missing, retained, or ambiguous state is an upgrade.
+Migration 200 persists that distinction in
+`idempotency_principal_cutover_state`. Fresh installs can serve immediately.
+Upgrades retain the migration-199 replay fence until its transaction-start
+timestamp plus 24 hours and a conservative 300-second margin. Because the
+mandatory traffic withdrawal and zero-session readback happen before `BEGIN`,
+the fence cannot end until more than 24 hours after the final possible legacy
+mutation; `_sqlx_migrations.installed_on` is not a commit timestamp. The serving
+role can only read this state, and every strict connection re-attests the exact
+row and writer-trigger boundary before it is published. The isolated migration
+owner remains the authority for this durable install-mode evidence and must be
+disabled with the rest of the one-shot migration credential after readback.
+
 ## Production pin resources and socket projection
 
 The checked-in Job is a suspended `source-template`, not an admissible Job. It
