@@ -23,7 +23,7 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:8929886d8232d9cbd676edffda1fbba68eb0ad04647d2046bfd8cd821b1eb496",
+        "content_digest": "sha256:28f02f1e68bf604e836e3a5f10077ded6fedb5a481b76f3d2ecb0266c8c0749f",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
@@ -89,7 +89,7 @@
       {
         "document_id": "source:ryuki-api-entra-auth",
         "document_version": 1,
-        "content_digest": "sha256:57547c6946fffc9c197af248fc8527a88a153ede0dac702d4b2cb49c45a15cb7",
+        "content_digest": "sha256:09f0c49ee289a26a9c592a71e88d9d0c4fe922159385e457bf1e8b15665de9ab",
         "artifact_locator": "sources/ryuki-api/src/entra_auth.rs"
       },
       {

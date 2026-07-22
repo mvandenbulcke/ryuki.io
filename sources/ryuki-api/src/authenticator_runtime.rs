@@ -16,7 +16,9 @@ use thiserror::Error;
 
 use crate::contracts::LocalLoginThrottle;
 use crate::cookie_runtime::ApiCookieRuntime;
-use crate::entra_auth::EntraTokenValidator;
+use crate::entra_auth::{
+    EntraBearerKeySourceKind, EntraBearerRuntimeObservation, EntraTokenValidator,
+};
 use crate::entra_sso::EntraSsoDeps;
 use crate::oidc_callback::{
     OidcCallbackDeps, OidcIdTokenValidator, ReqwestTokenExchanger, TokenExchanger,
@@ -29,8 +31,6 @@ const DISABLED_OIDC_AUDIENCE: &str = "disabled";
 const OIDC_CLOCK_SKEW_SECONDS: u64 = 60;
 const AUTHENTICATOR_LEAF_DIGEST_CONTRACT: &[u8] = b"ryuki-authenticator-runtime-leaf-binding-v1";
 
-const ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN: &[u8] = b"entra-issuer-authority-binding";
-const ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN: &[u8] = b"entra-audience-client-binding";
 const GENERIC_OIDC_ISSUER_AUTHORITY_BINDING_DOMAIN: &[u8] =
     b"generic-oidc-issuer-authority-binding";
 const GENERIC_OIDC_AUDIENCE_CLIENT_BINDING_DOMAIN: &[u8] = b"generic-oidc-audience-client-binding";
@@ -89,11 +89,7 @@ pub(crate) enum AuthenticatorSignatureAlgorithm {
 pub(crate) struct AuthenticatorRuntimeObservation {
     posture: ProductionAuthenticatorPosture,
     consumers: Box<[AuthenticatorRuntimeConsumer]>,
-    entra_issuer_authority_binding_digest: Option<String>,
-    entra_audience_client_binding_digest: Option<String>,
-    entra_signature_algorithm: Option<AuthenticatorSignatureAlgorithm>,
-    entra_jwks_ttl_seconds: u64,
-    entra_validation_leeway_seconds: u64,
+    entra_validator_observation: Option<Arc<EntraBearerRuntimeObservation>>,
     generic_oidc_enabled: bool,
     generic_oidc_issuer_authority_binding_digest: Option<String>,
     generic_oidc_audience_client_binding_digest: Option<String>,
@@ -115,13 +111,46 @@ impl fmt::Debug for AuthenticatorRuntimeObservation {
 }
 
 impl AuthenticatorRuntimeObservation {
-    fn measure(config: &RyukiConfig) -> Result<Self, String> {
+    fn measure(
+        config: &RyukiConfig,
+        entra_validator_observation: Arc<EntraBearerRuntimeObservation>,
+    ) -> Result<Self, String> {
         let posture = match &config.auth_mode {
             AuthMode::EntraId => ProductionAuthenticatorPosture::EntraOidc,
             AuthMode::MockDryRun => ProductionAuthenticatorPosture::CredentialFreeMockDryRun,
             AuthMode::StaticDryRun => ProductionAuthenticatorPosture::CredentialFreeStaticDryRun,
             AuthMode::Local => ProductionAuthenticatorPosture::PasswordLocal,
         };
+
+        if posture == ProductionAuthenticatorPosture::EntraOidc {
+            let exact_policy = entra_validator_observation.as_ref();
+            if exact_policy.key_source_kind() != EntraBearerKeySourceKind::NetworkJwks
+                || !exact_policy
+                    .issuer_authority_binding_digest()
+                    .starts_with("sha256:")
+                || !exact_policy
+                    .audience_client_binding_digest()
+                    .starts_with("sha256:")
+                || !exact_policy
+                    .key_source_binding_digest()
+                    .starts_with("sha256:")
+                || exact_policy.jwks_ttl_seconds().is_none()
+                || u32::try_from(exact_policy.validation_leeway_seconds()).is_err()
+                || exact_policy.accepted_algorithm_ids() != ["rs256"]
+                || exact_policy.required_claim_ids() != ["aud", "exp", "iat", "iss", "nbf", "sub"]
+                || exact_policy.provider_subject_claim_id() != "oid"
+                || !exact_policy.expiration_required()
+                || !exact_policy.not_before_required()
+                || !exact_policy.issued_at_required()
+                || exact_policy.nonce_required()
+                || exact_policy.redirects_allowed()
+            {
+                return Err(
+                    "retained Entra bearer validator does not implement the closed runtime policy"
+                        .to_string(),
+                );
+            }
+        }
 
         let mut consumers = match posture {
             ProductionAuthenticatorPosture::EntraOidc => {
@@ -145,24 +174,6 @@ impl AuthenticatorRuntimeObservation {
         if config.oidc.enabled {
             consumers.push(AuthenticatorRuntimeConsumer::GenericOidcBrowserCallback);
         }
-
-        let (entra_issuer_authority_binding_digest, entra_audience_client_binding_digest) =
-            if posture == ProductionAuthenticatorPosture::EntraOidc {
-                let issuer = normalized_entra_issuer(config)?;
-                let api_audience = format!("api://{}", config.entra_client_id);
-                (
-                    Some(leaf_binding_digest(
-                        ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN,
-                        &[issuer.as_bytes()],
-                    )),
-                    Some(leaf_binding_digest(
-                        ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN,
-                        &[config.entra_client_id.as_bytes(), api_audience.as_bytes()],
-                    )),
-                )
-            } else {
-                (None, None)
-            };
 
         let (
             generic_oidc_issuer_authority_binding_digest,
@@ -192,12 +203,8 @@ impl AuthenticatorRuntimeObservation {
         Ok(Self {
             posture,
             consumers: consumers.into_boxed_slice(),
-            entra_issuer_authority_binding_digest,
-            entra_audience_client_binding_digest,
-            entra_signature_algorithm: (posture == ProductionAuthenticatorPosture::EntraOidc)
-                .then_some(AuthenticatorSignatureAlgorithm::Rs256),
-            entra_jwks_ttl_seconds: config.entra_jwks_ttl_secs,
-            entra_validation_leeway_seconds: config.entra_leeway_secs,
+            entra_validator_observation: (posture == ProductionAuthenticatorPosture::EntraOidc)
+                .then_some(entra_validator_observation),
             generic_oidc_enabled: config.oidc.enabled,
             generic_oidc_issuer_authority_binding_digest,
             generic_oidc_audience_client_binding_digest,
@@ -221,27 +228,56 @@ impl AuthenticatorRuntimeObservation {
 
     #[cfg(test)]
     pub(crate) fn entra_issuer_authority_binding_digest(&self) -> Option<&str> {
-        self.entra_issuer_authority_binding_digest.as_deref()
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::issuer_authority_binding_digest)
     }
 
     #[cfg(test)]
     pub(crate) fn entra_audience_client_binding_digest(&self) -> Option<&str> {
-        self.entra_audience_client_binding_digest.as_deref()
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::audience_client_binding_digest)
     }
 
     #[cfg(test)]
     pub(crate) fn entra_signature_algorithm(&self) -> Option<AuthenticatorSignatureAlgorithm> {
-        self.entra_signature_algorithm
+        self.entra_validator_observation
+            .as_deref()
+            .and_then(|observation| {
+                (observation.accepted_algorithm_ids() == ["rs256"])
+                    .then_some(AuthenticatorSignatureAlgorithm::Rs256)
+            })
     }
 
     #[cfg(test)]
     pub(crate) fn entra_jwks_ttl_seconds(&self) -> u64 {
-        self.entra_jwks_ttl_seconds
+        self.entra_validator_observation
+            .as_deref()
+            .and_then(EntraBearerRuntimeObservation::jwks_ttl_seconds)
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
     pub(crate) fn entra_validation_leeway_seconds(&self) -> u64 {
-        self.entra_validation_leeway_seconds
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::validation_leeway_seconds)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_key_source_kind(&self) -> Option<EntraBearerKeySourceKind> {
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::key_source_kind)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_key_source_binding_digest(&self) -> Option<&str> {
+        self.entra_validator_observation
+            .as_deref()
+            .map(EntraBearerRuntimeObservation::key_source_binding_digest)
     }
 
     #[cfg(test)]
@@ -299,22 +335,6 @@ fn validated_exact_identity_url(raw: &str, label: &'static str) -> Result<String
         .map_err(|reason| format!("{label} is invalid: {reason}"))
 }
 
-fn normalized_entra_issuer(config: &RyukiConfig) -> Result<String, String> {
-    let mut authority = crate::oidc_callback::parse_identity_endpoint(&config.entra_authority)
-        .map_err(|reason| format!("Entra authority is invalid: {reason}"))?;
-    if authority.query().is_some() {
-        return Err("Entra authority must not contain a query".to_string());
-    }
-    let mut path = authority
-        .path_segments_mut()
-        .map_err(|_| "Entra authority cannot be used as a URL base".to_string())?;
-    path.pop_if_empty();
-    path.push(&config.entra_tenant_id);
-    path.push("v2.0");
-    drop(path);
-    Ok(authority.to_string())
-}
-
 fn leaf_binding_digest(domain: &[u8], fields: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
     update_length_prefixed(&mut digest, AUTHENTICATOR_LEAF_DIGEST_CONTRACT);
@@ -342,6 +362,7 @@ pub(crate) struct ApiAuthenticatorRuntime {
     operational_observation: Arc<AuthenticatorRuntimeObservation>,
     api_cookie_runtime: Arc<ApiCookieRuntime>,
     entra_bearer_validator: Arc<EntraTokenValidator>,
+    entra_bearer_observation: Arc<EntraBearerRuntimeObservation>,
     oidc_callback_dependencies: Arc<OidcCallbackDeps>,
     entra_sso_dependencies: Arc<EntraSsoDeps>,
     local_login_throttle: Arc<LocalLoginThrottle>,
@@ -358,8 +379,6 @@ impl ApiAuthenticatorRuntime {
         api_cookie_runtime
             .validate_config_binding(config, production_profile)
             .map_err(|error| error.to_string())?;
-        let operational_observation = Arc::new(AuthenticatorRuntimeObservation::measure(config)?);
-
         let entra_bearer_validator = Arc::new(EntraTokenValidator::from_app_config(
             &config.entra_tenant_id,
             &config.entra_client_id,
@@ -367,6 +386,11 @@ impl ApiAuthenticatorRuntime {
             config.entra_jwks_ttl_secs,
             config.entra_leeway_secs,
         ));
+        let entra_bearer_observation = Arc::new(entra_bearer_validator.runtime_observation());
+        let operational_observation = Arc::new(AuthenticatorRuntimeObservation::measure(
+            config,
+            Arc::clone(&entra_bearer_observation),
+        )?);
 
         let (token_endpoint, jwks_endpoint, issuer, audience) = if config.oidc.enabled {
             // The issuer claim is an exact protocol identifier. Parse it to
@@ -410,6 +434,7 @@ impl ApiAuthenticatorRuntime {
             operational_observation,
             api_cookie_runtime,
             entra_bearer_validator,
+            entra_bearer_observation,
             oidc_callback_dependencies,
             entra_sso_dependencies: EntraSsoDeps::from_app_config(config),
             local_login_throttle: Arc::new(LocalLoginThrottle::default()),
@@ -457,6 +482,10 @@ impl ApiAuthenticatorRuntime {
         Arc::clone(&self.entra_bearer_validator)
     }
 
+    pub(crate) fn entra_bearer_observation(&self) -> Arc<EntraBearerRuntimeObservation> {
+        Arc::clone(&self.entra_bearer_observation)
+    }
+
     pub(crate) fn oidc_callback_dependencies(&self) -> Arc<OidcCallbackDeps> {
         Arc::clone(&self.oidc_callback_dependencies)
     }
@@ -487,6 +516,17 @@ impl ApiAuthenticatorRuntime {
         Arc::ptr_eq(&self.entra_bearer_validator, validator)
     }
 
+    pub(crate) fn retains_entra_bearer_observation(
+        &self,
+        observation: &Arc<EntraBearerRuntimeObservation>,
+    ) -> bool {
+        Arc::ptr_eq(&self.entra_bearer_observation, observation)
+    }
+
+    pub(crate) fn remeasures_entra_bearer_observation(&self) -> bool {
+        *self.entra_bearer_observation == self.entra_bearer_validator.runtime_observation()
+    }
+
     pub(crate) fn retains_oidc_callback_dependencies(
         &self,
         dependencies: &Arc<OidcCallbackDeps>,
@@ -512,6 +552,7 @@ impl fmt::Debug for ApiAuthenticatorRuntime {
             .field("operational_observation", &"[RETAINED]")
             .field("api_cookie_runtime", &"[RETAINED]")
             .field("entra_bearer_validator", &"[RETAINED]")
+            .field("entra_bearer_observation", &"[RETAINED]")
             .field("oidc_callback_dependencies", &"[RETAINED]")
             .field("entra_sso_dependencies", &"[RETAINED]")
             .field("local_login_throttle", &"[RETAINED]")
@@ -543,6 +584,7 @@ mod tests {
         let (cookie_runtime, runtime) = build_runtime(&config);
         let observation = Arc::clone(runtime.operational_observation());
         let entra_bearer_validator = runtime.entra_bearer_validator();
+        let entra_bearer_observation = runtime.entra_bearer_observation();
         let oidc_callback_dependencies = runtime.oidc_callback_dependencies();
         let entra_sso_dependencies = runtime.entra_sso_dependencies();
         let local_login_throttle = runtime.local_login_throttle();
@@ -550,6 +592,8 @@ mod tests {
         assert!(runtime.retains_cookie_runtime(&cookie_runtime));
         assert!(runtime.retains_operational_observation(&observation));
         assert!(runtime.retains_entra_bearer_validator(&entra_bearer_validator));
+        assert!(runtime.retains_entra_bearer_observation(&entra_bearer_observation));
+        assert!(runtime.remeasures_entra_bearer_observation());
         assert!(runtime.retains_oidc_callback_dependencies(&oidc_callback_dependencies));
         assert!(runtime.retains_entra_sso_dependencies(&entra_sso_dependencies));
         assert!(runtime.retains_local_login_throttle(&local_login_throttle));
@@ -560,6 +604,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &runtime.entra_bearer_validator(),
             &runtime.entra_bearer_validator()
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.entra_bearer_observation(),
+            &runtime.entra_bearer_observation()
         ));
         assert!(Arc::ptr_eq(
             &runtime.oidc_callback_dependencies(),
@@ -578,6 +626,9 @@ mod tests {
         assert!(!runtime.retains_cookie_runtime(&other_cookie_runtime));
         assert!(!runtime.retains_operational_observation(other_runtime.operational_observation()));
         assert!(!runtime.retains_entra_bearer_validator(&other_runtime.entra_bearer_validator()));
+        assert!(
+            !runtime.retains_entra_bearer_observation(&other_runtime.entra_bearer_observation())
+        );
         assert!(!runtime
             .retains_oidc_callback_dependencies(&other_runtime.oidc_callback_dependencies()));
         assert!(!runtime.retains_entra_sso_dependencies(&other_runtime.entra_sso_dependencies()));
@@ -742,6 +793,13 @@ mod tests {
             Some(AuthenticatorSignatureAlgorithm::Rs256)
         );
         assert_eq!(
+            observation.entra_key_source_kind(),
+            Some(EntraBearerKeySourceKind::NetworkJwks)
+        );
+        assert!(observation
+            .entra_key_source_binding_digest()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert_eq!(
             observation.entra_jwks_ttl_seconds(),
             config.entra_jwks_ttl_secs
         );
@@ -877,6 +935,15 @@ mod tests {
             changed_runtime
                 .operational_observation()
                 .entra_jwks_ttl_seconds()
+        );
+        assert_ne!(
+            runtime
+                .operational_observation()
+                .entra_key_source_binding_digest(),
+            changed_runtime
+                .operational_observation()
+                .entra_key_source_binding_digest(),
+            "the exact retained JWKS TTL is part of the key-source binding"
         );
         assert_ne!(
             runtime

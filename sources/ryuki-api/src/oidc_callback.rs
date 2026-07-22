@@ -47,6 +47,14 @@ use uuid::Uuid;
 const IDENTITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IDENTITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub(crate) const fn identity_connect_timeout() -> Duration {
+    IDENTITY_CONNECT_TIMEOUT
+}
+
+pub(crate) const fn identity_request_timeout() -> Duration {
+    IDENTITY_REQUEST_TIMEOUT
+}
+
 /// Upper bound on a token-endpoint response. ID tokens are normally only a few
 /// KiB; one MiB leaves ample interoperability headroom without allowing a
 /// chunked response to grow the callback process's buffer without bound.

@@ -21,6 +21,7 @@
 //!   or header bytes.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -41,6 +42,12 @@ const MAX_JWKS_KEYS: usize = 32;
 /// Upper bound on the actual streamed JWKS response body. A declared length is
 /// only an early rejection hint; the cumulative bytes remain authoritative.
 const MAX_JWKS_BYTES: usize = 1 << 20;
+
+const AUTHENTICATOR_LEAF_DIGEST_CONTRACT: &[u8] = b"ryuki-authenticator-runtime-leaf-binding-v1";
+const ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN: &[u8] = b"entra-issuer-authority-binding";
+const ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN: &[u8] = b"entra-audience-client-binding";
+const ENTRA_JWKS_KEY_SOURCE_BINDING_DOMAIN: &[u8] = b"entra-jwks-key-source-binding";
+const ENTRA_REQUIRED_CLAIM_IDS: [&str; 6] = ["aud", "exp", "iat", "iss", "nbf", "sub"];
 
 /// Claims we extract from a validated Entra token. `sub` remains a required
 /// signed OIDC claim, while `oid` is the canonical Entra account key selected
@@ -173,6 +180,111 @@ struct JwksCache {
     jwks_uri: reqwest::Url,
     ttl: Duration,
     inner: RwLock<JwksState>,
+}
+
+/// Closed classification of the exact signing-key source retained by an Entra
+/// bearer validator. The static variant exists only in unit-test builds and
+/// can never be projected as production JWKS authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntraBearerKeySourceKind {
+    NetworkJwks,
+    #[cfg(test)]
+    StaticTestOnly,
+}
+
+/// Value-free measurement of one exact retained Entra bearer validator.
+///
+/// This is deliberately produced by [`EntraTokenValidator::runtime_observation`]
+/// from the validator's private fields and its concrete `JwksCache`. Callers
+/// cannot construct it from expected contract data or from a parallel config
+/// snapshot. Identity and endpoint values are retained only as domain-separated
+/// digests, and `Debug` never exposes them.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct EntraBearerRuntimeObservation {
+    issuer_authority_binding_digest: String,
+    audience_client_binding_digest: String,
+    key_source_kind: EntraBearerKeySourceKind,
+    key_source_binding_digest: String,
+    jwks_ttl_seconds: Option<u64>,
+    validation_leeway_seconds: u64,
+    accepted_algorithm_ids: [&'static str; 1],
+    required_claim_ids: [&'static str; 6],
+    provider_subject_claim_id: &'static str,
+    expiration_required: bool,
+    not_before_required: bool,
+    issued_at_required: bool,
+    nonce_required: bool,
+    redirects_allowed: bool,
+}
+
+impl fmt::Debug for EntraBearerRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EntraBearerRuntimeObservation")
+            .field("identity_bindings", &"[REDACTED]")
+            .field("key_source_kind", &self.key_source_kind)
+            .field("key_source_binding", &"[REDACTED]")
+            .field("verifier_policy", &"[RETAINED]")
+            .finish()
+    }
+}
+
+impl EntraBearerRuntimeObservation {
+    pub(crate) fn issuer_authority_binding_digest(&self) -> &str {
+        &self.issuer_authority_binding_digest
+    }
+
+    pub(crate) fn audience_client_binding_digest(&self) -> &str {
+        &self.audience_client_binding_digest
+    }
+
+    pub(crate) fn key_source_kind(&self) -> EntraBearerKeySourceKind {
+        self.key_source_kind
+    }
+
+    pub(crate) fn key_source_binding_digest(&self) -> &str {
+        &self.key_source_binding_digest
+    }
+
+    pub(crate) fn jwks_ttl_seconds(&self) -> Option<u64> {
+        self.jwks_ttl_seconds
+    }
+
+    pub(crate) fn validation_leeway_seconds(&self) -> u64 {
+        self.validation_leeway_seconds
+    }
+
+    pub(crate) fn accepted_algorithm_ids(&self) -> &[&str] {
+        &self.accepted_algorithm_ids
+    }
+
+    pub(crate) fn required_claim_ids(&self) -> &[&str] {
+        &self.required_claim_ids
+    }
+
+    pub(crate) fn provider_subject_claim_id(&self) -> &str {
+        self.provider_subject_claim_id
+    }
+
+    pub(crate) fn expiration_required(&self) -> bool {
+        self.expiration_required
+    }
+
+    pub(crate) fn not_before_required(&self) -> bool {
+        self.not_before_required
+    }
+
+    pub(crate) fn issued_at_required(&self) -> bool {
+        self.issued_at_required
+    }
+
+    pub(crate) fn nonce_required(&self) -> bool {
+        self.nonce_required
+    }
+
+    pub(crate) fn redirects_allowed(&self) -> bool {
+        self.redirects_allowed
+    }
 }
 
 /// A single RSA JWK from the discovery document. We only consume RS256 signing
@@ -367,6 +479,19 @@ fn request_read_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn authenticator_leaf_binding_digest(domain: &[u8], values: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for value in std::iter::once(AUTHENTICATOR_LEAF_DIGEST_CONTRACT)
+        .chain(std::iter::once(domain))
+        .chain(values.iter().copied())
+    {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    let digest = digest.finalize();
+    format!("sha256:{digest:x}")
+}
+
 /// Outcome of a validation attempt. The session is what callers consume; the
 /// reason is for safe logging only and is `None` on success.
 pub struct ValidationOutcome {
@@ -430,6 +555,99 @@ impl EntraTokenValidator {
             audiences,
             keys: KeySource::Network(cache),
             leeway_secs,
+        }
+    }
+
+    /// Independently measure the immutable verifier and key-source policy from
+    /// this exact retained object. No caller-provided expected value or config
+    /// projection participates in the result.
+    pub(crate) fn runtime_observation(&self) -> EntraBearerRuntimeObservation {
+        let mut audiences = self
+            .audiences
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        audiences.sort_unstable();
+        audiences.dedup();
+        let audience_bytes = audiences
+            .iter()
+            .map(|audience| audience.as_bytes())
+            .collect::<Vec<_>>();
+
+        let issuer_authority_binding_digest = authenticator_leaf_binding_digest(
+            ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN,
+            &[self.issuer.as_bytes()],
+        );
+        let audience_client_binding_digest = authenticator_leaf_binding_digest(
+            ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN,
+            &audience_bytes,
+        );
+
+        let (key_source_kind, key_source_binding_digest, jwks_ttl_seconds) = match &self.keys {
+            KeySource::Network(cache) => {
+                let ttl_seconds = cache.ttl.as_secs();
+                let ttl = ttl_seconds.to_string();
+                let refresh_cooldown = REFRESH_COOLDOWN.as_secs().to_string();
+                let maximum_keys = MAX_JWKS_KEYS.to_string();
+                let maximum_response_bytes = MAX_JWKS_BYTES.to_string();
+                let connect_timeout = crate::oidc_callback::identity_connect_timeout()
+                    .as_millis()
+                    .to_string();
+                let request_timeout = crate::oidc_callback::identity_request_timeout()
+                    .as_millis()
+                    .to_string();
+                let https_only = (cache.jwks_uri.scheme() == "https").to_string();
+                let digest = authenticator_leaf_binding_digest(
+                    ENTRA_JWKS_KEY_SOURCE_BINDING_DOMAIN,
+                    &[
+                        b"jwt-jwks",
+                        cache.jwks_uri.as_str().as_bytes(),
+                        ttl.as_bytes(),
+                        refresh_cooldown.as_bytes(),
+                        maximum_keys.as_bytes(),
+                        maximum_response_bytes.as_bytes(),
+                        connect_timeout.as_bytes(),
+                        request_timeout.as_bytes(),
+                        https_only.as_bytes(),
+                        b"no-proxy",
+                        b"redirects-disabled",
+                    ],
+                );
+                (
+                    EntraBearerKeySourceKind::NetworkJwks,
+                    digest,
+                    Some(ttl_seconds),
+                )
+            }
+            #[cfg(test)]
+            KeySource::Static(keys) => {
+                let key_count = keys.len().to_string();
+                (
+                    EntraBearerKeySourceKind::StaticTestOnly,
+                    authenticator_leaf_binding_digest(
+                        ENTRA_JWKS_KEY_SOURCE_BINDING_DOMAIN,
+                        &[b"static-test-only", key_count.as_bytes()],
+                    ),
+                    None,
+                )
+            }
+        };
+
+        EntraBearerRuntimeObservation {
+            issuer_authority_binding_digest,
+            audience_client_binding_digest,
+            key_source_kind,
+            key_source_binding_digest,
+            jwks_ttl_seconds,
+            validation_leeway_seconds: self.leeway_secs,
+            accepted_algorithm_ids: ["rs256"],
+            required_claim_ids: ENTRA_REQUIRED_CLAIM_IDS,
+            provider_subject_claim_id: "oid",
+            expiration_required: true,
+            not_before_required: true,
+            issued_at_required: true,
+            nonce_required: false,
+            redirects_allowed: false,
         }
     }
 

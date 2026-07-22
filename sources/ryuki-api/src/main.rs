@@ -3586,6 +3586,7 @@ async fn main() {
     let authenticator_observation_identity =
         Arc::clone(api_authenticator_runtime.operational_observation());
     let entra_bearer_validator_identity = api_authenticator_runtime.entra_bearer_validator();
+    let entra_bearer_observation_identity = api_authenticator_runtime.entra_bearer_observation();
     let oidc_callback_dependencies_identity =
         api_authenticator_runtime.oidc_callback_dependencies();
     let entra_sso_dependencies_identity = api_authenticator_runtime.entra_sso_dependencies();
@@ -3674,6 +3675,9 @@ async fn main() {
             .retains_operational_observation(&authenticator_observation_identity)
         || !api_authenticator_runtime_identity
             .retains_entra_bearer_validator(&entra_bearer_validator_identity)
+        || !api_authenticator_runtime_identity
+            .retains_entra_bearer_observation(&entra_bearer_observation_identity)
+        || !api_authenticator_runtime_identity.remeasures_entra_bearer_observation()
         || !api_authenticator_runtime_identity
             .retains_oidc_callback_dependencies(&oidc_callback_dependencies_identity)
         || !api_authenticator_runtime_identity
