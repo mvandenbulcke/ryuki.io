@@ -1,5 +1,10 @@
 .PHONY: build test test-unit test-db lint validate verify-clean cache-status clean run-api run-portal compose-up compose-down docker-build release-check db-backup db-restore
 
+# The ordinary Cargo targets below intentionally keep ./target for iterative
+# human development. Use `make verify-clean` for every complete verification
+# wave; it caps and removes a disposable target. Run `make clean` after any
+# deliberate debugging session that opts back into full debug information.
+
 build:
 	cargo build --workspace
 
@@ -109,8 +114,5 @@ docker-build:
 	docker build -f portal/portal-ui/Dockerfile -t ryuki/portal-ui:rust-dev .
 
 release-check:
-	cargo fmt --check --all
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace
-	$(MAKE) validate
+	$(MAKE) verify-clean
 	$(MAKE) docker-build

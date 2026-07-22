@@ -226,14 +226,15 @@ cd "$REPO_ROOT"
 test -n "$TEST_REVISION"
 test "$(git rev-parse HEAD)" = "$TEST_REVISION"
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
-cargo build --workspace
-cargo test --workspace
+make verify-clean
 (
   set -euo pipefail
   DB_TEST_CONTAINER="ryuki-gate1-db-${TEST_REVISION:0:12}-$$"
   DB_TEST_LOG="$(mktemp)"
+  DB_TEST_TARGET="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-gate1-target.XXXXXX")"
   cleanup_gate1_db() {
     rm -f "$DB_TEST_LOG"
+    rm -rf "$DB_TEST_TARGET"
     docker stop "$DB_TEST_CONTAINER" >/dev/null 2>&1 || true
   }
   trap cleanup_gate1_db EXIT
@@ -253,24 +254,26 @@ cargo test --workspace
   DB_TEST_PORT="${DB_TEST_BINDING##*:}"
   DB_TEST_URL="$(printf 'postgresql://%s@%s:%s/%s' \
     postgres 127.0.0.1 "$DB_TEST_PORT" ryuki_ci)"
-  RYUKI_DATABASE_URL="$DB_TEST_URL" \
+  CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 \
+  CARGO_TARGET_DIR="$DB_TEST_TARGET" \
+    RYUKI_DATABASE_URL="$DB_TEST_URL" \
     cargo test -p ryuki-api -- --test-threads=1 --nocapture \
     2>&1 | tee "$DB_TEST_LOG"
   ! grep -Eqi \
     'SKIP: (RYUKI_DATABASE_URL|DB (connect failed|unavailable|not available)|no seeded|seed .* not present|no DEFRA)|RYUKI_DATABASE_URL not set|skipping (DB|database) tests' \
     "$DB_TEST_LOG"
 )
-cargo fmt --check --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
-./scripts/no-secret-scan.sh
-git diff --check
 ```
 
-Every command must exit `0`. The PostgreSQL block starts an ephemeral
+Every command must exit `0`. `make verify-clean` runs the complete build,
+workspace tests, formatting, Clippy, validators, dependency audit, secret
+scan, and patch-hygiene checks in one capped disposable target. The PostgreSQL
+block starts an ephemeral
 PostgreSQL 18 container on a Docker-assigned loopback port, serializes the API
 tests, fails if a database-backed test reports that it skipped for lack of a
-database or fixture, and removes the container and test log on exit. Record
+database or fixture, and removes the container, test log, and its separate
+disposable Cargo target on exit. Record
 `TEST_REVISION` and the command results. Do not waive a failure as pre-existing;
 fix it or mark the test blocked. Do not switch revisions or edit
 tracked/untracked source through Gate 6: the agent binary embeds the tested IaC,

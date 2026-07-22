@@ -267,14 +267,15 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <span class="hl-cmd">test</span> <span class="hl-f">-n</span> <span class="hl-s">"$TEST_REVISION"</span>
 <span class="hl-cmd">test</span> <span class="hl-s">"$(git rev-parse HEAD)"</span> = <span class="hl-s">"$TEST_REVISION"</span>
 <span class="hl-cmd">test</span> <span class="hl-f">-z</span> <span class="hl-s">"$(git status --porcelain=v1 --untracked-files=all)"</span>
-<span class="hl-cmd">cargo</span> build <span class="hl-f">--workspace</span>
-<span class="hl-cmd">cargo</span> test <span class="hl-f">--workspace</span>
+<span class="hl-cmd">make</span> verify-clean
 <span class="hl-cmd">(</span>
   <span class="hl-cmd">set</span> <span class="hl-f">-euo</span> pipefail
   <span class="hl-cmd">DB_TEST_CONTAINER=</span><span class="hl-s">"ryuki-gate1-db-${TEST_REVISION:0:12}-$$"</span>
   <span class="hl-cmd">DB_TEST_LOG=</span><span class="hl-s">"$(mktemp)"</span>
+  <span class="hl-cmd">DB_TEST_TARGET=</span><span class="hl-s">"$(mktemp -d "</span><span class="hl-v">${TMPDIR:-/tmp}</span>/ryuki-gate1-target.XXXXXX<span class="hl-s">")"</span>
   <span class="hl-cmd">cleanup_gate1_db()</span> {
     <span class="hl-cmd">rm</span> <span class="hl-f">-f</span> <span class="hl-s">"$DB_TEST_LOG"</span>
+    <span class="hl-cmd">rm</span> <span class="hl-f">-rf</span> <span class="hl-s">"$DB_TEST_TARGET"</span>
     <span class="hl-cmd">docker</span> stop <span class="hl-s">"$DB_TEST_CONTAINER"</span> &gt;/dev/null 2&gt;&amp;1 || <span class="hl-cmd">true</span>
   <span class="hl-cmd">}</span>
   <span class="hl-cmd">trap</span> cleanup_gate1_db EXIT
@@ -294,19 +295,17 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
   <span class="hl-cmd">DB_TEST_PORT=</span><span class="hl-s">"${DB_TEST_BINDING##*:}"</span>
   <span class="hl-cmd">DB_TEST_URL=</span>"$(printf <span class="hl-s">'postgresql://%s@%s:%s/%s'</span> \
     <span class="hl-cmd">postgres</span> 127.0.0.1 <span class="hl-s">"$DB_TEST_PORT"</span> ryuki_ci)"
-  <span class="hl-cmd">RYUKI_DATABASE_URL=</span><span class="hl-s">"$DB_TEST_URL"</span> \
+  <span class="hl-cmd">CARGO_INCREMENTAL=0</span> \
+  <span class="hl-cmd">CARGO_PROFILE_TEST_DEBUG=0</span> \
+  <span class="hl-cmd">CARGO_TARGET_DIR=</span><span class="hl-s">"$DB_TEST_TARGET"</span> \
+    <span class="hl-cmd">RYUKI_DATABASE_URL=</span><span class="hl-s">"$DB_TEST_URL"</span> \
     <span class="hl-cmd">cargo</span> test <span class="hl-f">-p</span> ryuki-api <span class="hl-f">--</span> <span class="hl-f">--test-threads=1</span> <span class="hl-f">--nocapture</span> \
     <span class="hl-cmd">2&gt;&amp;1</span> | <span class="hl-cmd">tee</span> <span class="hl-s">"$DB_TEST_LOG"</span>
   <span class="hl-cmd">!</span> grep <span class="hl-f">-Eqi</span> \
     <span class="hl-s">'SKIP: (RYUKI_DATABASE_URL|DB (connect failed|unavailable|not available)|no seeded|seed .* not present|no DEFRA)|RYUKI_DATABASE_URL not set|skipping (DB|database) tests'</span> \
     <span class="hl-s">"$DB_TEST_LOG"</span>
-<span class="hl-cmd">)</span>
-<span class="hl-cmd">cargo</span> fmt <span class="hl-f">--check</span> <span class="hl-f">--all</span>
-<span class="hl-cmd">cargo</span> clippy <span class="hl-f">--workspace</span> <span class="hl-f">--all-targets</span> <span class="hl-f">--</span> <span class="hl-f">-D</span> warnings
-<span class="hl-cmd">cargo</span> run <span class="hl-f">--manifest-path</span> scripts/validator-rs/Cargo.toml <span class="hl-f">--</span> run-all <span class="hl-f">--root</span> .
-<span class="hl-cmd">./scripts/no-secret-scan.sh</span>
-<span class="hl-cmd">git</span> diff <span class="hl-f">--check</span></code></pre>
-<p>Every command must exit <code>0</code>. The PostgreSQL block starts an ephemeral PostgreSQL 18 container on a Docker-assigned loopback port, serializes the API tests, fails if a database-backed test reports that it skipped for lack of a database or fixture, and removes the container and test log on exit. Record <code>TEST_REVISION</code> and the command results. Do not waive a failure as pre-existing; fix it or mark the test blocked. Do not switch revisions or edit tracked/untracked source through Gate 6: the agent binary embeds the tested IaC, while the cleanup helper reads the current bundle from the checkout.</p>
+<span class="hl-cmd">)</span></code></pre>
+<p>Every command must exit <code>0</code>. <code>make verify-clean</code> runs the complete build, workspace tests, formatting, Clippy, validators, dependency audit, secret scan, and patch-hygiene checks in one capped disposable target. The PostgreSQL block starts an ephemeral PostgreSQL 18 container on a Docker-assigned loopback port, serializes the API tests, fails if a database-backed test reports that it skipped for lack of a database or fixture, and removes the container, test log, and its separate disposable Cargo target on exit. Record <code>TEST_REVISION</code> and the command results. Do not waive a failure as pre-existing; fix it or mark the test blocked. Do not switch revisions or edit tracked/untracked source through Gate 6: the agent binary embeds the tested IaC, while the cleanup helper reads the current bundle from the checkout.</p>
 <h2 id="gate-2-proving-ground-readiness">Gate 2: proving-ground readiness</h2>
 <p>Follow <code>deploy/proving-ground/README.md</code> to create the gitignored <code>.env</code>. Keep <code>PG_AGENT_ALLOW_LIVE=false</code> initially, then run:</p>
 <pre><code class="lang-bash"><span class="hl-cmd">cd</span> <span class="hl-s">"$PROVING_GROUND_DIR"</span>

@@ -49,11 +49,19 @@ other secrets to the repository.
 Use the root `Makefile`:
 
 ```bash
-make build       # cargo build --workspace
-make test        # cargo test --workspace
-make lint        # cargo fmt --check + clippy
-make validate    # validator run-all + secret scan
+make verify-clean # complete capped verification; disposable Cargo target
 make compose-up  # Docker Compose local dev environment
+```
+
+The following commands are iterative developer loops. They intentionally reuse
+the persistent repository `target/`; inspect it with `make cache-status` and
+remove it with `make clean` after a deliberate debug session:
+
+```bash
+make build
+make test
+make lint
+make validate
 ```
 
 Individual stages:
