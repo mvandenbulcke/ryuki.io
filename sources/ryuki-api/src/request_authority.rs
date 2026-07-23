@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ryuki_core::security_profile::SecurityProfile;
@@ -126,10 +127,13 @@ impl RequestReadCredentialWindow {
 
 /// Durable session credential metadata. The administrative UUID is not a
 /// bearer; the 32-byte verifier is already a keyed, non-reversible digest.
+/// Federated sessions additionally retain the exact sealed browser-origin Arc
+/// and its complete database projection; local sessions retain `None`.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PersistedSessionCredential {
     session_record_id: Uuid,
     bearer_verifier_digest: [u8; 32],
+    authenticator_origin: Option<crate::session_lookup_admission::BrowserOriginDatabaseBinding>,
     created_at: DateTime<Utc>,
     window: RequestReadCredentialWindow,
     digests: RequestReadCredentialDigests,
@@ -139,12 +143,16 @@ impl PersistedSessionCredential {
     pub(crate) fn new(
         session_record_id: Uuid,
         bearer_verifier_digest: [u8; 32],
+        authenticator_origin: Option<crate::session_lookup_admission::BrowserOriginDatabaseBinding>,
         created_at: DateTime<Utc>,
         window: RequestReadCredentialWindow,
         digests: RequestReadCredentialDigests,
     ) -> Result<Self, RequestAuthorityError> {
         if session_record_id.is_nil()
             || bearer_verifier_digest == [0; 32]
+            || authenticator_origin.as_ref().is_some_and(|origin| {
+                origin.origin_binding_digest() == &[0; 32] || !origin.verify_integrity()
+            })
             || bearer_verifier_digest != digests.credential_id
             || created_at != window.authenticated_at
         {
@@ -155,6 +163,7 @@ impl PersistedSessionCredential {
         Ok(Self {
             session_record_id,
             bearer_verifier_digest,
+            authenticator_origin,
             created_at,
             window,
             digests,
@@ -180,7 +189,6 @@ impl fmt::Debug for PersistedSessionCredential {
 pub(crate) struct DirectFederatedCredential {
     window: RequestReadCredentialWindow,
     digests: RequestReadCredentialDigests,
-    provider: String,
     issuer: String,
     subject: String,
 }
@@ -189,17 +197,14 @@ impl DirectFederatedCredential {
     pub(crate) fn new(
         window: RequestReadCredentialWindow,
         digests: RequestReadCredentialDigests,
-        provider: String,
         issuer: String,
         subject: String,
     ) -> Result<Self, RequestAuthorityError> {
-        validate_identifier(&provider)?;
         validate_identifier(&issuer)?;
         validate_identifier(&subject)?;
         Ok(Self {
             window,
             digests,
-            provider,
             issuer,
             subject,
         })
@@ -213,7 +218,6 @@ impl fmt::Debug for DirectFederatedCredential {
             .field("authenticated_at", &self.window.authenticated_at)
             .field("not_before", &self.window.not_before)
             .field("expires_at", &self.window.expires_at)
-            .field("provider", &self.provider)
             .field("issuer", &"<redacted>")
             .field("subject", &"<redacted>")
             .field("digests", &"<redacted>")
@@ -503,14 +507,29 @@ enum RequestReadPrincipal {
     },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 enum RevalidationSource {
     PersistedSession(Box<PersistedSessionCredential>),
-    DirectFederated,
+    DirectFederated(Arc<crate::authenticator_runtime::VerifiedDirectBearerAuthenticatorOrigin>),
     DevelopmentFixture,
     #[cfg(test)]
     TestFixture,
 }
+
+impl PartialEq for RevalidationSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PersistedSession(left), Self::PersistedSession(right)) => left == right,
+            (Self::DirectFederated(left), Self::DirectFederated(right)) => Arc::ptr_eq(left, right),
+            (Self::DevelopmentFixture, Self::DevelopmentFixture) => true,
+            #[cfg(test)]
+            (Self::TestFixture, Self::TestFixture) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RevalidationSource {}
 
 /// Opaque, non-serialized authority attached by authentication middleware.
 /// Possession is not yet a permit: the repository must revalidate it and then
@@ -530,13 +549,23 @@ impl RequestReadAuthority {
         principal: InteractiveRequestReadPrincipal,
         credential: PersistedSessionCredential,
     ) -> Result<Self, RequestAuthorityError> {
-        if principal.carrier_mode != "persisted-session" {
+        let origin_matches_provider = match credential.authenticator_origin.as_ref() {
+            Some(origin) => {
+                principal.source_provider != "local"
+                    && origin.provider_id() == principal.source_provider
+            }
+            None => principal.source_provider == "local",
+        };
+        if principal.carrier_mode != "persisted-session" || !origin_matches_provider {
             return Err(RequestAuthorityError::InvalidBinding(
                 "persisted session carrier mode",
             ));
         }
         let namespace = RequestReadNamespace::try_from(namespace)?;
         validate_interactive_namespace(&namespace, &principal)?;
+        if let Some(origin) = credential.authenticator_origin.as_ref() {
+            validate_browser_origin_namespace(&namespace, origin)?;
+        }
         let evidence = CredentialEvidence {
             kind: CredentialKind::PersistedSession,
             window: credential.window,
@@ -554,10 +583,17 @@ impl RequestReadAuthority {
         namespace: RequestReadSecurityNamespace,
         principal: InteractiveRequestReadPrincipal,
         credential: DirectFederatedCredential,
+        authenticator_origin: Arc<
+            crate::authenticator_runtime::VerifiedDirectBearerAuthenticatorOrigin,
+        >,
     ) -> Result<Self, RequestAuthorityError> {
+        authenticator_origin
+            .verify_integrity()
+            .map_err(|_| RequestAuthorityError::InvalidBinding("direct bearer origin"))?;
         if principal.carrier_mode != principal.source_provider
             || principal.source_provider == "local"
-            || credential.provider != principal.source_provider
+            || authenticator_origin.provider_id() != principal.source_provider
+            || !authenticator_origin.matches_validated_issuer(&principal.source_issuer)
             || credential.issuer != principal.source_issuer
             || credential.subject != principal.source_subject
         {
@@ -567,6 +603,7 @@ impl RequestReadAuthority {
         }
         let namespace = RequestReadNamespace::try_from(namespace)?;
         validate_interactive_namespace(&namespace, &principal)?;
+        validate_direct_origin_namespace(&namespace, &authenticator_origin)?;
         let evidence = CredentialEvidence {
             kind: CredentialKind::DirectFederated,
             window: credential.window,
@@ -576,7 +613,7 @@ impl RequestReadAuthority {
             namespace,
             RequestReadPrincipal::Interactive(Box::new(principal)),
             evidence,
-            RevalidationSource::DirectFederated,
+            RevalidationSource::DirectFederated(authenticator_origin),
         ))
     }
 
@@ -767,9 +804,10 @@ impl RequestReadAuthority {
                 RequestReadPrincipal::Interactive(principal),
                 RevalidationSource::PersistedSession(session),
             ) => revalidate_persisted_session(tx, principal, session, now).await?,
-            (RequestReadPrincipal::Interactive(principal), RevalidationSource::DirectFederated) => {
-                revalidate_direct_federated(tx, principal).await?
-            }
+            (
+                RequestReadPrincipal::Interactive(principal),
+                RevalidationSource::DirectFederated(origin),
+            ) => revalidate_direct_federated(tx, principal, origin).await?,
             (_, RevalidationSource::DevelopmentFixture) => {
                 return Err(RequestAuthorityError::InvalidBinding(
                     "development fixture cannot enter a database reader",
@@ -1078,6 +1116,13 @@ async fn revalidate_persisted_session(
     credential: &PersistedSessionCredential,
     now: DateTime<Utc>,
 ) -> Result<(), RequestAuthorityError> {
+    if credential
+        .authenticator_origin
+        .as_ref()
+        .is_some_and(|origin| !origin.verify_integrity())
+    {
+        return Err(RequestAuthorityError::StaleCredential);
+    }
     prepare_authority_reader(tx, principal).await?;
     let matched = sqlx::query_scalar::<_, i32>(
         "SELECT 1 \
@@ -1094,8 +1139,14 @@ async fn revalidate_persisted_session(
            ON p.principal_id = s.principal_id \
           AND p.lifecycle_version = s.principal_lifecycle_version \
           AND p.authority_version = s.principal_authority_version \
+         LEFT JOIN authenticator_authority_generations registered_origin \
+           ON registered_origin.authenticator_origin_binding_digest = \
+              s.authenticator_origin_binding_digest \
+         LEFT JOIN authenticator_authority_current_paths current_browser \
+           ON current_browser.provider_id = registered_origin.provider_id \
+          AND current_browser.path_kind = 'browser-derived-session' \
          WHERE s.session_record_id = $1 \
-           AND s.bearer_verifier = $2 \
+           AND s.session_bearer_verifier_v3 = $2 \
            AND s.principal_id = $3 \
            AND s.principal_lifecycle_version = $4 \
            AND s.principal_authority_version = $5 \
@@ -1134,6 +1185,36 @@ async fn revalidate_persisted_session(
                SELECT 1 FROM principal_key_tombstones t \
                WHERE t.principal_key_id = k.principal_key_id \
            ) \
+           AND ( \
+               ($21::BYTEA IS NULL \
+                AND s.authenticator_origin_binding_digest IS NULL \
+                AND registered_origin.authenticator_origin_binding_digest IS NULL \
+                AND current_browser.current_origin_binding_digest IS NULL \
+                AND k.provider_id = 'local') \
+               OR ($21::BYTEA IS NOT NULL \
+                   AND s.authenticator_origin_binding_digest = $21 \
+                   AND registered_origin.authenticator_origin_binding_digest = $21 \
+                   AND current_browser.path_status = 'active' \
+                   AND current_browser.current_origin_binding_digest = $21 \
+                   AND registered_origin.deployment_id = $22 \
+                   AND registered_origin.trust_domain_id = $23 \
+                   AND registered_origin.tenant_id IS NOT DISTINCT FROM $24 \
+                   AND registered_origin.provider_id = $25 \
+                   AND k.provider_id = registered_origin.provider_id \
+                   AND registered_origin.provider_configuration_version = $26 \
+                   AND registered_origin.provider_configuration_payload_digest = $27 \
+                   AND registered_origin.provider_lifecycle_record_version = $28 \
+                   AND registered_origin.provider_lifecycle_state = 'active' \
+                   AND registered_origin.binding_document_id = $29 \
+                   AND registered_origin.binding_document_version = $30 \
+                   AND registered_origin.binding_document_digest = $31 \
+                   AND registered_origin.binding_document_locator = $32 \
+                   AND registered_origin.provider_policy_binding_digest = $33 \
+                   AND registered_origin.runtime_binding_digest = $34 \
+                   AND registered_origin.path_id = $35 \
+                   AND registered_origin.path_version = $36 \
+                   AND registered_origin.path_kind = $37) \
+           ) \
          FOR SHARE OF s, k, l, p",
     )
     .bind(credential.session_record_id)
@@ -1156,6 +1237,108 @@ async fn revalidate_persisted_session(
     .bind(&principal.site_scope)
     .bind(principal.environment_mode.as_db())
     .bind(&principal.environment_scope)
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.origin_binding_digest().as_slice()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.deployment_id()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.trust_domain_id()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .and_then(|origin| origin.tenant_id()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.provider_id()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.provider_configuration_version()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.provider_configuration_payload_digest().as_slice()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.provider_lifecycle_record_version()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.binding_document_id()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.binding_document_version()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.binding_document_digest().as_slice()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.binding_document_locator()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.provider_policy_binding_digest().as_slice()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.runtime_binding_digest().as_slice()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.path_id()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.path_version()),
+    )
+    .bind(
+        credential
+            .authenticator_origin
+            .as_ref()
+            .map(|origin| origin.path_kind()),
+    )
     .fetch_optional(&mut **tx)
     .await?;
     if matched.is_none() {
@@ -1167,7 +1350,26 @@ async fn revalidate_persisted_session(
 async fn revalidate_direct_federated(
     tx: &mut Transaction<'_, Postgres>,
     principal: &InteractiveRequestReadPrincipal,
+    authenticator_origin: &Arc<
+        crate::authenticator_runtime::VerifiedDirectBearerAuthenticatorOrigin,
+    >,
 ) -> Result<(), RequestAuthorityError> {
+    authenticator_origin
+        .verify_integrity()
+        .map_err(|_| RequestAuthorityError::StaleCredential)?;
+    if authenticator_origin.provider_id() != principal.source_provider
+        || !authenticator_origin.matches_validated_issuer(&principal.source_issuer)
+    {
+        return Err(RequestAuthorityError::StaleCredential);
+    }
+    let origin = authenticator_origin.origin_projection();
+    let provider_configuration_payload_digest =
+        decode_origin_sha256(&origin.provider_configuration_payload_digest)?;
+    let binding_document_digest =
+        decode_origin_sha256(&origin.binding_document_reference.content_digest)?;
+    let provider_policy_binding_digest =
+        decode_origin_sha256(&origin.provider_policy_binding_digest)?;
+    let runtime_binding_digest = decode_origin_sha256(&origin.runtime_binding_digest)?;
     prepare_authority_reader(tx, principal).await?;
     let matched = sqlx::query_scalar::<_, i32>(
         "SELECT 1 \
@@ -1176,6 +1378,14 @@ async fn revalidate_direct_federated(
            ON l.principal_key_id = k.principal_key_id \
          JOIN principals p \
            ON p.principal_id = l.principal_id \
+         JOIN authenticator_authority_generations registered_origin \
+           ON registered_origin.authenticator_origin_binding_digest = $16 \
+         JOIN authenticator_authority_current_paths current_bearer \
+           ON current_bearer.provider_id = registered_origin.provider_id \
+          AND current_bearer.path_kind = 'bearer' \
+          AND current_bearer.path_status = 'active' \
+          AND current_bearer.current_origin_binding_digest = \
+              registered_origin.authenticator_origin_binding_digest \
          WHERE k.provider_id = $1 \
            AND k.issuer = $2 \
            AND k.subject = $3 \
@@ -1206,6 +1416,24 @@ async fn revalidate_direct_federated(
                SELECT 1 FROM principal_key_tombstones t \
                WHERE t.principal_key_id = k.principal_key_id \
            ) \
+           AND registered_origin.deployment_id = $17 \
+           AND registered_origin.trust_domain_id = $18 \
+           AND registered_origin.tenant_id IS NOT DISTINCT FROM $19 \
+           AND registered_origin.provider_id = $20 \
+           AND k.provider_id = registered_origin.provider_id \
+           AND registered_origin.provider_configuration_version = $21 \
+           AND registered_origin.provider_configuration_payload_digest = $22 \
+           AND registered_origin.provider_lifecycle_record_version = $23 \
+           AND registered_origin.provider_lifecycle_state = 'active' \
+           AND registered_origin.binding_document_id = $24 \
+           AND registered_origin.binding_document_version = $25 \
+           AND registered_origin.binding_document_digest = $26 \
+           AND registered_origin.binding_document_locator = $27 \
+           AND registered_origin.provider_policy_binding_digest = $28 \
+           AND registered_origin.runtime_binding_digest = $29 \
+           AND registered_origin.path_id = $30 \
+           AND registered_origin.path_version = $31 \
+           AND registered_origin.path_kind = $32 \
          FOR SHARE OF k, l, p",
     )
     .bind(&principal.source_provider)
@@ -1223,6 +1451,31 @@ async fn revalidate_direct_federated(
     .bind(&principal.site_scope)
     .bind(principal.environment_mode.as_db())
     .bind(&principal.environment_scope)
+    .bind(
+        authenticator_origin
+            .origin_binding_digest_bytes()
+            .as_slice(),
+    )
+    .bind(&origin.deployment_id)
+    .bind(&origin.trust_domain_id)
+    .bind(origin.tenant_id.as_deref())
+    .bind(&origin.provider_id)
+    .bind(origin_version_i64(origin.provider_configuration_version)?)
+    .bind(provider_configuration_payload_digest.as_slice())
+    .bind(origin_version_i64(
+        origin.provider_lifecycle_record_version,
+    )?)
+    .bind(&origin.binding_document_reference.document_id)
+    .bind(origin_version_i64(
+        origin.binding_document_reference.document_version,
+    )?)
+    .bind(binding_document_digest.as_slice())
+    .bind(&origin.binding_document_reference.artifact_locator)
+    .bind(provider_policy_binding_digest.as_slice())
+    .bind(runtime_binding_digest.as_slice())
+    .bind(&origin.path_id)
+    .bind(origin_version_i64(origin.path_version)?)
+    .bind(authenticator_origin.path_kind())
     .fetch_optional(&mut **tx)
     .await?;
     if matched.is_none() {
@@ -1265,6 +1518,45 @@ fn validate_interactive_namespace(
     if namespace.profile == DeploymentProfile::Production && principal.source_provider == "local" {
         return Err(RequestAuthorityError::InvalidBinding(
             "local interactive authority is not production credential authority",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_origin_namespace(
+    namespace: &RequestReadNamespace,
+    origin: &crate::session_lookup_admission::BrowserOriginDatabaseBinding,
+) -> Result<(), RequestAuthorityError> {
+    if namespace.deployment_id != origin.deployment_id()
+        || namespace.trust_domain_id != origin.trust_domain_id()
+        || namespace.tenant_id.as_deref() != origin.tenant_id()
+        || namespace.provider_id != origin.provider_id()
+        || i64::try_from(namespace.provider_configuration_version.get()).ok()
+            != Some(origin.provider_configuration_version())
+        || i64::try_from(namespace.provider_lifecycle_version.get()).ok()
+            != Some(origin.provider_lifecycle_record_version())
+    {
+        return Err(RequestAuthorityError::InvalidBinding(
+            "browser origin differs from security-contract namespace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_direct_origin_namespace(
+    namespace: &RequestReadNamespace,
+    origin: &Arc<crate::authenticator_runtime::VerifiedDirectBearerAuthenticatorOrigin>,
+) -> Result<(), RequestAuthorityError> {
+    let origin = origin.origin_projection();
+    if namespace.deployment_id.as_str() != origin.deployment_id.as_str()
+        || namespace.trust_domain_id.as_str() != origin.trust_domain_id.as_str()
+        || namespace.tenant_id.as_deref() != origin.tenant_id.as_deref()
+        || namespace.provider_id.as_str() != origin.provider_id.as_str()
+        || namespace.provider_configuration_version.get() != origin.provider_configuration_version
+        || namespace.provider_lifecycle_version.get() != origin.provider_lifecycle_record_version
+    {
+        return Err(RequestAuthorityError::InvalidBinding(
+            "direct bearer origin differs from security-contract namespace",
         ));
     }
     Ok(())
@@ -1343,6 +1635,37 @@ fn development_fixture_principal_id() -> PrincipalId {
 fn version_i64(version: BindingVersion) -> Result<i64, RequestAuthorityError> {
     i64::try_from(version.get())
         .map_err(|_| RequestAuthorityError::InvalidBinding("authority version"))
+}
+
+fn origin_version_i64(version: u64) -> Result<i64, RequestAuthorityError> {
+    i64::try_from(version)
+        .map_err(|_| RequestAuthorityError::InvalidBinding("authenticator origin version"))
+}
+
+fn decode_origin_sha256(value: &str) -> Result<[u8; 32], RequestAuthorityError> {
+    let encoded = value
+        .strip_prefix("sha256:")
+        .ok_or(RequestAuthorityError::InvalidBinding(
+            "authenticator origin digest",
+        ))?;
+    if encoded.len() != 64
+        || encoded
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(RequestAuthorityError::InvalidBinding(
+            "authenticator origin digest",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    hex::decode_to_slice(encoded, &mut digest)
+        .map_err(|_| RequestAuthorityError::InvalidBinding("authenticator origin digest"))?;
+    if digest == [0; 32] {
+        return Err(RequestAuthorityError::InvalidBinding(
+            "authenticator origin digest",
+        ));
+    }
+    Ok(digest)
 }
 
 fn validate_identifier(value: &str) -> Result<(), RequestAuthorityError> {
@@ -1446,9 +1769,50 @@ fn binding_digest(
             hash_u64(&mut hasher, 1);
             hash_bytes(&mut hasher, session.session_record_id.as_bytes());
             hash_bytes(&mut hasher, &session.bearer_verifier_digest);
+            match session.authenticator_origin.as_ref() {
+                Some(origin) => {
+                    hash_u64(&mut hasher, 1);
+                    hash_bytes(&mut hasher, origin.origin_binding_digest());
+                    hash_str(&mut hasher, origin.deployment_id());
+                    hash_str(&mut hasher, origin.trust_domain_id());
+                    match origin.tenant_id() {
+                        Some(tenant_id) => {
+                            hash_u64(&mut hasher, 1);
+                            hash_str(&mut hasher, tenant_id);
+                        }
+                        None => hash_u64(&mut hasher, 0),
+                    }
+                    hash_str(&mut hasher, origin.provider_id());
+                    hash_bytes(
+                        &mut hasher,
+                        &origin.provider_configuration_version().to_be_bytes(),
+                    );
+                    hash_bytes(&mut hasher, origin.provider_configuration_payload_digest());
+                    hash_bytes(
+                        &mut hasher,
+                        &origin.provider_lifecycle_record_version().to_be_bytes(),
+                    );
+                    hash_str(&mut hasher, origin.binding_document_id());
+                    hash_bytes(
+                        &mut hasher,
+                        &origin.binding_document_version().to_be_bytes(),
+                    );
+                    hash_bytes(&mut hasher, origin.binding_document_digest());
+                    hash_str(&mut hasher, origin.binding_document_locator());
+                    hash_bytes(&mut hasher, origin.provider_policy_binding_digest());
+                    hash_bytes(&mut hasher, origin.runtime_binding_digest());
+                    hash_str(&mut hasher, origin.path_id());
+                    hash_bytes(&mut hasher, &origin.path_version().to_be_bytes());
+                    hash_str(&mut hasher, origin.path_kind());
+                }
+                None => hash_u64(&mut hasher, 0),
+            }
             hash_time(&mut hasher, session.created_at);
         }
-        RevalidationSource::DirectFederated => hash_u64(&mut hasher, 2),
+        RevalidationSource::DirectFederated(origin) => {
+            hash_u64(&mut hasher, 2);
+            hash_bytes(&mut hasher, origin.origin_binding_digest_bytes());
+        }
         RevalidationSource::DevelopmentFixture => hash_u64(&mut hasher, 3),
         #[cfg(test)]
         RevalidationSource::TestFixture => hash_u64(&mut hasher, 4),

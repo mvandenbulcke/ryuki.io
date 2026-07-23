@@ -10,20 +10,23 @@
 //!   `Validation::new(Algorithm::RS256)`.
 //! - iss / aud / exp / nbf: pinned via `set_issuer`, `set_audience`,
 //!   `set_required_spec_claims`, `validate_exp`, `validate_nbf`.
-//! - nonce: stored server-side in `oidc_login_states`, compared to the
+//! - nonce: stored server-side in `oidc_login_states_v3`, compared to the
 //!   id_token `nonce` claim AFTER signature validation.
 //! - state single-use: `take()` is called before the token exchange; a missing
 //!   or already-consumed state returns 400.
 //! - No open redirect: post-login redirect is always `"/"`, IdP-error redirect
 //!   is always `"/?auth_error=1"`.  Neither comes from user input.
-//! - Secrets never logged: `client_secret`, `code`, `pkce_verifier`, `id_token`,
-//!   `access_token` are NEVER passed to any `tracing::*` call.
+//! - Secrets never logged: `client_secret`, `code`, `pkce_verifier`, and
+//!   `id_token` are NEVER passed to any `tracing::*` call. Provider access,
+//!   refresh, and token metadata are discarded by the private wire parser and
+//!   never retained in the exchange result.
 //! - Roles from validated claims only, via the `roles_claim` config key.
 //! - Validated provider subjects remain external lookup evidence. Identity
 //!   authority resolves the exact provider/issuer/subject tuple to a random,
 //!   opaque internal principal before persisting a session.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,6 +41,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use url::{Host, Position, Url};
 use uuid::Uuid;
@@ -46,6 +50,22 @@ use uuid::Uuid;
 
 const IDENTITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IDENTITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+const OIDC_RUNTIME_OBSERVATION_DIGEST_CONTRACT: &[u8] = b"ryuki-oidc-runtime-observation-leaf-v1";
+const OIDC_TOKEN_ENDPOINT_BINDING_DOMAIN: &[u8] = b"oidc-token-endpoint";
+const OIDC_ISSUER_BINDING_DOMAIN: &[u8] = b"oidc-issuer";
+const OIDC_AUDIENCE_BINDING_DOMAIN: &[u8] = b"oidc-audience";
+const OIDC_JWKS_ENDPOINT_BINDING_DOMAIN: &[u8] = b"oidc-jwks-endpoint";
+
+fn oidc_runtime_binding_digest(domain: &[u8], value: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    for field in [OIDC_RUNTIME_OBSERVATION_DIGEST_CONTRACT, domain, value] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    let digest = digest.finalize();
+    format!("sha256:{digest:x}")
+}
 
 pub(crate) const fn identity_connect_timeout() -> Duration {
     IDENTITY_CONNECT_TIMEOUT
@@ -197,11 +217,10 @@ pub struct TokenRequest {
     pub pkce_verifier: String,
 }
 
-/// Relevant fields from a token endpoint response.
+/// Minimal token-exchange result. Provider access/refresh tokens and token
+/// metadata never cross the private wire-decoding boundary.
 pub struct TokenResponse {
-    pub id_token: String,
-    #[allow(dead_code)]
-    pub access_token: Option<String>, // secret-scan-allow: field name, not a literal secret
+    pub(crate) id_token: String,
 }
 
 /// Errors that can occur during the token exchange.
@@ -230,8 +249,101 @@ pub trait TokenExchanger: Send + Sync {
 struct RawTokenResponse {
     #[serde(default)]
     id_token: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>, // secret-scan-allow: field name, not a literal secret
+}
+
+/// Value-free measurement of the exact retained authorization-code exchanger.
+///
+/// Construction stays private to [`ReqwestTokenExchanger::runtime_observation`]
+/// so a caller cannot project expected configuration as if it were a live
+/// exchanger. The endpoint is retained only as a domain-separated digest, and
+/// its identity is redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OidcTokenExchangerRuntimeObservation {
+    token_endpoint_binding_digest: String,
+    endpoint_https_only: bool,
+    redirects_allowed: bool,
+    ambient_proxy_allowed: bool,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    maximum_response_bytes: usize,
+    grant_type: &'static str,
+    pkce_verifier_included: bool,
+    redirect_uri_bound: bool,
+    client_id_bound: bool,
+    client_secret_form_parameter_optional: bool,
+}
+
+impl fmt::Debug for OidcTokenExchangerRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OidcTokenExchangerRuntimeObservation")
+            .field("token_endpoint_binding_digest", &"[REDACTED]")
+            .field("endpoint_https_only", &self.endpoint_https_only)
+            .field("redirects_allowed", &self.redirects_allowed)
+            .field("ambient_proxy_allowed", &self.ambient_proxy_allowed)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("maximum_response_bytes", &self.maximum_response_bytes)
+            .field("grant_type", &self.grant_type)
+            .field("pkce_verifier_included", &self.pkce_verifier_included)
+            .field("redirect_uri_bound", &self.redirect_uri_bound)
+            .field("client_id_bound", &self.client_id_bound)
+            .field(
+                "client_secret_form_parameter_optional",
+                &self.client_secret_form_parameter_optional,
+            )
+            .finish()
+    }
+}
+
+impl OidcTokenExchangerRuntimeObservation {
+    pub(crate) fn token_endpoint_binding_digest(&self) -> &str {
+        &self.token_endpoint_binding_digest
+    }
+
+    pub(crate) fn endpoint_https_only(&self) -> bool {
+        self.endpoint_https_only
+    }
+
+    pub(crate) fn redirects_allowed(&self) -> bool {
+        self.redirects_allowed
+    }
+
+    pub(crate) fn ambient_proxy_allowed(&self) -> bool {
+        self.ambient_proxy_allowed
+    }
+
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    pub(crate) fn maximum_response_bytes(&self) -> usize {
+        self.maximum_response_bytes
+    }
+
+    pub(crate) fn grant_type(&self) -> &str {
+        self.grant_type
+    }
+
+    pub(crate) fn pkce_verifier_included(&self) -> bool {
+        self.pkce_verifier_included
+    }
+
+    pub(crate) fn redirect_uri_bound(&self) -> bool {
+        self.redirect_uri_bound
+    }
+
+    pub(crate) fn client_id_bound(&self) -> bool {
+        self.client_id_bound
+    }
+
+    pub(crate) fn client_secret_form_parameter_optional(&self) -> bool {
+        self.client_secret_form_parameter_optional
+    }
 }
 
 /// Production exchanger: a `reqwest::Client` with a 10-second timeout and
@@ -251,6 +363,28 @@ impl ReqwestTokenExchanger {
         Self {
             client,
             token_endpoint,
+        }
+    }
+
+    /// Independently measure this exact retained exchanger and its fixed HTTP
+    /// and authorization-code form policy.
+    pub(crate) fn runtime_observation(&self) -> OidcTokenExchangerRuntimeObservation {
+        OidcTokenExchangerRuntimeObservation {
+            token_endpoint_binding_digest: oidc_runtime_binding_digest(
+                OIDC_TOKEN_ENDPOINT_BINDING_DOMAIN,
+                self.token_endpoint.as_str().as_bytes(),
+            ),
+            endpoint_https_only: self.token_endpoint.scheme() == "https",
+            redirects_allowed: false,
+            ambient_proxy_allowed: false,
+            connect_timeout: IDENTITY_CONNECT_TIMEOUT,
+            request_timeout: IDENTITY_REQUEST_TIMEOUT,
+            maximum_response_bytes: MAX_TOKEN_RESPONSE_BYTES,
+            grant_type: "authorization_code",
+            pkce_verifier_included: true,
+            redirect_uri_bound: true,
+            client_id_bound: true,
+            client_secret_form_parameter_optional: true,
         }
     }
 }
@@ -290,12 +424,12 @@ impl TokenExchanger for ReqwestTokenExchanger {
             let raw: RawTokenResponse = bounded_json_response(resp, MAX_TOKEN_RESPONSE_BYTES)
                 .await
                 .map_err(|_| OidcError::Deserialize)?;
-            let id_token = raw.id_token.ok_or(OidcError::MissingIdToken)?;
+            let id_token = raw
+                .id_token
+                .filter(|token| !token.is_empty())
+                .ok_or(OidcError::MissingIdToken)?;
 
-            Ok(TokenResponse {
-                id_token,
-                access_token: raw.access_token, // secret-scan-allow: moving parsed field, not a literal secret
-            })
+            Ok(TokenResponse { id_token })
         })
     }
 }
@@ -486,13 +620,184 @@ impl JwksCache {
 
 // ─── Injectable key source ────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 enum KeySource {
     Network(JwksCache),
+    #[cfg(test)]
     Static(HashMap<String, DecodingKey>),
 }
 
 // ─── id_token validator ───────────────────────────────────────────────────────
+
+/// Closed classification of the exact signing-key source retained by a
+/// generic OIDC validator. Static keys do not exist in non-test builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OidcIdTokenKeySourceKind {
+    NetworkJwks,
+    #[cfg(test)]
+    StaticTestOnly,
+}
+
+/// Network-only JWKS policy measured from a concrete retained [`JwksCache`].
+///
+/// The type cannot be constructed outside this module. A static-key validator
+/// has no instance of this type, preventing test-only key material from being
+/// represented as a network JWKS runtime.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OidcNetworkJwksRuntimeObservation {
+    endpoint_binding_digest: String,
+    endpoint_https_only: bool,
+    redirects_allowed: bool,
+    ambient_proxy_allowed: bool,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    cache_ttl: Duration,
+    refresh_cooldown: Duration,
+    maximum_cached_keys: usize,
+    maximum_response_bytes: usize,
+}
+
+impl fmt::Debug for OidcNetworkJwksRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OidcNetworkJwksRuntimeObservation")
+            .field("endpoint_binding_digest", &"[REDACTED]")
+            .field("endpoint_https_only", &self.endpoint_https_only)
+            .field("redirects_allowed", &self.redirects_allowed)
+            .field("ambient_proxy_allowed", &self.ambient_proxy_allowed)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("cache_ttl", &self.cache_ttl)
+            .field("refresh_cooldown", &self.refresh_cooldown)
+            .field("maximum_cached_keys", &self.maximum_cached_keys)
+            .field("maximum_response_bytes", &self.maximum_response_bytes)
+            .finish()
+    }
+}
+
+impl OidcNetworkJwksRuntimeObservation {
+    pub(crate) fn endpoint_binding_digest(&self) -> &str {
+        &self.endpoint_binding_digest
+    }
+
+    pub(crate) fn endpoint_https_only(&self) -> bool {
+        self.endpoint_https_only
+    }
+
+    pub(crate) fn redirects_allowed(&self) -> bool {
+        self.redirects_allowed
+    }
+
+    pub(crate) fn ambient_proxy_allowed(&self) -> bool {
+        self.ambient_proxy_allowed
+    }
+
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    pub(crate) fn cache_ttl(&self) -> Duration {
+        self.cache_ttl
+    }
+
+    pub(crate) fn refresh_cooldown(&self) -> Duration {
+        self.refresh_cooldown
+    }
+
+    pub(crate) fn maximum_cached_keys(&self) -> usize {
+        self.maximum_cached_keys
+    }
+
+    pub(crate) fn maximum_response_bytes(&self) -> usize {
+        self.maximum_response_bytes
+    }
+}
+
+/// Value-free measurement of one exact retained generic OIDC id-token
+/// validator. Issuer, audience, and JWKS endpoint values are represented only
+/// by independent domain-separated digests and are redacted from `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OidcIdTokenValidatorRuntimeObservation {
+    issuer_binding_digest: String,
+    audience_binding_digest: String,
+    issuer_https_only: bool,
+    key_source_kind: OidcIdTokenKeySourceKind,
+    network_jwks: Option<OidcNetworkJwksRuntimeObservation>,
+    accepted_algorithm_ids: [&'static str; 1],
+    required_claim_ids: [&'static str; 6],
+    expiration_required: bool,
+    not_before_required: bool,
+    nonce_required: bool,
+    leeway_seconds: u64,
+}
+
+impl fmt::Debug for OidcIdTokenValidatorRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OidcIdTokenValidatorRuntimeObservation")
+            .field("issuer_binding_digest", &"[REDACTED]")
+            .field("audience_binding_digest", &"[REDACTED]")
+            .field("issuer_https_only", &self.issuer_https_only)
+            .field("key_source_kind", &self.key_source_kind)
+            .field("network_jwks", &self.network_jwks)
+            .field("accepted_algorithm_ids", &self.accepted_algorithm_ids)
+            .field("required_claim_ids", &self.required_claim_ids)
+            .field("expiration_required", &self.expiration_required)
+            .field("not_before_required", &self.not_before_required)
+            .field("nonce_required", &self.nonce_required)
+            .field("leeway_seconds", &self.leeway_seconds)
+            .finish()
+    }
+}
+
+impl OidcIdTokenValidatorRuntimeObservation {
+    pub(crate) fn issuer_binding_digest(&self) -> &str {
+        &self.issuer_binding_digest
+    }
+
+    pub(crate) fn audience_binding_digest(&self) -> &str {
+        &self.audience_binding_digest
+    }
+
+    pub(crate) fn issuer_https_only(&self) -> bool {
+        self.issuer_https_only
+    }
+
+    pub(crate) fn key_source_kind(&self) -> OidcIdTokenKeySourceKind {
+        self.key_source_kind
+    }
+
+    pub(crate) fn network_jwks(&self) -> Option<&OidcNetworkJwksRuntimeObservation> {
+        self.network_jwks.as_ref()
+    }
+
+    pub(crate) fn accepted_algorithm_ids(&self) -> &[&str] {
+        &self.accepted_algorithm_ids
+    }
+
+    pub(crate) fn required_claim_ids(&self) -> &[&str] {
+        &self.required_claim_ids
+    }
+
+    pub(crate) fn expiration_required(&self) -> bool {
+        self.expiration_required
+    }
+
+    pub(crate) fn not_before_required(&self) -> bool {
+        self.not_before_required
+    }
+
+    pub(crate) fn nonce_required(&self) -> bool {
+        self.nonce_required
+    }
+
+    pub(crate) fn leeway_seconds(&self) -> u64 {
+        self.leeway_seconds
+    }
+}
 
 /// Validated identity extracted from an OIDC id_token.
 pub struct ValidatedOidcClaims {
@@ -580,8 +885,59 @@ impl OidcIdTokenValidator {
         }
     }
 
+    /// Independently measure the immutable validator and signing-key policy
+    /// from this exact retained object. Expected contract/config projections do
+    /// not participate in the result.
+    pub(crate) fn runtime_observation(&self) -> OidcIdTokenValidatorRuntimeObservation {
+        let (key_source_kind, network_jwks) = match &self.keys {
+            KeySource::Network(cache) => (
+                OidcIdTokenKeySourceKind::NetworkJwks,
+                Some(OidcNetworkJwksRuntimeObservation {
+                    endpoint_binding_digest: oidc_runtime_binding_digest(
+                        OIDC_JWKS_ENDPOINT_BINDING_DOMAIN,
+                        cache.jwks_uri.as_str().as_bytes(),
+                    ),
+                    endpoint_https_only: cache.jwks_uri.scheme() == "https",
+                    redirects_allowed: false,
+                    ambient_proxy_allowed: false,
+                    connect_timeout: IDENTITY_CONNECT_TIMEOUT,
+                    request_timeout: IDENTITY_REQUEST_TIMEOUT,
+                    cache_ttl: cache.ttl,
+                    refresh_cooldown: REFRESH_COOLDOWN,
+                    maximum_cached_keys: MAX_JWKS_KEYS,
+                    maximum_response_bytes: MAX_JWKS_BYTES,
+                }),
+            ),
+            #[cfg(test)]
+            KeySource::Static(_) => (OidcIdTokenKeySourceKind::StaticTestOnly, None),
+        };
+
+        let issuer = parse_identity_endpoint(&self.issuer)
+            .expect("retained OIDC issuer was validated during construction");
+        OidcIdTokenValidatorRuntimeObservation {
+            issuer_binding_digest: oidc_runtime_binding_digest(
+                OIDC_ISSUER_BINDING_DOMAIN,
+                self.issuer.as_bytes(),
+            ),
+            audience_binding_digest: oidc_runtime_binding_digest(
+                OIDC_AUDIENCE_BINDING_DOMAIN,
+                self.audience.as_bytes(),
+            ),
+            issuer_https_only: issuer.scheme() == "https",
+            key_source_kind,
+            network_jwks,
+            accepted_algorithm_ids: ["rs256"],
+            required_claim_ids: ["exp", "nbf", "iss", "aud", "sub", "nonce"],
+            expiration_required: true,
+            not_before_required: true,
+            nonce_required: true,
+            leeway_seconds: self.leeway_secs,
+        }
+    }
+
     async fn resolve_key(&self, kid: &str) -> Option<DecodingKey> {
         match &self.keys {
+            #[cfg(test)]
             KeySource::Static(map) => map.get(kid).cloned(),
             KeySource::Network(cache) => cache.decoding_key_for_kid(kid).await,
         }
@@ -733,9 +1089,32 @@ pub struct OidcCallbackDeps {
     pub(crate) session_credentials:
         Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
     pub(crate) cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    browser_authenticator_origin:
+        Option<Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>>,
 }
 
 impl OidcCallbackDeps {
+    pub(crate) fn new(
+        exchanger: Arc<dyn TokenExchanger + Send + Sync>,
+        validator: Arc<OidcIdTokenValidator>,
+        session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+        cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+        browser_authenticator_origin: Option<
+            Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
+        >,
+    ) -> Result<Self, String> {
+        if let Some(origin) = browser_authenticator_origin.as_deref() {
+            origin.verify_integrity()?;
+        }
+        Ok(Self {
+            exchanger,
+            validator,
+            session_credentials,
+            cookie_runtime,
+            browser_authenticator_origin,
+        })
+    }
+
     pub(crate) fn retains_session_credentials(
         &self,
         runtime: &Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
@@ -748,6 +1127,23 @@ impl OidcCallbackDeps {
         runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
     ) -> bool {
         Arc::ptr_eq(&self.cookie_runtime, runtime)
+    }
+
+    pub(crate) fn browser_authenticator_origin(
+        &self,
+    ) -> Option<Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>> {
+        self.browser_authenticator_origin.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn retains_browser_authenticator_origin(
+        &self,
+        origin: &Option<Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>>,
+    ) -> bool {
+        match (&self.browser_authenticator_origin, origin) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        }
     }
 }
 
@@ -809,6 +1205,14 @@ pub(crate) async fn oidc_callback(
         ));
     }
 
+    // The callback may burn state or exchange a code only under the exact
+    // browser authenticator origin retained at startup. An absent origin is a
+    // stable, value-free availability failure; ambient config never supplies a
+    // fallback digest.
+    let browser_authenticator_origin = deps
+        .browser_authenticator_origin()
+        .ok_or_else(crate::contracts::oidc_authenticator_origin_unavailable)?;
+
     // Gate 2: DB available.
     let pool = crate::database::get_db().ok_or_else(crate::contracts::status_503_no_db)?;
 
@@ -841,16 +1245,25 @@ pub(crate) async fn oidc_callback(
     })?;
 
     // Step 5: consume the state row (single-use, expiry-checked).
-    let (nonce, pkce_verifier, binding) =
-        match crate::repos::oidc_login_states::take(pool, &state_val)
-            .await
-            .map_err(crate::contracts::db_error)?
-        {
-            Some(row) => row,
-            None => {
-                return Err(invalid_state_problem());
-            }
-        };
+    let (nonce, pkce_verifier, binding) = match crate::repos::oidc_login_states::take(
+        pool,
+        &state_val,
+        browser_authenticator_origin.origin_binding_digest_bytes(),
+    )
+    .await
+    .map_err(crate::contracts::db_error)?
+    {
+        crate::repos::oidc_login_states::LoginStateTakeOutcome::Redeemed {
+            nonce,
+            pkce_verifier,
+            binding,
+        } => (nonce, pkce_verifier, binding),
+        crate::repos::oidc_login_states::LoginStateTakeOutcome::OriginMismatch
+        | crate::repos::oidc_login_states::LoginStateTakeOutcome::Expired
+        | crate::repos::oidc_login_states::LoginStateTakeOutcome::Absent => {
+            return Err(invalid_state_problem());
+        }
+    };
 
     // Step 5b: login-CSRF / session-swapping defense. The state is redeemable
     // only by the SAME browser that initiated the login: that browser holds the
@@ -905,6 +1318,7 @@ pub(crate) async fn oidc_callback(
                 Json(serde_json::json!({"error": "OIDC_TOKEN_INVALID"})),
             )
         })?;
+    drop(token_resp);
 
     // Step 8: mint unrelated management and authentication values. Only the
     // keyed verifier is persisted; the plaintext bearer is cookie-only.
@@ -919,7 +1333,7 @@ pub(crate) async fn oidc_callback(
     crate::contracts::map_auth_session_persistence_result(
         crate::identity_authority::create_federated_session(
             pool,
-            "oidc",
+            &browser_authenticator_origin,
             &cfg.oidc.issuer,
             &claims.provider_subject,
             &claims.display_name,
@@ -1034,8 +1448,22 @@ mod oidc_callback_db_tests {
     const TEST_ISS: &str = "https://idp.example.com";
     const TEST_AUD: &str = "oidc-client-test";
     const TEST_ENTRA_OID: &str = "11111111-2222-4333-8444-555555555555";
-    const TEST_BINDING: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    const OTHER_TEST_BINDING: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+
+    fn canonical_protocol_value() -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use rand::RngCore;
+
+        let mut value = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut value);
+        URL_SAFE_NO_PAD.encode(value)
+    }
+
+    fn test_browser_authenticator_origin(
+        label: &str,
+    ) -> Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin> {
+        crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(label)
+    }
 
     async fn read_test_http_request(stream: &mut TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
@@ -1168,6 +1596,193 @@ mod oidc_callback_db_tests {
             assert!(
                 parse_identity_endpoint(malformed).is_err(),
                 "malformed or lookalike endpoint must fail: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_token_exchanger_runtime_observation_retains_exact_endpoint_and_policy() {
+        let endpoint = "https://idp.example.com/oauth2/token?profile=production";
+        let exchanger = ReqwestTokenExchanger::new(endpoint);
+        let observation = exchanger.runtime_observation();
+
+        assert_eq!(
+            observation.token_endpoint_binding_digest(),
+            oidc_runtime_binding_digest(
+                OIDC_TOKEN_ENDPOINT_BINDING_DOMAIN,
+                Url::parse(endpoint)
+                    .expect("parse token endpoint fixture")
+                    .as_str()
+                    .as_bytes(),
+            )
+        );
+        assert!(observation.endpoint_https_only());
+        assert!(!observation.redirects_allowed());
+        assert!(!observation.ambient_proxy_allowed());
+        assert_eq!(observation.connect_timeout(), IDENTITY_CONNECT_TIMEOUT);
+        assert_eq!(observation.request_timeout(), IDENTITY_REQUEST_TIMEOUT);
+        assert_eq!(
+            observation.maximum_response_bytes(),
+            MAX_TOKEN_RESPONSE_BYTES
+        );
+        assert_eq!(observation.grant_type(), "authorization_code");
+        assert!(observation.pkce_verifier_included());
+        assert!(observation.redirect_uri_bound());
+        assert!(observation.client_id_bound());
+        assert!(observation.client_secret_form_parameter_optional());
+
+        let mutated =
+            ReqwestTokenExchanger::new("https://idp.example.com/oauth2/token?profile=rotated")
+                .runtime_observation();
+        assert_ne!(
+            observation.token_endpoint_binding_digest(),
+            mutated.token_endpoint_binding_digest(),
+            "an endpoint mutation must change the retained identity binding"
+        );
+
+        let debug = format!("{observation:?}");
+        assert!(!debug.contains(endpoint));
+        assert!(!debug.contains(observation.token_endpoint_binding_digest()));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_network_validator_runtime_observation_retains_jwks_and_validation_policy() {
+        let issuer = "https://idp.example.com/tenant/v2.0";
+        let audience = "generic-client-production";
+        let jwks = "https://idp.example.com/tenant/discovery/keys";
+        let validator = OidcIdTokenValidator::new(jwks, issuer, audience, 73);
+        let observation = validator.runtime_observation();
+
+        assert_eq!(
+            observation.issuer_binding_digest(),
+            oidc_runtime_binding_digest(OIDC_ISSUER_BINDING_DOMAIN, issuer.as_bytes())
+        );
+        assert_eq!(
+            observation.audience_binding_digest(),
+            oidc_runtime_binding_digest(OIDC_AUDIENCE_BINDING_DOMAIN, audience.as_bytes())
+        );
+        assert!(observation.issuer_https_only());
+        assert_eq!(
+            observation.key_source_kind(),
+            OidcIdTokenKeySourceKind::NetworkJwks
+        );
+        assert_eq!(observation.accepted_algorithm_ids(), &["rs256"]);
+        assert_eq!(
+            observation.required_claim_ids(),
+            &["exp", "nbf", "iss", "aud", "sub", "nonce"]
+        );
+        assert!(observation.expiration_required());
+        assert!(observation.not_before_required());
+        assert!(observation.nonce_required());
+        assert_eq!(observation.leeway_seconds(), 73);
+
+        let network = observation
+            .network_jwks()
+            .expect("a network validator must expose its retained JWKS cache policy");
+        assert_eq!(
+            network.endpoint_binding_digest(),
+            oidc_runtime_binding_digest(OIDC_JWKS_ENDPOINT_BINDING_DOMAIN, jwks.as_bytes())
+        );
+        assert!(network.endpoint_https_only());
+        assert!(!network.redirects_allowed());
+        assert!(!network.ambient_proxy_allowed());
+        assert_eq!(network.connect_timeout(), IDENTITY_CONNECT_TIMEOUT);
+        assert_eq!(network.request_timeout(), IDENTITY_REQUEST_TIMEOUT);
+        assert_eq!(network.cache_ttl(), Duration::from_secs(3_600));
+        assert_eq!(network.refresh_cooldown(), REFRESH_COOLDOWN);
+        assert_eq!(network.maximum_cached_keys(), MAX_JWKS_KEYS);
+        assert_eq!(network.maximum_response_bytes(), MAX_JWKS_BYTES);
+
+        let mutated = OidcIdTokenValidator::new(
+            "https://idp.example.com/tenant/discovery/rotated-keys",
+            issuer,
+            audience,
+            73,
+        )
+        .runtime_observation();
+        assert_ne!(
+            network.endpoint_binding_digest(),
+            mutated
+                .network_jwks()
+                .expect("mutated validator remains network-backed")
+                .endpoint_binding_digest(),
+            "a JWKS endpoint mutation must change the retained key-source binding"
+        );
+
+        let debug = format!("{observation:?}");
+        for identity in [
+            issuer,
+            audience,
+            jwks,
+            observation.issuer_binding_digest(),
+            observation.audience_binding_digest(),
+            network.endpoint_binding_digest(),
+        ] {
+            assert!(
+                !debug.contains(identity),
+                "Debug must redact identity values and digests"
+            );
+        }
+    }
+
+    #[test]
+    fn test_static_validator_cannot_project_network_jwks_observation() {
+        let (_, decoding) = make_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(TEST_KID.to_string(), decoding);
+        let mut validator = OidcIdTokenValidator::with_static_keys(TEST_ISS, TEST_AUD, keys);
+        validator.leeway_secs = 19;
+        let observation = validator.runtime_observation();
+
+        assert_eq!(
+            observation.key_source_kind(),
+            OidcIdTokenKeySourceKind::StaticTestOnly
+        );
+        assert!(
+            observation.network_jwks().is_none(),
+            "static test keys must never yield a network JWKS observation"
+        );
+        assert_eq!(observation.leeway_seconds(), 19);
+        assert_ne!(
+            oidc_runtime_binding_digest(OIDC_ISSUER_BINDING_DOMAIN, b"same-value"),
+            oidc_runtime_binding_digest(OIDC_AUDIENCE_BINDING_DOMAIN, b"same-value"),
+            "identity binding domains must remain independent"
+        );
+
+        let mutated_issuer = OidcIdTokenValidator::with_static_keys(
+            "https://alternate-idp.example.com",
+            TEST_AUD,
+            HashMap::new(),
+        )
+        .runtime_observation();
+        assert_ne!(
+            observation.issuer_binding_digest(),
+            mutated_issuer.issuer_binding_digest(),
+            "an issuer mutation must change its retained identity binding"
+        );
+        let mutated_audience = OidcIdTokenValidator::with_static_keys(
+            TEST_ISS,
+            "alternate-oidc-client",
+            HashMap::new(),
+        )
+        .runtime_observation();
+        assert_ne!(
+            observation.audience_binding_digest(),
+            mutated_audience.audience_binding_digest(),
+            "an audience mutation must change its retained identity binding"
+        );
+
+        let debug = format!("{observation:?}");
+        for identity in [
+            TEST_ISS,
+            TEST_AUD,
+            observation.issuer_binding_digest(),
+            observation.audience_binding_digest(),
+        ] {
+            assert!(
+                !debug.contains(identity),
+                "Debug must redact static-validator identity bindings"
             );
         }
     }
@@ -1415,7 +2030,14 @@ mod oidc_callback_db_tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept token request");
             let _request = read_test_http_request(&mut stream).await;
-            let body = r#"{"id_token":"fixture-id-token"}"#;
+            let body = json!({
+                "id_token": "fixture-id-token",
+                "access_token": Uuid::new_v4().to_string(),
+                "refresh_token": Uuid::new_v4().to_string(),
+                "token_type": "Bearer",
+                "expires_in": 3_600,
+            })
+            .to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -1443,6 +2065,46 @@ mod oidc_callback_db_tests {
         };
         assert_eq!(response.id_token, "fixture-id-token");
         server.await.expect("test token server task");
+    }
+
+    #[tokio::test]
+    async fn test_token_exchange_rejects_provider_tokens_without_id_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider-token custody test endpoint");
+        let address = listener.local_addr().expect("test endpoint address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept token request");
+            let _request = read_test_http_request(&mut stream).await;
+            let body = json!({
+                "access_token": Uuid::new_v4().to_string(),
+                "refresh_token": Uuid::new_v4().to_string(),
+                "token_type": "Bearer",
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write provider-token-only response");
+        });
+
+        let exchanger = ReqwestTokenExchanger::new(format!("http://{address}/token"));
+        let result = exchanger
+            .exchange(&TokenRequest {
+                code: "fixture-code".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+                client_id: "fixture-client".to_string(),
+                client_secret: None,
+                pkce_verifier: "fixture-verifier".to_string(),
+            })
+            .await;
+        assert!(matches!(result, Err(OidcError::MissingIdToken)));
+        server.await.expect("provider-token custody server task");
     }
 
     #[tokio::test]
@@ -1577,12 +2239,12 @@ mod oidc_callback_db_tests {
 
     /// Build a callback GET request carrying the matching secure binding cookie.
     /// Tests that should proceed past the browser-binding check use this.
-    fn callback_req(uri: String) -> Request<Body> {
+    fn callback_req(uri: String, binding: &str) -> Request<Body> {
         Request::builder()
             .uri(uri)
             .header(
                 axum::http::header::COOKIE,
-                format!("__Host-oidc_login_csrf={TEST_BINDING}"),
+                format!("__Host-oidc_login_csrf={binding}"),
             )
             .body(Body::empty())
             .unwrap()
@@ -1638,12 +2300,7 @@ mod oidc_callback_db_tests {
             _req: &'a TokenRequest,
         ) -> Pin<Box<dyn Future<Output = Result<TokenResponse, OidcError>> + Send + 'a>> {
             let id_token = self.id_token.clone();
-            Box::pin(async move {
-                Ok(TokenResponse {
-                    id_token,
-                    access_token: None,
-                })
-            })
+            Box::pin(async move { Ok(TokenResponse { id_token }) })
         }
     }
 
@@ -1683,19 +2340,35 @@ mod oidc_callback_db_tests {
     fn test_router(
         exchanger: Arc<dyn TokenExchanger + Send + Sync>,
         validator: Arc<OidcIdTokenValidator>,
+        browser_authenticator_origin: Arc<
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin,
+        >,
+    ) -> axum::Router {
+        test_router_with_optional_origin(exchanger, validator, Some(browser_authenticator_origin))
+    }
+
+    fn test_router_with_optional_origin(
+        exchanger: Arc<dyn TokenExchanger + Send + Sync>,
+        validator: Arc<OidcIdTokenValidator>,
+        browser_authenticator_origin: Option<
+            Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
+        >,
     ) -> axum::Router {
         ensure_config();
         let cfg = crate::config_store::get_app_config();
-        let deps = Arc::new(OidcCallbackDeps {
-            exchanger,
-            validator,
-            session_credentials:
+        let deps = Arc::new(
+            OidcCallbackDeps::new(
+                exchanger,
+                validator,
                 crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
                     &cfg.session,
                 )
                 .expect("test config must construct session credential runtime"),
-            cookie_runtime: crate::config_store::get_api_cookie_runtime(),
-        });
+                crate::config_store::get_api_cookie_runtime(),
+                browser_authenticator_origin,
+            )
+            .expect("sealed test browser authenticator origin must be retained"),
+        );
         axum::Router::new()
             .route("/api/auth/oidc/callback", axum::routing::get(oidc_callback))
             .layer(Extension(deps))
@@ -1704,39 +2377,123 @@ mod oidc_callback_db_tests {
     /// Inserts a login-state row for test setup using the static pool.
     async fn insert_test_state(
         pool: &'static PgPool,
+        browser_authenticator_origin: &Arc<
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin,
+        >,
         state: &str,
         login_nonce: &str,
-    ) -> Result<(), sqlx::Error> {
-        crate::repos::oidc_login_states::insert_test_material(
+    ) -> Result<String, sqlx::Error> {
+        crate::identity_authority::reconcile_test_authenticator_runtime(
             pool,
-            crate::repos::oidc_login_states::LoginFlow::GenericOidc,
-            state,
-            login_nonce,
-            "test-pkce-verifier",
-            TEST_BINDING,
+            browser_authenticator_origin,
         )
         .await
+        .expect("reconcile the synthetic paired test authenticator runtime");
+        let pkce_verifier = canonical_protocol_value();
+        let binding = canonical_protocol_value();
+        crate::repos::oidc_login_states::insert_test_material(
+            pool,
+            browser_authenticator_origin.origin_binding_digest_bytes(),
+            state,
+            login_nonce,
+            &pkce_verifier,
+            &binding,
+        )
+        .await?;
+        Ok(binding)
     }
 
     async fn provision_global_assignment(
         pool: &PgPool,
-        provider: &str,
+        browser_authenticator_origin: &Arc<
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin,
+        >,
         issuer: &str,
         subject: &str,
         roles: &[String],
     ) {
-        crate::human_authority::persist_governed_assignment(
+        crate::identity_authority::reconcile_test_authenticator_runtime(
             pool,
-            provider,
+            browser_authenticator_origin,
+        )
+        .await
+        .expect("reconcile the synthetic paired test authenticator runtime");
+        crate::identity_authority::provision_test_authenticator_assignment(
+            pool,
+            browser_authenticator_origin,
             issuer,
             subject,
-            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(roles),
+            roles,
         )
         .await
         .expect("seed OIDC human authority");
     }
 
     // ─── Tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn callback_dependencies_retain_only_the_exact_browser_origin_allocation() {
+        ensure_config();
+        let (_, decoding_key) = make_keypair();
+        let mut key_map = HashMap::new();
+        key_map.insert(TEST_KID.to_string(), decoding_key);
+        let retained_origin = test_browser_authenticator_origin("generic-oidc-arc-identity");
+        let equal_looking_substitute =
+            test_browser_authenticator_origin("generic-oidc-arc-identity");
+        let cfg = crate::config_store::get_app_config();
+        let dependencies = OidcCallbackDeps::new(
+            Arc::new(FailingTokenExchanger),
+            Arc::new(OidcIdTokenValidator::with_static_keys(
+                TEST_ISS, TEST_AUD, key_map,
+            )),
+            crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
+                &cfg.session,
+            )
+            .expect("test session credential runtime"),
+            crate::config_store::get_api_cookie_runtime(),
+            Some(Arc::clone(&retained_origin)),
+        )
+        .expect("sealed browser origin must be admitted");
+
+        assert!(
+            dependencies.retains_browser_authenticator_origin(&Some(Arc::clone(&retained_origin)))
+        );
+        assert!(!dependencies.retains_browser_authenticator_origin(&Some(equal_looking_substitute)));
+        assert!(!dependencies.retains_browser_authenticator_origin(&None));
+    }
+
+    #[tokio::test]
+    async fn callback_without_resolved_origin_fails_closed_before_exchange() {
+        let (_, decoding_key) = make_keypair();
+        let mut key_map = HashMap::new();
+        key_map.insert(TEST_KID.to_string(), decoding_key);
+        let app = test_router_with_optional_origin(
+            Arc::new(FailingTokenExchanger),
+            Arc::new(OidcIdTokenValidator::with_static_keys(
+                TEST_ISS, TEST_AUD, key_map,
+            )),
+            None,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=unused&state={}",
+                        canonical_protocol_value()
+                    ))
+                    .body(Body::empty())
+                    .expect("callback request"),
+            )
+            .await
+            .expect("missing-origin callback response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("read missing-origin response");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("missing-origin JSON problem");
+        assert_eq!(problem["error"], "OIDC_AUTHENTICATOR_ORIGIN_UNAVAILABLE");
+    }
 
     #[tokio::test]
     async fn test_callback_happy_path_mints_session_and_redirects() {
@@ -1745,9 +2502,11 @@ mod oidc_callback_db_tests {
             return;
         };
 
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-happy-path");
         provision_global_assignment(
             pool,
-            "oidc",
+            &browser_authenticator_origin,
             TEST_ISS,
             "sub-test-1",
             &["PlatformAdmin".to_string()],
@@ -1755,14 +2514,14 @@ mod oidc_callback_db_tests {
         .await;
 
         let (enc, dec) = make_keypair();
-        let nonce = "test-nonce-happy";
-        let state = format!("st-happy-{}", Uuid::new_v4());
+        let nonce = canonical_protocol_value();
+        let state = canonical_protocol_value();
 
-        insert_test_state(pool, &state, nonce)
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &nonce)
             .await
             .expect("insert state");
 
-        let id_token = sign_id_token(&enc, valid_id_token_claims(nonce));
+        let id_token = sign_id_token(&enc, valid_id_token_claims(&nonce));
 
         let mut key_map = HashMap::new();
         key_map.insert(TEST_KID.to_string(), dec);
@@ -1773,12 +2532,16 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        let req = callback_req(format!(
-            "/api/auth/oidc/callback?code=test-code&state={}",
-            state
-        ));
+        let req = callback_req(
+            format!("/api/auth/oidc/callback?code=test-code&state={state}"),
+            &binding,
+        );
 
         let resp = app.clone().oneshot(req).await.expect("request");
         assert_eq!(
@@ -1838,13 +2601,15 @@ mod oidc_callback_db_tests {
             persisted_provider,
             persisted_issuer,
             persisted_subject,
+            persisted_origin_binding_digest,
             remaining_secs,
-        ): (Uuid, Uuid, String, String, String, f64) = sqlx::query_as(
+        ): (Uuid, Uuid, String, String, String, Vec<u8>, f64) = sqlx::query_as(
             "SELECT s.session_record_id, s.principal_id, k.provider_id, k.issuer, k.subject, \
+                    s.authenticator_origin_binding_digest, \
                     EXTRACT(EPOCH FROM s.expires_at - NOW())::double precision \
              FROM sessions s \
              JOIN principal_keys k ON k.principal_key_id = s.principal_key_id \
-             WHERE s.bearer_verifier = $1",
+             WHERE s.session_bearer_verifier_v3 = $1",
         )
         .bind(verifier.as_slice())
         .fetch_one(pool)
@@ -1855,12 +2620,21 @@ mod oidc_callback_db_tests {
             Uuid::nil(),
             "the persisted session must use a registry-issued opaque principal id"
         );
-        assert_eq!(persisted_provider, "oidc");
+        assert_eq!(
+            persisted_provider,
+            browser_authenticator_origin.provider_id()
+        );
         assert_eq!(
             persisted_issuer, TEST_ISS,
             "the exact validated issuer remains provider-key provenance"
         );
         assert_eq!(persisted_subject, "sub-test-1");
+        assert_eq!(
+            persisted_origin_binding_digest.as_slice(),
+            browser_authenticator_origin
+                .origin_binding_digest_bytes()
+                .as_slice()
+        );
         assert!(
             (590.0..=600.0).contains(&remaining_secs),
             "server expiry must align with the configured 600-second cookie lifetime; got {remaining_secs}"
@@ -1884,13 +2658,15 @@ mod oidc_callback_db_tests {
         };
 
         let (enc, dec) = make_keypair();
-        let nonce = "test-nonce-binding";
-        let state = format!("st-binding-{}", Uuid::new_v4());
-        insert_test_state(pool, &state, nonce)
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-binding-mismatch");
+        let nonce = canonical_protocol_value();
+        let state = canonical_protocol_value();
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &nonce)
             .await
             .expect("insert state");
 
-        let id_token = sign_id_token(&enc, valid_id_token_claims(nonce));
+        let id_token = sign_id_token(&enc, valid_id_token_claims(&nonce));
         let mut key_map = HashMap::new();
         key_map.insert(TEST_KID.to_string(), dec);
         let exchanger: Arc<dyn TokenExchanger + Send + Sync> =
@@ -1898,10 +2674,18 @@ mod oidc_callback_db_tests {
         let validator = Arc::new(OidcIdTokenValidator::with_static_keys(
             TEST_ISS, TEST_AUD, key_map,
         ));
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        // WRONG binding cookie — does not match the TEST_BINDING stored with the
-        // state, so the callback must reject before exchanging or minting.
+        // A separately generated binding does not match the state row, so the
+        // callback must reject before exchanging or minting.
+        let mut other_binding = canonical_protocol_value();
+        while other_binding == binding {
+            other_binding = canonical_protocol_value();
+        }
         let req = Request::builder()
             .uri(format!(
                 "/api/auth/oidc/callback?code=test-code&state={}",
@@ -1909,7 +2693,7 @@ mod oidc_callback_db_tests {
             ))
             .header(
                 axum::http::header::COOKIE,
-                format!("__Host-oidc_login_csrf={OTHER_TEST_BINDING}"),
+                format!("__Host-oidc_login_csrf={other_binding}"),
             )
             .body(Body::empty())
             .unwrap();
@@ -1926,15 +2710,85 @@ mod oidc_callback_db_tests {
         );
 
         let retry = app
-            .oneshot(callback_req(format!(
-                "/api/auth/oidc/callback?code=test-code&state={state}"
-            )))
+            .oneshot(callback_req(
+                format!("/api/auth/oidc/callback?code=test-code&state={state}"),
+                &binding,
+            ))
             .await
             .expect("retry request");
         assert_eq!(
             retry.status(),
             StatusCode::BAD_REQUEST,
             "binding failure must consume the single-use state before retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_callback_origin_mismatch_is_indistinguishable_and_burns_before_exchange() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            return;
+        };
+
+        let initiating_origin =
+            test_browser_authenticator_origin("generic-oidc-origin-mismatch-initiating");
+        let callback_origin =
+            test_browser_authenticator_origin("generic-oidc-origin-mismatch-callback");
+        let state = canonical_protocol_value();
+        let nonce = canonical_protocol_value();
+        let binding = insert_test_state(pool, &initiating_origin, &state, &nonce)
+            .await
+            .expect("insert state under initiating origin");
+
+        let (_, decoding_key) = make_keypair();
+        let mut wrong_origin_keys = HashMap::new();
+        wrong_origin_keys.insert(TEST_KID.to_string(), decoding_key.clone());
+        let wrong_origin_app = test_router(
+            Arc::new(FailingTokenExchanger),
+            Arc::new(OidcIdTokenValidator::with_static_keys(
+                TEST_ISS,
+                TEST_AUD,
+                wrong_origin_keys,
+            )),
+            callback_origin,
+        );
+        let wrong_origin_response = wrong_origin_app
+            .oneshot(callback_req(
+                format!("/api/auth/oidc/callback?code=unused&state={state}"),
+                &binding,
+            ))
+            .await
+            .expect("wrong-origin callback response");
+        assert_eq!(wrong_origin_response.status(), StatusCode::BAD_REQUEST);
+        let wrong_origin_body = axum::body::to_bytes(wrong_origin_response.into_body(), 16_384)
+            .await
+            .expect("read wrong-origin response");
+
+        let mut exact_origin_keys = HashMap::new();
+        exact_origin_keys.insert(TEST_KID.to_string(), decoding_key);
+        let exact_origin_retry_app = test_router(
+            Arc::new(FailingTokenExchanger),
+            Arc::new(OidcIdTokenValidator::with_static_keys(
+                TEST_ISS,
+                TEST_AUD,
+                exact_origin_keys,
+            )),
+            initiating_origin,
+        );
+        let absent_retry_response = exact_origin_retry_app
+            .oneshot(callback_req(
+                format!("/api/auth/oidc/callback?code=unused&state={state}"),
+                &binding,
+            ))
+            .await
+            .expect("burned-state retry response");
+        assert_eq!(absent_retry_response.status(), StatusCode::BAD_REQUEST);
+        let absent_retry_body = axum::body::to_bytes(absent_retry_response.into_body(), 16_384)
+            .await
+            .expect("read burned-state retry response");
+        assert_eq!(
+            wrong_origin_body, absent_retry_body,
+            "origin mismatch and absent state must have one external representation"
         );
     }
 
@@ -1954,7 +2808,11 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            test_browser_authenticator_origin("generic-oidc-idp-error"),
+        );
 
         let req = Request::builder()
             .uri("/api/auth/oidc/callback?error=access_denied&error_description=User+denied+access")
@@ -1991,7 +2849,11 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            test_browser_authenticator_origin("generic-oidc-missing-code"),
+        );
 
         let req = Request::builder()
             .uri("/api/auth/oidc/callback?state=some-state")
@@ -2018,7 +2880,11 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            test_browser_authenticator_origin("generic-oidc-missing-state"),
+        );
 
         let req = Request::builder()
             .uri("/api/auth/oidc/callback?code=some-code")
@@ -2045,11 +2911,18 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            test_browser_authenticator_origin("generic-oidc-absent-state"),
+        );
 
         // Use a state value that was never inserted.
+        let absent_state = canonical_protocol_value();
         let req = Request::builder()
-            .uri("/api/auth/oidc/callback?code=some-code&state=nonexistent-state-xyz")
+            .uri(format!(
+                "/api/auth/oidc/callback?code=some-code&state={absent_state}"
+            ))
             .body(Body::empty())
             .unwrap();
 
@@ -2069,9 +2942,11 @@ mod oidc_callback_db_tests {
             return;
         };
 
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-single-use");
         provision_global_assignment(
             pool,
-            "oidc",
+            &browser_authenticator_origin,
             TEST_ISS,
             "sub-test-1",
             &["PlatformAdmin".to_string()],
@@ -2079,14 +2954,14 @@ mod oidc_callback_db_tests {
         .await;
 
         let (enc, dec) = make_keypair();
-        let nonce = "test-nonce-su";
-        let state = format!("st-su2-{}", Uuid::new_v4());
+        let nonce = canonical_protocol_value();
+        let state = canonical_protocol_value();
 
-        insert_test_state(pool, &state, nonce)
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &nonce)
             .await
             .expect("insert state");
 
-        let id_token = sign_id_token(&enc, valid_id_token_claims(nonce));
+        let id_token = sign_id_token(&enc, valid_id_token_claims(&nonce));
 
         let mut key_map = HashMap::new();
         key_map.insert(TEST_KID.to_string(), dec.clone());
@@ -2100,13 +2975,17 @@ mod oidc_callback_db_tests {
             key_map.clone(),
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
         // First request: succeeds.
-        let req1 = callback_req(format!(
-            "/api/auth/oidc/callback?code=code1&state={}",
-            state
-        ));
+        let req1 = callback_req(
+            format!("/api/auth/oidc/callback?code=code1&state={state}"),
+            &binding,
+        );
         let resp1 = app.oneshot(req1).await.expect("first request");
         assert_eq!(resp1.status(), StatusCode::FOUND);
 
@@ -2118,15 +2997,16 @@ mod oidc_callback_db_tests {
         let validator2 = Arc::new(OidcIdTokenValidator::with_static_keys(
             TEST_ISS, TEST_AUD, key_map2,
         ));
-        let app2 = test_router(exchanger2, validator2);
+        let app2 = test_router(
+            exchanger2,
+            validator2,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        let req2 = Request::builder()
-            .uri(format!(
-                "/api/auth/oidc/callback?code=code2&state={}",
-                state
-            ))
-            .body(Body::empty())
-            .unwrap();
+        let req2 = callback_req(
+            format!("/api/auth/oidc/callback?code=code2&state={state}"),
+            &binding,
+        );
         let resp2 = app2.oneshot(req2).await.expect("second request");
         assert_eq!(
             resp2.status(),
@@ -2143,16 +3023,21 @@ mod oidc_callback_db_tests {
         };
 
         let (enc, dec) = make_keypair();
-        let stored_nonce = "stored-nonce-abc";
-        let token_nonce = "DIFFERENT-nonce-xyz"; // mismatch
-        let state = format!("st-nonce-{}", Uuid::new_v4());
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-nonce-mismatch");
+        let stored_nonce = canonical_protocol_value();
+        let mut token_nonce = canonical_protocol_value();
+        while token_nonce == stored_nonce {
+            token_nonce = canonical_protocol_value();
+        }
+        let state = canonical_protocol_value();
 
-        insert_test_state(pool, &state, stored_nonce)
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &stored_nonce)
             .await
             .expect("insert state");
 
         // Token carries a different nonce from what is stored.
-        let id_token = sign_id_token(&enc, valid_id_token_claims(token_nonce));
+        let id_token = sign_id_token(&enc, valid_id_token_claims(&token_nonce));
 
         let mut key_map = HashMap::new();
         key_map.insert(TEST_KID.to_string(), dec);
@@ -2163,9 +3048,16 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        let req = callback_req(format!("/api/auth/oidc/callback?code=code&state={}", state));
+        let req = callback_req(
+            format!("/api/auth/oidc/callback?code=code&state={state}"),
+            &binding,
+        );
 
         let resp = app.oneshot(req).await.expect("request");
         assert_eq!(
@@ -2188,10 +3080,12 @@ mod oidc_callback_db_tests {
         };
 
         let (_, dec) = make_keypair();
-        let nonce = "test-nonce-502";
-        let state = format!("st-502-{}", Uuid::new_v4());
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-token-exchange-failure");
+        let nonce = canonical_protocol_value();
+        let state = canonical_protocol_value();
 
-        insert_test_state(pool, &state, nonce)
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &nonce)
             .await
             .expect("insert state");
 
@@ -2203,9 +3097,16 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        let req = callback_req(format!("/api/auth/oidc/callback?code=code&state={}", state));
+        let req = callback_req(
+            format!("/api/auth/oidc/callback?code=code&state={state}"),
+            &binding,
+        );
 
         let resp = app.oneshot(req).await.expect("request");
         assert_eq!(
@@ -2227,10 +3128,12 @@ mod oidc_callback_db_tests {
             return;
         };
 
-        let nonce = Uuid::new_v4().to_string();
-        let state = format!("st-alg-{}", Uuid::new_v4());
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-wrong-algorithm");
+        let nonce = canonical_protocol_value();
+        let state = canonical_protocol_value();
 
-        insert_test_state(pool, &state, &nonce)
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &nonce)
             .await
             .expect("insert state");
 
@@ -2251,9 +3154,16 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        let req = callback_req(format!("/api/auth/oidc/callback?code=code&state={}", state));
+        let req = callback_req(
+            format!("/api/auth/oidc/callback?code=code&state={state}"),
+            &binding,
+        );
 
         let resp = app.oneshot(req).await.expect("request");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2267,14 +3177,16 @@ mod oidc_callback_db_tests {
         };
 
         let (enc, dec) = make_keypair();
-        let nonce = "test-nonce-exp";
-        let state = format!("st-exp2-{}", Uuid::new_v4());
+        let browser_authenticator_origin =
+            test_browser_authenticator_origin("generic-oidc-expired-token");
+        let nonce = canonical_protocol_value();
+        let state = canonical_protocol_value();
 
-        insert_test_state(pool, &state, nonce)
+        let binding = insert_test_state(pool, &browser_authenticator_origin, &state, &nonce)
             .await
             .expect("insert state");
 
-        let mut claims = valid_id_token_claims(nonce);
+        let mut claims = valid_id_token_claims(&nonce);
         claims["exp"] = json!(now() - 3600); // already expired
         let id_token = sign_id_token(&enc, claims);
 
@@ -2287,9 +3199,16 @@ mod oidc_callback_db_tests {
             TEST_ISS, TEST_AUD, key_map,
         ));
 
-        let app = test_router(exchanger, validator);
+        let app = test_router(
+            exchanger,
+            validator,
+            Arc::clone(&browser_authenticator_origin),
+        );
 
-        let req = callback_req(format!("/api/auth/oidc/callback?code=code&state={}", state));
+        let req = callback_req(
+            format!("/api/auth/oidc/callback?code=code&state={state}"),
+            &binding,
+        );
 
         let resp = app.oneshot(req).await.expect("request");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2424,8 +3343,8 @@ mod oidc_callback_db_tests {
             .expect("Entra token with oid is valid");
         assert_eq!(oid_claims.provider_subject, TEST_ENTRA_OID);
 
-        let display_fallback_nonce = "nonce-entra-display-fallback";
-        let mut display_fallback_claims = valid_id_token_claims(display_fallback_nonce);
+        let display_fallback_nonce = Uuid::new_v4().to_string();
+        let mut display_fallback_claims = valid_id_token_claims(&display_fallback_nonce);
         for claim in ["name", "preferred_username"] {
             display_fallback_claims
                 .as_object_mut()
@@ -2434,7 +3353,7 @@ mod oidc_callback_db_tests {
         }
         let display_fallback_token = sign_id_token(&enc, display_fallback_claims);
         let display_fallback = validator
-            .validate_entra_id_token(&display_fallback_token, display_fallback_nonce, "roles")
+            .validate_entra_id_token(&display_fallback_token, &display_fallback_nonce, "roles")
             .await
             .expect("canonical Entra oid remains a valid display-name fallback");
         assert_eq!(display_fallback.display_name, TEST_ENTRA_OID);
@@ -2447,7 +3366,7 @@ mod oidc_callback_db_tests {
             ("compact", Some("11111111222243338444555555555555")),
             ("provider-subject", Some("sub-test-1")),
         ] {
-            let nonce = format!("nonce-entra-oid-{label}");
+            let nonce = Uuid::new_v4().to_string();
             let mut claims = valid_id_token_claims(&nonce);
             match oid {
                 Some(oid) => claims["oid"] = json!(oid),

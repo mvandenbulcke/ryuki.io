@@ -164,7 +164,8 @@ async fn locked_key(
     subject: &str,
 ) -> Result<Option<PrincipalKeyRow>, PrincipalRegistryError> {
     Ok(sqlx::query_as::<_, PrincipalKeyRow>(
-        "SELECT principal_key_id, key_version, key_state, authority_digest \
+        "SELECT principal_key_id, key_version, key_state, \
+                authority_digest_v3 AS authority_digest \
          FROM principal_keys \
          WHERE provider_id = $1 AND issuer = $2 AND subject = $3 \
          FOR SHARE",
@@ -255,7 +256,7 @@ pub(crate) async fn resolve_or_create_active_binding_tx(
         .map_err(|_| PrincipalRegistryError::InvalidStoredBinding)?;
     let (principal_key_id, key_version) = sqlx::query_as::<_, (Uuid, i64)>(
         "INSERT INTO principal_keys \
-         (provider_id, issuer, subject, key_state, authority_digest, \
+         (provider_id, issuer, subject, key_state, authority_digest_v3, \
           transition_reason, transitioned_by) \
          VALUES ($1, $2, $3, 'active', $4, 'initial-provider-qualified-binding', $5) \
          RETURNING principal_key_id, key_version",
@@ -330,7 +331,7 @@ pub(crate) async fn tombstone_key_tx(
             let unasserted_digest: [u8; 32] = rand::random();
             let (principal_key_id, key_version) = sqlx::query_as::<_, (Uuid, i64)>(
                 "INSERT INTO principal_keys \
-                 (provider_id, issuer, subject, key_state, authority_digest, \
+                 (provider_id, issuer, subject, key_state, authority_digest_v3, \
                   transition_reason, transitioned_by) \
                  VALUES ($1, $2, $3, 'active', $4, $5, $6) \
                  RETURNING principal_key_id, key_version",
@@ -409,7 +410,7 @@ pub(crate) async fn reconcile_authority_digest_tx(
         .ok_or(PrincipalRegistryError::InvalidStoredBinding)?;
     let rotated = sqlx::query_scalar::<_, i64>(
         "UPDATE principal_keys SET \
-           key_version = $2, authority_digest = $3, \
+           key_version = $2, authority_digest_v3 = $3, \
            transition_reason = 'credential-authority-change', transitioned_by = $4 \
          WHERE principal_key_id = $1 AND key_version = $5 AND key_state = 'active' \
          RETURNING key_version",

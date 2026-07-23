@@ -307,11 +307,14 @@ applicable, inside its authenticated hard bounds, and equal to the selected
 authenticator binding. A legacy ambient leeway setting is rejected rather than
 kept as dormant competing authority.
 
-### Generic OIDC (current single-provider flow)
+### Generic OIDC (reserved single-provider inputs)
 
-The current release also implements one provider-agnostic confidential OIDC
-Authorization Code + PKCE flow. Set `RYUKI_OIDC__ENABLED=true` and configure all
-of the following; the login and callback routes remain hidden when it is false.
+The configuration schema still retains the original single-provider generic
+OIDC inputs, but the current runtime does not yet have an authenticated D/P/Q/R
+authority for that path. `RYUKI_OIDC__ENABLED=true` is therefore rejected at
+startup in every authentication mode, before the listener binds. Keep it false;
+the login and callback routes are unavailable until the governed provider
+registry can publish and retain the exact runtime authority.
 
 | Variable | Description | Default |
 |---|---|---|
@@ -325,20 +328,11 @@ of the following; the login and callback routes remain hidden when it is false.
 | `RYUKI_OIDC__SCOPES` | Requested scopes as a JSON string array | `["openid","profile","email"]` |
 | `RYUKI_OIDC__ROLES_CLAIM` | ID-token claim containing platform role values | `roles` |
 
-Issuer, authorization, token, JWKS, and redirect URLs require HTTPS outside
-explicit loopback unit tests. Token and signing-key clients never follow
-redirects, and identity-provider JSON bodies are bounded by the bytes actually
-received before parsing. Cached signing-key generations have a monotonic
-absolute expiry; a failed refresh never revives an expired key. Persisted OIDC
-and Entra browser sessions use `RYUKI_SESSION__COOKIE_MAX_AGE_SECS` as their
-server-side maximum as well as their cookie lifetime.
-
-Enabling this flow also requires PostgreSQL, the persisted-session verifier
-key, and the distinct certificate-pagination cursor key. It is the implemented
-bridge toward the normative registry, but it is not yet the multi-issuer registry: simultaneous
-providers, discovery-driven configuration, lifecycle/SCIM, WebAuthn emergency
-access, service OAuth profiles, and workload identity remain specification
-work rather than current launch claims.
+The remaining fields are compatibility placeholders, not a launch contract.
+When this path is implemented, issuer, authorization, token, JWKS, redirect,
+client-authentication, cache, state, and derived-session behavior must all be
+measured into one exact retained authority before these inputs can be enabled.
+There is no development fallback that fabricates or borrows an Entra origin.
 
 ### Vault Kubernetes workload-authenticated resolver
 
@@ -448,9 +442,10 @@ workload-authentication or `SecretRef` fingerprint key.
 | `RYUKI_PLATFORM_URL` | Public base URL for the API | `http://localhost:18080` |
 | `RYUKI_AUTH_MODE`     | `mock-dry-run`, `static-dry-run`, `entra-id`, or `local` | `mock-dry-run` |
 
-The four primary modes above plus the separately enabled single generic-OIDC
-flow describe the current implementation. The production target
-is a provider registry with one or more generic OpenID Connect issuers, an
+The four primary modes above describe the current selectable implementation.
+The retained generic-OIDC inputs are rejected until the production target—a
+provider registry with one or more generic OpenID Connect issuers—can bind an
+exact runtime authority. That target also includes an
 optional OIDC identity broker for SAML/LDAP/AD, a WebAuthn-based emergency
 provider, scoped service credentials, and workload identity. Entra ID remains a
 supported OIDC configuration rather than the only production identity source.
@@ -543,7 +538,8 @@ Most operational settings are grouped under typed nested structs. Use double und
 ### Certificate-pagination cursor key
 
 `RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` is required before the listener
-binds for Local and Entra authentication, and whenever generic OIDC is enabled.
+binds for Local and Entra authentication. An admitted future generic-OIDC path
+will require it as well.
 Supply at least 32 random bytes through the selected secret manager or an
 equivalent runtime-only injection. The value is excluded from serialized
 configuration and redacted from `Debug` output. It must be distinct from
@@ -554,12 +550,31 @@ continuations, so clients must restart pagination with no cursor.
 Only explicit credential-free `mock-dry-run` and `static-dry-run` modes may omit
 this setting. Those modes are already restricted to literal loopback listeners
 and origins, and use one process-ephemeral CSPRNG key; their cursors do not
-survive a restart. Enabling generic OIDC disables that development fallback.
+survive a restart. The reserved generic-OIDC enable flag is rejected rather
+than activating that development fallback.
+
+### Browser-session security limits
+
+The authenticated security-limit contract owns and reconciles the runtime
+values used by an admitted browser authenticator. Environment settings cannot
+override the selected limit profile: startup requires their admitted values to
+match the exact resolved limits.
+
+| Runtime limit | Required value |
+|---|---|
+| Browser/local session and cookie maximum age (`RYUKI_SESSION__COOKIE_MAX_AGE_SECS`) | `1..=86400` seconds; default `86400` |
+| Federated-authority staleness (`RYUKI_SESSION__FEDERATED_AUTHORITY_MAX_STALENESS_SECS`) | `1..=3600` seconds; default `900`, and never greater than the session/cookie maximum age |
+| Browser authorization-state lifetime | Exactly `600` seconds; selected through the security-limit profile, enforced from database-owned time, and not caller-configurable |
+
+Any profile/runtime disagreement fails closed. In particular, there is no
+environment variable or callback parameter that can extend the browser-state
+lifetime beyond the database-owned 600-second contract.
 
 ### Persisted-session verifier key
 
 `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` is required before the listener binds
-whenever Local, Entra, or generic OIDC sessions can be minted. Supply at least
+whenever Local or Entra sessions can be minted; a future admitted generic-OIDC
+path will require it too. Supply at least
 32 random bytes through the selected secret manager or an equivalent
 runtime-only secret injection; do not put the value in a committed TOML, JSON,
 Compose, or Kubernetes manifest. The API stores only an HMAC-SHA256 verifier of
@@ -571,9 +586,10 @@ cryptographic purposes.
 
 `RYUKI_SESSION__FEDERATED_AUTHORITY_MAX_STALENESS_SECS` bounds how long a
 persisted non-local session may authorize without a fresh validated assertion
-or trusted lifecycle heartbeat. It defaults to 900 seconds and cannot exceed
-3600 seconds. Expiry at this bound fails closed and requires fresh identity
-evidence; it does not claim that an IdP lifecycle connector delivered an event.
+or trusted lifecycle heartbeat. It must remain within `1..=3600` seconds and
+cannot exceed `RYUKI_SESSION__COOKIE_MAX_AGE_SECS`. Expiry at this bound fails
+closed and requires fresh identity evidence; it does not claim that an IdP
+lifecycle connector delivered an event.
 
 `RYUKI_SESSION__COOKIE_SECURE=false` is admitted only when
 `RYUKI_PLATFORM_URL` is plain HTTP on a literal loopback host (`localhost`, a
@@ -581,9 +597,9 @@ evidence; it does not claim that an IdP lifecycle connector delivered an event.
 startup unless Secure cookies remain enabled. This rule is derived from the
 external platform URL rather than the API listener address, so TLS-terminating
 reverse proxies and loopback-published container bridges keep the intended
-policy. When generic OIDC or Entra browser callbacks are configured, their
-redirect URLs must also use loopback HTTP before non-Secure cookie mode is
-admitted.
+policy. Entra browser callbacks must also use a loopback-HTTP redirect before
+non-Secure cookie mode is admitted. The same rule is reserved for a future
+admitted generic-OIDC callback.
 
 This release supports one active verifier key. Changing it deliberately
 invalidates all current bearers, so stale rows simply expire or are swept and

@@ -16513,7 +16513,7 @@ async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure>
 
     let mut tx = pool.begin().await.map_err(LogoutFailure::Database)?;
     let row: Option<LogoutSessionRow> = sqlx::query_as(
-        "DELETE FROM sessions WHERE bearer_verifier = $1 \
+        "DELETE FROM sessions WHERE session_bearer_verifier_v3 = $1 \
          RETURNING principal_id, display_name, roles",
     )
     .bind(verifier.as_slice())
@@ -16637,7 +16637,7 @@ async fn auth_local_logout(headers: HeaderMap) -> Response {
 ///
 /// Generates a cryptographically random `state`, `nonce`, and PKCE
 /// `code_verifier` (all via OsRng / getrandom), persists them to the
-/// `oidc_login_states` table, then redirects the browser to the IdP's
+/// `oidc_login_states_v3` table, then redirects the browser to the IdP's
 /// authorization endpoint with the full set of OAuth2/OIDC parameters.
 ///
 /// # Security properties
@@ -16647,7 +16647,7 @@ async fn auth_local_logout(headers: HeaderMap) -> Response {
 /// - `state` is single-use and expires in 10 minutes (enforced by `take`
 ///   in slice 2 and by the DB `expires_at` column).
 /// - Mandatory exact-route source/global admission runs before PostgreSQL;
-///   serialized DB-time cleanup and provider/global quotas run before entropy
+///   serialized DB-time cleanup and exact-origin/global quotas run before entropy
 ///   generation. A 429 carries `Retry-After: 1`.
 /// - All authorize-URL query parameters are percent-encoded by the `url` crate,
 ///   preventing injection via `redirect_uri`, `scope`, or `client_id`.
@@ -16784,7 +16784,7 @@ pub(crate) fn login_state_insert_error(
     match error {
         LoginStateInsertError::Database(error) => db_error(error),
         admission_error @ (LoginStateInsertError::Busy
-        | LoginStateInsertError::FlowCapacity
+        | LoginStateInsertError::OriginCapacity
         | LoginStateInsertError::GlobalCapacity) => {
             tracing::warn!(reason = ?admission_error, "durable login-state admission rejected");
             (
@@ -16796,6 +16796,16 @@ pub(crate) fn login_state_insert_error(
             )
         }
     }
+}
+
+pub(crate) fn oidc_authenticator_origin_unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "OIDC_AUTHENTICATOR_ORIGIN_UNAVAILABLE",
+            "message": "OIDC authenticator origin is unavailable"
+        })),
+    )
 }
 
 async fn oidc_login_initiate(request: Request) -> Result<Response, (StatusCode, Json<Value>)> {
@@ -16846,14 +16856,25 @@ async fn oidc_login_initiate(request: Request) -> Result<Response, (StatusCode, 
         )
     };
 
+    // Generic OIDC may create durable protocol state only when startup retained
+    // one exact, independently verified browser authenticator origin. Never
+    // derive or fabricate a digest from ambient configuration here.
+    let browser_authenticator_origin = request
+        .extensions()
+        .get::<std::sync::Arc<crate::oidc_callback::OidcCallbackDeps>>()
+        .and_then(|dependencies| dependencies.browser_authenticator_origin())
+        .ok_or_else(oidc_authenticator_origin_unavailable)?;
+
     // Gate: a DB is required to persist the state (single-use, short-lived).
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
-    // The repository serializes DB-time cleanup and exact cluster quotas before
-    // generating any protocol material, then inserts it in the same transaction.
+    // Startup alone advances the durable current-path pointer. The repository
+    // locks and verifies that exact active browser origin before generating or
+    // inserting protocol material, so a request can never re-register or roll
+    // back authenticator authority.
     let material = crate::repos::oidc_login_states::create(
         pool,
-        crate::repos::oidc_login_states::LoginFlow::GenericOidc,
+        browser_authenticator_origin.origin_binding_digest_bytes(),
     )
     .await
     .map_err(login_state_insert_error)?;
@@ -19109,7 +19130,7 @@ async fn admin_sessions_revoke(
     let revoked: Option<(Uuid, String, Vec<u8>)> = map_api_token_result(
         sqlx::query_as::<_, (Uuid, String, Vec<u8>)>(
             "DELETE FROM sessions WHERE session_record_id = $1 \
-             RETURNING principal_id, display_name, bearer_verifier",
+             RETURNING principal_id, display_name, session_bearer_verifier_v3",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -51250,6 +51271,26 @@ mod unit_tests {
         assert_eq!(body["error"], "LOGIN_ADMISSION_CONTEXT_UNAVAILABLE");
     }
 
+    #[tokio::test]
+    async fn oidc_login_initiation_fails_closed_without_exact_browser_origin_before_db() {
+        let mut cfg = ryuki_core::config::RyukiConfig::default();
+        cfg.oidc.enabled = true;
+        crate::config_store::init_with_config("oidc-origin-admission-test.json", &cfg);
+
+        let mut request = Request::builder()
+            .uri("/api/auth/oidc/login")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(crate::repos::oidc_login_states::LoginInitiationPreAdmitted);
+        let Err((status, Json(body))) = oidc_login_initiate(request).await else {
+            panic!("missing browser origin must fail closed before database acquisition");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "OIDC_AUTHENTICATOR_ORIGIN_UNAVAILABLE");
+    }
+
     #[test]
     fn login_initiation_retryable_rejections_carry_bounded_retry_after() {
         let mut rejected = (StatusCode::TOO_MANY_REQUESTS, "retry").into_response();
@@ -51289,6 +51330,12 @@ mod unit_tests {
 
         let (status, Json(body)) = login_state_insert_error(
             crate::repos::oidc_login_states::LoginStateInsertError::GlobalCapacity,
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "LOGIN_STATE_CAPACITY_EXHAUSTED");
+
+        let (status, Json(body)) = login_state_insert_error(
+            crate::repos::oidc_login_states::LoginStateInsertError::OriginCapacity,
         );
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "LOGIN_STATE_CAPACITY_EXHAUSTED");
@@ -59075,7 +59122,7 @@ mod db_lifecycle_tests {
             .expect("prepare session seed writer");
         sqlx::query(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, principal_id, principal_lifecycle_version, \
+             (session_record_id, session_bearer_verifier_v3, principal_id, principal_lifecycle_version, \
               principal_authority_version, principal_key_id, principal_key_version, \
               principal_link_id, principal_link_version, display_name, email, roles, \
               site_authority_mode, site_scope, environment_authority_mode, environment_scope) \
@@ -62290,7 +62337,7 @@ mod db_lifecycle_tests {
             .expect("prepare audit session writer");
         sqlx::query(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, principal_id, principal_lifecycle_version, \
+             (session_record_id, session_bearer_verifier_v3, principal_id, principal_lifecycle_version, \
               principal_authority_version, principal_key_id, principal_key_version, \
               principal_link_id, principal_link_version, display_name, roles, \
               site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
@@ -62365,7 +62412,7 @@ mod db_lifecycle_tests {
             .expect("prepare get-session writer");
         sqlx::query(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, principal_id, principal_lifecycle_version, \
+             (session_record_id, session_bearer_verifier_v3, principal_id, principal_lifecycle_version, \
               principal_authority_version, principal_key_id, principal_key_version, \
               principal_link_id, principal_link_version, display_name, roles, \
               site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
@@ -99840,8 +99887,8 @@ mod admin_tokens_sessions_pagination_db_tests {
         pool: &PgPool,
         subject: &str,
     ) -> (String, crate::principal_registry::PrincipalBinding) {
-        let provider = "static-dry-run";
-        let issuer = "urn:ryuki:test:session-pagination";
+        let provider = crate::identity_authority::LOCAL_PROVIDER;
+        let issuer = crate::identity_authority::LOCAL_ISSUER;
         let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
         let roles = vec!["PlatformAdmin".to_string()];
         let mut tx = pool.begin().await.expect("begin pagination principal seed");
@@ -99882,7 +99929,7 @@ mod admin_tokens_sessions_pagination_db_tests {
         let mut token_tx = pool.begin().await.expect("begin pagination token seed");
         crate::human_authority::prepare_writer_tx(
             &mut token_tx,
-            "static-dry-run",
+            crate::identity_authority::LOCAL_PROVIDER,
             &issuer,
             &subject,
         )
@@ -100015,7 +100062,7 @@ mod admin_tokens_sessions_pagination_db_tests {
         let mut token_tx = pool.begin().await.expect("begin tied token seed");
         crate::human_authority::prepare_writer_tx(
             &mut token_tx,
-            "static-dry-run",
+            crate::identity_authority::LOCAL_PROVIDER,
             &issuer,
             &subject,
         )
@@ -100118,7 +100165,7 @@ mod admin_tokens_sessions_pagination_db_tests {
             let mut session_tx = pool.begin().await.expect("begin pagination session seed");
             crate::human_authority::prepare_writer_tx(
                 &mut session_tx,
-                "static-dry-run",
+                crate::identity_authority::LOCAL_PROVIDER,
                 &issuer,
                 &user_id,
             )
@@ -100126,7 +100173,7 @@ mod admin_tokens_sessions_pagination_db_tests {
             .expect("prepare pagination session writer");
             let id: Uuid = sqlx::query_scalar(
                 "INSERT INTO sessions \
-                 (session_record_id, bearer_verifier, principal_id, \
+                 (session_record_id, session_bearer_verifier_v3, principal_id, \
                   principal_lifecycle_version, principal_authority_version, \
                   principal_key_id, principal_key_version, principal_link_id, \
                   principal_link_version, display_name, roles, site_authority_mode, \
@@ -100164,7 +100211,7 @@ mod admin_tokens_sessions_pagination_db_tests {
         let mut expired_tx = pool.begin().await.expect("begin expired session seed");
         crate::human_authority::prepare_writer_tx(
             &mut expired_tx,
-            "static-dry-run",
+            crate::identity_authority::LOCAL_PROVIDER,
             &expired_issuer,
             &expired_user,
         )
@@ -100172,7 +100219,7 @@ mod admin_tokens_sessions_pagination_db_tests {
         .expect("prepare expired session writer");
         let expired_id: Uuid = sqlx::query_scalar(
             "INSERT INTO sessions \
-             (session_record_id, bearer_verifier, principal_id, \
+             (session_record_id, session_bearer_verifier_v3, principal_id, \
               principal_lifecycle_version, principal_authority_version, \
               principal_key_id, principal_key_version, principal_link_id, \
               principal_link_version, display_name, roles, site_authority_mode, \

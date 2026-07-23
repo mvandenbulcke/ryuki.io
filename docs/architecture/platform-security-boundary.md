@@ -197,8 +197,10 @@ or API token never falls through to a cookie or reusable session identifier.
 ### Implemented interactive-authority kernel
 
 Migration 182 and the API authority repository implement the provider-neutral
-authorization kernel used by the current Local, generic OIDC, and Entra
-carriers. The durable key is `(provider, canonical issuer, provider subject)`;
+authorization kernel used by the current Local and Entra carriers. The generic
+OIDC handler is retained fail-closed but cannot launch until the registry binds
+it to an exact D/P/Q/R runtime authority. The durable key is
+`(provider, canonical issuer, provider subject)`;
 vendor-specific tenant, object, email, or group fields are not schema keys.
 The same key admits future brokered SAML/LDAP and passkey providers without
 changing assignment or session semantics.
@@ -1596,9 +1598,10 @@ sessions rather than admitting an unversioned fallback, records authority by
 current monotonic epoch. Local startup reconciliation advances that epoch for
 password rotation, role changes, account removal, re-creation, and rollback;
 therefore an older local session cannot become valid again when configuration
-is restored to an earlier value. Validated Entra and generic OIDC callbacks use
-the same projection, so a changed role assertion advances the epoch instead of
-silently coexisting with the old snapshot. Every startup also removes sessions
+is restored to an earlier value. Validated Entra callbacks use the same
+projection, and an admitted future generic-OIDC callback must do so as well, so
+a changed role assertion advances the epoch instead of silently coexisting
+with the old snapshot. Every startup also removes sessions
 whose exact provider/issuer tuple is no longer admitted, so Local/Entra mode
 switches, OIDC disablement, tenant rotation, issuer rotation, and later config
 rollback require a new login rather than reviving a previously stored row.

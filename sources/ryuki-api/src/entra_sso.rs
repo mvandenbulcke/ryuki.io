@@ -8,14 +8,14 @@
 //! uses (`__Host-ryuki_session` for HTTPS, unprefixed only for explicit
 //! non-Secure loopback development/test configuration). In EntraId mode the
 //! session resolver honors ONLY the validated SSO
-//! providers (`entra-id` and the generic `oidc` flow), never a stale
-//! local/dry-run session — mirroring the symmetric restriction Local mode
-//! already applies.
+//! browser-authenticator origins and their canonical provider IDs, never a
+//! carrier-family alias or stale local/dry-run session — mirroring the
+//! symmetric restriction Local mode already applies.
 //!
 //! # Endpoints
 //! - `GET /api/auth/entra/authorize-url` — generates `state`/`nonce`/PKCE
 //!   verifier (all CSPRNG), persists them via the existing single-use
-//!   `oidc_login_states` store (10-minute TTL), and returns the tenant
+//!   `oidc_login_states_v3` store (10-minute TTL), and returns the tenant
 //!   authorize URL as JSON for the portal server function to navigate to.
 //! - `GET /api/auth/entra/callback` — redeems the single-use state, exchanges
 //!   the code at the tenant token endpoint (PKCE public client — NO client
@@ -59,6 +59,7 @@
 //! - No token material, code, verifier, or session id is ever logged; id_token
 //!   failures log only the validator's safe reason string.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -72,9 +73,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::oidc_callback::{
-    OidcCallbackQuery, OidcIdTokenValidator, ReqwestTokenExchanger, TokenExchanger, TokenRequest,
+    OidcCallbackQuery, OidcIdTokenValidator, OidcIdTokenValidatorRuntimeObservation,
+    OidcTokenExchangerRuntimeObservation, ReqwestTokenExchanger, TokenExchanger, TokenRequest,
+    TokenResponse, ValidatedOidcClaims,
 };
 use crate::security_contracts::ResolvedAuthenticatorBrowserLimits;
+use ryuki_core::security_profile::AuthenticatorBrowserClientAuthentication;
 
 /// Entra ID app roles are always issued in the `roles` claim (same claim the
 /// bearer-token validator's `EntraClaims` consumes).
@@ -83,6 +87,65 @@ const ENTRA_ROLES_CLAIM: &str = "roles";
 /// Scopes requested for the browser sign-in. `openid` is mandatory for an
 /// id_token; profile/email populate display identity claims.
 const ENTRA_SCOPES: &str = "openid profile email";
+
+const ENTRA_SSO_RUNTIME_OBSERVATION_DIGEST_CONTRACT: &[u8] =
+    b"ryuki-entra-sso-runtime-observation-leaf-v1";
+const ENTRA_AUTHORIZE_ENDPOINT_BINDING_DOMAIN: &[u8] = b"entra-authorize-endpoint";
+const ENTRA_REDIRECT_URI_BINDING_DOMAIN: &[u8] = b"entra-redirect-uri";
+const ENTRA_CLIENT_ID_BINDING_DOMAIN: &[u8] = b"entra-client-id";
+const ENTRA_SCOPES_BINDING_DOMAIN: &[u8] = b"entra-scopes";
+const ENTRA_BROWSER_JWKS_KEY_SOURCE_BINDING_DOMAIN: &[u8] = b"entra-browser-jwks-key-source";
+
+fn entra_sso_runtime_binding_digest(domain: &[u8], value: &[u8]) -> String {
+    entra_sso_runtime_binding_digest_fields(domain, &[value])
+}
+
+fn entra_sso_runtime_binding_digest_fields(domain: &[u8], values: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for field in [ENTRA_SSO_RUNTIME_OBSERVATION_DIGEST_CONTRACT, domain] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    for value in values {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(*value);
+    }
+    let digest = digest.finalize();
+    format!("sha256:{digest:x}")
+}
+
+fn entra_browser_jwks_key_source_binding_digest(
+    validator: &OidcIdTokenValidatorRuntimeObservation,
+) -> String {
+    let jwks = validator
+        .network_jwks()
+        .expect("Entra browser validator must retain network JWKS");
+    let endpoint_https_only = jwks.endpoint_https_only().to_string();
+    let redirects_allowed = jwks.redirects_allowed().to_string();
+    let ambient_proxy_allowed = jwks.ambient_proxy_allowed().to_string();
+    let connect_timeout_milliseconds = jwks.connect_timeout().as_millis().to_string();
+    let request_timeout_milliseconds = jwks.request_timeout().as_millis().to_string();
+    let cache_ttl_milliseconds = jwks.cache_ttl().as_millis().to_string();
+    let refresh_cooldown_milliseconds = jwks.refresh_cooldown().as_millis().to_string();
+    let maximum_cached_keys = jwks.maximum_cached_keys().to_string();
+    let maximum_response_bytes = jwks.maximum_response_bytes().to_string();
+    entra_sso_runtime_binding_digest_fields(
+        ENTRA_BROWSER_JWKS_KEY_SOURCE_BINDING_DOMAIN,
+        &[
+            b"network-jwks",
+            jwks.endpoint_binding_digest().as_bytes(),
+            endpoint_https_only.as_bytes(),
+            redirects_allowed.as_bytes(),
+            ambient_proxy_allowed.as_bytes(),
+            connect_timeout_milliseconds.as_bytes(),
+            request_timeout_milliseconds.as_bytes(),
+            cache_ttl_milliseconds.as_bytes(),
+            refresh_cooldown_milliseconds.as_bytes(),
+            maximum_cached_keys.as_bytes(),
+            maximum_response_bytes.as_bytes(),
+        ],
+    )
+}
 
 /// Derived per-tenant endpoints (see module docs for the fixed URL patterns).
 struct EntraEndpoints {
@@ -102,8 +165,332 @@ fn derive_entra_endpoints(authority: &str, tenant_id: &str) -> EntraEndpoints {
     }
 }
 
-/// All Entra-SSO dependencies, injected as a single axum `Extension` (the
-/// `OidcCallbackDeps` pattern). Built ONCE at startup from the app config;
+/// Closed public-client browser-flow capability retained by the Entra SSO
+/// dependencies and used directly by both handlers. Keeping protocol choices
+/// behind this private type makes the observation causal: callback code cannot
+/// independently select client-secret authentication, a weaker PKCE mode, a
+/// nonce-free validation entry point, or a different provider-subject mapping.
+struct EntraBrowserFlowRuntime {
+    client_authentication: AuthenticatorBrowserClientAuthentication,
+    client_credential_present: bool,
+    pkce_method: &'static str,
+    pkce_wire_method: &'static str,
+    nonce_required: bool,
+    browser_binding_required: bool,
+    id_token_required: bool,
+    provider_tokens_persisted: bool,
+    provider_tokens_exposed: bool,
+    accepted_algorithm_ids: [&'static str; 1],
+    required_claim_ids: [&'static str; 7],
+    provider_subject_claim_id: &'static str,
+    expiration_required: bool,
+    not_before_required: bool,
+    issued_at_required: bool,
+}
+
+impl EntraBrowserFlowRuntime {
+    fn public_client() -> Arc<Self> {
+        Arc::new(Self {
+            client_authentication: AuthenticatorBrowserClientAuthentication::None,
+            client_credential_present: false,
+            pkce_method: "s256",
+            pkce_wire_method: "S256",
+            nonce_required: true,
+            browser_binding_required: true,
+            id_token_required: true,
+            provider_tokens_persisted: false,
+            provider_tokens_exposed: false,
+            accepted_algorithm_ids: ["rs256"],
+            required_claim_ids: ["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"],
+            provider_subject_claim_id: "oid",
+            expiration_required: true,
+            not_before_required: true,
+            issued_at_required: false,
+        })
+    }
+
+    fn verify_integrity(&self) -> bool {
+        self.client_authentication == AuthenticatorBrowserClientAuthentication::None
+            && !self.client_credential_present
+            && self.pkce_method == "s256"
+            && self.pkce_wire_method == "S256"
+            && self.nonce_required
+            && self.browser_binding_required
+            && self.id_token_required
+            && !self.provider_tokens_persisted
+            && !self.provider_tokens_exposed
+            && self.accepted_algorithm_ids == ["rs256"]
+            && self.required_claim_ids == ["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"]
+            && self.provider_subject_claim_id == "oid"
+            && self.expiration_required
+            && self.not_before_required
+            && !self.issued_at_required
+    }
+
+    fn pkce_code_challenge(&self, verifier: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        debug_assert!(self.verify_integrity());
+        URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+    }
+
+    fn required_nonce<'a>(&self, nonce: &'a str) -> &'a str {
+        debug_assert!(self.verify_integrity());
+        nonce
+    }
+
+    fn token_request(
+        &self,
+        code: String,
+        redirect_uri: String,
+        client_id: String,
+        pkce_verifier: String,
+    ) -> TokenRequest {
+        debug_assert!(self.verify_integrity());
+        TokenRequest {
+            code,
+            redirect_uri,
+            client_id,
+            client_secret: None,
+            pkce_verifier,
+        }
+    }
+
+    fn browser_binding_matches(&self, persisted: &str, presented: &str) -> bool {
+        self.browser_binding_required && !persisted.is_empty() && persisted == presented
+    }
+
+    async fn validate_token_response(
+        &self,
+        validator: &OidcIdTokenValidator,
+        response: TokenResponse,
+        expected_nonce: &str,
+    ) -> Result<ValidatedOidcClaims, &'static str> {
+        if !self.verify_integrity() {
+            return Err("invalid-entra-browser-flow-runtime");
+        }
+        // `TokenResponse` exposes only the mandatory id_token; access/refresh
+        // tokens are dropped inside the exchanger's private wire decoder.
+        validator
+            .validate_entra_id_token(&response.id_token, expected_nonce, ENTRA_ROLES_CLAIM)
+            .await
+    }
+}
+
+/// Value-free measurement of the exact retained Entra browser SSO runtime.
+///
+/// Construction is private to [`EntraSsoDeps`]. Identity, endpoint, redirect,
+/// client, and scope values are represented only by independently
+/// domain-separated digests. The nested observations are themselves produced
+/// from the concrete exchanger, validator, session-credential, and cookie
+/// runtime allocations retained by the dependencies. `Debug` deliberately
+/// reveals neither raw values nor their equality-capable digests.
+pub(crate) struct EntraSsoRuntimeObservation {
+    mode_is_entra: bool,
+    configured: bool,
+    authorization_endpoint_binding_digest: String,
+    authorization_endpoint_https_only: bool,
+    redirect_uri_binding_digest: String,
+    redirect_uri_https_only: bool,
+    client_id_binding_digest: String,
+    scopes_binding_digest: String,
+    token_exchanger: OidcTokenExchangerRuntimeObservation,
+    id_token_validator: OidcIdTokenValidatorRuntimeObservation,
+    key_source_binding_digest: String,
+    accepted_algorithm_ids: [&'static str; 1],
+    required_claim_ids: [&'static str; 7],
+    provider_subject_claim_id: &'static str,
+    expiration_required: bool,
+    not_before_required: bool,
+    issued_at_required: bool,
+    client_authentication: AuthenticatorBrowserClientAuthentication,
+    client_credential_present: bool,
+    pkce_method: &'static str,
+    nonce_required: bool,
+    browser_binding_required: bool,
+    id_token_required: bool,
+    provider_tokens_persisted: bool,
+    provider_tokens_exposed: bool,
+    redirects_allowed: bool,
+    clock_skew_limit_id: Option<String>,
+    maximum_clock_skew_seconds: Option<u64>,
+    session_credentials: crate::session_credentials::DerivedSessionRuntimeObservation,
+    cookie_runtime: crate::cookie_runtime::ApiCookieRuntimeObservation,
+    retained_flow_runtime: Arc<EntraBrowserFlowRuntime>,
+    retained_exchanger: Arc<ReqwestTokenExchanger>,
+    retained_validator: Arc<OidcIdTokenValidator>,
+    retained_browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+    retained_session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
+}
+
+impl fmt::Debug for EntraSsoRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EntraSsoRuntimeObservation")
+            .field("mode_is_entra", &self.mode_is_entra)
+            .field("configured", &self.configured)
+            .field("identity_bindings", &"[REDACTED]")
+            .field("redirect_uri_https_only", &self.redirect_uri_https_only)
+            .field("token_exchanger", &self.token_exchanger)
+            .field("id_token_validator", &self.id_token_validator)
+            .field("key_source_binding", &"[REDACTED]")
+            .field("verifier_policy", &"[RETAINED]")
+            .field("client_authentication", &self.client_authentication)
+            .field("client_credential_present", &self.client_credential_present)
+            .field("pkce_method", &self.pkce_method)
+            .field("nonce_required", &self.nonce_required)
+            .field("browser_binding_required", &self.browser_binding_required)
+            .field("id_token_required", &self.id_token_required)
+            .field("provider_tokens_persisted", &self.provider_tokens_persisted)
+            .field("provider_tokens_exposed", &self.provider_tokens_exposed)
+            .field("redirects_allowed", &self.redirects_allowed)
+            .field("browser_limit_authority", &"[RETAINED]")
+            .field("session_credentials", &"[RETAINED]")
+            .field("cookie_runtime", &"[RETAINED]")
+            .finish()
+    }
+}
+
+impl EntraSsoRuntimeObservation {
+    pub(crate) fn mode_is_entra(&self) -> bool {
+        self.mode_is_entra
+    }
+
+    pub(crate) fn configured(&self) -> bool {
+        self.configured
+    }
+
+    pub(crate) fn authorization_endpoint_binding_digest(&self) -> &str {
+        &self.authorization_endpoint_binding_digest
+    }
+
+    pub(crate) fn authorization_endpoint_https_only(&self) -> bool {
+        self.authorization_endpoint_https_only
+    }
+
+    pub(crate) fn redirect_uri_binding_digest(&self) -> &str {
+        &self.redirect_uri_binding_digest
+    }
+
+    pub(crate) fn redirect_uri_https_only(&self) -> bool {
+        self.redirect_uri_https_only
+    }
+
+    pub(crate) fn client_id_binding_digest(&self) -> &str {
+        &self.client_id_binding_digest
+    }
+
+    pub(crate) fn scopes_binding_digest(&self) -> &str {
+        &self.scopes_binding_digest
+    }
+
+    pub(crate) fn token_exchanger(&self) -> &OidcTokenExchangerRuntimeObservation {
+        &self.token_exchanger
+    }
+
+    pub(crate) fn id_token_validator(&self) -> &OidcIdTokenValidatorRuntimeObservation {
+        &self.id_token_validator
+    }
+
+    pub(crate) fn key_source_binding_digest(&self) -> &str {
+        &self.key_source_binding_digest
+    }
+
+    pub(crate) fn accepted_algorithm_ids(&self) -> &[&str] {
+        &self.accepted_algorithm_ids
+    }
+
+    pub(crate) fn required_claim_ids(&self) -> &[&str] {
+        &self.required_claim_ids
+    }
+
+    pub(crate) fn provider_subject_claim_id(&self) -> &str {
+        self.provider_subject_claim_id
+    }
+
+    pub(crate) fn expiration_required(&self) -> bool {
+        self.expiration_required
+    }
+
+    pub(crate) fn not_before_required(&self) -> bool {
+        self.not_before_required
+    }
+
+    pub(crate) fn issued_at_required(&self) -> bool {
+        self.issued_at_required
+    }
+
+    pub(crate) fn client_authentication(&self) -> AuthenticatorBrowserClientAuthentication {
+        self.client_authentication
+    }
+
+    pub(crate) fn client_credential_present(&self) -> bool {
+        self.client_credential_present
+    }
+
+    pub(crate) fn pkce_method(&self) -> &str {
+        self.pkce_method
+    }
+
+    pub(crate) fn nonce_required(&self) -> bool {
+        self.nonce_required
+    }
+
+    pub(crate) fn browser_binding_required(&self) -> bool {
+        self.browser_binding_required
+    }
+
+    pub(crate) fn id_token_required(&self) -> bool {
+        self.id_token_required
+    }
+
+    pub(crate) fn provider_tokens_persisted(&self) -> bool {
+        self.provider_tokens_persisted
+    }
+
+    pub(crate) fn provider_tokens_exposed(&self) -> bool {
+        self.provider_tokens_exposed
+    }
+
+    pub(crate) fn redirects_allowed(&self) -> bool {
+        self.redirects_allowed
+    }
+
+    pub(crate) fn clock_skew_limit_id(&self) -> Option<&str> {
+        self.clock_skew_limit_id.as_deref()
+    }
+
+    pub(crate) fn maximum_clock_skew_seconds(&self) -> Option<u64> {
+        self.maximum_clock_skew_seconds
+    }
+
+    pub(crate) fn session_credentials(
+        &self,
+    ) -> &crate::session_credentials::DerivedSessionRuntimeObservation {
+        &self.session_credentials
+    }
+
+    pub(crate) fn cookie_runtime(&self) -> &crate::cookie_runtime::ApiCookieRuntimeObservation {
+        &self.cookie_runtime
+    }
+}
+
+fn entra_sso_is_configured(
+    tenant_id: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    browser_limits: Option<&Arc<ResolvedAuthenticatorBrowserLimits>>,
+) -> bool {
+    !tenant_id.is_empty()
+        && !client_id.is_empty()
+        && !redirect_uri.is_empty()
+        && browser_limits.is_some()
+}
+
+/// All base Entra-SSO dependencies, retained inside the single post-seal
+/// [`crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps`] extension.
+/// Built ONCE at startup from the app config;
 /// tests build it against a local stub authority through the same
 /// constructor, so they exercise the production exchanger + JWKS validator.
 ///
@@ -126,8 +513,10 @@ pub struct EntraSsoDeps {
     session_credentials: Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
     cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
-    exchanger: Arc<dyn TokenExchanger + Send + Sync>,
+    flow_runtime: Arc<EntraBrowserFlowRuntime>,
+    exchanger: Arc<ReqwestTokenExchanger>,
     validator: Arc<OidcIdTokenValidator>,
+    runtime_observation: Arc<EntraSsoRuntimeObservation>,
 }
 
 impl EntraSsoDeps {
@@ -158,7 +547,13 @@ impl EntraSsoDeps {
         let cookie_runtime =
             crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, false)
                 .expect("test config must construct cookie runtime");
-        let browser_limits = Some(ResolvedAuthenticatorBrowserLimits::fixture(leeway_secs));
+        let browser_limits = Some(
+            ResolvedAuthenticatorBrowserLimits::fixture_with_session_policy(
+                leeway_secs,
+                config.session.cookie_max_age_secs,
+                config.session.federated_authority_max_staleness_secs,
+            ),
+        );
         Self::build_with_trusted_proxies(
             mode_is_entra,
             tenant_id,
@@ -185,8 +580,8 @@ impl EntraSsoDeps {
         trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
     ) -> Arc<Self> {
         let endpoints = derive_entra_endpoints(authority, tenant_id);
-        let exchanger: Arc<dyn TokenExchanger + Send + Sync> =
-            Arc::new(ReqwestTokenExchanger::new(endpoints.token));
+        let flow_runtime = EntraBrowserFlowRuntime::public_client();
+        let exchanger = Arc::new(ReqwestTokenExchanger::new(endpoints.token));
         // The id_token audience is the BARE client id (unlike access tokens,
         // Entra never issues id_tokens with the api:// audience form).
         let validator = Arc::new(OidcIdTokenValidator::new(
@@ -198,19 +593,94 @@ impl EntraSsoDeps {
                 .map(ResolvedAuthenticatorBrowserLimits::maximum_clock_skew_seconds)
                 .unwrap_or(0),
         ));
+        let authorize_endpoint = endpoints.authorize;
+        let authorize_url = crate::oidc_callback::parse_identity_endpoint(&authorize_endpoint)
+            .expect("derived Entra authorize endpoint must retain the admitted identity transport");
+        let token_exchanger_observation = exchanger.runtime_observation();
+        let id_token_validator_observation = validator.runtime_observation();
+        let key_source_binding_digest =
+            entra_browser_jwks_key_source_binding_digest(&id_token_validator_observation);
+        let redirects_allowed = token_exchanger_observation.redirects_allowed()
+            || id_token_validator_observation
+                .network_jwks()
+                .is_none_or(|jwks| jwks.redirects_allowed());
+        let runtime_observation = Arc::new(EntraSsoRuntimeObservation {
+            mode_is_entra,
+            configured: entra_sso_is_configured(
+                tenant_id,
+                client_id,
+                redirect_uri,
+                browser_limits.as_ref(),
+            ),
+            authorization_endpoint_binding_digest: entra_sso_runtime_binding_digest(
+                ENTRA_AUTHORIZE_ENDPOINT_BINDING_DOMAIN,
+                authorize_endpoint.as_bytes(),
+            ),
+            authorization_endpoint_https_only: authorize_url.scheme() == "https",
+            redirect_uri_binding_digest: entra_sso_runtime_binding_digest(
+                ENTRA_REDIRECT_URI_BINDING_DOMAIN,
+                redirect_uri.as_bytes(),
+            ),
+            redirect_uri_https_only: url::Url::parse(redirect_uri)
+                .is_ok_and(|redirect| redirect.scheme() == "https"),
+            client_id_binding_digest: entra_sso_runtime_binding_digest(
+                ENTRA_CLIENT_ID_BINDING_DOMAIN,
+                client_id.as_bytes(),
+            ),
+            scopes_binding_digest: entra_sso_runtime_binding_digest(
+                ENTRA_SCOPES_BINDING_DOMAIN,
+                ENTRA_SCOPES.as_bytes(),
+            ),
+            token_exchanger: token_exchanger_observation,
+            id_token_validator: id_token_validator_observation,
+            key_source_binding_digest,
+            accepted_algorithm_ids: flow_runtime.accepted_algorithm_ids,
+            required_claim_ids: flow_runtime.required_claim_ids,
+            provider_subject_claim_id: flow_runtime.provider_subject_claim_id,
+            expiration_required: flow_runtime.expiration_required,
+            not_before_required: flow_runtime.not_before_required,
+            issued_at_required: flow_runtime.issued_at_required,
+            client_authentication: flow_runtime.client_authentication,
+            client_credential_present: flow_runtime.client_credential_present,
+            pkce_method: flow_runtime.pkce_method,
+            nonce_required: flow_runtime.nonce_required,
+            browser_binding_required: flow_runtime.browser_binding_required,
+            id_token_required: flow_runtime.id_token_required,
+            provider_tokens_persisted: flow_runtime.provider_tokens_persisted,
+            provider_tokens_exposed: flow_runtime.provider_tokens_exposed,
+            redirects_allowed,
+            clock_skew_limit_id: browser_limits
+                .as_deref()
+                .map(ResolvedAuthenticatorBrowserLimits::clock_skew_limit_id)
+                .map(str::to_owned),
+            maximum_clock_skew_seconds: browser_limits
+                .as_deref()
+                .map(ResolvedAuthenticatorBrowserLimits::maximum_clock_skew_seconds),
+            session_credentials: session_credentials.runtime_observation(),
+            cookie_runtime: cookie_runtime
+                .live_observation()
+                .expect("admitted Entra cookie runtime must remain measurable"),
+            retained_flow_runtime: Arc::clone(&flow_runtime),
+            retained_exchanger: Arc::clone(&exchanger),
+            retained_validator: Arc::clone(&validator),
+            retained_browser_limits: browser_limits.as_ref().map(Arc::clone),
+            retained_session_credentials: Arc::clone(&session_credentials),
+        });
         Arc::new(Self {
             mode_is_entra,
             tenant_id: tenant_id.to_string(),
             client_id: client_id.to_string(),
             redirect_uri: redirect_uri.to_string(),
-            authorize_endpoint: endpoints.authorize,
+            authorize_endpoint,
             issuer: endpoints.issuer,
             browser_limits,
             session_credentials,
             cookie_runtime,
             trusted_proxies,
+            flow_runtime,
             exchanger,
             validator,
+            runtime_observation,
         })
     }
 
@@ -247,6 +717,143 @@ impl EntraSsoDeps {
         )
     }
 
+    /// The exact live measurement retained at construction. A caller cannot
+    /// construct this observation from declaration or configuration data.
+    pub(crate) fn runtime_observation(&self) -> Arc<EntraSsoRuntimeObservation> {
+        Arc::clone(&self.runtime_observation)
+    }
+
+    pub(crate) fn retains_runtime_observation(
+        &self,
+        observation: &Arc<EntraSsoRuntimeObservation>,
+    ) -> bool {
+        Arc::ptr_eq(&self.runtime_observation, observation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_exchanger(&self) -> Arc<ReqwestTokenExchanger> {
+        Arc::clone(&self.exchanger)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id_token_validator(&self) -> Arc<OidcIdTokenValidator> {
+        Arc::clone(&self.validator)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_token_exchanger(&self, exchanger: &Arc<ReqwestTokenExchanger>) -> bool {
+        Arc::ptr_eq(&self.exchanger, exchanger)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_id_token_validator(&self, validator: &Arc<OidcIdTokenValidator>) -> bool {
+        Arc::ptr_eq(&self.validator, validator)
+    }
+
+    /// Re-measure every immutable leaf and verify that the cookie observation
+    /// still retains the exact cookie runtime and secure-policy allocations.
+    pub(crate) fn remeasures_runtime_observation(&self) -> bool {
+        let observation = self.runtime_observation.as_ref();
+        let authorize_url =
+            crate::oidc_callback::parse_identity_endpoint(self.authorize_endpoint.as_str()).ok();
+        let browser_limit_integrity = self
+            .browser_limits
+            .as_deref()
+            .map(ResolvedAuthenticatorBrowserLimits::verify_integrity)
+            .transpose()
+            .is_ok();
+        let retains_browser_limits = match (
+            observation.retained_browser_limits.as_ref(),
+            self.browser_limits.as_ref(),
+        ) {
+            (Some(retained), Some(candidate)) => Arc::ptr_eq(retained, candidate),
+            (None, None) => true,
+            _ => false,
+        };
+
+        browser_limit_integrity
+            && self.flow_runtime.verify_integrity()
+            && Arc::ptr_eq(&observation.retained_flow_runtime, &self.flow_runtime)
+            && Arc::ptr_eq(&observation.retained_exchanger, &self.exchanger)
+            && Arc::ptr_eq(&observation.retained_validator, &self.validator)
+            && retains_browser_limits
+            && Arc::ptr_eq(
+                &observation.retained_session_credentials,
+                &self.session_credentials,
+            )
+            && observation.mode_is_entra == self.mode_is_entra
+            && observation.configured == self.configured()
+            && observation.authorization_endpoint_binding_digest
+                == entra_sso_runtime_binding_digest(
+                    ENTRA_AUTHORIZE_ENDPOINT_BINDING_DOMAIN,
+                    self.authorize_endpoint.as_bytes(),
+                )
+            && observation.authorization_endpoint_https_only
+                == authorize_url
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.scheme() == "https")
+            && observation.redirect_uri_binding_digest
+                == entra_sso_runtime_binding_digest(
+                    ENTRA_REDIRECT_URI_BINDING_DOMAIN,
+                    self.redirect_uri.as_bytes(),
+                )
+            && observation.redirect_uri_https_only
+                == url::Url::parse(&self.redirect_uri)
+                    .is_ok_and(|redirect| redirect.scheme() == "https")
+            && observation.client_id_binding_digest
+                == entra_sso_runtime_binding_digest(
+                    ENTRA_CLIENT_ID_BINDING_DOMAIN,
+                    self.client_id.as_bytes(),
+                )
+            && observation.scopes_binding_digest
+                == entra_sso_runtime_binding_digest(
+                    ENTRA_SCOPES_BINDING_DOMAIN,
+                    ENTRA_SCOPES.as_bytes(),
+                )
+            && observation.token_exchanger == self.exchanger.runtime_observation()
+            && observation.id_token_validator == self.validator.runtime_observation()
+            && observation.key_source_binding_digest
+                == entra_browser_jwks_key_source_binding_digest(
+                    &self.validator.runtime_observation(),
+                )
+            && observation.accepted_algorithm_ids == self.flow_runtime.accepted_algorithm_ids
+            && observation.required_claim_ids == self.flow_runtime.required_claim_ids
+            && observation.provider_subject_claim_id == self.flow_runtime.provider_subject_claim_id
+            && observation.expiration_required == self.flow_runtime.expiration_required
+            && observation.not_before_required == self.flow_runtime.not_before_required
+            && observation.issued_at_required == self.flow_runtime.issued_at_required
+            && observation.client_authentication == self.flow_runtime.client_authentication
+            && observation.client_credential_present == self.flow_runtime.client_credential_present
+            && observation.pkce_method == self.flow_runtime.pkce_method
+            && observation.nonce_required == self.flow_runtime.nonce_required
+            && observation.browser_binding_required == self.flow_runtime.browser_binding_required
+            && observation.id_token_required == self.flow_runtime.id_token_required
+            && observation.provider_tokens_persisted == self.flow_runtime.provider_tokens_persisted
+            && observation.provider_tokens_exposed == self.flow_runtime.provider_tokens_exposed
+            && observation.redirects_allowed
+                == (self.exchanger.runtime_observation().redirects_allowed()
+                    || self
+                        .validator
+                        .runtime_observation()
+                        .network_jwks()
+                        .is_none_or(|jwks| jwks.redirects_allowed()))
+            && observation.clock_skew_limit_id.as_deref()
+                == self
+                    .browser_limits
+                    .as_deref()
+                    .map(ResolvedAuthenticatorBrowserLimits::clock_skew_limit_id)
+            && observation.maximum_clock_skew_seconds
+                == self
+                    .browser_limits
+                    .as_deref()
+                    .map(ResolvedAuthenticatorBrowserLimits::maximum_clock_skew_seconds)
+            && observation.session_credentials == self.session_credentials.runtime_observation()
+            && observation
+                .cookie_runtime
+                .verify_retained_runtime(&self.cookie_runtime)
+                .is_ok()
+    }
+
     pub(crate) fn retains_session_credentials(
         &self,
         runtime: &Arc<crate::session_credentials::DerivedSessionCredentialRuntime>,
@@ -276,10 +883,12 @@ impl EntraSsoDeps {
         // All three are load-bearing: the authorize/token URLs embed the tenant,
         // so an empty tenant yields a malformed IdP URL. The gate must require
         // everything the ENTRA_SSO_NOT_CONFIGURED message claims it does.
-        !self.tenant_id.is_empty()
-            && !self.client_id.is_empty()
-            && !self.redirect_uri.is_empty()
-            && self.browser_limits.is_some()
+        entra_sso_is_configured(
+            &self.tenant_id,
+            &self.client_id,
+            &self.redirect_uri,
+            self.browser_limits.as_ref(),
+        )
     }
 }
 
@@ -310,10 +919,36 @@ fn entra_sso_gate(deps: &EntraSsoDeps) -> Result<(), (StatusCode, Json<Value>)> 
     Ok(())
 }
 
+fn entra_runtime_authority_unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "ENTRA_AUTHORITY_UNAVAILABLE",
+            "message": "Entra ID sign-in authority is unavailable"
+        })),
+    )
+}
+
+fn verified_entra_handler_authority(
+    handler: &Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps>,
+) -> Result<
+    (
+        Arc<EntraSsoDeps>,
+        Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
+    ),
+    (StatusCode, Json<Value>),
+> {
+    handler.verify_integrity().map_err(|error| {
+        tracing::error!(error = %error, "retained Entra SSO handler authority failed integrity verification");
+        entra_runtime_authority_unavailable()
+    })?;
+    Ok((Arc::clone(handler.base()), Arc::clone(handler.origin())))
+}
+
 /// GET /api/auth/entra/authorize-url — begins a browser sign-in.
 ///
 /// Persists `(state, nonce, pkce_verifier, binding)` via the single-use
-/// `oidc_login_states` store, then returns the tenant authorize URL plus the
+/// `oidc_login_states_v3` store, then returns the tenant authorize URL plus the
 /// per-browser binding as JSON. The binding is ALSO set as the HttpOnly
 /// mode-selected binding cookie for direct same-origin browser callers; the
 /// portal server function (which cannot forward upstream Set-Cookie headers)
@@ -323,13 +958,12 @@ fn entra_sso_gate(deps: &EntraSsoDeps) -> Result<(), (StatusCode, Json<Value>)> 
 /// provider/global quotas precede entropy generation. A 429 carries a bounded
 /// `Retry-After` response header.
 pub(crate) async fn entra_authorize_url(
-    Extension(deps): Extension<Arc<EntraSsoDeps>>,
+    Extension(handler): Extension<Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps>>,
     request: Request,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
     use url::Url;
 
+    let (deps, authenticator_origin) = verified_entra_handler_authority(&handler)?;
     entra_sso_gate(&deps)?;
 
     // Mandatory shared login admission precedes database acquisition. The
@@ -359,11 +993,12 @@ pub(crate) async fn entra_authorize_url(
     // A DB is required to persist the single-use state.
     let pool = crate::database::get_db().ok_or_else(crate::contracts::status_503_no_db)?;
 
-    // Shared DB admission runs before protocol material is generated and keeps
-    // generation + insertion inside the same serialized transaction.
+    // Startup alone advances the durable current-path pointer. Shared DB
+    // admission locks and verifies this exact active browser origin before it
+    // generates or inserts protocol material, preventing request-time rollback.
     let material = crate::repos::oidc_login_states::create(
         pool,
-        crate::repos::oidc_login_states::LoginFlow::Entra,
+        authenticator_origin.origin_binding_digest_bytes(),
     )
     .await
     .map_err(crate::contracts::login_state_insert_error)?;
@@ -372,7 +1007,7 @@ pub(crate) async fn entra_authorize_url(
     let pkce_verifier = material.pkce_verifier.as_str();
     let binding = material.binding.as_str();
     // PKCE S256: code_challenge = BASE64URL(SHA-256(ASCII(code_verifier))).
-    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
+    let code_challenge = deps.flow_runtime.pkce_code_challenge(pkce_verifier);
 
     // All parameter values are percent-encoded by Url::parse_with_params, so
     // nothing can inject into the query string.
@@ -383,9 +1018,9 @@ pub(crate) async fn entra_authorize_url(
         ("response_mode", "query"),
         ("scope", ENTRA_SCOPES),
         ("state", state),
-        ("nonce", nonce),
+        ("nonce", deps.flow_runtime.required_nonce(nonce)),
         ("code_challenge", &code_challenge),
-        ("code_challenge_method", "S256"),
+        ("code_challenge_method", deps.flow_runtime.pkce_wire_method),
     ];
     let authorize_url = Url::parse_with_params(&deps.authorize_endpoint, &params).map_err(|e| {
         tracing::error!(error = %e, "failed to build Entra authorize URL");
@@ -451,10 +1086,11 @@ fn invalid_state_problem() -> (StatusCode, Json<Value>) {
 ///    row-expiry and cookie Max-Age), set the mode-selected session cookie, and
 ///    302-redirect to `/` (hardcoded — no open-redirect surface).
 pub(crate) async fn entra_callback(
-    Extension(deps): Extension<Arc<EntraSsoDeps>>,
+    Extension(handler): Extension<Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps>>,
     headers: axum::http::HeaderMap,
     Query(params): Query<OidcCallbackQuery>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
+    let (deps, authenticator_origin) = verified_entra_handler_authority(&handler)?;
     entra_sso_gate(&deps)?;
 
     let pool = crate::database::get_db().ok_or_else(crate::contracts::status_503_no_db)?;
@@ -487,14 +1123,25 @@ pub(crate) async fn entra_callback(
     })?;
 
     // Consume the state row — single-use, expiry-checked, atomic.
-    let (nonce, pkce_verifier, binding) =
-        match crate::repos::oidc_login_states::take(pool, &state_val)
-            .await
-            .map_err(crate::contracts::db_error)?
-        {
-            Some(row) => row,
-            None => return Err(invalid_state_problem()),
-        };
+    let (nonce, pkce_verifier, binding) = match crate::repos::oidc_login_states::take(
+        pool,
+        &state_val,
+        authenticator_origin.origin_binding_digest_bytes(),
+    )
+    .await
+    .map_err(crate::contracts::db_error)?
+    {
+        crate::repos::oidc_login_states::LoginStateTakeOutcome::Redeemed {
+            nonce,
+            pkce_verifier,
+            binding,
+        } => (nonce, pkce_verifier, binding),
+        crate::repos::oidc_login_states::LoginStateTakeOutcome::OriginMismatch
+        | crate::repos::oidc_login_states::LoginStateTakeOutcome::Expired
+        | crate::repos::oidc_login_states::LoginStateTakeOutcome::Absent => {
+            return Err(invalid_state_problem());
+        }
+    };
 
     // Login-CSRF / session-swapping defense: the state is redeemable only by
     // the browser that initiated the login (it holds the matching
@@ -506,35 +1153,34 @@ pub(crate) async fn entra_callback(
         crate::cookie_runtime::CookieEvidence::Absent
         | crate::cookie_runtime::CookieEvidence::Invalid => return Err(invalid_state_problem()),
     };
-    if binding.is_empty() || cookie_binding != binding {
+    if !deps
+        .flow_runtime
+        .browser_binding_matches(&binding, cookie_binding)
+    {
         tracing::warn!("entra callback: login-state browser binding mismatch");
         return Err(invalid_state_problem());
     }
 
     // Token exchange — PKCE public client: NO client_secret is sent.
     // NEVER log code, pkce_verifier, or the resulting tokens.
-    let token_resp = deps
-        .exchanger
-        .exchange(&TokenRequest {
-            code: code_val,
-            redirect_uri: deps.redirect_uri.clone(),
-            client_id: deps.client_id.clone(),
-            client_secret: None,
-            pkce_verifier,
-        })
-        .await
-        .map_err(|_| {
-            tracing::error!("entra token exchange failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "ENTRA_TOKEN_EXCHANGE_FAILED"})),
-            )
-        })?;
+    let token_request = deps.flow_runtime.token_request(
+        code_val,
+        deps.redirect_uri.clone(),
+        deps.client_id.clone(),
+        pkce_verifier,
+    );
+    let token_resp = deps.exchanger.exchange(&token_request).await.map_err(|_| {
+        tracing::error!("entra token exchange failed");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "ENTRA_TOKEN_EXCHANGE_FAILED"})),
+        )
+    })?;
 
     // Validate the id_token; log only the safe reason string.
     let claims = deps
-        .validator
-        .validate_entra_id_token(&token_resp.id_token, &nonce, ENTRA_ROLES_CLAIM)
+        .flow_runtime
+        .validate_token_response(&deps.validator, token_resp, &nonce)
         .await
         .map_err(|reason| {
             tracing::warn!(reason, "entra id_token validation failed");
@@ -557,7 +1203,7 @@ pub(crate) async fn entra_callback(
     crate::contracts::map_auth_session_persistence_result(
         crate::identity_authority::create_federated_session(
             pool,
-            "entra-id",
+            &authenticator_origin,
             &deps.issuer,
             &claims.provider_subject,
             &claims.display_name,
@@ -630,14 +1276,40 @@ pub(crate) async fn entra_callback(
 mod tests {
     use super::*;
 
+    fn handler_deps(
+        base: Arc<EntraSsoDeps>,
+        label: &str,
+    ) -> Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps> {
+        crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps::fixture(
+            base,
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(label),
+        )
+    }
+
     fn deps(mode_is_entra: bool, client_id: &str, redirect_uri: &str) -> Arc<EntraSsoDeps> {
-        EntraSsoDeps::build(
+        deps_with_authority_and_limits(
             mode_is_entra,
-            "test-tenant",
             client_id,
             "https://login.microsoftonline.example",
             redirect_uri,
             60,
+        )
+    }
+
+    fn deps_with_authority_and_limits(
+        mode_is_entra: bool,
+        client_id: &str,
+        authority: &str,
+        redirect_uri: &str,
+        leeway_secs: u64,
+    ) -> Arc<EntraSsoDeps> {
+        EntraSsoDeps::build(
+            mode_is_entra,
+            "test-tenant",
+            client_id,
+            authority,
+            redirect_uri,
+            leeway_secs,
             ryuki_core::config::SessionConfig::default(),
         )
     }
@@ -720,19 +1392,367 @@ mod tests {
         assert!(entra_sso_gate(&configured).is_ok());
     }
 
+    #[test]
+    fn runtime_observation_measures_the_exact_closed_browser_authority() {
+        let configured = deps(
+            true,
+            "client-runtime-observation",
+            "https://portal.example/api/auth/entra/callback",
+        );
+        let observation = configured.runtime_observation();
+
+        assert!(observation.mode_is_entra());
+        assert!(observation.configured());
+        assert!(observation.authorization_endpoint_https_only());
+        assert!(observation.redirect_uri_https_only());
+        assert_eq!(
+            observation.client_authentication(),
+            AuthenticatorBrowserClientAuthentication::None
+        );
+        assert!(!observation.client_credential_present());
+        assert_eq!(observation.pkce_method(), "s256");
+        assert!(observation.nonce_required());
+        assert!(observation.browser_binding_required());
+        assert!(observation.id_token_required());
+        assert!(!observation.provider_tokens_persisted());
+        assert!(!observation.provider_tokens_exposed());
+        assert!(!observation.redirects_allowed());
+        assert_eq!(observation.accepted_algorithm_ids(), ["rs256"]);
+        assert_eq!(
+            observation.required_claim_ids(),
+            ["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"]
+        );
+        assert_eq!(observation.provider_subject_claim_id(), "oid");
+        assert!(observation.expiration_required());
+        assert!(observation.not_before_required());
+        assert!(!observation.issued_at_required());
+        assert!(observation
+            .key_source_binding_digest()
+            .starts_with("sha256:"));
+        assert_eq!(observation.maximum_clock_skew_seconds(), Some(60));
+        assert!(observation.clock_skew_limit_id().is_some());
+        assert!(
+            observation
+                .session_credentials()
+                .maximum_session_age_seconds()
+                > 0
+        );
+        assert!(observation
+            .cookie_runtime()
+            .policy_inventory_digest()
+            .is_some());
+
+        let exchanger = observation.token_exchanger();
+        assert!(exchanger.endpoint_https_only());
+        assert!(!exchanger.redirects_allowed());
+        assert!(!exchanger.ambient_proxy_allowed());
+        assert_eq!(exchanger.grant_type(), "authorization_code");
+        assert!(exchanger.pkce_verifier_included());
+        assert!(exchanger.redirect_uri_bound());
+        assert!(exchanger.client_id_bound());
+        assert!(exchanger.client_secret_form_parameter_optional());
+        assert_eq!(
+            exchanger.connect_timeout(),
+            crate::oidc_callback::identity_connect_timeout()
+        );
+        assert_eq!(
+            exchanger.request_timeout(),
+            crate::oidc_callback::identity_request_timeout()
+        );
+        assert!(exchanger.maximum_response_bytes() > 0);
+
+        let validator = observation.id_token_validator();
+        assert!(validator.issuer_https_only());
+        assert!(validator.nonce_required());
+        assert_eq!(validator.leeway_seconds(), 60);
+        let jwks = validator
+            .network_jwks()
+            .expect("Entra browser validator must retain network JWKS");
+        assert!(jwks.endpoint_https_only());
+        assert!(!jwks.redirects_allowed());
+        assert!(!jwks.ambient_proxy_allowed());
+        assert_eq!(
+            jwks.connect_timeout(),
+            crate::oidc_callback::identity_connect_timeout()
+        );
+        assert_eq!(
+            jwks.request_timeout(),
+            crate::oidc_callback::identity_request_timeout()
+        );
+        assert!(jwks.maximum_response_bytes() > 0);
+
+        assert!(configured.retains_runtime_observation(&observation));
+        assert!(configured.remeasures_runtime_observation());
+        let concrete_exchanger = configured.token_exchanger();
+        let concrete_validator = configured.id_token_validator();
+        assert!(configured.retains_token_exchanger(&concrete_exchanger));
+        assert!(configured.retains_id_token_validator(&concrete_validator));
+    }
+
+    #[test]
+    fn runtime_observation_mutates_every_identity_and_limit_binding() {
+        let baseline = deps_with_authority_and_limits(
+            true,
+            "client-runtime-baseline",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/callback",
+            60,
+        );
+        let changed_client = deps_with_authority_and_limits(
+            true,
+            "client-runtime-changed",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/callback",
+            60,
+        );
+        let changed_redirect = deps_with_authority_and_limits(
+            true,
+            "client-runtime-baseline",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/other-callback",
+            60,
+        );
+        let changed_authority = deps_with_authority_and_limits(
+            true,
+            "client-runtime-baseline",
+            "https://login.changed.example",
+            "https://portal.example/api/auth/entra/callback",
+            60,
+        );
+        let changed_limit = deps_with_authority_and_limits(
+            true,
+            "client-runtime-baseline",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/callback",
+            61,
+        );
+
+        let baseline = baseline.runtime_observation();
+        let changed_client = changed_client.runtime_observation();
+        let changed_redirect = changed_redirect.runtime_observation();
+        let changed_authority = changed_authority.runtime_observation();
+        let changed_limit = changed_limit.runtime_observation();
+        assert_ne!(
+            baseline.client_id_binding_digest(),
+            changed_client.client_id_binding_digest()
+        );
+        assert_ne!(
+            baseline.id_token_validator().audience_binding_digest(),
+            changed_client
+                .id_token_validator()
+                .audience_binding_digest()
+        );
+        assert_ne!(
+            baseline.redirect_uri_binding_digest(),
+            changed_redirect.redirect_uri_binding_digest()
+        );
+        assert_ne!(
+            baseline.authorization_endpoint_binding_digest(),
+            changed_authority.authorization_endpoint_binding_digest()
+        );
+        assert_ne!(
+            baseline.token_exchanger().token_endpoint_binding_digest(),
+            changed_authority
+                .token_exchanger()
+                .token_endpoint_binding_digest()
+        );
+        assert_ne!(
+            baseline.id_token_validator().issuer_binding_digest(),
+            changed_authority
+                .id_token_validator()
+                .issuer_binding_digest()
+        );
+        assert_ne!(
+            baseline
+                .id_token_validator()
+                .network_jwks()
+                .unwrap()
+                .endpoint_binding_digest(),
+            changed_authority
+                .id_token_validator()
+                .network_jwks()
+                .unwrap()
+                .endpoint_binding_digest()
+        );
+        assert_ne!(
+            baseline.key_source_binding_digest(),
+            changed_authority.key_source_binding_digest()
+        );
+        assert_ne!(
+            baseline.maximum_clock_skew_seconds(),
+            changed_limit.maximum_clock_skew_seconds()
+        );
+        assert_ne!(
+            baseline.id_token_validator().leeway_seconds(),
+            changed_limit.id_token_validator().leeway_seconds()
+        );
+        assert_ne!(
+            baseline.scopes_binding_digest(),
+            entra_sso_runtime_binding_digest(
+                ENTRA_REDIRECT_URI_BINDING_DOMAIN,
+                ENTRA_SCOPES.as_bytes(),
+            )
+        );
+    }
+
+    #[test]
+    fn equal_looking_substitutes_fail_exact_arc_retention() {
+        let first = deps(
+            true,
+            "client-runtime-substitution",
+            "https://portal.example/api/auth/entra/callback",
+        );
+        let substitute = deps(
+            true,
+            "client-runtime-substitution",
+            "https://portal.example/api/auth/entra/callback",
+        );
+        let first_observation = first.runtime_observation();
+        let substitute_observation = substitute.runtime_observation();
+        let substitute_exchanger = substitute.token_exchanger();
+        let substitute_validator = substitute.id_token_validator();
+
+        assert!(!first.retains_runtime_observation(&substitute_observation));
+        assert!(!first.retains_token_exchanger(&substitute_exchanger));
+        assert!(!first.retains_id_token_validator(&substitute_validator));
+        assert!(!first.retains_session_credentials(&substitute.session_credentials));
+        assert!(!first.retains_cookie_runtime(&substitute.cookie_runtime));
+        assert!(!first.retains_browser_limits(&substitute.browser_limits));
+        assert!(first_observation
+            .cookie_runtime()
+            .verify_retained_runtime(&first.cookie_runtime)
+            .is_ok());
+        assert!(first_observation
+            .cookie_runtime()
+            .verify_retained_runtime(&substitute.cookie_runtime)
+            .is_err());
+        assert!(first.remeasures_runtime_observation());
+        assert!(substitute.remeasures_runtime_observation());
+    }
+
+    #[test]
+    fn session_key_and_cookie_policy_mutations_change_retained_observations() {
+        let mut baseline_session = ryuki_core::config::SessionConfig {
+            credential_hmac_key: Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+        let mut changed_key_session = baseline_session.clone();
+        changed_key_session.credential_hmac_key = Uuid::new_v4().to_string();
+        let baseline = EntraSsoDeps::build(
+            true,
+            "test-tenant",
+            "client-session-observation",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/callback",
+            60,
+            baseline_session.clone(),
+        );
+        let changed_key = EntraSsoDeps::build(
+            true,
+            "test-tenant",
+            "client-session-observation",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/callback",
+            60,
+            changed_key_session,
+        );
+        baseline_session.cookie_max_age_secs -= 1;
+        let changed_policy = EntraSsoDeps::build(
+            true,
+            "test-tenant",
+            "client-session-observation",
+            "https://login.microsoftonline.example",
+            "https://portal.example/api/auth/entra/callback",
+            60,
+            baseline_session,
+        );
+
+        let baseline = baseline.runtime_observation();
+        let changed_key = changed_key.runtime_observation();
+        let changed_policy = changed_policy.runtime_observation();
+        assert_ne!(
+            baseline.session_credentials().key_identity_binding_digest(),
+            changed_key
+                .session_credentials()
+                .key_identity_binding_digest()
+        );
+        assert_ne!(
+            baseline.session_credentials().maximum_session_age_seconds(),
+            changed_policy
+                .session_credentials()
+                .maximum_session_age_seconds()
+        );
+        assert_ne!(
+            baseline.cookie_runtime().policy_inventory_digest(),
+            changed_policy.cookie_runtime().policy_inventory_digest()
+        );
+    }
+
+    #[test]
+    fn runtime_observation_debug_redacts_identity_and_secret_values() {
+        let client_id = "client-debug-must-not-appear";
+        let redirect_uri = "https://portal.example/debug-must-not-appear";
+        let authority = "https://authority-debug-must-not-appear.example";
+        let configured =
+            deps_with_authority_and_limits(true, client_id, authority, redirect_uri, 60);
+        let rendered = format!("{:?}", configured.runtime_observation());
+
+        for forbidden in [client_id, redirect_uri, authority, ENTRA_SCOPES] {
+            assert!(
+                !rendered.contains(forbidden),
+                "runtime observation Debug leaked {forbidden}"
+            );
+        }
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("[RETAINED]"));
+    }
+
     #[tokio::test]
     async fn authorize_url_fails_closed_without_tcp_peer_before_db() {
         let configured = deps(true, "client-1", "http://localhost/api/auth/entra/callback");
+        let handler = handler_deps(configured, "entra-unit-peer");
         let request = Request::builder()
             .uri("/api/auth/entra/authorize-url")
             .body(axum::body::Body::empty())
             .expect("request");
-        let Err((status, Json(body))) = entra_authorize_url(Extension(configured), request).await
+        let Err((status, Json(body))) = entra_authorize_url(Extension(handler), request).await
         else {
             panic!("missing TCP peer must fail closed before database acquisition");
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "LOGIN_ADMISSION_CONTEXT_UNAVAILABLE");
+    }
+
+    #[test]
+    fn verified_handler_authority_returns_only_the_exact_wrapped_arcs() {
+        let base = deps(
+            true,
+            "client-handler-retention",
+            "https://portal.example/api/auth/entra/callback",
+        );
+        let substitute_base = deps(
+            true,
+            "client-handler-retention",
+            "https://portal.example/api/auth/entra/callback",
+        );
+        let origin = crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+            "entra-unit-origin",
+        );
+        let substitute_origin =
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+                "entra-unit-origin",
+            );
+        let handler = crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps::fixture(
+            Arc::clone(&base),
+            Arc::clone(&origin),
+        );
+
+        let (returned_base, returned_origin) =
+            verified_entra_handler_authority(&handler).expect("fixture wrapper integrity");
+        assert!(Arc::ptr_eq(&returned_base, &base));
+        assert!(Arc::ptr_eq(&returned_origin, &origin));
+        assert!(!Arc::ptr_eq(&returned_base, &substitute_base));
+        assert!(!Arc::ptr_eq(&returned_origin, &substitute_origin));
     }
 }
 
@@ -803,6 +1823,12 @@ mod entra_sso_db_tests {
                 return candidate;
             }
         }
+    }
+
+    fn canonical_protocol_value() -> String {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        b64url(bytes.to_vec())
     }
 
     // ─── DB pool gate (mirrors the oidc_callback db-test pattern) ─────────
@@ -988,7 +2014,7 @@ mod entra_sso_db_tests {
                             Json(json!({
                                 "token_type": "Bearer",
                                 "expires_in": 3600,
-                                "access_token": "stub-access-token",
+                                "access_token": Uuid::new_v4().to_string(),
                                 "id_token": id_token,
                             })),
                         )
@@ -1021,26 +2047,54 @@ mod entra_sso_db_tests {
         )
     }
 
-    fn test_router(deps: Arc<EntraSsoDeps>) -> Router {
+    fn stub_handler_deps(
+        stub: &StubIdp,
+    ) -> Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps> {
+        crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps::fixture(
+            stub_deps(stub),
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+                "entra-sso-db",
+            ),
+        )
+    }
+
+    async fn test_router(
+        pool: &PgPool,
+        dependencies: Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps>,
+    ) -> Router {
+        crate::identity_authority::reconcile_test_authenticator_runtime(
+            pool,
+            dependencies.origin(),
+        )
+        .await
+        .expect("reconcile the synthetic paired test authenticator runtime");
         Router::new()
             .route("/api/auth/entra/authorize-url", get(entra_authorize_url))
             .route("/api/auth/entra/callback", get(entra_callback))
-            .layer(Extension(deps))
+            .layer(Extension(dependencies))
     }
 
     async fn provision_global_assignment(
         pool: &PgPool,
-        provider: &str,
+        browser_authenticator_origin: &Arc<
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin,
+        >,
         issuer: &str,
         subject: &str,
         roles: &[String],
     ) {
-        crate::human_authority::persist_governed_assignment(
+        crate::identity_authority::reconcile_test_authenticator_runtime(
             pool,
-            provider,
+            browser_authenticator_origin,
+        )
+        .await
+        .expect("reconcile the synthetic paired test authenticator runtime");
+        crate::identity_authority::provision_test_authenticator_assignment(
+            pool,
+            browser_authenticator_origin,
             issuer,
             subject,
-            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(roles),
+            roles,
         )
         .await
         .expect("seed Entra human authority");
@@ -1115,7 +2169,9 @@ mod entra_sso_db_tests {
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let handler = stub_handler_deps(&stub);
+        let origin = Arc::clone(handler.origin());
+        let app = test_router(pool, handler).await;
 
         let resp = app
             .clone()
@@ -1146,17 +2202,30 @@ mod entra_sso_db_tests {
         assert!(!params["state"].is_empty());
         assert!(!params["nonce"].is_empty());
         assert!(!params["code_challenge"].is_empty());
+        for value in [
+            params["state"].as_str(),
+            params["nonce"].as_str(),
+            params["code_challenge"].as_str(),
+            body["binding"].as_str().expect("binding"),
+        ] {
+            assert_eq!(value.len(), 43);
+            assert!(value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+        }
 
         // The persisted row must carry the SAME nonce the URL carries, and the
         // stored verifier must hash (S256) to the URL's code_challenge.
-        let row: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT nonce, pkce_verifier, binding FROM oidc_login_states WHERE state = $1",
+        let row: Option<(String, String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT nonce, pkce_verifier, binding, authenticator_origin_binding_digest \
+             FROM oidc_login_states_v3 WHERE state = $1",
         )
         .bind(&params["state"])
         .fetch_optional(pool)
         .await
         .expect("state row query");
-        let (db_nonce, db_verifier, db_binding) = row.expect("state row must be persisted");
+        let (db_nonce, db_verifier, db_binding, db_origin) =
+            row.expect("state row must be persisted");
         assert_eq!(db_nonce, params["nonce"]);
         assert_eq!(
             b64url(Sha256::digest(db_verifier.as_bytes()).to_vec()),
@@ -1164,6 +2233,7 @@ mod entra_sso_db_tests {
             "stored PKCE verifier must hash to the code_challenge in the URL"
         );
         assert_eq!(db_binding, body["binding"].as_str().unwrap());
+        assert_eq!(db_origin, origin.origin_binding_digest_bytes().as_slice());
 
         // The verifier itself must NOT appear anywhere in the authorize URL.
         assert!(
@@ -1172,10 +2242,17 @@ mod entra_sso_db_tests {
         );
 
         // Cleanup the unconsumed row.
-        let _ = sqlx::query("DELETE FROM oidc_login_states WHERE state = $1")
-            .bind(&params["state"])
-            .execute(pool)
-            .await;
+        let cleanup = crate::repos::oidc_login_states::take(
+            pool,
+            &params["state"],
+            origin.origin_binding_digest_bytes(),
+        )
+        .await
+        .expect("v3 state cleanup");
+        assert!(matches!(
+            cleanup,
+            crate::repos::oidc_login_states::LoginStateTakeOutcome::Redeemed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1186,17 +2263,20 @@ mod entra_sso_db_tests {
         };
 
         let stub = start_stub_idp().await;
-        let deps = stub_deps(&stub);
+        let handler = stub_handler_deps(&stub);
+        let deps = Arc::clone(handler.base());
+        let origin = Arc::clone(handler.origin());
+        let origin_digest = handler.origin().origin_binding_digest_bytes().to_vec();
         let expected_issuer = deps.issuer.clone();
         provision_global_assignment(
             pool,
-            "entra-id",
+            &origin,
             &deps.issuer,
             TEST_ENTRA_OID,
             &["PlatformAdmin".to_string()],
         )
         .await;
-        let app = test_router(deps);
+        let app = test_router(pool, handler).await;
 
         let (state, nonce, code_challenge, binding) = begin_login(&app).await;
         // A real IdP echoes the request nonce into the id_token.
@@ -1239,7 +2319,8 @@ mod entra_sso_db_tests {
             "__Host-entra_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
         );
 
-        // The minted session row: provider entra-id, identity from the id_token.
+        // The minted session row retains the exact canonical origin provider,
+        // never a carrier-family alias such as `entra-id`.
         let session_bearer = cookie
             .split(';')
             .next()
@@ -1253,12 +2334,22 @@ mod entra_sso_db_tests {
             &test_session_config(),
         )
         .expect("test verifier");
-        let row: (Uuid, Uuid, String, Vec<String>, String, String, String) = sqlx::query_as(
+        let row: (
+            Uuid,
+            Uuid,
+            String,
+            Vec<String>,
+            String,
+            String,
+            String,
+            Vec<u8>,
+        ) = sqlx::query_as(
             "SELECT s.session_record_id, s.principal_id, s.display_name, s.roles, \
-                    k.provider_id, k.issuer, k.subject \
+                    k.provider_id, k.issuer, k.subject, \
+                    s.authenticator_origin_binding_digest \
              FROM sessions s \
              JOIN principal_keys k ON k.principal_key_id = s.principal_key_id \
-             WHERE s.bearer_verifier = $1 AND s.expires_at > NOW()",
+             WHERE s.session_bearer_verifier_v3 = $1 AND s.expires_at > NOW()",
         )
         .bind(verifier.as_slice())
         .fetch_one(pool)
@@ -1271,9 +2362,10 @@ mod entra_sso_db_tests {
         );
         assert_eq!(row.2, "Entra Test User");
         assert_eq!(row.3, vec!["PlatformAdmin".to_string()]);
-        assert_eq!(row.4, "entra-id");
+        assert_eq!(row.4, origin.provider_id());
         assert_eq!(row.5, expected_issuer);
         assert_eq!(row.6, TEST_ENTRA_OID);
+        assert_eq!(row.7, origin_digest);
 
         // The token exchange must have been a PKCE PUBLIC client exchange:
         // grant/code/redirect/client + a verifier that hashes to the
@@ -1308,19 +2400,21 @@ mod entra_sso_db_tests {
         };
 
         let stub = start_stub_idp().await;
-        let deps = stub_deps(&stub);
+        let handler = stub_handler_deps(&stub);
+        let deps = Arc::clone(handler.base());
+        let origin = Arc::clone(handler.origin());
         // Make the signed `sub` fully admissible as an authority key. If the
         // callback ever restores oid→sub fallback, this request would mint a
         // session and the regression would fail.
         provision_global_assignment(
             pool,
-            "entra-id",
+            &origin,
             &deps.issuer,
             "entra-sub-1",
             &["PlatformAdmin".to_string()],
         )
         .await;
-        let app = test_router(deps);
+        let app = test_router(pool, handler).await;
 
         let (state, nonce, _code_challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1347,15 +2441,18 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_unknown_state_returns_400() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let resp = app
-            .oneshot(callback_req("never-issued-state", "any-binding"))
+            .oneshot(callback_req(
+                &canonical_protocol_value(),
+                &canonical_protocol_value(),
+            ))
             .await
             .expect("request");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1371,16 +2468,18 @@ mod entra_sso_db_tests {
         };
 
         let stub = start_stub_idp().await;
-        let deps = stub_deps(&stub);
+        let handler = stub_handler_deps(&stub);
+        let deps = Arc::clone(handler.base());
+        let origin = Arc::clone(handler.origin());
         provision_global_assignment(
             pool,
-            "entra-id",
+            &origin,
             &deps.issuer,
             TEST_ENTRA_OID,
             &["PlatformAdmin".to_string()],
         )
         .await;
-        let app = test_router(deps);
+        let app = test_router(pool, handler).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1411,14 +2510,70 @@ mod entra_sso_db_tests {
     }
 
     #[tokio::test]
-    async fn test_callback_binding_mismatch_returns_400() {
+    async fn substituted_origin_wrapper_burns_state_before_exchange() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let base = stub_deps(&stub);
+        let initiating_origin =
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+                "entra-origin-a",
+            );
+        let substituted_origin =
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+                "entra-origin-b",
+            );
+        let initiating_handler = crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps::fixture(
+            Arc::clone(&base),
+            Arc::clone(&initiating_origin),
+        );
+        let substituted_handler =
+            crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps::fixture(
+                base,
+                Arc::clone(&substituted_origin),
+            );
+        assert!(!Arc::ptr_eq(
+            initiating_handler.origin(),
+            substituted_handler.origin()
+        ));
+        let initiating_app = test_router(pool, initiating_handler).await;
+        let substituted_app = test_router(pool, substituted_handler).await;
+
+        let (state, nonce, _challenge, binding) = begin_login(&initiating_app).await;
+        stub.set_nonce(&nonce);
+        let mismatched = substituted_app
+            .oneshot(callback_req(&state, &binding))
+            .await
+            .expect("substituted-origin callback");
+        assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            stub.last_token_form().is_none(),
+            "origin mismatch must burn state before token exchange"
+        );
+
+        let retry = initiating_app
+            .oneshot(callback_req(&state, &binding))
+            .await
+            .expect("initiating-origin retry");
+        assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            stub.last_token_form().is_none(),
+            "mismatched redemption must consume the state permanently"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_callback_binding_mismatch_returns_400() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            return;
+        };
+
+        let stub = start_stub_idp().await;
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1450,21 +2605,23 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_duplicate_binding_cookies_return_400() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
         let mut request = callback_req(&state, &binding);
         request.headers_mut().append(
             axum::http::header::COOKIE,
-            axum::http::HeaderValue::from_static(
-                "other=value; __Host-entra_login_csrf=attacker-binding",
-            ),
+            axum::http::HeaderValue::from_str(&format!(
+                "other=value; __Host-entra_login_csrf={}",
+                canonical_protocol_value()
+            ))
+            .expect("canonical duplicate binding cookie"),
         );
 
         let resp = app.oneshot(request).await.expect("callback");
@@ -1480,17 +2637,17 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_wrong_nonce_returns_401() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         // The stub issues an id_token with a DIFFERENT nonce.
         let mismatched_nonce = loop {
-            let candidate = Uuid::new_v4().to_string();
+            let candidate = canonical_protocol_value();
             if candidate != nonce {
                 break candidate;
             }
@@ -1510,12 +2667,12 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_wrong_audience_returns_401() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1534,12 +2691,12 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_expired_id_token_returns_401() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1556,12 +2713,12 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_token_endpoint_500_returns_502() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1584,12 +2741,12 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_idp_error_redirects_to_auth_error() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let app = test_router(pool, stub_handler_deps(&stub)).await;
 
         let resp = app
             .oneshot(
@@ -1614,7 +2771,7 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_wrong_mode_rejects_both_endpoints_with_400() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
@@ -1629,7 +2786,13 @@ mod entra_sso_db_tests {
             60,
             ryuki_core::config::SessionConfig::default(),
         );
-        let app = test_router(deps);
+        let handler = crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps::fixture(
+            deps,
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+                "entra-wrong-mode",
+            ),
+        );
+        let app = test_router(pool, handler).await;
 
         let authorize = app
             .clone()
@@ -1647,171 +2810,14 @@ mod entra_sso_db_tests {
 
         let callback = app
             .clone()
-            .oneshot(callback_req("any-state", "any-binding"))
+            .oneshot(callback_req(
+                &canonical_protocol_value(),
+                &canonical_protocol_value(),
+            ))
             .await
             .expect("callback request");
         assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
         let body = body_json(callback).await;
         assert_eq!(body["error"], "ENTRA_AUTH_DISABLED");
-    }
-
-    /// Security regression: in EntraId mode the session resolver must honor
-    /// ONLY validated-SSO provider sessions ('entra-id'/'oidc'), never a stale
-    /// 'local'/dry-run session — otherwise a leftover admin cookie from a prior
-    /// deployment mode would authenticate against the SSO deployment.
-    #[tokio::test]
-    async fn entra_mode_rejects_non_sso_provider_sessions() {
-        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = global_pool().await else {
-            return;
-        };
-
-        // Seed one session per provider, all non-expired, all admin-privileged.
-        let seed = |provider: &'static str| {
-            let record_id = Uuid::new_v4();
-            async move {
-                let credential =
-                    crate::session_credentials::issue_session_credential(&test_session_config())
-                        .expect("test session credential");
-                let issuer = if provider == "local" {
-                    crate::identity_authority::LOCAL_ISSUER
-                } else {
-                    "https://login.microsoftonline.example/test-tenant/v2.0"
-                };
-                crate::human_authority::persist_governed_assignment(
-                    pool,
-                    provider,
-                    issuer,
-                    "admin",
-                    crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&[
-                        "PlatformAdmin".to_string(),
-                    ]),
-                )
-                .await
-                .expect("seed opaque principal authority");
-                let mut session_tx = pool.begin().await.expect("begin Entra test session seed");
-                crate::human_authority::prepare_writer_tx(
-                    &mut session_tx,
-                    provider,
-                    issuer,
-                    "admin",
-                )
-                .await
-                .expect("prepare Entra test session writer");
-                let binding = crate::principal_registry::resolve_active_binding_tx(
-                    &mut session_tx,
-                    provider,
-                    issuer,
-                    "admin",
-                )
-                .await
-                .expect("resolve Entra test principal binding");
-                sqlx::query(
-                    "INSERT INTO sessions \
-                     (session_record_id, bearer_verifier, principal_id, \
-                      principal_lifecycle_version, principal_authority_version, \
-                      principal_key_id, principal_key_version, principal_link_id, \
-                      principal_link_version, display_name, email, roles, \
-                      site_authority_mode, site_scope, environment_authority_mode, \
-                      environment_scope, expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Admin', NULL, $10, \
-                             'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], \
-                             NOW() + INTERVAL '1 hour')",
-                )
-                .bind(record_id)
-                .bind(credential.verifier().as_slice())
-                .bind(binding.principal_id.into_uuid())
-                .bind(binding.principal_lifecycle_version)
-                .bind(binding.principal_authority_version)
-                .bind(binding.principal_key_id)
-                .bind(binding.principal_key_version)
-                .bind(binding.principal_link_id)
-                .bind(binding.principal_link_version)
-                .bind(&["PlatformAdmin".to_string()] as &[String])
-                .execute(&mut *session_tx)
-                .await
-                .expect("seed session");
-                session_tx
-                    .commit()
-                    .await
-                    .expect("commit Entra test session seed");
-                (
-                    record_id,
-                    credential.bearer().to_string(),
-                    binding.principal_id,
-                )
-            }
-        };
-        let (local_id, local_bearer, _local_principal) = seed("local").await;
-        let (entra_id, entra_bearer, entra_principal) = seed("entra-id").await;
-        let (oidc_id, oidc_bearer, _oidc_principal) = seed("oidc").await;
-
-        let resolve = |session_bearer: String, tenant_id: &'static str, oidc_enabled: bool| async move {
-            let session_config = test_session_config();
-            let mut resolution_config = ryuki_core::config::RyukiConfig {
-                auth_mode: ryuki_core::config::AuthMode::EntraId,
-                entra_authority: "https://login.microsoftonline.example".to_string(),
-                entra_tenant_id: tenant_id.to_string(),
-                session: session_config,
-                ..Default::default()
-            };
-            resolution_config.oidc.enabled = oidc_enabled;
-            resolution_config.oidc.issuer =
-                "https://login.microsoftonline.example/test-tenant/v2.0".to_string();
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                axum::http::header::COOKIE,
-                format!("__Host-ryuki_session={session_bearer}")
-                    .parse()
-                    .unwrap(),
-            );
-            // Each policy variant gets an isolated admission cache. A policy
-            // rejection is intentionally negative-cached by bearer, so sharing
-            // the process-global cache here would make the enabled assertion
-            // depend on which variant the test exercised first.
-            let admission =
-                crate::session_lookup_admission::SessionLookupAdmission::for_tests(8, 8, 1, 8);
-            crate::auth_session_from_persisted_session_with_admission(
-                &headers,
-                None,
-                &resolution_config,
-                &admission,
-                None,
-            )
-            .await
-            .expect("resolver returns Some")
-            .0
-        };
-
-        // The stale local session must NOT authenticate: no roles, not valid.
-        let local = resolve(local_bearer, "test-tenant", false).await;
-        assert!(!local.token_valid, "stale local session must not be valid");
-        assert!(
-            local.roles.is_empty(),
-            "stale local session grants no roles"
-        );
-        // The entra-id session resolves with its identity + roles.
-        let entra = resolve(entra_bearer.clone(), "test-tenant", false).await;
-        assert_eq!(entra.principal_id, Some(entra_principal));
-        assert_eq!(entra.roles, vec!["PlatformAdmin".to_string()]);
-        let rotated_tenant = resolve(entra_bearer, "rotated-tenant", false).await;
-        assert!(
-            !rotated_tenant.token_valid,
-            "an Entra authority/tenant change must reject sessions from the old issuer"
-        );
-
-        let disabled_oidc = resolve(oidc_bearer.clone(), "test-tenant", false).await;
-        assert!(
-            !disabled_oidc.token_valid,
-            "disabling generic OIDC must reject its persisted sessions"
-        );
-        let enabled_oidc = resolve(oidc_bearer, "test-tenant", true).await;
-        assert!(enabled_oidc.token_valid);
-
-        sqlx::query("DELETE FROM sessions WHERE session_record_id = ANY($1)")
-            .bind(&[local_id, entra_id, oidc_id] as &[Uuid])
-            .execute(pool)
-            .await
-            .ok();
     }
 }

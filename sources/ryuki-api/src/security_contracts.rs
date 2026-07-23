@@ -64,16 +64,27 @@ use ryuki_core::public_ingress::{
     MAX_PUBLIC_INGRESS_REQUEST_BYTES, MAX_PUBLIC_INGRESS_RESPONSE_BYTES,
 };
 use ryuki_core::security_profile::{
-    authenticator_provider_policy_binding_digest, secret_provider_inventory_digest, ArtifactKind,
-    AuthenticatorCredentialCarrier, AuthenticatorCredentialProfileRuntimeProjection,
-    AuthenticatorCredentialReuse, AuthenticatorKeySourceKind, AuthenticatorNonceBinding,
-    AuthenticatorPresentationReplayDefense, AuthenticatorProofBinding,
-    AuthenticatorRuntimeOwnership, AuthenticatorSenderConstraint,
+    authenticator_provider_policy_binding_digest, authenticator_runtime_binding_digest,
+    secret_provider_inventory_digest, ArtifactKind, AuthenticatorCredentialCarrier,
+    AuthenticatorCredentialProfileRuntimeProjection, AuthenticatorCredentialReuse,
+    AuthenticatorKeySourceKind, AuthenticatorNonceBinding, AuthenticatorPresentationReplayDefense,
+    AuthenticatorProofBinding, AuthenticatorRuntimeBindingDocumentReference,
+    AuthenticatorRuntimeBindingProjection, AuthenticatorRuntimeOwnership,
+    AuthenticatorRuntimePathProjection, AuthenticatorSenderConstraint,
     AuthenticatorVerifierRuntimeProjection, DeploymentSecurityProfile, ExpectedProviderBinding,
-    ExpectedSecretProviderBinding, GuardId, MigrationAuthoritySource, ProductionDatabaseProvider,
-    ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile, StartupAdmissionContext,
-    TenancyMode, VersionedContentReference, AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
+    ExpectedSecretProviderBinding, GuardId, MigrationAuthoritySource, ProductionAuthenticatorKind,
+    ProductionDatabaseProvider, ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile,
+    StartupAdmissionContext, TenancyMode, VersionedContentReference,
+    AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+    AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID, AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS,
+    AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+    AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
     SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT,
+};
+#[cfg(test)]
+use ryuki_core::security_profile::{
+    AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT,
+    AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1151,10 +1162,14 @@ struct ResolvedAuthenticatorBrowserLimitValues {
     provider_id: String,
     path_id: String,
     clock_skew: ResolvedSecondsLimit,
+    state_lifetime: ResolvedSecondsLimit,
+    session_maximum_age: ResolvedSecondsLimit,
+    federated_authority_staleness: ResolvedSecondsLimit,
 }
 
-/// Closed clock-skew authority for the exact Entra browser ID-token path.
-/// Browser credentials deliberately have no bearer credential-lifetime arm.
+/// Closed limit authority for the exact Entra browser ID-token path and its
+/// derived session. Browser credentials deliberately have no bearer
+/// credential-lifetime arm.
 pub(crate) struct ResolvedAuthenticatorBrowserLimits {
     security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
     runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
@@ -1170,6 +1185,21 @@ impl fmt::Debug for ResolvedAuthenticatorBrowserLimits {
             .field(
                 "clock_skew_override_id",
                 &self.values.clock_skew.applied_override_id,
+            )
+            .field(
+                "state_lifetime_override_id",
+                &self.values.state_lifetime.applied_override_id,
+            )
+            .field(
+                "session_maximum_age_override_id",
+                &self.values.session_maximum_age.applied_override_id,
+            )
+            .field(
+                "federated_authority_staleness_override_id",
+                &self
+                    .values
+                    .federated_authority_staleness
+                    .applied_override_id,
             )
             .field("security_limit_profile", &"[RETAINED]")
             .field("runtime_binding", &"[RETAINED]")
@@ -1203,6 +1233,30 @@ impl ResolvedAuthenticatorBrowserLimits {
 
     pub(crate) fn maximum_clock_skew_seconds(&self) -> u64 {
         self.values.clock_skew.effective_seconds
+    }
+
+    pub(crate) fn state_lifetime_limit_id(&self) -> &str {
+        &self.values.state_lifetime.limit_id
+    }
+
+    pub(crate) fn maximum_state_lifetime_seconds(&self) -> u64 {
+        self.values.state_lifetime.effective_seconds
+    }
+
+    pub(crate) fn session_maximum_age_limit_id(&self) -> &str {
+        &self.values.session_maximum_age.limit_id
+    }
+
+    pub(crate) fn maximum_session_age_seconds(&self) -> u64 {
+        self.values.session_maximum_age.effective_seconds
+    }
+
+    pub(crate) fn federated_authority_staleness_limit_id(&self) -> &str {
+        &self.values.federated_authority_staleness.limit_id
+    }
+
+    pub(crate) fn maximum_federated_authority_staleness_seconds(&self) -> u64 {
+        self.values.federated_authority_staleness.effective_seconds
     }
 
     #[cfg(test)]
@@ -1239,8 +1293,27 @@ impl ResolvedAuthenticatorBrowserLimits {
 
     #[cfg(test)]
     pub(crate) fn fixture(clock_skew_seconds: u64) -> Arc<Self> {
+        let session = ryuki_core::config::SessionConfig::default();
+        Self::fixture_with_session_policy(
+            clock_skew_seconds,
+            session.cookie_max_age_secs,
+            session.federated_authority_max_staleness_secs,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_with_session_policy(
+        clock_skew_seconds: u64,
+        maximum_session_age_seconds: u64,
+        maximum_federated_authority_staleness_seconds: u64,
+    ) -> Arc<Self> {
         Self::seal(
-            Arc::new(fixture_security_limit_profile(clock_skew_seconds, 3_600)),
+            Arc::new(fixture_security_limit_profile_with_browser_limits(
+                clock_skew_seconds,
+                3_600,
+                maximum_session_age_seconds,
+                maximum_federated_authority_staleness_seconds,
+            )),
             Arc::new(fixture_authenticator_runtime_binding(
                 clock_skew_seconds,
                 3_600,
@@ -1248,6 +1321,907 @@ impl ResolvedAuthenticatorBrowserLimits {
             "provider:fixture-entra",
         )
         .expect("canonical authenticator browser limit fixture must resolve")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAuthenticatorPathMetadata {
+    path_id: String,
+    path_version: u64,
+}
+
+fn declared_entra_runtime_binding_projection(
+    binding_document_reference: &AuthenticatorRuntimeBindingDocumentReference,
+    document: &AuthenticatorRuntimeBindingDocument,
+    provider_configuration_payload_digest: &str,
+    provider_lifecycle_record_version: u64,
+    provider_policy_binding_digest: &str,
+) -> Result<AuthenticatorRuntimeBindingProjection, String> {
+    if document.authenticator_kind != "oidc" {
+        return Err("declared Entra runtime-binding projection must remain OIDC".into());
+    }
+    let credential_paths = document
+        .credential_paths
+        .iter()
+        .map(|path| AuthenticatorRuntimePathProjection {
+            path_id: path.path_id.clone(),
+            path_version: path.path_version,
+            verifier: path.verifier.clone(),
+            credential_profile: path.credential_profile.clone(),
+            cache_partition_binding_digest: path.cache_partition.binding_digest.clone(),
+            protocol_binding_digest: path.protocol_binding.binding_digest.clone(),
+            retained_consumer_ids: path.retained_consumer_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    let projection = AuthenticatorRuntimeBindingProjection {
+        provider: ExpectedProviderBinding {
+            provider_id: document.provider_id.clone(),
+            configuration_version: document.provider_configuration_version,
+            configuration_payload_digest: provider_configuration_payload_digest.to_owned(),
+            lifecycle_record_version: provider_lifecycle_record_version,
+            lifecycle_state: ProviderLifecycleState::Active,
+            capability_descriptor_id: document.capability_descriptor_id.clone(),
+            capability_descriptor_version: document.capability_descriptor_version,
+            adapter_kind: document.adapter_kind.clone(),
+            adapter_version: document.adapter_version.clone(),
+        },
+        binding_document_reference: binding_document_reference.clone(),
+        authenticator_kind: ProductionAuthenticatorKind::Oidc,
+        provider_policy_binding_digest: provider_policy_binding_digest.to_owned(),
+        capability_ids: document.capability_ids.clone(),
+        credential_paths,
+        ownership: document.ownership.clone(),
+    };
+    // This call validates the complete canonical declared projection. Its
+    // digest is intentionally discarded: only a separately observed runtime
+    // allocation may supply measured R.
+    authenticator_runtime_binding_digest(&projection).map_err(|error| {
+        format!("declared Entra runtime-binding projection is invalid: {error}")
+    })?;
+    Ok(projection)
+}
+
+/// One closed selection of the active Entra provider declaration, its exact D
+/// allocation, independently recomputed provider policy Q, and the limit
+/// authorities resolved from that same D/profile pair.
+///
+/// This is startup configuration authority only. It deliberately makes no
+/// claim about a measured runtime allocation and is not a production guard
+/// witness.
+pub(crate) struct ResolvedEntraAuthenticatorAuthority {
+    deployment_id: String,
+    trust_domain_id: String,
+    tenant_id: Option<String>,
+    provider_id: String,
+    provider_configuration_version: u64,
+    provider_configuration_payload_digest: String,
+    provider_lifecycle_record_version: u64,
+    provider_lifecycle_state: ProviderLifecycleState,
+    binding_document_reference: AuthenticatorRuntimeBindingDocumentReference,
+    provider_policy_binding_digest: String,
+    oidc_configuration: OidcKindConfig,
+    declared_runtime_binding_projection: AuthenticatorRuntimeBindingProjection,
+    security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
+    runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+    bearer_limits: Arc<ResolvedAuthenticatorBearerLimits>,
+    browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+    bearer_path: ResolvedAuthenticatorPathMetadata,
+    browser_path: Option<ResolvedAuthenticatorPathMetadata>,
+}
+
+impl fmt::Debug for ResolvedEntraAuthenticatorAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedEntraAuthenticatorAuthority")
+            .field("deployment_id", &self.deployment_id)
+            .field("trust_domain_id", &self.trust_domain_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("provider_id", &self.provider_id)
+            .field(
+                "provider_configuration_version",
+                &self.provider_configuration_version,
+            )
+            .field(
+                "provider_lifecycle_record_version",
+                &self.provider_lifecycle_record_version,
+            )
+            .field("provider_lifecycle_state", &self.provider_lifecycle_state)
+            .field(
+                "binding_document_reference",
+                &self.binding_document_reference,
+            )
+            .field("bearer_path", &self.bearer_path)
+            .field("browser_path", &self.browser_path)
+            .field("security_limit_profile", &"[RETAINED]")
+            .field("runtime_binding", &"[RETAINED]")
+            .field("bearer_limits", &"[RETAINED]")
+            .field(
+                "browser_limits",
+                &self.browser_limits.as_ref().map(|_| "[RETAINED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedEntraAuthenticatorAuthority {
+    fn seal(
+        deployment_id: &str,
+        tenant_id: Option<&str>,
+        security_limit_profile: Arc<VerifiedSecurityLimitProfile>,
+        provider: &ActiveProviderConfiguration,
+        runtime_binding: Arc<VerifiedAuthenticatorRuntimeBinding>,
+        bearer_limits: Arc<ResolvedAuthenticatorBearerLimits>,
+        browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+    ) -> Result<Arc<Self>, String> {
+        security_limit_profile.verify_integrity()?;
+        runtime_binding.verify_integrity()?;
+        bearer_limits.verify_integrity()?;
+        if let Some(browser_limits) = &browser_limits {
+            browser_limits.verify_integrity()?;
+        }
+
+        let ActiveProviderKindConfig::Oidc {
+            configuration,
+            verified_runtime_binding,
+        } = &provider.kind_config
+        else {
+            return Err("active Entra authenticator authority requires an OIDC provider".into());
+        };
+        if !Arc::ptr_eq(verified_runtime_binding, &runtime_binding) {
+            return Err(
+                "active Entra provider and authority retain different D allocations".into(),
+            );
+        }
+        if !Arc::ptr_eq(
+            &security_limit_profile,
+            &bearer_limits.security_limit_profile,
+        ) || !Arc::ptr_eq(&runtime_binding, &bearer_limits.runtime_binding)
+        {
+            return Err(
+                "active Entra bearer limits do not retain the authority's exact D/profile allocations"
+                    .into(),
+            );
+        }
+        if browser_limits.as_ref().is_some_and(|browser_limits| {
+            !Arc::ptr_eq(
+                &security_limit_profile,
+                &browser_limits.security_limit_profile,
+            ) || !Arc::ptr_eq(&runtime_binding, &browser_limits.runtime_binding)
+        }) {
+            return Err(
+                "active Entra browser limits do not retain the authority's exact D/profile allocations"
+                    .into(),
+            );
+        }
+
+        let document = &runtime_binding.document;
+        if provider.kind != "oidc"
+            || provider.capability_descriptor.adapter_kind != "auth.entra-id"
+            || provider.provider_id != document.provider_id
+            || provider.config_version != document.provider_configuration_version
+            || provider.trust_domain_id != document.trust_domain_id
+            || deployment_id != document.deployment_id
+            || provider.active_lifecycle_record_version == 0
+            || provider.capability_descriptor.descriptor_id != document.capability_descriptor_id
+            || provider.capability_descriptor.descriptor_version
+                != document.capability_descriptor_version
+            || provider.capability_descriptor.adapter_kind != document.adapter_kind
+            || provider.capability_descriptor.adapter_version != document.adapter_version
+            || runtime_binding.reference.document_id != document.document_id
+            || runtime_binding.reference.document_version != document.document_version
+        {
+            return Err(
+                "active Entra provider metadata differs from its exact runtime-binding D".into(),
+            );
+        }
+        if configuration.runtime_binding_ref != runtime_binding.reference {
+            return Err(
+                "active Entra provider configuration does not reference the retained D".into(),
+            );
+        }
+        validate_digest_pin(
+            "active Entra provider configuration payload digest",
+            &provider.payload_digest,
+        )?;
+        let oidc_configuration_value =
+            serde_json::to_value(configuration.as_ref()).map_err(|error| {
+                format!("active Entra OIDC policy could not be reprojected: {error}")
+            })?;
+        let provider_policy_binding_digest = authenticator_provider_policy_binding_digest(
+            &oidc_configuration_value,
+        )
+        .map_err(|error| {
+            format!(
+                "active Entra provider-policy digest could not be independently recomputed: {error}"
+            )
+        })?;
+        if document.provider_policy.digest_contract
+            != AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT
+            || document.provider_policy.binding_digest != provider_policy_binding_digest
+        {
+            return Err(
+                "active Entra provider policy Q differs from its independently recomputed policy"
+                    .into(),
+            );
+        }
+        let d_digest = &runtime_binding.reference.content_digest;
+        let p_digest = &provider.payload_digest;
+        let q_digest = &provider_policy_binding_digest;
+        if d_digest == p_digest || d_digest == q_digest || p_digest == q_digest {
+            return Err("active Entra authority violates D/P/Q digest separation".into());
+        }
+
+        let binding_document_reference = AuthenticatorRuntimeBindingDocumentReference {
+            document_id: runtime_binding.reference.document_id.clone(),
+            document_version: runtime_binding.reference.document_version,
+            content_digest: runtime_binding.reference.content_digest.clone(),
+            artifact_locator: runtime_binding.reference.artifact_locator.clone(),
+        };
+        let declared_runtime_binding_projection = declared_entra_runtime_binding_projection(
+            &binding_document_reference,
+            document,
+            &provider.payload_digest,
+            provider.active_lifecycle_record_version,
+            &provider_policy_binding_digest,
+        )?;
+        let bearer_paths = document
+            .credential_paths
+            .iter()
+            .filter(|path| path.credential_profile.token_profile == "jwt-access-token")
+            .collect::<Vec<_>>();
+        let bearer_path = match bearer_paths.as_slice() {
+            [path] if path.path_id == bearer_limits.values.path_id => {
+                ResolvedAuthenticatorPathMetadata {
+                    path_id: path.path_id.clone(),
+                    path_version: path.path_version,
+                }
+            }
+            _ => {
+                return Err(
+                    "active Entra D has ambiguous or mismatched bearer path authority".into(),
+                );
+            }
+        };
+
+        let browser_paths = document
+            .credential_paths
+            .iter()
+            .filter(|path| path.credential_profile.token_profile == "oidc-id-token")
+            .collect::<Vec<_>>();
+        let browser_path = match (browser_paths.as_slice(), &browser_limits) {
+            ([], None) => None,
+            ([path], Some(browser_limits)) if path.path_id == browser_limits.values.path_id => {
+                Some(ResolvedAuthenticatorPathMetadata {
+                    path_id: path.path_id.clone(),
+                    path_version: path.path_version,
+                })
+            }
+            ([], Some(_)) => {
+                return Err(
+                    "active Entra browser limits have no corresponding browser path in D".into(),
+                );
+            }
+            ([_], None) => {
+                return Err(
+                    "active Entra browser path has no resolved browser limit authority".into(),
+                );
+            }
+            _ => {
+                return Err(
+                    "active Entra D has ambiguous or mismatched browser path authority".into(),
+                );
+            }
+        };
+
+        let resolved = Arc::new(Self {
+            deployment_id: deployment_id.to_owned(),
+            trust_domain_id: provider.trust_domain_id.clone(),
+            tenant_id: tenant_id.map(str::to_owned),
+            provider_id: provider.provider_id.clone(),
+            provider_configuration_version: provider.config_version,
+            provider_configuration_payload_digest: provider.payload_digest.clone(),
+            provider_lifecycle_record_version: provider.active_lifecycle_record_version,
+            provider_lifecycle_state: ProviderLifecycleState::Active,
+            binding_document_reference,
+            provider_policy_binding_digest,
+            oidc_configuration: configuration.as_ref().clone(),
+            declared_runtime_binding_projection,
+            security_limit_profile,
+            runtime_binding,
+            bearer_limits,
+            browser_limits,
+            bearer_path,
+            browser_path,
+        });
+        resolved.verify_integrity()?;
+        Ok(resolved)
+    }
+
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+
+    pub(crate) fn trust_domain_id(&self) -> &str {
+        &self.trust_domain_id
+    }
+
+    pub(crate) fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub(crate) fn provider_configuration_version(&self) -> u64 {
+        self.provider_configuration_version
+    }
+
+    pub(crate) fn provider_configuration_payload_digest(&self) -> &str {
+        &self.provider_configuration_payload_digest
+    }
+
+    pub(crate) fn provider_lifecycle_record_version(&self) -> u64 {
+        self.provider_lifecycle_record_version
+    }
+
+    pub(crate) fn provider_lifecycle_state(&self) -> ProviderLifecycleState {
+        self.provider_lifecycle_state
+    }
+
+    pub(crate) fn binding_document_reference(
+        &self,
+    ) -> &AuthenticatorRuntimeBindingDocumentReference {
+        &self.binding_document_reference
+    }
+
+    pub(crate) fn verified_runtime_binding(&self) -> &Arc<VerifiedAuthenticatorRuntimeBinding> {
+        &self.runtime_binding
+    }
+
+    pub(crate) fn provider_policy_binding_digest(&self) -> &str {
+        &self.provider_policy_binding_digest
+    }
+
+    /// Full declaration-side expectation reconstructed from exact D plus the
+    /// selected active provider P/lifecycle and independently recomputed Q.
+    /// Callers must compare this with their own live observation; this value is
+    /// never a runtime measurement by itself.
+    pub(crate) fn declared_runtime_binding_projection(
+        &self,
+    ) -> &AuthenticatorRuntimeBindingProjection {
+        &self.declared_runtime_binding_projection
+    }
+
+    pub(crate) fn bearer_limits(&self) -> &Arc<ResolvedAuthenticatorBearerLimits> {
+        &self.bearer_limits
+    }
+
+    pub(crate) fn browser_limits(&self) -> Option<&Arc<ResolvedAuthenticatorBrowserLimits>> {
+        self.browser_limits.as_ref()
+    }
+
+    pub(crate) fn bearer_path_id(&self) -> &str {
+        &self.bearer_path.path_id
+    }
+
+    pub(crate) fn bearer_path_version(&self) -> u64 {
+        self.bearer_path.path_version
+    }
+
+    pub(crate) fn browser_path_id(&self) -> Option<&str> {
+        self.browser_path.as_ref().map(|path| path.path_id.as_str())
+    }
+
+    pub(crate) fn browser_path_version(&self) -> Option<u64> {
+        self.browser_path.as_ref().map(|path| path.path_version)
+    }
+
+    /// Build a test-only authority through the same closed seal used by
+    /// startup. The declaration is derived from the supplied live Entra
+    /// configuration; no independently configurable D/P/Q test knobs exist.
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        config: &RyukiConfig,
+        clock_skew_seconds: u64,
+        maximum_lifetime_seconds: u64,
+        browser_required: bool,
+    ) -> Arc<Self> {
+        assert_eq!(
+            config.auth_mode,
+            AuthMode::EntraId,
+            "Entra authority fixtures require entra-id mode"
+        );
+        assert!(
+            !config.entra_tenant_id.is_empty() && !config.entra_client_id.is_empty(),
+            "Entra authority fixtures require tenant and client identity"
+        );
+        let mut binding_value: Value = serde_json::from_slice(
+            &fixture_authenticator_runtime_binding(clock_skew_seconds, maximum_lifetime_seconds)
+                .raw_bytes,
+        )
+        .expect("fixture D must remain exact JSON");
+        if browser_required {
+            binding_value["capability_ids"] =
+                serde_json::json!(["browser-sso", "token-validation"]);
+        } else {
+            binding_value["capability_ids"] = serde_json::json!(["token-validation"]);
+            binding_value["credential_paths"]
+                .as_array_mut()
+                .expect("fixture D paths")
+                .retain(|path| path["credential_profile"]["token_profile"] != "oidc-id-token");
+        }
+
+        // Construct the real bearer validator once against provisional exact
+        // limits, then carry only its value-free observation into D.
+        let provisional_binding = Arc::new(fixture_verified_authenticator_runtime_binding(
+            binding_value.clone(),
+        ));
+        let provisional_profile = Arc::new(fixture_security_limit_profile_with_browser_limits(
+            clock_skew_seconds,
+            maximum_lifetime_seconds,
+            config.session.cookie_max_age_secs,
+            config.session.federated_authority_max_staleness_secs,
+        ));
+        let provisional_bearer_limits = ResolvedAuthenticatorBearerLimits::seal(
+            provisional_profile,
+            provisional_binding,
+            "provider:fixture-entra",
+        )
+        .expect("fixture bearer limits must resolve");
+        let bearer_observation = crate::entra_auth::EntraTokenValidator::from_app_config(
+            &config.entra_tenant_id,
+            &config.entra_client_id,
+            &config.entra_authority,
+            config.entra_jwks_ttl_secs,
+            provisional_bearer_limits,
+        )
+        .runtime_observation();
+        let bearer_path = binding_value["credential_paths"]
+            .as_array_mut()
+            .expect("fixture D paths")
+            .iter_mut()
+            .find(|path| path["credential_profile"]["token_profile"] == "jwt-access-token")
+            .expect("fixture D bearer path");
+        bearer_path["verifier"]["issuer_binding_digest"] =
+            serde_json::json!(bearer_observation.issuer_authority_binding_digest());
+        bearer_path["verifier"]["audience_set_binding_digest"] =
+            serde_json::json!(bearer_observation.audience_client_binding_digest());
+        bearer_path["verifier"]["key_source_binding_digest"] =
+            serde_json::json!(bearer_observation.key_source_binding_digest());
+
+        let reference_digest = |label: &str, values: &[&str]| {
+            let projection = serde_json::json!({
+                "fixture_binding": label,
+                "values": values,
+            });
+            raw_digest(
+                &canonical_json_bytes(&projection)
+                    .expect("fixture reference projection must canonicalize"),
+            )
+        };
+        bearer_path["cache_partition"]["binding_digest"] = serde_json::json!(reference_digest(
+            "entra-bearer-cache",
+            &[
+                bearer_observation.issuer_authority_binding_digest(),
+                bearer_observation.audience_client_binding_digest(),
+                bearer_observation.key_source_binding_digest(),
+            ],
+        ));
+        bearer_path["protocol_binding"]["binding_digest"] = serde_json::json!(reference_digest(
+            "entra-bearer-protocol",
+            &[
+                bearer_observation.clock_skew_limit_id(),
+                bearer_observation.credential_lifetime_limit_id(),
+            ],
+        ));
+
+        if browser_required {
+            let mut authority = reqwest::Url::parse(&config.entra_authority)
+                .expect("fixture Entra authority must be a URL");
+            let endpoint = |authority: &reqwest::Url, segments: &[&str]| {
+                let mut endpoint = authority.clone();
+                let mut path = endpoint
+                    .path_segments_mut()
+                    .expect("fixture Entra authority must be a base URL");
+                path.pop_if_empty();
+                for segment in segments {
+                    path.push(segment);
+                }
+                drop(path);
+                endpoint.to_string()
+            };
+            authority.set_query(None);
+            authority.set_fragment(None);
+            let issuer = endpoint(&authority, &[&config.entra_tenant_id, "v2.0"]);
+            let jwks = endpoint(
+                &authority,
+                &[&config.entra_tenant_id, "discovery", "v2.0", "keys"],
+            );
+            let browser_observation = crate::oidc_callback::OidcIdTokenValidator::new(
+                jwks,
+                issuer,
+                config.entra_client_id.clone(),
+                clock_skew_seconds,
+            )
+            .runtime_observation();
+            let network_jwks = browser_observation
+                .network_jwks()
+                .expect("fixture browser validator must retain network JWKS");
+            let browser_key_source_digest = reference_digest(
+                "entra-browser-jwks",
+                &[
+                    network_jwks.endpoint_binding_digest(),
+                    &network_jwks.cache_ttl().as_secs().to_string(),
+                    &network_jwks.refresh_cooldown().as_secs().to_string(),
+                    &network_jwks.maximum_cached_keys().to_string(),
+                    &network_jwks.maximum_response_bytes().to_string(),
+                    &network_jwks.endpoint_https_only().to_string(),
+                    &network_jwks.redirects_allowed().to_string(),
+                    &network_jwks.ambient_proxy_allowed().to_string(),
+                    &network_jwks.connect_timeout().as_millis().to_string(),
+                    &network_jwks.request_timeout().as_millis().to_string(),
+                ],
+            );
+            let browser_path = binding_value["credential_paths"]
+                .as_array_mut()
+                .expect("fixture D paths")
+                .iter_mut()
+                .find(|path| path["credential_profile"]["token_profile"] == "oidc-id-token")
+                .expect("fixture D browser path");
+            browser_path["verifier"]["issuer_binding_digest"] =
+                serde_json::json!(browser_observation.issuer_binding_digest());
+            browser_path["verifier"]["audience_set_binding_digest"] =
+                serde_json::json!(browser_observation.audience_binding_digest());
+            browser_path["verifier"]["key_source_binding_digest"] =
+                serde_json::json!(browser_key_source_digest);
+            browser_path["verifier"]["required_claim_ids"] =
+                serde_json::json!(["aud", "exp", "iss", "nbf", "nonce", "oid", "sub"]);
+            browser_path["verifier"]["issued_at_required"] = serde_json::json!(false);
+            browser_path["cache_partition"]["binding_digest"] =
+                serde_json::json!(reference_digest(
+                    "entra-browser-cache",
+                    &[
+                        browser_observation.issuer_binding_digest(),
+                        browser_observation.audience_binding_digest(),
+                        network_jwks.endpoint_binding_digest(),
+                    ],
+                ));
+            browser_path["protocol_binding"]["binding_digest"] =
+                serde_json::json!(reference_digest(
+                    "entra-browser-protocol",
+                    &[
+                        &config.entra_redirect_uri,
+                        bearer_observation.clock_skew_limit_id(),
+                        "pkce-s256",
+                        "single-use-state",
+                    ],
+                ));
+        }
+
+        let provisional_reference = ContentReferenceBinding {
+            document_id: "authenticator-runtime-binding:fixture-entra".into(),
+            document_version: 1,
+            content_digest: raw_digest(
+                &serde_json::to_vec(&binding_value).expect("fixture D must serialize"),
+            ),
+            artifact_locator:
+                "catalog/security-contracts/v1/authenticator-runtime-binding.test.json".into(),
+        };
+        let mut oidc_configuration =
+            fixture_entra_oidc_configuration(config, provisional_reference, &reference_digest);
+        let q = authenticator_provider_policy_binding_digest(
+            &serde_json::to_value(&oidc_configuration)
+                .expect("fixture OIDC configuration must serialize"),
+        )
+        .expect("fixture Q must derive");
+        binding_value["provider_policy"]["binding_digest"] = serde_json::json!(q);
+        let runtime_binding = Arc::new(fixture_verified_authenticator_runtime_binding(
+            binding_value,
+        ));
+        oidc_configuration.runtime_binding_ref = runtime_binding.reference.clone();
+        let p_projection = serde_json::json!({
+            "provider_id": "provider:fixture-entra",
+            "configuration_version": 1,
+            "trust_domain_id": "trust-domain:fixture-authenticator",
+            "lifecycle_record_version": 3,
+            "kind_config": &oidc_configuration,
+        });
+        let p = raw_digest(
+            &canonical_json_bytes(&p_projection)
+                .expect("fixture provider payload projection must canonicalize"),
+        );
+        let capability_ids = runtime_binding.document.capability_ids.clone();
+        let mut provider = ActiveProviderConfiguration {
+            provider_id: "provider:fixture-entra".into(),
+            config_version: 1,
+            payload_digest: p,
+            kind: "oidc".into(),
+            trust_domain_id: "trust-domain:fixture-authenticator".into(),
+            active_lifecycle_record_version: 3,
+            capability_descriptor: ProviderCapabilityDescriptorBinding {
+                descriptor_id: "capability-descriptor:fixture-entra".into(),
+                descriptor_version: 1,
+                adapter_kind: "auth.entra-id".into(),
+                adapter_version: "1.0.0".into(),
+                advertised_capabilities: capability_ids,
+                mandatory_baseline_ref: ContentReferenceBinding {
+                    document_id: "mandatory-baseline:fixture-entra".into(),
+                    document_version: 1,
+                    content_digest: reference_digest(
+                        "entra-mandatory-baseline",
+                        &["oidc", "jwt-jwks", "rs256"],
+                    ),
+                    artifact_locator:
+                        "catalog/security-contracts/v1/mandatory-baseline.fixture.json".into(),
+                },
+                implementation_applicable: true,
+                production_eligible: true,
+            },
+            credential_refs: Vec::new(),
+            kind_config: ActiveProviderKindConfig::Oidc {
+                configuration: Box::new(oidc_configuration),
+                verified_runtime_binding: Arc::clone(&runtime_binding),
+            },
+        };
+        let security_limit_profile = Arc::new(fixture_security_limit_profile_with_browser_limits(
+            clock_skew_seconds,
+            maximum_lifetime_seconds,
+            config.session.cookie_max_age_secs,
+            config.session.federated_authority_max_staleness_secs,
+        ));
+        let bearer_limits = ResolvedAuthenticatorBearerLimits::seal(
+            Arc::clone(&security_limit_profile),
+            Arc::clone(&runtime_binding),
+            &provider.provider_id,
+        )
+        .expect("fixture bearer limits must seal");
+        let browser_limits = browser_required
+            .then(|| {
+                ResolvedAuthenticatorBrowserLimits::seal(
+                    Arc::clone(&security_limit_profile),
+                    Arc::clone(&runtime_binding),
+                    &provider.provider_id,
+                )
+            })
+            .transpose()
+            .expect("fixture browser limits must seal");
+        let provisional_authority = Self::seal(
+            "deployment:fixture-authenticator",
+            None,
+            Arc::clone(&security_limit_profile),
+            &provider,
+            Arc::clone(&runtime_binding),
+            Arc::clone(&bearer_limits),
+            browser_limits.as_ref().map(Arc::clone),
+        )
+        .expect("provisional fixture Entra authority must satisfy resolver invariants");
+
+        // Construct the same concrete objects that production measures, then
+        // replace every provisional D path with the canonical live projection.
+        // Q excludes only D's top-level reference, so these preimages remain
+        // stable when final D and P are re-hashed below.
+        let bearer_validator = crate::entra_auth::EntraTokenValidator::from_app_config(
+            &config.entra_tenant_id,
+            &config.entra_client_id,
+            &config.entra_authority,
+            config.entra_jwks_ttl_secs,
+            Arc::clone(provisional_authority.bearer_limits()),
+        );
+        let mut runtime_config = config.clone();
+        if runtime_config.session.credential_hmac_key.is_empty() {
+            runtime_config.session.credential_hmac_key = hex::encode(rand::random::<[u8; 32]>());
+        }
+        if browser_required && runtime_config.entra_redirect_uri.is_empty() {
+            // Some negative constructor tests intentionally request a dormant
+            // browser declaration. Give only the synthetic measurement object
+            // a valid redirect so D can still be canonically projected; the
+            // real config remains empty and is rejected by runtime admission.
+            runtime_config.entra_redirect_uri =
+                "https://fixture.invalid/entra/callback".to_string();
+        }
+        let derived_session_credentials =
+            crate::session_credentials::DerivedSessionCredentialRuntime::from_admitted_config(
+                &runtime_config.session,
+            )
+            .expect("fixture session authority must construct");
+        let cookie_runtime =
+            crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&runtime_config, true)
+                .expect("fixture production cookie authority must construct");
+        let entra_sso_dependencies = crate::entra_sso::EntraSsoDeps::from_app_config(
+            &runtime_config,
+            provisional_authority.browser_limits().map(Arc::clone),
+            Arc::clone(&derived_session_credentials),
+            Arc::clone(&cookie_runtime),
+        );
+        let measured_paths = crate::authenticator_runtime::fixture_measured_entra_paths(
+            &provisional_authority,
+            &bearer_validator,
+            &entra_sso_dependencies,
+            &derived_session_credentials,
+            &cookie_runtime,
+        )
+        .expect("fixture authenticator paths must use canonical live preimages");
+        let mut final_binding_value: Value =
+            serde_json::from_slice(&runtime_binding.raw_bytes).expect("provisional fixture D JSON");
+        fixture_replace_authenticator_path(
+            &mut final_binding_value,
+            &measured_paths.direct_bearer_path,
+        );
+        match (browser_required, measured_paths.browser.as_ref()) {
+            (true, Some(browser)) => {
+                fixture_replace_authenticator_path(&mut final_binding_value, browser)
+            }
+            (false, None) => {}
+            _ => panic!("fixture browser declaration and live measurement differ"),
+        }
+        let runtime_binding = Arc::new(fixture_verified_authenticator_runtime_binding(
+            final_binding_value,
+        ));
+        let ActiveProviderKindConfig::Oidc {
+            configuration,
+            verified_runtime_binding,
+        } = &mut provider.kind_config
+        else {
+            panic!("fixture Entra provider must retain OIDC configuration")
+        };
+        configuration.runtime_binding_ref = runtime_binding.reference.clone();
+        *verified_runtime_binding = Arc::clone(&runtime_binding);
+        let p_projection = serde_json::json!({
+            "provider_id": "provider:fixture-entra",
+            "configuration_version": 1,
+            "trust_domain_id": "trust-domain:fixture-authenticator",
+            "lifecycle_record_version": 3,
+            "kind_config": configuration.as_ref(),
+        });
+        provider.payload_digest = raw_digest(
+            &canonical_json_bytes(&p_projection)
+                .expect("final fixture provider payload projection must canonicalize"),
+        );
+        let bearer_limits = ResolvedAuthenticatorBearerLimits::seal(
+            Arc::clone(&security_limit_profile),
+            Arc::clone(&runtime_binding),
+            &provider.provider_id,
+        )
+        .expect("final fixture bearer limits must seal");
+        let browser_limits = browser_required
+            .then(|| {
+                ResolvedAuthenticatorBrowserLimits::seal(
+                    Arc::clone(&security_limit_profile),
+                    Arc::clone(&runtime_binding),
+                    &provider.provider_id,
+                )
+            })
+            .transpose()
+            .expect("final fixture browser limits must seal");
+        Self::seal(
+            "deployment:fixture-authenticator",
+            None,
+            security_limit_profile,
+            &provider,
+            runtime_binding,
+            bearer_limits,
+            browser_limits,
+        )
+        .expect("fixture Entra authority must satisfy the production resolver invariants")
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<(), String> {
+        self.security_limit_profile.verify_integrity()?;
+        self.runtime_binding.verify_integrity()?;
+        self.bearer_limits.verify_integrity()?;
+        if !Arc::ptr_eq(
+            &self.security_limit_profile,
+            &self.bearer_limits.security_limit_profile,
+        ) || !Arc::ptr_eq(&self.runtime_binding, &self.bearer_limits.runtime_binding)
+        {
+            return Err("retained Entra bearer limits lost the exact D/profile allocations".into());
+        }
+        if let Some(browser_limits) = &self.browser_limits {
+            browser_limits.verify_integrity()?;
+            if !Arc::ptr_eq(
+                &self.security_limit_profile,
+                &browser_limits.security_limit_profile,
+            ) || !Arc::ptr_eq(&self.runtime_binding, &browser_limits.runtime_binding)
+            {
+                return Err(
+                    "retained Entra browser limits lost the exact D/profile allocations".into(),
+                );
+            }
+        }
+        let oidc_configuration =
+            serde_json::to_value(&self.oidc_configuration).map_err(|error| {
+                format!("retained Entra OIDC policy could not be reprojected: {error}")
+            })?;
+        let remeasured_q = authenticator_provider_policy_binding_digest(&oidc_configuration)
+            .map_err(|error| {
+                format!("retained Entra provider-policy Q could not be recomputed: {error}")
+            })?;
+        let document = &self.runtime_binding.document;
+        if self.oidc_configuration.runtime_binding_ref != self.runtime_binding.reference
+            || remeasured_q != self.provider_policy_binding_digest
+            || document.provider_policy.binding_digest != self.provider_policy_binding_digest
+            || self.binding_document_reference.document_id
+                != self.runtime_binding.reference.document_id
+            || self.binding_document_reference.document_version
+                != self.runtime_binding.reference.document_version
+            || self.binding_document_reference.content_digest
+                != self.runtime_binding.reference.content_digest
+            || self.binding_document_reference.artifact_locator
+                != self.runtime_binding.reference.artifact_locator
+            || self.binding_document_reference.document_id != document.document_id
+            || self.binding_document_reference.document_version != document.document_version
+            || self.provider_id != document.provider_id
+            || self.provider_configuration_version != document.provider_configuration_version
+            || self.deployment_id != document.deployment_id
+            || self.trust_domain_id != document.trust_domain_id
+            || self.provider_lifecycle_record_version == 0
+            || self.provider_lifecycle_state != ProviderLifecycleState::Active
+        {
+            return Err("retained Entra authority differs from its sealed D/P/Q metadata".into());
+        }
+        validate_digest_pin(
+            "retained Entra provider configuration payload digest",
+            &self.provider_configuration_payload_digest,
+        )?;
+        let d_digest = &self.binding_document_reference.content_digest;
+        let p_digest = &self.provider_configuration_payload_digest;
+        let q_digest = &self.provider_policy_binding_digest;
+        if d_digest == p_digest || d_digest == q_digest || p_digest == q_digest {
+            return Err("retained Entra authority violates D/P/Q digest separation".into());
+        }
+        let reprojected = declared_entra_runtime_binding_projection(
+            &self.binding_document_reference,
+            document,
+            &self.provider_configuration_payload_digest,
+            self.provider_lifecycle_record_version,
+            &self.provider_policy_binding_digest,
+        )?;
+        if reprojected != self.declared_runtime_binding_projection {
+            return Err(
+                "retained Entra declared projection differs from exact D/P/Q authority".into(),
+            );
+        }
+        let retained_bearer_paths = document
+            .credential_paths
+            .iter()
+            .filter(|path| path.credential_profile.token_profile == "jwt-access-token")
+            .collect::<Vec<_>>();
+        match retained_bearer_paths.as_slice() {
+            [document_path]
+                if self.bearer_path.path_version > 0
+                    && self.bearer_path.path_id == self.bearer_limits.values.path_id
+                    && self.bearer_path.path_id == document_path.path_id
+                    && self.bearer_path.path_version == document_path.path_version => {}
+            _ => {
+                return Err(
+                    "retained Entra bearer path differs from its exact limit authority".into(),
+                );
+            }
+        }
+        let retained_browser_paths = document
+            .credential_paths
+            .iter()
+            .filter(|path| path.credential_profile.token_profile == "oidc-id-token")
+            .collect::<Vec<_>>();
+        match (
+            retained_browser_paths.as_slice(),
+            &self.browser_path,
+            &self.browser_limits,
+        ) {
+            ([], None, None) => {}
+            ([document_path], Some(path), Some(limits))
+                if path.path_version > 0
+                    && path.path_id == limits.values.path_id
+                    && path.path_id == document_path.path_id
+                    && path.path_version == document_path.path_version => {}
+            _ => {
+                return Err(
+                    "retained Entra browser path differs from its exact limit authority".into(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1480,7 +2454,7 @@ fn resolve_entra_browser_limit_values(
         _ => {
             return Err(
                 "active Entra binding has ambiguous browser ID-token credential paths".into(),
-            )
+            );
         }
     };
     let verifier = &browser_path.verifier;
@@ -1504,9 +2478,42 @@ fn resolve_entra_browser_limit_values(
     };
     let clock_skew = security_limit_profile
         .resolve_exact_seconds_limit(AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID, &scope)?;
+    let state_lifetime = security_limit_profile
+        .resolve_exact_seconds_limit(AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID, &scope)?;
+    let session_maximum_age = security_limit_profile
+        .resolve_exact_seconds_limit(AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID, &scope)?;
+    let federated_authority_staleness = security_limit_profile.resolve_exact_seconds_limit(
+        AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        &scope,
+    )?;
     if clock_skew.effective_seconds != u64::from(verifier.maximum_clock_skew_seconds) {
         return Err(
             "active Entra browser D clock-skew maximum differs from the resolved security limit"
+                .into(),
+        );
+    }
+    if state_lifetime.effective_seconds != AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS {
+        return Err(format!(
+            "active Entra browser state lifetime must resolve exactly to {AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS} seconds"
+        ));
+    }
+    if session_maximum_age.effective_seconds == 0
+        || federated_authority_staleness.effective_seconds == 0
+    {
+        return Err(
+            "active Entra browser session maximum age and federated-authority staleness must be positive"
+                .into(),
+        );
+    }
+    if session_maximum_age.effective_seconds > ryuki_core::config::MAX_SESSION_COOKIE_AGE_SECS {
+        return Err(format!(
+            "active Entra browser session maximum age exceeds the {} second runtime cap",
+            ryuki_core::config::MAX_SESSION_COOKIE_AGE_SECS
+        ));
+    }
+    if federated_authority_staleness.effective_seconds > session_maximum_age.effective_seconds {
+        return Err(
+            "active Entra federated-authority staleness exceeds the browser session maximum age"
                 .into(),
         );
     }
@@ -1514,6 +2521,9 @@ fn resolve_entra_browser_limit_values(
         provider_id: provider_id.to_owned(),
         path_id: browser_path.path_id.clone(),
         clock_skew,
+        state_lifetime,
+        session_maximum_age,
+        federated_authority_staleness,
     })
 }
 
@@ -1521,6 +2531,22 @@ fn resolve_entra_browser_limit_values(
 fn fixture_security_limit_profile(
     clock_skew_seconds: u64,
     maximum_lifetime_seconds: u64,
+) -> VerifiedSecurityLimitProfile {
+    let session = ryuki_core::config::SessionConfig::default();
+    fixture_security_limit_profile_with_browser_limits(
+        clock_skew_seconds,
+        maximum_lifetime_seconds,
+        session.cookie_max_age_secs,
+        session.federated_authority_max_staleness_secs,
+    )
+}
+
+#[cfg(test)]
+fn fixture_security_limit_profile_with_browser_limits(
+    clock_skew_seconds: u64,
+    maximum_lifetime_seconds: u64,
+    maximum_session_age_seconds: u64,
+    maximum_federated_authority_staleness_seconds: u64,
 ) -> VerifiedSecurityLimitProfile {
     let mut document: Value = serde_json::from_str(include_str!(
         "../../../catalog/security-contracts/v1/security-limit-profile.implementation.json"
@@ -1545,6 +2571,24 @@ fn fixture_security_limit_profile(
             maximum_lifetime_seconds,
             1,
             maximum_lifetime_seconds.max(86_400),
+        ),
+        fixture_authenticator_limit_row(
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+            AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS,
+            AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS,
+            AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS,
+        ),
+        fixture_authenticator_limit_row(
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+            maximum_session_age_seconds,
+            1,
+            ryuki_core::config::MAX_SESSION_COOKIE_AGE_SECS,
+        ),
+        fixture_authenticator_limit_row(
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+            maximum_federated_authority_staleness_seconds,
+            1,
+            3_600,
         )
     ]);
     fixture_verified_security_limit_profile(document)
@@ -1609,7 +2653,10 @@ fn fixture_authenticator_limit_row(
             "source_symbol": match limit_id {
                 AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID => "ResolvedAuthenticatorBearerLimits::maximum_clock_skew_seconds",
                 AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID => "ResolvedAuthenticatorBearerLimits::maximum_credential_lifetime_seconds",
-                _ => "ResolvedAuthenticatorBearerLimits",
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID => "ResolvedAuthenticatorBrowserLimits::maximum_state_lifetime_seconds",
+                AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID => "ResolvedAuthenticatorBrowserLimits::maximum_session_age_seconds",
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID => "ResolvedAuthenticatorBrowserLimits::maximum_federated_authority_staleness_seconds",
+                _ => "ResolvedAuthenticatorBrowserLimits",
             }
         },
         "overrides": [],
@@ -1679,12 +2726,12 @@ fn fixture_authenticator_runtime_binding(
             "digest_contract": AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT,
             "binding_digest": digest('f')
         },
-        "capability_ids": ["token-validation"],
+        "capability_ids": ["browser-sso", "token-validation"],
         "credential_paths": [{
-            "path_id": "authenticator-path:fixture-entra-bearer",
+            "path_id": "authenticator-path:api-bearer",
             "path_version": 1,
             "verifier": {
-                "verifier_id": "authenticator-verifier:fixture-entra-bearer",
+                "verifier_id": "authenticator-verifier:api-bearer",
                 "verifier_version": 1,
                 "issuer_binding_digest": digest('1'),
                 "audience_set_binding_digest": digest('2'),
@@ -1702,7 +2749,7 @@ fn fixture_authenticator_runtime_binding(
                 "redirects_allowed": false
             },
             "credential_profile": {
-                "profile_id": "credential-profile:fixture-entra-bearer",
+                "profile_id": "credential-profile:api-bearer",
                 "profile_version": 1,
                 "token_profile": "jwt-access-token",
                 "carrier": "authorization-bearer",
@@ -1725,7 +2772,7 @@ fn fixture_authenticator_runtime_binding(
                 "digest_contract": "ryuki-authenticator-protocol-binding-v1",
                 "binding_digest": digest('5')
             },
-            "retained_consumer_ids": ["runtime-consumer:fixture-entra-bearer"]
+            "retained_consumer_ids": ["runtime-consumer:entra-bearer-request-admission"]
         }],
         "ownership": {
             "single_runtime_owner": true,
@@ -1733,14 +2780,14 @@ fn fixture_authenticator_runtime_binding(
         }
     });
     let mut browser_path = document_value["credential_paths"][0].clone();
-    browser_path["path_id"] = serde_json::json!("authenticator-path:fixture-entra-browser");
+    browser_path["path_id"] = serde_json::json!("authenticator-path:browser-sso");
     browser_path["verifier"]["verifier_id"] =
-        serde_json::json!("authenticator-verifier:fixture-entra-browser");
+        serde_json::json!("authenticator-verifier:browser-sso");
     browser_path["verifier"]["required_claim_ids"] =
         serde_json::json!(["aud", "exp", "iat", "iss", "nbf", "nonce", "oid", "sub"]);
     browser_path["verifier"]["nonce_required"] = serde_json::json!(true);
     browser_path["credential_profile"]["profile_id"] =
-        serde_json::json!("credential-profile:fixture-entra-browser");
+        serde_json::json!("credential-profile:browser-sso");
     browser_path["credential_profile"]["token_profile"] = serde_json::json!("oidc-id-token");
     browser_path["credential_profile"]["carrier"] = serde_json::json!("oauth-callback");
     browser_path["credential_profile"]["proof_binding"] = serde_json::json!("pkce-s256");
@@ -1756,7 +2803,7 @@ fn fixture_authenticator_runtime_binding(
     browser_path["cache_partition"]["binding_digest"] = serde_json::json!(digest('7'));
     browser_path["protocol_binding"]["binding_digest"] = serde_json::json!(digest('8'));
     browser_path["retained_consumer_ids"] =
-        serde_json::json!(["runtime-consumer:fixture-entra-browser"]);
+        serde_json::json!(["runtime-consumer:entra-browser-sso"]);
     document_value["credential_paths"]
         .as_array_mut()
         .expect("test authenticator paths")
@@ -1792,6 +2839,112 @@ fn fixture_verified_authenticator_runtime_binding(
         .verify_integrity()
         .expect("test authenticator runtime-binding exact bytes must verify");
     verified
+}
+
+#[cfg(test)]
+fn fixture_replace_authenticator_path(
+    document: &mut Value,
+    measured: &AuthenticatorRuntimePathProjection,
+) {
+    let path = document["credential_paths"]
+        .as_array_mut()
+        .expect("fixture D credential paths")
+        .iter_mut()
+        .find(|path| {
+            path["credential_profile"]["token_profile"].as_str()
+                == Some(measured.credential_profile.token_profile.as_str())
+        })
+        .expect("fixture D must contain the measured token profile");
+    path["path_id"] = serde_json::json!(&measured.path_id);
+    path["path_version"] = serde_json::json!(measured.path_version);
+    path["verifier"] =
+        serde_json::to_value(&measured.verifier).expect("measured verifier must serialize");
+    path["credential_profile"] = serde_json::to_value(&measured.credential_profile)
+        .expect("measured credential profile must serialize");
+    path["cache_partition"] = serde_json::json!({
+        "digest_contract": AUTHENTICATOR_CACHE_PARTITION_BINDING_DIGEST_CONTRACT,
+        "binding_digest": &measured.cache_partition_binding_digest,
+    });
+    path["protocol_binding"] = serde_json::json!({
+        "digest_contract": AUTHENTICATOR_PROTOCOL_BINDING_DIGEST_CONTRACT,
+        "binding_digest": &measured.protocol_binding_digest,
+    });
+    path["retained_consumer_ids"] = serde_json::json!(&measured.retained_consumer_ids);
+}
+
+#[cfg(test)]
+fn fixture_entra_oidc_configuration(
+    config: &RyukiConfig,
+    runtime_binding_ref: ContentReferenceBinding,
+    reference_digest: &impl Fn(&str, &[&str]) -> String,
+) -> OidcKindConfig {
+    let reference = |document_id: &str, artifact_locator: &str, label: &str, values: &[&str]| {
+        ContentReferenceBinding {
+            document_id: document_id.into(),
+            document_version: 1,
+            content_digest: reference_digest(label, values),
+            artifact_locator: artifact_locator.into(),
+        }
+    };
+    OidcKindConfig {
+        configuration_kind: "oidc".into(),
+        runtime_binding_ref,
+        issuer_ref: reference(
+            "issuer:fixture-entra",
+            "catalog/security-contracts/v1/issuer.fixture.json",
+            "entra-issuer",
+            &[&config.entra_authority, &config.entra_tenant_id],
+        ),
+        endpoint_policy_ref: reference(
+            "endpoint-policy:fixture-entra",
+            "catalog/security-contracts/v1/endpoint-policy.fixture.json",
+            "entra-endpoint-policy",
+            &[
+                &config.entra_authority,
+                &config.entra_tenant_id,
+                &config.entra_jwks_ttl_secs.to_string(),
+            ],
+        ),
+        validation_mode: "jwt-jwks".into(),
+        client_id_ref: reference(
+            "client-id:fixture-entra",
+            "catalog/security-contracts/v1/client-id.fixture.json",
+            "entra-client",
+            &[&config.entra_client_id],
+        ),
+        client_authentication_method: "none".into(),
+        accepted_audiences_ref: reference(
+            "accepted-audiences:fixture-entra",
+            "catalog/security-contracts/v1/accepted-audiences.fixture.json",
+            "entra-audiences",
+            &[
+                &config.entra_client_id,
+                &format!("api://{}", config.entra_client_id),
+            ],
+        ),
+        accepted_algorithms: vec!["RS256".into()],
+        redirect_policy_ref: reference(
+            "redirect-policy:fixture-entra",
+            "catalog/security-contracts/v1/redirect-policy.fixture.json",
+            "entra-redirect",
+            &[&config.entra_redirect_uri],
+        ),
+        claim_mapping_ref: reference(
+            "claim-mapping:fixture-entra",
+            "catalog/security-contracts/v1/claim-mapping.fixture.json",
+            "entra-claim-mapping",
+            &["oid", "name", "preferred_username", "roles"],
+        ),
+        assurance_mapping_ref: reference(
+            "assurance-mapping:fixture-entra",
+            "catalog/security-contracts/v1/assurance-mapping.fixture.json",
+            "entra-assurance-mapping",
+            &["signed-oidc", "provider-active"],
+        ),
+        logout_mode: "provider-session".into(),
+        lifecycle_mode: "provider-registry".into(),
+        revocation_mode: "provider-registry".into(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2313,8 +3466,16 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
-// HttpsPublicUrls, SecureCookies, and ApprovedSecretProvider have live
-// production verifiers. The remaining five nominal witness types and the final
+const REMAINING_PRODUCTION_RUNTIME_GUARDS: [GuardId; 4] = [
+    GuardId::DurablePostgresql,
+    GuardId::ExternalSigningKeyMaterial,
+    GuardId::MockDependenciesDisabled,
+    GuardId::FirstOwnerPathClosed,
+];
+
+// HttpsPublicUrls, SecureCookies, ApprovedSecretProvider, and
+// NonDevelopmentAuthenticator have live production verifiers. The remaining
+// four nominal witness types and the final
 // eight-witness aggregate stay under this temporary dead-code allowance until
 // their guard-specific verifiers are implemented.
 #[allow(dead_code)]
@@ -2946,6 +4107,402 @@ mod runtime_admission {
         trusted_now: impl FnMut() -> DateTime<Utc>,
     ) -> Result<VerifiedSecureCookieRuntimeWitness, ProductionRuntimeAdmissionError> {
         verify_secure_cookie_guard_with_clock(boundary, runtime, trusted_now)
+    }
+
+    /// Exact process-lifetime authenticator composition retained after the
+    /// NonDevelopmentAuthenticator guard seals. Every field is an allocation
+    /// already owned by the immutable API runtime; no declaration-shaped
+    /// substitute can be supplied independently.
+    pub(super) struct VerifiedNonDevelopmentAuthenticatorRuntimeHandle {
+        runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+        operational_observation: Arc<crate::authenticator_runtime::AuthenticatorRuntimeObservation>,
+        authority: Arc<ResolvedEntraAuthenticatorAuthority>,
+        binding_document: Arc<VerifiedAuthenticatorRuntimeBinding>,
+        bearer_limits: Arc<ResolvedAuthenticatorBearerLimits>,
+        browser_limits: Option<Arc<ResolvedAuthenticatorBrowserLimits>>,
+        bearer_validator: Arc<crate::entra_auth::EntraTokenValidator>,
+        bearer_observation: Arc<crate::entra_auth::EntraBearerRuntimeObservation>,
+        runtime_binding:
+            Arc<crate::authenticator_runtime::VerifiedEntraAuthenticatorRuntimeBinding>,
+        entra_sso_dependencies: Arc<crate::entra_sso::EntraSsoDeps>,
+        browser_origin:
+            Option<Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>>,
+        entra_sso_handler_dependencies:
+            Option<Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps>>,
+    }
+
+    impl fmt::Debug for VerifiedNonDevelopmentAuthenticatorRuntimeHandle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedNonDevelopmentAuthenticatorRuntimeHandle")
+                .field("provider_id", &self.authority.provider_id())
+                .field("runtime", &"[RETAINED]")
+                .field("operational_observation", &"[RETAINED]")
+                .field("authority", &"[RETAINED]")
+                .field("binding_document", &"[RETAINED]")
+                .field("limit_authorities", &"[RETAINED]")
+                .field("bearer_validator", &"[RETAINED]")
+                .field("runtime_binding", &"[RETAINED]")
+                .field(
+                    "browser_origin",
+                    &self.browser_origin.as_ref().map(|_| "[RETAINED]"),
+                )
+                .field(
+                    "entra_sso_handler_dependencies",
+                    &self
+                        .entra_sso_handler_dependencies
+                        .as_ref()
+                        .map(|_| "[RETAINED]"),
+                )
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl VerifiedNonDevelopmentAuthenticatorRuntimeHandle {
+        fn capture(
+            runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+        ) -> Result<Self, ProductionRuntimeAdmissionError> {
+            let measurement_failed = non_development_authenticator_measurement_failed;
+            runtime
+                .validate_production_posture()
+                .map_err(|_| measurement_failed())?;
+            let operational_observation = Arc::clone(runtime.operational_observation());
+            let authority = runtime
+                .entra_authenticator_authority()
+                .ok_or_else(measurement_failed)?;
+            let binding_document = Arc::clone(authority.verified_runtime_binding());
+            let bearer_limits = Arc::clone(authority.bearer_limits());
+            let browser_limits = authority.browser_limits().map(Arc::clone);
+            let bearer_validator = runtime
+                .entra_bearer_validator()
+                .ok_or_else(measurement_failed)?;
+            let bearer_observation = runtime
+                .entra_bearer_observation()
+                .ok_or_else(measurement_failed)?;
+            let runtime_binding = runtime
+                .verified_entra_runtime_binding()
+                .ok_or_else(measurement_failed)?;
+            let entra_sso_dependencies = runtime.entra_sso_dependencies();
+            let browser_origin = runtime.browser_authenticator_origin();
+            let entra_sso_handler_dependencies = runtime.entra_sso_handler_dependencies();
+            let handle = Self {
+                runtime: Arc::clone(runtime),
+                operational_observation,
+                authority,
+                binding_document,
+                bearer_limits,
+                browser_limits,
+                bearer_validator,
+                bearer_observation,
+                runtime_binding,
+                entra_sso_dependencies,
+                browser_origin,
+                entra_sso_handler_dependencies,
+            };
+            validate_non_development_authenticator_runtime_handle(&handle)?;
+            Ok(handle)
+        }
+
+        pub(super) fn retains_runtime(
+            &self,
+            runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+        ) -> bool {
+            Arc::ptr_eq(&self.runtime, runtime)
+        }
+
+        pub(super) fn matches_auth_mode(&self, auth_mode: &AuthMode) -> bool {
+            self.runtime.auth_mode() == auth_mode && matches!(auth_mode, AuthMode::EntraId)
+        }
+
+        pub(super) fn matches_provider(&self, provider: &ActiveProviderConfiguration) -> bool {
+            let ActiveProviderKindConfig::Oidc {
+                configuration,
+                verified_runtime_binding,
+            } = &provider.kind_config
+            else {
+                return false;
+            };
+            let expected_provider = ExpectedProviderBinding {
+                provider_id: provider.provider_id.clone(),
+                configuration_version: provider.config_version,
+                configuration_payload_digest: provider.payload_digest.clone(),
+                lifecycle_record_version: provider.active_lifecycle_record_version,
+                lifecycle_state: ProviderLifecycleState::Active,
+                capability_descriptor_id: provider.capability_descriptor.descriptor_id.clone(),
+                capability_descriptor_version: provider.capability_descriptor.descriptor_version,
+                adapter_kind: provider.capability_descriptor.adapter_kind.clone(),
+                adapter_version: provider.capability_descriptor.adapter_version.clone(),
+            };
+            provider.kind == "oidc"
+                && provider.trust_domain_id == self.authority.trust_domain_id()
+                && provider.capability_descriptor.implementation_applicable
+                && provider.capability_descriptor.production_eligible
+                && configuration.as_ref() == &self.authority.oidc_configuration
+                && Arc::ptr_eq(verified_runtime_binding, &self.binding_document)
+                && provider
+                    .capability_descriptor
+                    .advertised_capabilities
+                    .as_slice()
+                    == self.binding_document.document.capability_ids.as_slice()
+                && self.runtime_binding.provider_binding() == &expected_provider
+                && self.authority.provider_id() == provider.provider_id.as_str()
+                && self.authority.provider_configuration_version() == provider.config_version
+                && self.authority.provider_configuration_payload_digest()
+                    == provider.payload_digest.as_str()
+                && self.authority.provider_lifecycle_record_version()
+                    == provider.active_lifecycle_record_version
+        }
+    }
+
+    pub(super) type VerifiedNonDevelopmentAuthenticatorRuntimeWitness =
+        VerifiedNonDevelopmentAuthenticatorGuardWitness<
+            VerifiedNonDevelopmentAuthenticatorRuntimeHandle,
+        >;
+
+    fn non_development_authenticator_measurement_failed() -> ProductionRuntimeAdmissionError {
+        ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+            guard_id: GuardId::NonDevelopmentAuthenticator,
+        }
+    }
+
+    fn validate_non_development_authenticator_runtime_handle(
+        handle: &VerifiedNonDevelopmentAuthenticatorRuntimeHandle,
+    ) -> Result<RuntimeGuardExpectedValue, ProductionRuntimeAdmissionError> {
+        let measurement_failed = non_development_authenticator_measurement_failed;
+        handle
+            .runtime
+            .validate_production_posture()
+            .map_err(|_| measurement_failed())?;
+        handle
+            .authority
+            .verify_integrity()
+            .map_err(|_| measurement_failed())?;
+        handle
+            .binding_document
+            .verify_integrity()
+            .map_err(|_| measurement_failed())?;
+        handle
+            .bearer_limits
+            .verify_integrity()
+            .map_err(|_| measurement_failed())?;
+        if let Some(browser_limits) = &handle.browser_limits {
+            browser_limits
+                .verify_integrity()
+                .map_err(|_| measurement_failed())?;
+        }
+        handle
+            .runtime_binding
+            .verify_integrity()
+            .map_err(|_| measurement_failed())?;
+        if !handle
+            .runtime
+            .retains_operational_observation(&handle.operational_observation)
+            || !handle
+                .runtime
+                .retains_entra_authenticator_authority(&Some(Arc::clone(&handle.authority)))
+            || !Arc::ptr_eq(
+                &handle.binding_document,
+                handle.authority.verified_runtime_binding(),
+            )
+            || !Arc::ptr_eq(&handle.bearer_limits, handle.authority.bearer_limits())
+            || !handle
+                .runtime
+                .retains_authenticator_bearer_limits(&Some(Arc::clone(&handle.bearer_limits)))
+            || !handle
+                .runtime
+                .retains_authenticator_browser_limits(&handle.browser_limits)
+            || !handle
+                .runtime
+                .retains_entra_bearer_validator(&Some(Arc::clone(&handle.bearer_validator)))
+            || !handle
+                .runtime
+                .retains_entra_bearer_observation(&Some(Arc::clone(&handle.bearer_observation)))
+            || !handle.runtime.remeasures_entra_bearer_observation()
+            || !handle
+                .runtime
+                .retains_verified_entra_runtime_binding(&Some(Arc::clone(&handle.runtime_binding)))
+            || !handle.runtime_binding.retains_authority(&handle.authority)
+            || !handle
+                .runtime_binding
+                .retains_bearer_validator(&handle.bearer_validator)
+            || !handle
+                .runtime
+                .retains_entra_sso_dependencies(&handle.entra_sso_dependencies)
+            || !handle
+                .runtime_binding
+                .retains_entra_sso_dependencies(&handle.entra_sso_dependencies)
+            || handle.runtime.auth_mode() != &AuthMode::EntraId
+        {
+            return Err(measurement_failed());
+        }
+        let browser_declared = handle.authority.browser_path_id().is_some();
+        if browser_declared != handle.browser_limits.is_some() {
+            return Err(measurement_failed());
+        }
+        match (
+            browser_declared,
+            handle.browser_origin.as_ref(),
+            handle.entra_sso_handler_dependencies.as_ref(),
+        ) {
+            (true, Some(origin), Some(handler))
+                if origin.verify_integrity().is_ok()
+                    && origin.retains_entra_runtime_binding(&handle.runtime_binding)
+                    && origin.retains_entra_sso_dependencies(&handle.entra_sso_dependencies)
+                    && handler.verify_integrity().is_ok()
+                    && Arc::ptr_eq(handler.base(), &handle.entra_sso_dependencies)
+                    && Arc::ptr_eq(handler.origin(), origin)
+                    && handle
+                        .runtime
+                        .retains_browser_authenticator_origin(&handle.browser_origin)
+                    && handle.runtime.retains_entra_sso_handler_dependencies(
+                        &handle.entra_sso_handler_dependencies,
+                    ) => {}
+            (false, None, None)
+                if handle.runtime.retains_browser_authenticator_origin(&None)
+                    && handle.runtime.retains_entra_sso_handler_dependencies(&None) => {}
+            _ => return Err(measurement_failed()),
+        }
+
+        let observed_value = handle
+            .runtime
+            .measured_authenticator_inventory_value()
+            .ok_or_else(measurement_failed)?
+            .clone();
+        if handle.runtime.expected_authenticator_inventory_value() != Some(&observed_value)
+            || handle
+                .runtime_binding
+                .measured_authenticator_inventory_value()
+                != &observed_value
+            || handle
+                .runtime_binding
+                .expected_authenticator_inventory_value()
+                != &observed_value
+            || handle.runtime.measured_authenticator_inventory_digest()
+                != Some(
+                    handle
+                        .runtime_binding
+                        .measured_authenticator_inventory_digest(),
+                )
+            || handle.runtime.expected_authenticator_inventory_digest()
+                != Some(
+                    handle
+                        .runtime_binding
+                        .expected_authenticator_inventory_digest(),
+                )
+        {
+            return Err(measurement_failed());
+        }
+        let RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+            authenticator_inventory_digest,
+            authenticators,
+        } = &observed_value
+        else {
+            return Err(measurement_failed());
+        };
+        match authenticators.as_slice() {
+            [authenticator]
+                if &authenticator.provider == handle.runtime_binding.provider_binding()
+                    && authenticator.authenticator_kind == ProductionAuthenticatorKind::Oidc
+                    && authenticator.runtime_binding_digest.as_str()
+                        == handle.runtime_binding.runtime_binding_digest()
+                    && authenticator_inventory_digest.as_str()
+                        == handle
+                            .runtime_binding
+                            .measured_authenticator_inventory_digest() => {}
+            _ => return Err(measurement_failed()),
+        }
+        Ok(observed_value)
+    }
+
+    pub(super) fn measured_non_development_authenticator_value(
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> Result<RuntimeGuardExpectedValue, ProductionRuntimeAdmissionError> {
+        let handle = VerifiedNonDevelopmentAuthenticatorRuntimeHandle::capture(runtime)?;
+        validate_non_development_authenticator_runtime_handle(&handle)
+    }
+
+    #[cfg(test)]
+    pub(super) fn capture_non_development_authenticator_runtime_handle(
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> Result<VerifiedNonDevelopmentAuthenticatorRuntimeHandle, ProductionRuntimeAdmissionError>
+    {
+        VerifiedNonDevelopmentAuthenticatorRuntimeHandle::capture(runtime)
+    }
+
+    pub(super) fn verify_non_development_authenticator_guard(
+        boundary: &VerifiedProductionBoundary,
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> Result<VerifiedNonDevelopmentAuthenticatorRuntimeWitness, ProductionRuntimeAdmissionError>
+    {
+        verify_non_development_authenticator_guard_with_clock(boundary, runtime, Utc::now)
+    }
+
+    fn verify_non_development_authenticator_guard_with_clock(
+        boundary: &VerifiedProductionBoundary,
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+        mut trusted_now: impl FnMut() -> DateTime<Utc>,
+    ) -> Result<VerifiedNonDevelopmentAuthenticatorRuntimeWitness, ProductionRuntimeAdmissionError>
+    {
+        let observed_at_not_before = trusted_now();
+        boundary
+            .ensure_fresh(trusted_time_point(observed_at_not_before))
+            .map_err(|_| ProductionRuntimeAdmissionError::BoundaryStale)?;
+        let handle = VerifiedNonDevelopmentAuthenticatorRuntimeHandle::capture(runtime)?;
+        let observed_value = validate_non_development_authenticator_runtime_handle(&handle)?;
+        let challenge = exact_challenge(boundary, GuardId::NonDevelopmentAuthenticator)?;
+        if &observed_value != challenge.expected_value() {
+            return Err(ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+            });
+        }
+        let observed_at_not_after = trusted_now();
+        let valid_until = observed_at_not_before
+            .checked_add_signed(chrono::TimeDelta::seconds(
+                MAX_RUNTIME_GUARD_WITNESS_LIFETIME_SECONDS,
+            ))
+            .ok_or(ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+            })?;
+        let verification_now = ConformanceTrustedTimeWindow {
+            not_before: trusted_now(),
+            not_after: trusted_now(),
+        };
+        VerifiedNonDevelopmentAuthenticatorGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+                observed_value,
+                requirement_digest: challenge.requirement_digest().to_owned(),
+                challenge_binding_digest: challenge.challenge_binding_digest().to_owned(),
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle,
+            },
+            verification_now,
+        )
+    }
+
+    pub(super) fn recheck_non_development_authenticator_guard(
+        boundary: &VerifiedProductionBoundary,
+        witness: &VerifiedNonDevelopmentAuthenticatorRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        let remeasured = validate_non_development_authenticator_runtime_handle(witness.handle())?;
+        if witness.0.observed_value != remeasured {
+            return Err(non_development_authenticator_measurement_failed());
+        }
+        witness.recheck(boundary, trusted_now)
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_non_development_authenticator_guard_with_test_clock(
+        boundary: &VerifiedProductionBoundary,
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+        trusted_now: impl FnMut() -> DateTime<Utc>,
+    ) -> Result<VerifiedNonDevelopmentAuthenticatorRuntimeWitness, ProductionRuntimeAdmissionError>
+    {
+        verify_non_development_authenticator_guard_with_clock(boundary, runtime, trusted_now)
     }
 
     /// Exact process-lifetime secret-provider authority retained after the
@@ -4397,6 +5954,10 @@ pub(crate) struct SecurityContractContext {
     /// current provider lease that satisfied the receipt-bound D/P/R/I chain.
     verified_approved_secret_provider_guard:
         Option<runtime_admission::VerifiedApprovedSecretProviderRuntimeWitness>,
+    /// Exact live Entra D/P/Q/R/I composition and every retained authority
+    /// allocation that satisfied NonDevelopmentAuthenticator.
+    verified_non_development_authenticator_guard:
+        Option<runtime_admission::VerifiedNonDevelopmentAuthenticatorRuntimeWitness>,
     /// Exact active security-limit document selected by the deployment root.
     /// Runtime owners receive only opaque policies resolved from this retained
     /// authority and the verified provider D document.
@@ -4470,13 +6031,10 @@ impl SecurityContractContext {
         self.profile.security_profile.is_production()
     }
 
-    /// Resolve the one active Entra bearer path against the exact retained
-    /// security-limit authority. Resolution is intentionally lazy so profiles
-    /// that select no Entra authenticator do not need synthetic OIDC limits.
-    pub(crate) fn resolved_entra_bearer_limits(
+    fn select_entra_authenticator_provider(
         &self,
-    ) -> Result<Arc<ResolvedAuthenticatorBearerLimits>, String> {
-        self.verified_security_limit_profile.verify_integrity()?;
+        ambiguity_context: &str,
+    ) -> Result<&ActiveProviderConfiguration, String> {
         let candidates = self
             .active_providers
             .values()
@@ -4485,69 +6043,89 @@ impl SecurityContractContext {
                     && provider.capability_descriptor.adapter_kind == "auth.entra-id"
             })
             .collect::<Vec<_>>();
-        let provider = match candidates.as_slice() {
-            [provider] => *provider,
-            [] => {
-                return Err(
-                    "no active Entra OIDC provider has an exact authenticator runtime binding"
-                        .into(),
-                );
-            }
-            _ => {
-                return Err(
-                    "active Entra OIDC provider selection is ambiguous for bearer limits".into(),
-                );
-            }
-        };
-        let runtime_binding = provider
-            .verified_authenticator_runtime_binding()
-            .ok_or_else(|| {
-                "active Entra OIDC provider has no exact authenticator runtime binding".to_string()
-            })?;
-        ResolvedAuthenticatorBearerLimits::seal(
-            Arc::clone(&self.verified_security_limit_profile),
-            Arc::clone(runtime_binding),
-            &provider.provider_id,
-        )
+        match candidates.as_slice() {
+            [provider] => Ok(*provider),
+            [] => Err(
+                "no active Entra OIDC provider has an exact authenticator runtime binding".into(),
+            ),
+            _ => Err(format!(
+                "active Entra OIDC provider selection is ambiguous for {ambiguity_context}"
+            )),
+        }
     }
 
-    /// Resolve browser ID-token clock skew independently from bearer lifetime
-    /// policy. A deployment without a browser path fails only this accessor.
-    pub(crate) fn resolved_entra_browser_limits(
+    /// Resolve the one active Entra authenticator authority as an indivisible
+    /// D/P/Q/provider/limit bundle. This remains declaration authority; the
+    /// runtime must independently measure its retained allocation before any
+    /// production guard or session provenance can be sealed.
+    pub(crate) fn resolved_entra_authenticator_authority(
         &self,
-    ) -> Result<Arc<ResolvedAuthenticatorBrowserLimits>, String> {
-        self.verified_security_limit_profile.verify_integrity()?;
-        let candidates = self
-            .active_providers
-            .values()
-            .filter(|provider| {
-                provider.kind == "oidc"
-                    && provider.capability_descriptor.adapter_kind == "auth.entra-id"
-            })
-            .collect::<Vec<_>>();
-        let provider = match candidates.as_slice() {
-            [provider] => *provider,
-            [] => {
+        browser_required: bool,
+    ) -> Result<Arc<ResolvedEntraAuthenticatorAuthority>, String> {
+        if self.profile.tenancy_mode != TenancyMode::SingleTenant {
+            return Err(
+                "Entra authenticator authority requires an exact tenant for multi-tenant profiles"
+                    .into(),
+            );
+        }
+        let provider = self.select_entra_authenticator_provider("authenticator authority")?;
+        if !self
+            .profile
+            .trust_topology
+            .trust_domain_ids
+            .contains(&provider.trust_domain_id)
+        {
+            return Err(
+                "active Entra provider trust domain is outside the deployment topology".into(),
+            );
+        }
+        if let ConformanceState::Production(boundary) = &self.conformance_state {
+            if self.profile.deployment_id != boundary.conformance.deployment_id()
+                || provider.trust_domain_id != boundary.conformance.trust_domain_id()
+            {
                 return Err(
-                    "no active Entra OIDC provider has an exact authenticator runtime binding"
-                        .into(),
-                )
+                    "active Entra authority differs from the sealed production identity".into(),
+                );
             }
-            _ => {
-                return Err(
-                    "active Entra OIDC provider selection is ambiguous for browser limits".into(),
-                )
-            }
-        };
-        let runtime_binding = provider
-            .verified_authenticator_runtime_binding()
-            .ok_or_else(|| {
-                "active Entra OIDC provider has no exact authenticator runtime binding".to_string()
-            })?;
-        ResolvedAuthenticatorBrowserLimits::seal(
-            Arc::clone(&self.verified_security_limit_profile),
-            Arc::clone(runtime_binding),
+        } else if self.profile.security_profile.is_production() {
+            return Err("production Entra authority has no sealed boundary".into());
+        }
+        let runtime_binding = Arc::clone(
+            provider
+                .verified_authenticator_runtime_binding()
+                .ok_or_else(|| {
+                    "active Entra OIDC provider has no exact authenticator runtime binding"
+                        .to_string()
+                })?,
+        );
+        let security_limit_profile = Arc::clone(&self.verified_security_limit_profile);
+        let bearer_limits = ResolvedAuthenticatorBearerLimits::seal(
+            Arc::clone(&security_limit_profile),
+            Arc::clone(&runtime_binding),
             &provider.provider_id,
+        )?;
+        let has_browser_path = runtime_binding
+            .document
+            .credential_paths
+            .iter()
+            .any(|path| path.credential_profile.token_profile == "oidc-id-token");
+        let browser_limits = if browser_required || has_browser_path {
+            Some(ResolvedAuthenticatorBrowserLimits::seal(
+                Arc::clone(&security_limit_profile),
+                Arc::clone(&runtime_binding),
+                &provider.provider_id,
+            )?)
+        } else {
+            None
+        };
+        ResolvedEntraAuthenticatorAuthority::seal(
+            &self.profile.deployment_id,
+            None,
+            security_limit_profile,
+            provider,
+            runtime_binding,
+            bearer_limits,
+            browser_limits,
         )
     }
 
@@ -4572,7 +6150,10 @@ impl SecurityContractContext {
                 credential_provider == "development-fixture"
                     && self.profile.security_profile.admits_development_fixture()
             }
-            AuthMode::EntraId => matches!(credential_provider, "entra-id" | "oidc"),
+            // The canonical provider id is checked against the selected
+            // registry configuration below. Transport/adapter aliases never
+            // identify credential provenance.
+            AuthMode::EntraId => true,
             AuthMode::Local => credential_provider == "local",
         };
         if !provider_matches_mode {
@@ -4589,6 +6170,12 @@ impl SecurityContractContext {
         }
 
         let selected = self.select_authentication_provider(auth_mode)?;
+        if matches!(auth_mode, AuthMode::EntraId) && credential_provider != selected.provider_id {
+            return Err(format!(
+                "credential provider {credential_provider} does not match selected canonical provider {}",
+                selected.provider_id
+            ));
+        }
         if selected.config_version == 0 || selected.active_lifecycle_record_version == 0 {
             return Err("request-read provider versions must be positive".into());
         }
@@ -4787,6 +6374,18 @@ impl SecurityContractContext {
                 format!("approved-secret-provider runtime guard freshness recheck failed: {error}")
             })?;
         }
+        if let Some(witness) = &self.verified_non_development_authenticator_guard {
+            runtime_admission::recheck_non_development_authenticator_guard(
+                boundary,
+                witness,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!(
+                    "non-development-authenticator runtime guard freshness recheck failed: {error}"
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -4980,6 +6579,53 @@ impl SecurityContractContext {
             .is_some_and(|witness| witness.handle().retains_runtime(runtime))
     }
 
+    /// Seal NonDevelopmentAuthenticator from the exact immutable API runtime.
+    /// Startup must call this once immediately after
+    /// `ApiAuthenticatorRuntime::validate_production_posture` and before any
+    /// handler-facing runtime Arc is published.
+    pub(crate) fn verify_non_development_authenticator_runtime_guard(
+        &mut self,
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_non_development_authenticator_guard.is_some() {
+                return Err(
+                    "non-production startup retained a non-development-authenticator witness"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        if self.verified_non_development_authenticator_guard.is_some() {
+            return Err(
+                "production non-development-authenticator runtime guard was verified more than once"
+                    .into(),
+            );
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        let witness =
+            runtime_admission::verify_non_development_authenticator_guard(boundary, runtime)
+                .map_err(|error| {
+                    format!(
+                        "non-development-authenticator runtime guard verification failed: {error}"
+                    )
+                })?;
+        self.verified_non_development_authenticator_guard = Some(witness);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_non_development_authenticator_runtime(
+        &self,
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> bool {
+        self.verified_non_development_authenticator_guard
+            .as_ref()
+            .is_some_and(|witness| witness.handle().retains_runtime(runtime))
+    }
+
     pub(crate) fn validate_runtime_bindings(
         &self,
         config: &RyukiConfig,
@@ -5017,6 +6663,13 @@ impl SecurityContractContext {
                     "production startup has no verified approved-secret-provider runtime guard"
                         .to_string()
                 })?;
+            let non_development_authenticator_guard = self
+                .verified_non_development_authenticator_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production startup has no verified non-development-authenticator runtime guard"
+                        .to_string()
+                })?;
             let (secret_provider, _) = self.exact_production_secret_provider()?;
             let trusted_now = trusted_time_point(now);
             runtime_admission::recheck_https_public_urls_guard(
@@ -5044,18 +6697,31 @@ impl SecurityContractContext {
             .map_err(|error| {
                 format!("approved-secret-provider runtime guard freshness recheck failed: {error}")
             })?;
+            runtime_admission::recheck_non_development_authenticator_guard(
+                boundary,
+                non_development_authenticator_guard,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!(
+                    "non-development-authenticator runtime guard freshness recheck failed: {error}"
+                )
+            })?;
+            let selected = self.select_authentication_provider(&config.auth_mode)?;
+            self.validate_selected_provider(selected, config)?;
             let provider_applicability = format!(
                 "provider registry version {} with {} active provider applicability claims",
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and HttpsPublicUrls, the exact retained SecureCookies policy, plus the singleton ApprovedSecretProvider D/P/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining five runtime guards are verified: durable-postgresql, non-development-authenticator, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: durable-postgresql, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
                 boundary.deployed_workload.workload_id(),
                 provider_applicability,
+                REMAINING_PRODUCTION_RUNTIME_GUARDS.len(),
             ));
         }
 
@@ -5201,15 +6867,26 @@ impl SecurityContractContext {
                         provider.provider_id
                     ));
                 }
-                // The v1 provider schema intentionally stores content references, not
-                // the resolved Entra tenant/client/endpoint values in `RyukiConfig`.
-                // Accepting on provider kind alone would leave two authorities. Until
-                // a typed runtime-value projection exists, live Entra is fail closed.
                 let _ = oidc.security_binding_summary()?;
-                Err(format!(
-                    "selected provider {} cannot be bound to all live entra-id runtime values; typed runtime-value projections are required",
-                    provider.provider_id
-                ))
+                let witness = self
+                    .verified_non_development_authenticator_guard
+                    .as_ref()
+                    .ok_or_else(|| {
+                        format!(
+                            "selected provider {} has no exact retained non-development-authenticator runtime witness",
+                            provider.provider_id
+                        )
+                    })?;
+                let handle = witness.handle();
+                if !handle.matches_auth_mode(&config.auth_mode)
+                    || !handle.matches_provider(provider)
+                {
+                    return Err(format!(
+                        "selected provider {} differs from the exact provider and runtime retained by the non-development-authenticator witness",
+                        provider.provider_id
+                    ));
+                }
+                Ok(())
             }
             (AuthMode::Local, ActiveProviderKindConfig::LocalWebauthn(local)) => {
                 // Local username/password material cannot be compared with the
@@ -6239,6 +7916,7 @@ fn finalize_startup_security_contract(
         verified_secure_cookie_guard: None,
         verified_https_public_urls_guard: None,
         verified_approved_secret_provider_guard: None,
+        verified_non_development_authenticator_guard: None,
         verified_security_limit_profile: prepared.verified_security_limit_profile,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
@@ -10857,6 +12535,67 @@ mod tests {
         .expect("one exact signed production identity must seal")
     }
 
+    fn production_entra_authenticator_runtime_fixture(
+        identity_suffix: &str,
+    ) -> (
+        RyukiConfig,
+        Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        config.entra_tenant_id = format!("tenant-{identity_suffix}");
+        config.entra_client_id = format!("client-{identity_suffix}");
+        config.entra_redirect_uri =
+            format!("https://portal.example.test/{identity_suffix}/entra/callback");
+        config.session.credential_hmac_key = "k".repeat(32);
+        let cookie_runtime =
+            crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, true)
+                .expect("production Entra fixture cookie runtime");
+        let authority = ResolvedEntraAuthenticatorAuthority::fixture(&config, 60, 3_600, true);
+        let runtime = crate::authenticator_runtime::ApiAuthenticatorRuntime::from_admitted_config(
+            &config,
+            cookie_runtime,
+            Some(authority),
+            true,
+        )
+        .expect("production Entra fixture authenticator runtime");
+        (config, runtime)
+    }
+
+    fn canonical_provider_for_runtime(
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> ActiveProviderConfiguration {
+        let authority = runtime
+            .entra_authenticator_authority()
+            .expect("production Entra runtime authority");
+        let document = &authority.runtime_binding.document;
+        ActiveProviderConfiguration {
+            provider_id: authority.provider_id.clone(),
+            config_version: authority.provider_configuration_version,
+            payload_digest: authority.provider_configuration_payload_digest.clone(),
+            kind: "oidc".into(),
+            trust_domain_id: authority.trust_domain_id.clone(),
+            active_lifecycle_record_version: authority.provider_lifecycle_record_version,
+            capability_descriptor: ProviderCapabilityDescriptorBinding {
+                descriptor_id: document.capability_descriptor_id.clone(),
+                descriptor_version: document.capability_descriptor_version,
+                adapter_kind: document.adapter_kind.clone(),
+                adapter_version: document.adapter_version.clone(),
+                advertised_capabilities: document.capability_ids.clone(),
+                mandatory_baseline_ref: authority.oidc_configuration.issuer_ref.clone(),
+                implementation_applicable: true,
+                production_eligible: true,
+            },
+            credential_refs: Vec::new(),
+            kind_config: ActiveProviderKindConfig::Oidc {
+                configuration: Box::new(authority.oidc_configuration.clone()),
+                verified_runtime_binding: Arc::clone(&authority.runtime_binding),
+            },
+        }
+    }
+
     fn postgresql_infrastructure_pins(
         boundary: &VerifiedProductionBoundary,
     ) -> StartupPostgresqlInfrastructureAttestationPins {
@@ -11759,6 +13498,190 @@ mod tests {
             ProductionRuntimeAdmissionError::GuardMeasurementFailed {
                 guard_id: GuardId::SecureCookies,
             }
+        );
+    }
+
+    #[test]
+    fn non_development_authenticator_measurement_retains_the_exact_runtime_graph() {
+        let (_, runtime) = production_entra_authenticator_runtime_fixture("authenticator-guard");
+        let measured = measured_non_development_authenticator_value(&runtime)
+            .expect("the closed production Entra graph must be independently measurable");
+        let RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+            authenticators,
+            authenticator_inventory_digest,
+        } = &measured
+        else {
+            panic!("live authenticator measurement changed kind");
+        };
+        assert_eq!(authenticators.len(), 1);
+        assert_eq!(
+            authenticators[0].authenticator_kind,
+            ProductionAuthenticatorKind::Oidc
+        );
+        assert!(authenticator_inventory_digest.starts_with("sha256:"));
+
+        let handle = capture_non_development_authenticator_runtime_handle(&runtime)
+            .expect("the exact runtime graph must be retainable");
+        assert!(handle.retains_runtime(&runtime));
+        let (_, substituted_runtime) =
+            production_entra_authenticator_runtime_fixture("authenticator-guard");
+        assert_eq!(
+            measured_non_development_authenticator_value(&substituted_runtime).unwrap(),
+            measured,
+            "an equal-valued independently constructed graph is useful only as a substitution test"
+        );
+        assert!(
+            !handle.retains_runtime(&substituted_runtime),
+            "equal values must not substitute for the retained runtime allocation"
+        );
+
+        let development_config = RyukiConfig::default();
+        let development_cookie_runtime =
+            crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(
+                &development_config,
+                false,
+            )
+            .expect("development cookie runtime");
+        let development_runtime =
+            crate::authenticator_runtime::ApiAuthenticatorRuntime::from_admitted_config(
+                &development_config,
+                development_cookie_runtime,
+                None,
+                false,
+            )
+            .expect("development authenticator runtime");
+        assert_eq!(
+            measured_non_development_authenticator_value(&development_runtime).unwrap_err(),
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+            }
+        );
+    }
+
+    #[test]
+    fn non_development_authenticator_witness_rejects_challenge_staleness_and_recheck_drift() {
+        let boundary = genuine_production_boundary(240);
+        let (_, runtime) = production_entra_authenticator_runtime_fixture("witness-guard");
+        let mut samples = [
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(9, 9).not_before,
+            production_composition_time(10, 10).not_before,
+        ]
+        .into_iter();
+        assert_eq!(
+            verify_non_development_authenticator_guard_with_test_clock(&boundary, &runtime, || {
+                samples.next().expect("authenticator verifier time sample")
+            },)
+            .unwrap_err(),
+            ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+            },
+            "the signed fixture names a different provider and must not admit this live graph"
+        );
+
+        let (expected_value, requirement_digest, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::NonDevelopmentAuthenticator);
+        let stale_handle = capture_non_development_authenticator_runtime_handle(&runtime).unwrap();
+        assert_eq!(
+            VerifiedNonDevelopmentAuthenticatorGuardWitness::seal_test_observation(
+                &boundary,
+                expected_value,
+                requirement_digest,
+                challenge_binding_digest,
+                production_composition_time(7, 7).not_before,
+                production_composition_time(8, 8).not_before,
+                production_composition_time(8, 8).not_before,
+                stale_handle,
+                production_composition_time(9, 10),
+            )
+            .unwrap_err(),
+            ProductionRuntimeAdmissionError::WitnessStale {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+            }
+        );
+
+        let (expected_value, requirement_digest, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::NonDevelopmentAuthenticator);
+        let handle = capture_non_development_authenticator_runtime_handle(&runtime).unwrap();
+        let witness = VerifiedNonDevelopmentAuthenticatorGuardWitness::seal_test_observation(
+            &boundary,
+            expected_value,
+            requirement_digest,
+            challenge_binding_digest,
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(180, 180).not_before,
+            handle,
+            production_composition_time(9, 10),
+        )
+        .expect("nominal witness mechanics require an exact signed challenge");
+        assert_eq!(
+            recheck_non_development_authenticator_guard(
+                &boundary,
+                &witness,
+                production_composition_time(10, 11),
+            )
+            .unwrap_err(),
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::NonDevelopmentAuthenticator,
+            },
+            "recheck must independently remeasure instead of trusting the sealed observation"
+        );
+    }
+
+    #[test]
+    fn canonical_entra_provider_requires_and_matches_the_exact_runtime_witness() {
+        let fixture = ActiveFixture::build();
+        let mut context = fixture.load().expect("active test contract");
+        let (config, runtime) = production_entra_authenticator_runtime_fixture("provider-guard");
+        let provider = canonical_provider_for_runtime(&runtime);
+
+        context
+            .verify_non_development_authenticator_runtime_guard(&runtime)
+            .expect("non-production verification is a no-op");
+        assert!(!context.retains_non_development_authenticator_runtime(&runtime));
+        assert!(context
+            .validate_selected_provider(&provider, &config)
+            .unwrap_err()
+            .contains("has no exact retained non-development-authenticator runtime witness"));
+
+        let boundary = genuine_production_boundary(240);
+        let (expected_value, requirement_digest, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::NonDevelopmentAuthenticator);
+        let handle = capture_non_development_authenticator_runtime_handle(&runtime).unwrap();
+        context.verified_non_development_authenticator_guard = Some(
+            VerifiedNonDevelopmentAuthenticatorGuardWitness::seal_test_observation(
+                &boundary,
+                expected_value,
+                requirement_digest,
+                challenge_binding_digest,
+                production_composition_time(7, 7).not_before,
+                production_composition_time(8, 8).not_before,
+                production_composition_time(180, 180).not_before,
+                handle,
+                production_composition_time(9, 10),
+            )
+            .expect("nominal exact-challenge witness"),
+        );
+        context
+            .validate_selected_provider(&provider, &config)
+            .expect("the exact witness-bound canonical provider must be accepted");
+
+        let mut aliased_provider = provider.clone();
+        aliased_provider.provider_id = "entra-id".into();
+        assert!(context
+            .validate_selected_provider(&aliased_provider, &config)
+            .unwrap_err()
+            .contains("differs from the exact provider and runtime retained"));
+        assert_eq!(
+            REMAINING_PRODUCTION_RUNTIME_GUARDS,
+            [
+                GuardId::DurablePostgresql,
+                GuardId::ExternalSigningKeyMaterial,
+                GuardId::MockDependenciesDisabled,
+                GuardId::FirstOwnerPathClosed,
+            ]
         );
     }
 
@@ -14174,6 +16097,327 @@ mod tests {
             .contains("exact profile-selected artifact"));
     }
 
+    fn fixture_entra_policy_reference(
+        document_id: &str,
+        artifact_locator: &str,
+        digest_character: char,
+    ) -> ContentReferenceBinding {
+        ContentReferenceBinding {
+            document_id: document_id.into(),
+            document_version: 1,
+            content_digest: format!("sha256:{}", digest_character.to_string().repeat(64)),
+            artifact_locator: artifact_locator.into(),
+        }
+    }
+
+    fn fixture_entra_authority_components() -> (
+        Arc<VerifiedSecurityLimitProfile>,
+        ActiveProviderConfiguration,
+        Arc<VerifiedAuthenticatorRuntimeBinding>,
+        Arc<ResolvedAuthenticatorBearerLimits>,
+        Arc<ResolvedAuthenticatorBrowserLimits>,
+    ) {
+        let initial_binding = fixture_authenticator_runtime_binding(60, 3_600);
+        let oidc_configuration = OidcKindConfig {
+            configuration_kind: "oidc".into(),
+            runtime_binding_ref: initial_binding.reference.clone(),
+            issuer_ref: fixture_entra_policy_reference(
+                "issuer:fixture-entra",
+                "catalog/security-contracts/v1/issuer.fixture.json",
+                'a',
+            ),
+            endpoint_policy_ref: fixture_entra_policy_reference(
+                "endpoint-policy:fixture-entra",
+                "catalog/security-contracts/v1/endpoint-policy.fixture.json",
+                'b',
+            ),
+            validation_mode: "jwt-jwks".into(),
+            client_id_ref: fixture_entra_policy_reference(
+                "client-id:fixture-entra",
+                "catalog/security-contracts/v1/client-id.fixture.json",
+                'c',
+            ),
+            client_authentication_method: "none".into(),
+            accepted_audiences_ref: fixture_entra_policy_reference(
+                "accepted-audiences:fixture-entra",
+                "catalog/security-contracts/v1/accepted-audiences.fixture.json",
+                'd',
+            ),
+            accepted_algorithms: vec!["RS256".into()],
+            redirect_policy_ref: fixture_entra_policy_reference(
+                "redirect-policy:fixture-entra",
+                "catalog/security-contracts/v1/redirect-policy.fixture.json",
+                'e',
+            ),
+            claim_mapping_ref: fixture_entra_policy_reference(
+                "claim-mapping:fixture-entra",
+                "catalog/security-contracts/v1/claim-mapping.fixture.json",
+                '9',
+            ),
+            assurance_mapping_ref: fixture_entra_policy_reference(
+                "assurance-mapping:fixture-entra",
+                "catalog/security-contracts/v1/assurance-mapping.fixture.json",
+                '8',
+            ),
+            logout_mode: "provider-session".into(),
+            lifecycle_mode: "provider-registry".into(),
+            revocation_mode: "provider-registry".into(),
+        };
+        let q = authenticator_provider_policy_binding_digest(
+            &serde_json::to_value(&oidc_configuration).unwrap(),
+        )
+        .unwrap();
+        let mut binding_document: Value =
+            serde_json::from_slice(&initial_binding.raw_bytes).unwrap();
+        binding_document["capability_ids"] = json!(["browser-sso", "token-validation"]);
+        binding_document["provider_policy"]["binding_digest"] = json!(q);
+        let runtime_binding = Arc::new(fixture_verified_authenticator_runtime_binding(
+            binding_document,
+        ));
+        let mut oidc_configuration = oidc_configuration;
+        oidc_configuration.runtime_binding_ref = runtime_binding.reference.clone();
+        let provider = ActiveProviderConfiguration {
+            provider_id: "provider:fixture-entra".into(),
+            config_version: 1,
+            payload_digest: format!("sha256:{}", "ab".repeat(32)),
+            kind: "oidc".into(),
+            trust_domain_id: "trust-domain:fixture-authenticator".into(),
+            active_lifecycle_record_version: 3,
+            capability_descriptor: ProviderCapabilityDescriptorBinding {
+                descriptor_id: "capability-descriptor:fixture-entra".into(),
+                descriptor_version: 1,
+                adapter_kind: "auth.entra-id".into(),
+                adapter_version: "1.0.0".into(),
+                advertised_capabilities: vec!["browser-sso".into(), "token-validation".into()],
+                mandatory_baseline_ref: fixture_entra_policy_reference(
+                    "mandatory-baseline:fixture-entra",
+                    "catalog/security-contracts/v1/mandatory-baseline.fixture.json",
+                    '7',
+                ),
+                implementation_applicable: true,
+                production_eligible: true,
+            },
+            credential_refs: Vec::new(),
+            kind_config: ActiveProviderKindConfig::Oidc {
+                configuration: Box::new(oidc_configuration),
+                verified_runtime_binding: Arc::clone(&runtime_binding),
+            },
+        };
+        let security_limit_profile = Arc::new(fixture_security_limit_profile(60, 3_600));
+        let bearer_limits = ResolvedAuthenticatorBearerLimits::seal(
+            Arc::clone(&security_limit_profile),
+            Arc::clone(&runtime_binding),
+            &provider.provider_id,
+        )
+        .unwrap();
+        let browser_limits = ResolvedAuthenticatorBrowserLimits::seal(
+            Arc::clone(&security_limit_profile),
+            Arc::clone(&runtime_binding),
+            &provider.provider_id,
+        )
+        .unwrap();
+        (
+            security_limit_profile,
+            provider,
+            runtime_binding,
+            bearer_limits,
+            browser_limits,
+        )
+    }
+
+    #[test]
+    fn resolved_entra_authority_retains_one_exact_d_and_limit_profile_allocation() {
+        let (profile, provider, binding, bearer, browser) = fixture_entra_authority_components();
+        let authority = ResolvedEntraAuthenticatorAuthority::seal(
+            "deployment:fixture-authenticator",
+            None,
+            Arc::clone(&profile),
+            &provider,
+            Arc::clone(&binding),
+            Arc::clone(&bearer),
+            Some(Arc::clone(&browser)),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&authority.security_limit_profile, &profile));
+        assert!(Arc::ptr_eq(authority.verified_runtime_binding(), &binding));
+        assert!(Arc::ptr_eq(authority.bearer_limits(), &bearer));
+        assert!(Arc::ptr_eq(authority.browser_limits().unwrap(), &browser));
+        assert_eq!(
+            authority.deployment_id(),
+            "deployment:fixture-authenticator"
+        );
+        assert_eq!(
+            authority.trust_domain_id(),
+            "trust-domain:fixture-authenticator"
+        );
+        assert_eq!(authority.tenant_id(), None);
+        assert_eq!(authority.provider_id(), "provider:fixture-entra");
+        assert_eq!(authority.provider_configuration_version(), 1);
+        assert_eq!(authority.provider_lifecycle_record_version(), 3);
+        assert_eq!(
+            authority.provider_lifecycle_state(),
+            ProviderLifecycleState::Active
+        );
+        assert_eq!(authority.bearer_path_id(), "authenticator-path:api-bearer");
+        assert_eq!(authority.bearer_path_version(), 1);
+        assert_eq!(
+            authority.browser_path_id(),
+            Some("authenticator-path:browser-sso")
+        );
+        assert_eq!(authority.browser_path_version(), Some(1));
+        let declared = authority.declared_runtime_binding_projection();
+        assert_eq!(declared.provider.provider_id, "provider:fixture-entra");
+        assert_eq!(
+            declared.binding_document_reference.content_digest,
+            binding.reference.content_digest
+        );
+        assert_eq!(
+            declared.provider_policy_binding_digest,
+            authority.provider_policy_binding_digest()
+        );
+        assert_eq!(declared.capability_ids, ["browser-sso", "token-validation"]);
+        assert_eq!(declared.credential_paths.len(), 2);
+        assert!(declared.credential_paths.iter().all(|path| {
+            !path.cache_partition_binding_digest.is_empty()
+                && !path.protocol_binding_digest.is_empty()
+                && !path.retained_consumer_ids.is_empty()
+        }));
+        assert!(declared.ownership.single_runtime_owner);
+        assert!(!declared.ownership.ambient_reconfiguration_allowed);
+        let declared_expectation_digest = authenticator_runtime_binding_digest(declared).unwrap();
+        assert_ne!(
+            declared_expectation_digest,
+            authority.binding_document_reference().content_digest
+        );
+        assert_ne!(
+            declared_expectation_digest,
+            authority.provider_configuration_payload_digest()
+        );
+        assert_ne!(
+            declared_expectation_digest,
+            authority.provider_policy_binding_digest()
+        );
+        assert!(authority.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn resolved_entra_authority_rejects_equal_looking_substitute_allocations() {
+        let (profile, provider, binding, bearer, browser) = fixture_entra_authority_components();
+        let duplicate_profile = Arc::new(fixture_security_limit_profile(60, 3_600));
+        let duplicate_binding = Arc::new(fixture_verified_authenticator_runtime_binding(
+            serde_json::from_slice(&binding.raw_bytes).unwrap(),
+        ));
+        assert_eq!(
+            duplicate_profile.reference, profile.reference,
+            "fixture must be value-equal before pointer substitution is attempted"
+        );
+        assert_eq!(
+            duplicate_binding.reference, binding.reference,
+            "fixture D must be value-equal before pointer substitution is attempted"
+        );
+        let mut substituted_provider = provider.clone();
+        let ActiveProviderKindConfig::Oidc {
+            verified_runtime_binding,
+            ..
+        } = &mut substituted_provider.kind_config
+        else {
+            panic!("fixture must retain OIDC authority")
+        };
+        *verified_runtime_binding = Arc::clone(&duplicate_binding);
+        let provider_error = ResolvedEntraAuthenticatorAuthority::seal(
+            "deployment:fixture-authenticator",
+            None,
+            Arc::clone(&profile),
+            &substituted_provider,
+            Arc::clone(&binding),
+            Arc::clone(&bearer),
+            Some(browser),
+        )
+        .unwrap_err();
+        assert!(provider_error.contains("different D allocations"));
+
+        let substituted_browser = ResolvedAuthenticatorBrowserLimits::seal(
+            duplicate_profile,
+            duplicate_binding,
+            &provider.provider_id,
+        )
+        .unwrap();
+
+        let error = ResolvedEntraAuthenticatorAuthority::seal(
+            "deployment:fixture-authenticator",
+            None,
+            profile,
+            &provider,
+            binding,
+            bearer,
+            Some(substituted_browser),
+        )
+        .unwrap_err();
+        assert!(error.contains("exact D/profile allocations"));
+    }
+
+    #[test]
+    fn request_read_entra_provenance_requires_the_selected_canonical_provider_id() {
+        let fixture = ActiveFixture::build();
+        let mut context = fixture.load().expect("active test contract");
+        let (_, mut provider, _, _, _) = fixture_entra_authority_components();
+        provider.trust_domain_id = context
+            .profile
+            .trust_topology
+            .trust_domain_ids
+            .iter()
+            .next()
+            .expect("fixture trust domain")
+            .clone();
+        let canonical_provider_id = provider.provider_id.clone();
+        context.active_providers.clear();
+        context
+            .active_providers
+            .insert(canonical_provider_id.clone(), provider);
+
+        for alias in ["entra-id", "oidc"] {
+            let error = context
+                .request_read_security_namespace(&AuthMode::EntraId, alias)
+                .expect_err("adapter aliases must not identify credential provenance");
+            assert!(error.contains("does not match selected canonical provider"));
+        }
+
+        let namespace = context
+            .request_read_security_namespace(&AuthMode::EntraId, &canonical_provider_id)
+            .expect("the exact selected provider id must identify credential provenance");
+        assert_eq!(namespace.provider_id, canonical_provider_id);
+        assert_eq!(namespace.credential_source_provider, namespace.provider_id);
+    }
+
+    #[test]
+    fn resolved_entra_authority_rejects_d_p_q_aliasing() {
+        let (profile, mut provider, binding, bearer, browser) =
+            fixture_entra_authority_components();
+        let aliased_q = {
+            let ActiveProviderKindConfig::Oidc { configuration, .. } = &provider.kind_config else {
+                panic!("fixture must retain OIDC policy authority")
+            };
+            authenticator_provider_policy_binding_digest(
+                &serde_json::to_value(configuration.as_ref()).unwrap(),
+            )
+            .unwrap()
+        };
+        provider.payload_digest = aliased_q;
+
+        let error = ResolvedEntraAuthenticatorAuthority::seal(
+            "deployment:fixture-authenticator",
+            None,
+            profile,
+            &provider,
+            binding,
+            bearer,
+            Some(browser),
+        )
+        .unwrap_err();
+        assert!(error.contains("D/P/Q digest separation"));
+    }
+
     fn resolve_fixture_bearer_limits(
         document: Value,
         d_clock_skew_seconds: u64,
@@ -14191,11 +16435,20 @@ mod tests {
         binding_document: Value,
         profile_clock_skew_seconds: u64,
     ) -> Result<Arc<ResolvedAuthenticatorBrowserLimits>, String> {
+        resolve_fixture_browser_limits_with_profile(
+            fixture_security_limit_profile(profile_clock_skew_seconds, 3_600)
+                .document
+                .clone(),
+            binding_document,
+        )
+    }
+
+    fn resolve_fixture_browser_limits_with_profile(
+        profile_document: Value,
+        binding_document: Value,
+    ) -> Result<Arc<ResolvedAuthenticatorBrowserLimits>, String> {
         ResolvedAuthenticatorBrowserLimits::seal(
-            Arc::new(fixture_security_limit_profile(
-                profile_clock_skew_seconds,
-                3_600,
-            )),
+            Arc::new(fixture_verified_security_limit_profile(profile_document)),
             Arc::new(fixture_verified_authenticator_runtime_binding(
                 binding_document,
             )),
@@ -14230,10 +16483,7 @@ mod tests {
         );
         assert_eq!(resolved.maximum_credential_lifetime_seconds(), 3_600);
         assert_eq!(resolved.provider_id(), "provider:fixture-entra");
-        assert_eq!(
-            resolved.path_id(),
-            "authenticator-path:fixture-entra-bearer"
-        );
+        assert_eq!(resolved.path_id(), "authenticator-path:api-bearer");
         assert!(resolved
             .security_limit_profile_content_digest()
             .starts_with("sha256:"));
@@ -14241,18 +16491,39 @@ mod tests {
     }
 
     #[test]
-    fn authenticator_browser_limits_resolve_only_clock_skew() {
+    fn authenticator_browser_limits_resolve_exact_profile_and_session_values() {
         let resolved = ResolvedAuthenticatorBrowserLimits::fixture(60);
         assert_eq!(
             resolved.clock_skew_limit_id(),
             AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID
         );
         assert_eq!(resolved.maximum_clock_skew_seconds(), 60);
-        assert_eq!(resolved.provider_id(), "provider:fixture-entra");
         assert_eq!(
-            resolved.path_id(),
-            "authenticator-path:fixture-entra-browser"
+            resolved.state_lifetime_limit_id(),
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID
         );
+        assert_eq!(
+            resolved.maximum_state_lifetime_seconds(),
+            AUTHENTICATOR_BROWSER_STATE_MAXIMUM_TTL_SECONDS
+        );
+        assert_eq!(
+            resolved.session_maximum_age_limit_id(),
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID
+        );
+        assert_eq!(
+            resolved.maximum_session_age_seconds(),
+            ryuki_core::config::MAX_SESSION_COOKIE_AGE_SECS
+        );
+        assert_eq!(
+            resolved.federated_authority_staleness_limit_id(),
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID
+        );
+        assert_eq!(
+            resolved.maximum_federated_authority_staleness_seconds(),
+            900
+        );
+        assert_eq!(resolved.provider_id(), "provider:fixture-entra");
+        assert_eq!(resolved.path_id(), "authenticator-path:browser-sso");
         assert!(resolved.remeasures_exact_values());
     }
 
@@ -14285,6 +16556,205 @@ mod tests {
         assert!(resolve_fixture_browser_limits(mismatched, 60)
             .unwrap_err()
             .contains("D clock-skew maximum differs"));
+    }
+
+    #[test]
+    fn authenticator_browser_limit_resolution_rejects_missing_and_duplicate_rows() {
+        let binding = fixture_authenticator_runtime_binding(60, 3_600);
+        let binding_document: Value = serde_json::from_slice(&binding.raw_bytes).unwrap();
+        for limit_id in [
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        ] {
+            let mut missing = canonical_authenticator_limit_document();
+            missing["limits"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|limit| limit["limit_id"] != limit_id);
+            assert!(
+                resolve_fixture_browser_limits_with_profile(missing, binding_document.clone(),)
+                    .unwrap_err()
+                    .contains("omits required authenticator limit"),
+                "missing browser limit {limit_id} must fail closed"
+            );
+
+            let mut duplicate = canonical_authenticator_limit_document();
+            let index = authenticator_limit_index(&duplicate, limit_id);
+            let repeated = duplicate["limits"][index].clone();
+            duplicate["limits"].as_array_mut().unwrap().push(repeated);
+            assert!(
+                resolve_fixture_browser_limits_with_profile(duplicate, binding_document.clone(),)
+                    .unwrap_err()
+                    .contains("duplicates authenticator limit"),
+                "duplicate browser limit {limit_id} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticator_browser_limit_resolution_enforces_exact_and_cross_limit_bounds() {
+        let binding = fixture_authenticator_runtime_binding(60, 3_600);
+        let binding_document: Value = serde_json::from_slice(&binding.raw_bytes).unwrap();
+
+        let mut wrong_state_lifetime = canonical_authenticator_limit_document();
+        let state_index = authenticator_limit_index(
+            &wrong_state_lifetime,
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+        );
+        wrong_state_lifetime["limits"][state_index]["selected_value"] = json!(599);
+        wrong_state_lifetime["limits"][state_index]["published_default"] = json!(599);
+        wrong_state_lifetime["limits"][state_index]["hard_bounds"]["minimum"] = json!(1);
+        wrong_state_lifetime["limits"][state_index]["hard_bounds"]["maximum"] = json!(1_200);
+        assert!(resolve_fixture_browser_limits_with_profile(
+            wrong_state_lifetime,
+            binding_document.clone(),
+        )
+        .unwrap_err()
+        .contains("must resolve exactly to 600 seconds"));
+
+        let mut zero_session_age = canonical_authenticator_limit_document();
+        let session_index = authenticator_limit_index(
+            &zero_session_age,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        );
+        zero_session_age["limits"][session_index]["selected_value"] = json!(0);
+        zero_session_age["limits"][session_index]["published_default"] = json!(0);
+        zero_session_age["limits"][session_index]["hard_bounds"]["minimum"] = json!(0);
+        assert!(resolve_fixture_browser_limits_with_profile(
+            zero_session_age,
+            binding_document.clone(),
+        )
+        .unwrap_err()
+        .contains("must be positive"));
+
+        let mut oversized_session_age = canonical_authenticator_limit_document();
+        let session_index = authenticator_limit_index(
+            &oversized_session_age,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        );
+        oversized_session_age["limits"][session_index]["selected_value"] = json!(86_401);
+        oversized_session_age["limits"][session_index]["published_default"] = json!(86_401);
+        oversized_session_age["limits"][session_index]["hard_bounds"]["maximum"] = json!(90_000);
+        assert!(resolve_fixture_browser_limits_with_profile(
+            oversized_session_age,
+            binding_document.clone(),
+        )
+        .unwrap_err()
+        .contains("exceeds the 86400 second runtime cap"));
+
+        let mut staleness_out_of_bounds = canonical_authenticator_limit_document();
+        let staleness_index = authenticator_limit_index(
+            &staleness_out_of_bounds,
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        );
+        staleness_out_of_bounds["limits"][staleness_index]["hard_bounds"]["maximum"] = json!(899);
+        assert!(resolve_fixture_browser_limits_with_profile(
+            staleness_out_of_bounds,
+            binding_document.clone(),
+        )
+        .unwrap_err()
+        .contains("outside its exact hard bounds"));
+
+        let mut staleness_exceeds_session = canonical_authenticator_limit_document();
+        let session_index = authenticator_limit_index(
+            &staleness_exceeds_session,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        );
+        staleness_exceeds_session["limits"][session_index]["selected_value"] = json!(600);
+        staleness_exceeds_session["limits"][session_index]["published_default"] = json!(600);
+        assert!(resolve_fixture_browser_limits_with_profile(
+            staleness_exceeds_session,
+            binding_document,
+        )
+        .unwrap_err()
+        .contains("staleness exceeds the browser session maximum age"));
+    }
+
+    #[test]
+    fn authenticator_browser_limit_resolution_applies_scoped_tightening_overrides() {
+        let matching_override = |override_id: &str, selected_value: u64| {
+            json!({
+                "override_id": override_id,
+                "selected_value": selected_value,
+                "scope_dimensions": [
+                    {"dimension": "deployment_id", "value": "deployment:fixture-authenticator"},
+                    {"dimension": "provider_id", "value": "provider:fixture-entra"},
+                    {"dimension": "trust_domain_id", "value": "trust-domain:fixture-authenticator"}
+                ],
+                "tightens_only": true,
+                "reason": "Test exact browser limit override."
+            })
+        };
+        let mut document = canonical_authenticator_limit_document();
+        let session_index = authenticator_limit_index(
+            &document,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        );
+        document["limits"][session_index]["overrides"] = Value::Array(vec![matching_override(
+            "override:fixture-entra-browser-session-age",
+            1_800,
+        )]);
+        let staleness_index = authenticator_limit_index(
+            &document,
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        );
+        document["limits"][staleness_index]["overrides"] = Value::Array(vec![matching_override(
+            "override:fixture-entra-federated-staleness",
+            600,
+        )]);
+        let binding = fixture_authenticator_runtime_binding(60, 3_600);
+        let binding_document: Value = serde_json::from_slice(&binding.raw_bytes).unwrap();
+        let resolved = resolve_fixture_browser_limits_with_profile(document, binding_document)
+            .expect("exact scoped browser overrides must resolve");
+        assert_eq!(resolved.maximum_session_age_seconds(), 1_800);
+        assert_eq!(
+            resolved.maximum_federated_authority_staleness_seconds(),
+            600
+        );
+        assert!(resolved.remeasures_exact_values());
+
+        let mut invalid = canonical_authenticator_limit_document();
+        let session_index =
+            authenticator_limit_index(&invalid, AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID);
+        invalid["limits"][session_index]["overrides"] = Value::Array(vec![matching_override(
+            "override:fixture-entra-browser-session-too-short",
+            600,
+        )]);
+        let binding = fixture_authenticator_runtime_binding(60, 3_600);
+        let binding_document: Value = serde_json::from_slice(&binding.raw_bytes).unwrap();
+        assert!(
+            resolve_fixture_browser_limits_with_profile(invalid, binding_document)
+                .unwrap_err()
+                .contains("staleness exceeds the browser session maximum age")
+        );
+    }
+
+    #[test]
+    fn authenticator_browser_limit_integrity_rejects_resolved_value_substitution() {
+        let mut substituted_state = ResolvedAuthenticatorBrowserLimits::fixture(60);
+        let resolved = Arc::get_mut(&mut substituted_state).expect("unique test allocation");
+        resolved.values.state_lifetime = resolved.values.session_maximum_age.clone();
+        assert!(resolved
+            .verify_integrity()
+            .unwrap_err()
+            .contains("exact D/profile remeasurement"));
+
+        let mut substituted_session = ResolvedAuthenticatorBrowserLimits::fixture(60);
+        let resolved = Arc::get_mut(&mut substituted_session).expect("unique test allocation");
+        resolved.values.session_maximum_age = resolved.values.state_lifetime.clone();
+        assert!(resolved
+            .verify_integrity()
+            .unwrap_err()
+            .contains("exact D/profile remeasurement"));
+
+        let mut substituted_staleness = ResolvedAuthenticatorBrowserLimits::fixture(60);
+        let resolved = Arc::get_mut(&mut substituted_staleness).expect("unique test allocation");
+        resolved.values.federated_authority_staleness = resolved.values.session_maximum_age.clone();
+        assert!(resolved
+            .verify_integrity()
+            .unwrap_err()
+            .contains("exact D/profile remeasurement"));
     }
 
     #[test]

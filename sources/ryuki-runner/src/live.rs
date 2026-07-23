@@ -997,20 +997,29 @@ fn append_basic_auth_variants(
     username: Option<&str>,
     password_value: Option<&str>,
 ) {
-    let username = username.unwrap_or_default();
-    let password = password_value.unwrap_or_default(); // secret-scan-allow: parsed credential reference, not a literal
-    if username.is_empty() && password.is_empty() {
+    let username = username.filter(|value| !value.is_empty());
+    let password_value = password_value.filter(|value| !value.is_empty());
+    if username.is_none() && password_value.is_none() {
         return;
     }
-    if !username.is_empty() {
+    if let Some(username) = username {
         values.push(username.as_bytes().to_vec());
         append_go_json_escape_variant(values, username);
     }
-    if !password.is_empty() {
-        values.push(password.as_bytes().to_vec());
-        append_go_json_escape_variant(values, password);
+    if let Some(password_value) = password_value {
+        values.push(password_value.as_bytes().to_vec());
+        append_go_json_escape_variant(values, password_value);
     }
-    let combined = format!("{username}:{password}");
+    let mut combined = String::with_capacity(
+        username.map_or(0, str::len) + password_value.map_or(0, str::len) + 1,
+    );
+    if let Some(username) = username {
+        combined.push_str(username);
+    }
+    combined.push(':');
+    if let Some(password_value) = password_value {
+        combined.push_str(password_value);
+    }
     values.push(combined.as_bytes().to_vec());
     values.push(standard_base64(combined.as_bytes()));
 }

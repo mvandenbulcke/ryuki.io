@@ -10,9 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::http::header::SET_COOKIE;
-use axum::http::{HeaderMap, HeaderValue, header::InvalidHeaderValue};
+use axum::http::{header::InvalidHeaderValue, HeaderMap, HeaderValue};
 use axum::response::Response;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::cookie_policy::{
     CookiePolicyConsumer, CookiePolicyError, ProductionApiCookiePolicyConfig, RetainedCookiePolicy,
@@ -1202,11 +1202,9 @@ mod tests {
             ApiCookieRuntime::from_admitted_config(&production_config, true).unwrap();
         let mut non_http_only = production_config;
         non_http_only.session.cookie_http_only = false;
-        assert!(
-            production_runtime
-                .validate_config_binding(&non_http_only, true)
-                .is_err()
-        );
+        assert!(production_runtime
+            .validate_config_binding(&non_http_only, true)
+            .is_err());
 
         let mut loopback_config = secure_config();
         loopback_config.session.cookie_secure = false;
@@ -1215,17 +1213,13 @@ mod tests {
             ApiCookieRuntime::from_admitted_config(&loopback_config, false).unwrap();
 
         loopback_config.server.bind_address = "127.0.0.1:8081".into();
-        assert!(
-            loopback_runtime
-                .validate_config_binding(&loopback_config, false)
-                .is_err()
-        );
+        assert!(loopback_runtime
+            .validate_config_binding(&loopback_config, false)
+            .is_err());
         loopback_config.server.bind_address = "0.0.0.0:8080".into();
-        assert!(
-            loopback_runtime
-                .validate_config_binding(&loopback_config, false)
-                .is_err()
-        );
+        assert!(loopback_runtime
+            .validate_config_binding(&loopback_config, false)
+            .is_err());
     }
 
     #[test]
@@ -1555,13 +1549,11 @@ mod tests {
         assert!(observation_debug.contains("[RETAINED]"));
         assert!(!observation_debug.contains("must-not-appear"));
         assert!(!observation_debug.contains("__Host-"));
-        assert!(
-            !observation_debug.contains(
-                runtime
-                    .secure_policy_set()
-                    .unwrap()
-                    .policy_inventory_digest()
-            )
-        );
+        assert!(!observation_debug.contains(
+            runtime
+                .secure_policy_set()
+                .unwrap()
+                .policy_inventory_digest()
+        ));
     }
 }

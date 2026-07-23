@@ -2078,7 +2078,7 @@ fn validate_authenticator_protocol_binding_projection(
         (None, None) => true,
         _ => false,
     };
-    let direct_bearer = protocol.path_identity.path_role
+    let direct_bearer_path_is_valid = protocol.path_identity.path_role
         == AuthenticatorRuntimePathRole::DirectBearer
         && protocol.carrier == AuthenticatorCredentialCarrier::AuthorizationBearer
         && protocol.proof_binding == AuthenticatorProofBinding::Bearer
@@ -2121,7 +2121,7 @@ fn validate_authenticator_protocol_binding_projection(
 
     if !replay_store_valid
         || !authority_digests_are_domain_separated
-        || !(direct_bearer || browser_derived_session)
+        || !(direct_bearer_path_is_valid || browser_derived_session)
     {
         return Err(RuntimeGuardDigestError::InvalidProjection(
             "authenticator protocol binding",

@@ -64,8 +64,8 @@
   "security_limit_profile_ref": {
     "artifact_kind": "security-limit-profile",
     "document_id": "security-limit-profile:repository-implementation-v1",
-    "document_version": 2,
-    "content_digest": "sha256:5647238adb449c8d97fb5e844cc04db1972ebbfb51c7fb84397bce5c310bbca2",
+    "document_version": 3,
+    "content_digest": "sha256:8226bd5424ddf2864ad1586e63f368959318dcefb3fd94967188a4735ffe7833",
     "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
   },
   "control_plane_topology_ref": {

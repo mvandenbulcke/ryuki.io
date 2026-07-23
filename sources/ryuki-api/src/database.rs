@@ -475,6 +475,22 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("api_tokens", true, true, false),
     TablePolicy::new("app_environments", true, true, true),
     TablePolicy::new("approved_packages", true, true, true),
+    // The migration-captured PG18 CHECK-expression hashes are sealed evidence.
+    TablePolicy::new(
+        "authenticator_authority_check_manifest",
+        false,
+        false,
+        false,
+    ),
+    // Current path advancement is available only through the bounded atomic
+    // startup function. Runtime request paths are read-only observers.
+    TablePolicy::new("authenticator_authority_current_paths", false, false, false),
+    // Runtime may publish one exact, append-only authenticator generation but
+    // may never mutate or remove an admitted generation.
+    TablePolicy::new("authenticator_authority_generations", true, false, false),
+    // Only the two reviewed startup transition functions may mutate this
+    // durable singleton; serving paths observe it read-only.
+    TablePolicy::new("authenticator_authority_runtime_mode", false, false, false),
     TablePolicy::new("audit_chain_verification_jobs", true, true, true),
     TablePolicy::new("audit_log", false, false, false),
     TablePolicy::new("backup_coverage_reports", true, true, true),
@@ -564,7 +580,9 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("noisy_triggers", true, true, true),
     TablePolicy::new("notification_dispatch_outbox", true, true, true),
     TablePolicy::new("ntfs_permissions", true, true, true),
-    TablePolicy::new("oidc_login_states", true, true, true),
+    // Login-state v3 is insert/consume only. Its database writer contract and
+    // ALWAYS triggers independently reject update and unfenced deletion.
+    TablePolicy::new("oidc_login_states_v3", true, false, true),
     TablePolicy::new("on_call_contacts", true, true, true),
     TablePolicy::new("oob_endpoints", true, true, true),
     TablePolicy::new("outage_notice_acknowledgments", true, true, true),
@@ -3140,7 +3158,7 @@ async fn attest_application_acl(
     Ok(())
 }
 
-/// The runtime may directly invoke exactly six reviewed entry points. Every
+/// The runtime may directly invoke exactly eight reviewed entry points. Every
 /// trigger, validator, and maintenance routine remains
 /// owner/trigger-only; PUBLIC, the ephemeral login, and grant options are
 /// denied across the complete public routine inventory.
@@ -3163,7 +3181,9 @@ async fn attest_application_routine_acl(
                 ('public.ryuki_acquire_live_site_execution_epoch(text)'::text, TRUE),
                 ('public.human_authority_lock_key(text,text,text)'::text, FALSE),
                 ('public.principal_registry_provider_lock_key(text)'::text, FALSE),
-                ('public.principal_registry_writer_contract_is_held(text,text,text)'::text, TRUE)
+                ('public.principal_registry_writer_contract_is_held(text,text,text)'::text, TRUE),
+                ('public.reconcile_authenticator_authority_current_paths_v3(bytea,bytea)'::text, TRUE),
+                ('public.disable_all_authenticator_authority_current_paths_v3()'::text, TRUE)
         ),
         routines AS (
             SELECT procedure.oid,
@@ -3184,8 +3204,8 @@ async fn attest_application_routine_acl(
         )
         SELECT COALESCE((
             SELECT
-                (SELECT count(*) FROM expected) = 6
-                AND (SELECT count(*) FROM allowed) = 6
+                (SELECT count(*) FROM expected) = 8
+                AND (SELECT count(*) FROM allowed) = 8
                 AND NOT EXISTS (
                     SELECT 1
                     FROM allowed
@@ -3235,18 +3255,15 @@ async fn attest_application_routine_acl(
                             pg_catalog.acldefault('f', procedure.proowner)
                         )
                     ) AS acl
-                    WHERE acl.privilege_type = 'EXECUTE'
-                      AND (
-                           acl.grantee = 0
-                           OR acl.grantee = login.oid
-                           OR (
-                               acl.grantee = app.oid
-                               AND (
-                                   procedure.oid NOT IN (SELECT oid FROM allowed)
-                                   OR acl.is_grantable
-                               )
-                           )
-                      )
+                    WHERE acl.privilege_type <> 'EXECUTE'
+                       OR acl.grantee NOT IN (procedure.proowner, app.oid)
+                       OR (
+                            acl.grantee = app.oid
+                            AND (
+                                procedure.oid NOT IN (SELECT oid FROM allowed)
+                                OR acl.is_grantable
+                            )
+                       )
                 )
             FROM app
             CROSS JOIN login
@@ -3258,7 +3275,7 @@ async fn attest_application_routine_acl(
     .await?;
     if !exact {
         return Err(role_protocol_error(
-            "application routine privileges differ from the six reviewed entry-point policy",
+            "application routine privileges differ from the eight reviewed entry-point policy",
         ));
     }
     Ok(())
@@ -4671,7 +4688,7 @@ async fn attest_principal_registry_authority_chain(
                 ('principal_keys', 3, 'issuer', 'text', TRUE, '<none>'),
                 ('principal_keys', 4, 'subject', 'text', TRUE, '<none>'),
                 ('principal_keys', 5, 'key_version', 'bigint', TRUE, '1'),
-                ('principal_keys', 6, 'authority_digest', 'bytea', TRUE, '<none>'),
+                ('principal_keys', 6, 'authority_digest_v3', 'bytea', TRUE, '<none>'),
                 ('principal_keys', 7, 'key_state', 'text', TRUE, '<none>'),
                 ('principal_keys', 8, 'transition_reason', 'text', TRUE, '<none>'),
                 ('principal_keys', 9, 'transitioned_by', 'text', TRUE, '<none>'),
@@ -4720,6 +4737,7 @@ async fn attest_principal_registry_authority_chain(
                 ('principal_key_tombstones', 9, 'tombstoned_at', 'timestamptz', TRUE, 'statement_timestamp'),
 
                 ('sessions', NULL, 'principal_id', 'uuid', TRUE, '<none>'),
+                ('sessions', NULL, 'session_bearer_verifier_v3', 'bytea', TRUE, '<none>'),
                 ('sessions', NULL, 'principal_lifecycle_version', 'bigint', TRUE, '<none>'),
                 ('sessions', NULL, 'principal_authority_version', 'bigint', TRUE, '<none>'),
                 ('sessions', NULL, 'principal_key_id', 'uuid', TRUE, '<none>'),
@@ -4730,6 +4748,7 @@ async fn attest_principal_registry_authority_chain(
                 ('sessions', NULL, 'site_scope', 'text[]', TRUE, '<none>'),
                 ('sessions', NULL, 'environment_authority_mode', 'text', TRUE, '<none>'),
                 ('sessions', NULL, 'environment_scope', 'text[]', TRUE, '<none>'),
+                ('sessions', NULL, 'authenticator_origin_binding_digest', 'bytea', FALSE, '<none>'),
 
                 ('api_tokens', NULL, 'issuing_principal_id', 'uuid', FALSE, '<none>'),
                 ('api_tokens', NULL, 'issuing_principal_lifecycle_version', 'bigint', FALSE, '<none>'),
@@ -4821,6 +4840,8 @@ async fn attest_principal_registry_authority_chain(
                 ('sessions', 'identity_subject'),
                 ('sessions', 'identity_authority_epoch'),
                 ('sessions', 'human_authority_version'),
+                ('sessions', 'bearer_verifier'),
+                ('principal_keys', 'authority_digest'),
                 ('api_tokens', 'owner_principal'),
                 ('api_tokens', 'issued_by_provider'),
                 ('api_tokens', 'issued_by_issuer'),
@@ -4981,7 +5002,11 @@ async fn attest_principal_registry_authority_chain(
               AND constraint.convalidated
               AND NOT constraint.condeferrable
               AND NOT constraint.condeferred
-              AND NOT constraint.connoinherit
+              AND constraint.connoinherit
+              AND constraint.conislocal
+              AND constraint.coninhcount = 0
+              AND constraint.conparentid = 0
+              AND NOT constraint.conperiod
               AND (
                   (
                       expected.constraint_kind IN ('p', 'u')
@@ -5039,14 +5064,14 @@ async fn attest_principal_registry_authority_chain(
                 ('principals', ARRAY['lifecycle_state', 'tombstoned_at'], 1),
                 ('principal_provider_tombstones', ARRAY['tombstone_version'], 1),
                 ('principal_provider_tombstones', ARRAY['provider_tombstone_id'], 1),
-                ('principal_provider_tombstones', ARRAY['provider_id'], 2),
+                ('principal_provider_tombstones', ARRAY['provider_id'], 1),
                 ('principal_provider_tombstones', ARRAY['reason'], 1),
                 ('principal_provider_tombstones', ARRAY['tombstoned_by'], 1),
                 ('principal_keys', ARRAY['key_version'], 1),
-                ('principal_keys', ARRAY['authority_digest'], 1),
+                ('principal_keys', ARRAY['authority_digest_v3'], 1),
                 ('principal_keys', ARRAY['key_state'], 1),
                 ('principal_keys', ARRAY['principal_key_id'], 1),
-                ('principal_keys', ARRAY['provider_id'], 2),
+                ('principal_keys', ARRAY['provider_id'], 1),
                 ('principal_keys', ARRAY['issuer'], 1),
                 ('principal_keys', ARRAY['subject'], 1),
                 ('principal_keys', ARRAY['transition_reason'], 1),
@@ -5071,7 +5096,7 @@ async fn attest_principal_registry_authority_chain(
                 ('principal_link_events', ARRAY['transitioned_by'], 1),
                 ('principal_key_tombstones', ARRAY['key_version'], 1),
                 ('principal_key_tombstones', ARRAY['key_tombstone_id'], 1),
-                ('principal_key_tombstones', ARRAY['provider_id'], 2),
+                ('principal_key_tombstones', ARRAY['provider_id'], 1),
                 ('principal_key_tombstones', ARRAY['issuer'], 1),
                 ('principal_key_tombstones', ARRAY['subject'], 1),
                 ('principal_key_tombstones', ARRAY['reason'], 1),
@@ -5297,8 +5322,8 @@ async fn attest_principal_registry_authority_chain(
                 ('public.enforce_principal_lifecycle()', '838cf16b820b3c2a89eda3356f9a6dbdfc57f4b31810886e9c8e7d8c0c7b3b54', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.enforce_agent_principal_binding()', '410e86c617278908bbd37cc7ae985f6a4d4a24bce2396c429c354e09b0bc3b0f', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.enforce_principal_provider_tombstone()', '46cae1bc7a41cdcafee69b1a14d2b4b79e70645b58cfca1f2c3a95b3144f74a8', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
-                ('public.enforce_principal_key_lifecycle()', 'f5f122c396a84c7c716c14f805394a88370caae1e483508fd3e548e37b2ebed1', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
-                ('public.append_principal_key_version()', '2f4259d0611a9d4b739f76b516cdde792afd6f0fdc7eb9dd5d7d5be92ec290e5', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_key_lifecycle()', 'acb477819995dcbcda226cfb0d59a5649e9552742c01b4e301acb93e9fc3f0e2', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.append_principal_key_version()', 'cb557214674be561f03669f5b0985c5c5077e0624365cdc2e3b5413d7d2c8a34', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.record_principal_key_tombstone()', 'dae3e68d8b9f397ea195cfdbb2aa8ab5786b7d81a71f3bac470e6d727f65ad50', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.enforce_principal_link_lifecycle()', '3e8bdf94abf91d867fb4e9a315b430200eceb9e8ccdf09c133f74660fdfaeed1', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.append_principal_link_event()', '1a887d6f5178c3ed614a151163f5e502b9f4f114a54958db31a5b41fb2f3943f', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
@@ -5519,6 +5544,844 @@ async fn attest_principal_registry_authority_chain(
     Ok(())
 }
 
+/// Pin the migration-201 authenticator-origin cutover to the exact catalog
+/// shape consumed by the runtime. Old login-state and session-bearer names are
+/// deliberate binary-generation fences; accepting either would allow a
+/// pre-cutover binary to reinterpret state without D/P/Q/R provenance.
+async fn attest_authenticator_runtime_provenance_chain(
+    connection: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    let columns_are_exact: bool = sqlx::query_scalar(
+        r#"
+        WITH expected_tables(table_name, column_count) AS (
+            VALUES
+                ('authenticator_authority_check_manifest'::text, 3::bigint),
+                ('authenticator_authority_generations'::text, 19::bigint),
+                ('authenticator_authority_current_paths'::text, 6::bigint),
+                ('authenticator_authority_runtime_mode'::text, 3::bigint),
+                ('oidc_login_states_v3'::text, 8::bigint)
+        ),
+        target_tables AS (
+            SELECT expected.table_name,
+                   expected.column_count,
+                   class.*
+            FROM expected_tables AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+        ),
+        expected_columns(
+            table_name, ordinal, column_name, type_name, not_null, default_expr
+        ) AS (
+            VALUES
+                ('authenticator_authority_check_manifest'::text, 1, 'table_name'::text, 'text'::text, TRUE, '<none>'::text),
+                ('authenticator_authority_check_manifest', 2, 'constraint_name', 'text', TRUE, '<none>'),
+                ('authenticator_authority_check_manifest', 3, 'expression_sha256', 'bytea', TRUE, '<none>'),
+                ('authenticator_authority_generations'::text, 1, 'authenticator_origin_binding_digest'::text, 'bytea'::text, TRUE, '<none>'::text),
+                ('authenticator_authority_generations', 2, 'deployment_id', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 3, 'trust_domain_id', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 4, 'tenant_id', 'text', FALSE, '<none>'),
+                ('authenticator_authority_generations', 5, 'provider_id', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 6, 'provider_configuration_version', 'bigint', TRUE, '<none>'),
+                ('authenticator_authority_generations', 7, 'provider_configuration_payload_digest', 'bytea', TRUE, '<none>'),
+                ('authenticator_authority_generations', 8, 'provider_lifecycle_record_version', 'bigint', TRUE, '<none>'),
+                ('authenticator_authority_generations', 9, 'provider_lifecycle_state', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 10, 'binding_document_id', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 11, 'binding_document_version', 'bigint', TRUE, '<none>'),
+                ('authenticator_authority_generations', 12, 'binding_document_digest', 'bytea', TRUE, '<none>'),
+                ('authenticator_authority_generations', 13, 'binding_document_locator', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 14, 'provider_policy_binding_digest', 'bytea', TRUE, '<none>'),
+                ('authenticator_authority_generations', 15, 'runtime_binding_digest', 'bytea', TRUE, '<none>'),
+                ('authenticator_authority_generations', 16, 'path_id', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 17, 'path_version', 'bigint', TRUE, '<none>'),
+                ('authenticator_authority_generations', 18, 'path_kind', 'text', TRUE, '<none>'),
+                ('authenticator_authority_generations', 19, 'recorded_at', 'timestamptz', TRUE, 'statement_timestamp'),
+                ('authenticator_authority_current_paths', 1, 'provider_id', 'text', TRUE, '<none>'),
+                ('authenticator_authority_current_paths', 2, 'path_kind', 'text', TRUE, '<none>'),
+                ('authenticator_authority_current_paths', 3, 'path_status', 'text', TRUE, '<none>'),
+                ('authenticator_authority_current_paths', 4, 'current_origin_binding_digest', 'bytea', FALSE, '<none>'),
+                ('authenticator_authority_current_paths', 5, 'provider_epoch_origin_binding_digest', 'bytea', TRUE, '<none>'),
+                ('authenticator_authority_current_paths', 6, 'provider_epoch_path_kind', 'text', TRUE, '<none>'),
+                ('authenticator_authority_runtime_mode', 1, 'singleton', 'boolean', TRUE, '<none>'),
+                ('authenticator_authority_runtime_mode', 2, 'mode_status', 'text', TRUE, '<none>'),
+                ('authenticator_authority_runtime_mode', 3, 'minimum_provider_configuration_version', 'bigint', FALSE, '<none>'),
+                ('oidc_login_states_v3', 1, 'state', 'text', TRUE, '<none>'),
+                ('oidc_login_states_v3', 2, 'nonce', 'text', TRUE, '<none>'),
+                ('oidc_login_states_v3', 3, 'pkce_verifier', 'text', TRUE, '<none>'),
+                ('oidc_login_states_v3', 4, 'binding', 'text', TRUE, '<none>'),
+                ('oidc_login_states_v3', 5, 'authenticator_origin_binding_digest', 'bytea', TRUE, '<none>'),
+                ('oidc_login_states_v3', 6, 'authenticator_path_kind', 'text', TRUE, '<none>'),
+                ('oidc_login_states_v3', 7, 'expires_at', 'timestamptz', TRUE, '<none>'),
+                ('oidc_login_states_v3', 8, 'created_at', 'timestamptz', TRUE, '<none>')
+        ),
+        matching_columns AS (
+            SELECT expected.table_name, expected.column_name
+            FROM expected_columns AS expected
+            JOIN target_tables AS target
+              ON target.table_name = expected.table_name
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = target.oid
+             AND attribute.attname = expected.column_name
+             AND attribute.attnum = expected.ordinal
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+            WHERE attribute.atttypid = pg_catalog.to_regtype(expected.type_name)
+              AND attribute.attnotnull = expected.not_null
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+              AND LOWER(
+                    pg_catalog.regexp_replace(
+                        pg_catalog.regexp_replace(
+                            COALESCE(
+                                pg_catalog.pg_get_expr(
+                                    default_value.adbin,
+                                    default_value.adrelid
+                                ),
+                                '<none>'
+                            ),
+                            '::(text|bigint|timestamp with time zone)',
+                            '',
+                            'g'
+                        ),
+                        '[[:space:]()]',
+                        '',
+                        'g'
+                    )
+                  ) = expected.default_expr
+        ),
+        expected_fenced_columns(table_name, column_name, type_name, not_null) AS (
+            VALUES
+                ('sessions'::text, 'session_bearer_verifier_v3'::text, 'bytea'::text, TRUE),
+                ('sessions', 'authenticator_origin_binding_digest', 'bytea', FALSE),
+                ('principal_keys', 'authority_digest_v3', 'bytea', TRUE)
+        ),
+        matching_fenced_columns AS (
+            SELECT expected.table_name, expected.column_name
+            FROM expected_fenced_columns AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+             AND class.relkind = 'r'
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = class.oid
+             AND attribute.attname = expected.column_name
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef AS default_value
+              ON default_value.adrelid = attribute.attrelid
+             AND default_value.adnum = attribute.attnum
+            WHERE attribute.atttypid = pg_catalog.to_regtype(expected.type_name)
+              AND attribute.attnotnull = expected.not_null
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+              AND default_value.oid IS NULL
+        )
+        SELECT (SELECT COUNT(*) FROM target_tables) = 5
+           AND NOT EXISTS (
+               SELECT 1
+               FROM target_tables AS target
+               WHERE target.relkind <> 'r'
+                  OR target.relpersistence <> 'p'
+                  OR target.relispartition
+                  OR target.relrowsecurity
+                  OR target.relforcerowsecurity
+                  OR target.relreplident <> 'd'
+                  OR target.relam <> (
+                        SELECT access_method.oid
+                        FROM pg_catalog.pg_am AS access_method
+                        WHERE access_method.amname = 'heap'
+                     )
+                  OR (
+                       SELECT COUNT(*)
+                       FROM pg_catalog.pg_attribute AS attribute
+                       WHERE attribute.attrelid = target.oid
+                         AND attribute.attnum > 0
+                         AND NOT attribute.attisdropped
+                     ) <> target.column_count
+                  OR EXISTS (
+                       SELECT 1
+                       FROM pg_catalog.pg_attribute AS attribute
+                       WHERE attribute.attrelid = target.oid
+                         AND attribute.attnum > 0
+                         AND attribute.attisdropped
+                     )
+                  OR EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_policy AS policy
+                       WHERE policy.polrelid = target.oid
+                     )
+                  OR EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_inherits AS inheritance
+                       WHERE inheritance.inhrelid = target.oid
+                          OR inheritance.inhparent = target.oid
+                     )
+           )
+           AND (SELECT COUNT(*) FROM matching_columns) =
+                   (SELECT COUNT(*) FROM expected_columns)
+           AND (SELECT COUNT(*) FROM matching_fenced_columns) = 3
+           AND (
+               SELECT COUNT(*)
+               FROM public.authenticator_authority_runtime_mode AS mode
+               WHERE mode.singleton
+                 AND (
+                     (
+                         mode.mode_status = 'enabled'
+                         AND mode.minimum_provider_configuration_version >= 1
+                     )
+                     OR
+                     (
+                         mode.mode_status = 'disabled'
+                         AND (
+                             mode.minimum_provider_configuration_version IS NULL
+                             OR mode.minimum_provider_configuration_version >= 1
+                         )
+                     )
+                 )
+           ) = 1
+           AND pg_catalog.to_regclass('public.oidc_login_states') IS NULL
+           AND pg_catalog.to_regclass('public.oidc_login_states_v2_retired') IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+               FROM pg_catalog.pg_namespace AS namespace
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = 'sessions'
+               JOIN pg_catalog.pg_attribute AS attribute
+                 ON attribute.attrelid = class.oid
+                AND attribute.attname = 'bearer_verifier'
+                AND attribute.attnum > 0
+                AND NOT attribute.attisdropped
+               WHERE namespace.nspname = 'public'
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM pg_catalog.pg_namespace AS namespace
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = 'principal_keys'
+               JOIN pg_catalog.pg_attribute AS attribute
+                 ON attribute.attrelid = class.oid
+                AND attribute.attname = 'authority_digest'
+                AND attribute.attnum > 0
+                AND NOT attribute.attisdropped
+               WHERE namespace.nspname = 'public'
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !columns_are_exact {
+        return Err(role_protocol_error(
+            "authenticator runtime provenance tables or binary-generation fences are not canonical",
+        ));
+    }
+
+    let constraints_and_indexes_are_exact: bool = sqlx::query_scalar(
+        r#"
+        WITH expected_checks(
+            table_name, constraint_name, column_names, normalized_expression
+        ) AS (
+            VALUES
+                ('principal_provider_tombstones'::text, 'principal_provider_tombstones_provider_id_canonical_check'::text, ARRAY['provider_id']::text[], 'provider_id~''^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$''ORprovider_id~''^provider:[a-z0-9][a-z0-9._-]{2,126}$'''::text),
+                ('principal_keys', 'principal_keys_provider_id_canonical_check', ARRAY['provider_id'], 'provider_id~''^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$''ORprovider_id~''^provider:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('principal_key_tombstones', 'principal_key_tombstones_provider_id_canonical_check', ARRAY['provider_id'], 'provider_id~''^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$''ORprovider_id~''^provider:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_origin_digest_check', ARRAY['authenticator_origin_binding_digest'], 'octet_length(authenticator_origin_binding_digest)=32ANDauthenticator_origin_binding_digest<>decode(repeat(''00'',32),''hex'')'),
+                ('authenticator_authority_generations', 'authenticator_authority_deployment_id_check', ARRAY['deployment_id'], 'deployment_id~''^deployment:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_trust_domain_id_check', ARRAY['trust_domain_id'], 'trust_domain_id~''^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_tenant_id_check', ARRAY['tenant_id'], 'tenant_idISNULLORtenant_id~''^tenant:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_provider_id_check', ARRAY['provider_id'], 'provider_id~''^provider:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_provider_version_check', ARRAY['provider_configuration_version', 'provider_lifecycle_record_version'], 'provider_configuration_version>0ANDprovider_lifecycle_record_version>0'),
+                ('authenticator_authority_generations', 'authenticator_authority_provider_lifecycle_check', ARRAY['provider_lifecycle_state'], 'provider_lifecycle_state=''active'''),
+                ('authenticator_authority_generations', 'authenticator_authority_document_id_check', ARRAY['binding_document_id'], 'binding_document_id~''^authenticator-runtime-binding:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_document_version_check', ARRAY['binding_document_version'], 'binding_document_version>0'),
+                ('authenticator_authority_generations', 'authenticator_authority_document_locator_check', ARRAY['binding_document_locator'], 'octet_length(binding_document_locator)>=3ANDoctet_length(binding_document_locator)<=1024ANDbinding_document_locator~''^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+[.]json$''ANDbinding_document_locator!~''(^|/)[.][.]?(/|$)'''),
+                ('authenticator_authority_generations', 'authenticator_authority_path_id_check', ARRAY['path_id'], 'path_id~''^authenticator-path:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_generations', 'authenticator_authority_path_version_check', ARRAY['path_version'], 'path_version>0'),
+                ('authenticator_authority_generations', 'authenticator_authority_path_kind_check', ARRAY['path_kind'], 'path_kind=ANYARRAY[''bearer'',''browser-derived-session'']'),
+                ('authenticator_authority_generations', 'authenticator_authority_digests_check', ARRAY['provider_configuration_payload_digest', 'binding_document_digest', 'provider_policy_binding_digest', 'runtime_binding_digest'], 'octet_length(provider_configuration_payload_digest)=32ANDoctet_length(binding_document_digest)=32ANDoctet_length(provider_policy_binding_digest)=32ANDoctet_length(runtime_binding_digest)=32ANDprovider_configuration_payload_digest<>decode(repeat(''00'',32),''hex'')ANDbinding_document_digest<>decode(repeat(''00'',32),''hex'')ANDprovider_policy_binding_digest<>decode(repeat(''00'',32),''hex'')ANDruntime_binding_digest<>decode(repeat(''00'',32),''hex'')'),
+                ('authenticator_authority_generations', 'authenticator_authority_d_p_q_r_separation_check', ARRAY['binding_document_digest', 'provider_configuration_payload_digest', 'provider_policy_binding_digest', 'runtime_binding_digest'], 'binding_document_digest<>provider_configuration_payload_digestANDbinding_document_digest<>provider_policy_binding_digestANDbinding_document_digest<>runtime_binding_digestANDprovider_configuration_payload_digest<>provider_policy_binding_digestANDprovider_configuration_payload_digest<>runtime_binding_digestANDprovider_policy_binding_digest<>runtime_binding_digest'),
+                ('authenticator_authority_generations', 'authenticator_authority_origin_separation_check', ARRAY['authenticator_origin_binding_digest', 'binding_document_digest', 'provider_configuration_payload_digest', 'provider_policy_binding_digest', 'runtime_binding_digest'], 'authenticator_origin_binding_digest<>binding_document_digestANDauthenticator_origin_binding_digest<>provider_configuration_payload_digestANDauthenticator_origin_binding_digest<>provider_policy_binding_digestANDauthenticator_origin_binding_digest<>runtime_binding_digest'),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_provider_id_check', ARRAY['provider_id'], 'provider_id~''^provider:[a-z0-9][a-z0-9._-]{2,126}$'''),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_path_kind_check', ARRAY['path_kind'], 'path_kind=ANYARRAY[''bearer'',''browser-derived-session'']'),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_path_status_check', ARRAY['path_status'], 'path_status=ANYARRAY[''active'',''disabled'']'),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_epoch_path_check', ARRAY['provider_epoch_path_kind'], 'provider_epoch_path_kind=''bearer'''),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_digest_check', ARRAY['provider_epoch_origin_binding_digest', 'current_origin_binding_digest'], 'octet_length(provider_epoch_origin_binding_digest)=32ANDprovider_epoch_origin_binding_digest<>decode(repeat(''00'',32),''hex'')AND(current_origin_binding_digestISNULLORoctet_length(current_origin_binding_digest)=32ANDcurrent_origin_binding_digest<>decode(repeat(''00'',32),''hex''))'),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_shape_check', ARRAY['path_kind', 'path_status', 'current_origin_binding_digest', 'provider_epoch_origin_binding_digest'], 'path_kind=''bearer''ANDpath_status=''active''ANDcurrent_origin_binding_digestISNOTNULLANDcurrent_origin_binding_digest=provider_epoch_origin_binding_digestORpath_kind=''browser-derived-session''AND(path_status=''active''ANDcurrent_origin_binding_digestISNOTNULLORpath_status=''disabled''ANDcurrent_origin_binding_digestISNULL)'),
+                ('authenticator_authority_runtime_mode', 'authenticator_authority_runtime_mode_singleton_check', ARRAY['singleton'], 'singleton'),
+                ('authenticator_authority_runtime_mode', 'authenticator_authority_runtime_mode_status_check', ARRAY['mode_status'], 'mode_status=ANYARRAY[''enabled'',''disabled'']'),
+                ('authenticator_authority_runtime_mode', 'authenticator_authority_runtime_mode_floor_check', ARRAY['mode_status', 'minimum_provider_configuration_version'], 'mode_status=''enabled''ANDminimum_provider_configuration_version>=1ORmode_status=''disabled''AND(minimum_provider_configuration_versionISNULLORminimum_provider_configuration_version>=1)'),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_state_check', ARRAY['state'], 'state~''^[A-Za-z0-9_-]{43}$'''),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_nonce_check', ARRAY['nonce'], 'nonce~''^[A-Za-z0-9_-]{43}$'''),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_pkce_verifier_check', ARRAY['pkce_verifier'], 'pkce_verifier~''^[A-Za-z0-9_-]{43}$'''),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_binding_check', ARRAY['binding'], 'binding~''^[A-Za-z0-9_-]{43}$'''),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_origin_digest_check', ARRAY['authenticator_origin_binding_digest'], 'octet_length(authenticator_origin_binding_digest)=32'),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_path_kind_check', ARRAY['authenticator_path_kind'], 'authenticator_path_kind=''browser-derived-session'''),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_expiry_check', ARRAY['expires_at', 'created_at'], 'expires_at>created_atANDexpires_at<=created_at+''00:10:00''::interval'),
+                ('sessions', 'sessions_bearer_verifier_length', ARRAY['session_bearer_verifier_v3'], 'octet_length(session_bearer_verifier_v3)=32'),
+                ('sessions', 'sessions_authenticator_origin_digest_check', ARRAY['authenticator_origin_binding_digest'], 'authenticator_origin_binding_digestISNULLORoctet_length(authenticator_origin_binding_digest)=32')
+        ),
+        resolved_checks AS (
+            SELECT expected.*,
+                   class.oid AS table_oid,
+                   resolved.resolved_count,
+                   resolved.attnums
+            FROM expected_checks AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+             AND class.relkind = 'r'
+            CROSS JOIN LATERAL (
+                SELECT COUNT(attribute.attnum)::integer AS resolved_count,
+                       pg_catalog.array_agg(
+                           attribute.attnum::smallint
+                           ORDER BY requested.ordinality
+                       ) AS attnums
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = class.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+        ),
+        matching_checks AS (
+            SELECT expected.constraint_name
+            FROM resolved_checks AS expected
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = expected.table_oid
+             AND constraint_catalog.conname = expected.constraint_name
+             AND constraint_catalog.contype = 'c'
+             AND constraint_catalog.conkey = expected.attnums
+            JOIN public.authenticator_authority_check_manifest AS manifest
+              ON manifest.table_name = expected.table_name
+             AND manifest.constraint_name = expected.constraint_name
+            WHERE expected.resolved_count =
+                      pg_catalog.cardinality(expected.column_names)
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND NOT constraint_catalog.connoinherit
+              AND pg_catalog.octet_length(manifest.expression_sha256) = 32
+              AND manifest.expression_sha256 = pg_catalog.sha256(
+                    pg_catalog.convert_to(
+                        pg_catalog.pg_get_expr(
+                            constraint_catalog.conbin,
+                            constraint_catalog.conrelid
+                        ),
+                        'UTF8'
+                    )
+                  )
+        ),
+        expected_keys(
+            constraint_name,
+            table_name,
+            constraint_kind,
+            column_names,
+            referenced_table,
+            referenced_column_names,
+            nulls_not_distinct
+        ) AS (
+            VALUES
+                ('authenticator_authority_check_manifest_pkey'::text, 'authenticator_authority_check_manifest'::text, 'p'::text, ARRAY['table_name', 'constraint_name']::text[], NULL::text, NULL::text[], FALSE),
+                ('authenticator_authority_generations_pkey'::text, 'authenticator_authority_generations'::text, 'p'::text, ARRAY['authenticator_origin_binding_digest']::text[], NULL::text, NULL::text[], FALSE),
+                ('authenticator_authority_generations_digest_path_kind_key', 'authenticator_authority_generations', 'u', ARRAY['authenticator_origin_binding_digest', 'path_kind'], NULL, NULL, FALSE),
+                ('authenticator_authority_generations_digest_provider_path_key', 'authenticator_authority_generations', 'u', ARRAY['authenticator_origin_binding_digest', 'provider_id', 'path_kind'], NULL, NULL, FALSE),
+                ('authenticator_authority_generations_complete_preimage_key', 'authenticator_authority_generations', 'u', ARRAY['deployment_id', 'trust_domain_id', 'tenant_id', 'provider_id', 'provider_configuration_version', 'provider_configuration_payload_digest', 'provider_lifecycle_record_version', 'provider_lifecycle_state', 'binding_document_id', 'binding_document_version', 'binding_document_digest', 'binding_document_locator', 'provider_policy_binding_digest', 'runtime_binding_digest', 'path_id', 'path_version', 'path_kind'], NULL, NULL, TRUE),
+                ('authenticator_authority_current_paths_pkey', 'authenticator_authority_current_paths', 'p', ARRAY['provider_id', 'path_kind'], NULL, NULL, FALSE),
+                ('authenticator_authority_current_paths_current_origin_fk', 'authenticator_authority_current_paths', 'f', ARRAY['current_origin_binding_digest', 'provider_id', 'path_kind'], 'authenticator_authority_generations', ARRAY['authenticator_origin_binding_digest', 'provider_id', 'path_kind'], FALSE),
+                ('authenticator_authority_current_paths_epoch_origin_fk', 'authenticator_authority_current_paths', 'f', ARRAY['provider_epoch_origin_binding_digest', 'provider_id', 'provider_epoch_path_kind'], 'authenticator_authority_generations', ARRAY['authenticator_origin_binding_digest', 'provider_id', 'path_kind'], FALSE),
+                ('authenticator_authority_runtime_mode_pkey', 'authenticator_authority_runtime_mode', 'p', ARRAY['singleton'], NULL, NULL, FALSE),
+                ('oidc_login_states_v3_pkey', 'oidc_login_states_v3', 'p', ARRAY['state'], NULL, NULL, FALSE),
+                ('oidc_login_states_v3_state_origin_key', 'oidc_login_states_v3', 'u', ARRAY['state', 'authenticator_origin_binding_digest'], NULL, NULL, FALSE),
+                ('oidc_login_states_v3_origin_fk', 'oidc_login_states_v3', 'f', ARRAY['authenticator_origin_binding_digest', 'authenticator_path_kind'], 'authenticator_authority_generations', ARRAY['authenticator_origin_binding_digest', 'path_kind'], FALSE),
+                ('sessions_authenticator_origin_fk', 'sessions', 'f', ARRAY['authenticator_origin_binding_digest'], 'authenticator_authority_generations', ARRAY['authenticator_origin_binding_digest'], FALSE)
+        ),
+        resolved_keys AS (
+            SELECT expected.*,
+                   source_table.oid AS table_oid,
+                   referenced_table.oid AS referenced_table_oid,
+                   source_columns.attnums AS source_attnums,
+                   source_columns.resolved_count AS source_count,
+                   referenced_columns.attnums AS referenced_attnums,
+                   referenced_columns.resolved_count AS referenced_count
+            FROM expected_keys AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS source_table
+              ON source_table.relnamespace = namespace.oid
+             AND source_table.relname = expected.table_name
+             AND source_table.relkind = 'r'
+            LEFT JOIN pg_catalog.pg_class AS referenced_table
+              ON referenced_table.relnamespace = namespace.oid
+             AND referenced_table.relname = expected.referenced_table
+             AND referenced_table.relkind = 'r'
+            CROSS JOIN LATERAL (
+                SELECT COUNT(*)::integer AS resolved_count,
+                       pg_catalog.array_agg(
+                           attribute.attnum::smallint
+                           ORDER BY requested.ordinality
+                       ) AS attnums
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = source_table.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS source_columns
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*)::integer AS resolved_count,
+                       pg_catalog.array_agg(
+                           attribute.attnum::smallint
+                           ORDER BY requested.ordinality
+                       ) AS attnums
+                FROM pg_catalog.unnest(expected.referenced_column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = referenced_table.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS referenced_columns ON expected.constraint_kind = 'f'
+        ),
+        matching_keys AS (
+            SELECT expected.constraint_name
+            FROM resolved_keys AS expected
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = expected.table_oid
+             AND constraint_catalog.conname = expected.constraint_name
+             AND constraint_catalog.contype::text = expected.constraint_kind
+             AND constraint_catalog.conkey = expected.source_attnums
+            WHERE expected.source_count =
+                      pg_catalog.cardinality(expected.column_names)
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND constraint_catalog.connoinherit
+              AND constraint_catalog.conislocal
+              AND constraint_catalog.coninhcount = 0
+              AND constraint_catalog.conparentid = 0
+              AND NOT constraint_catalog.conperiod
+              AND (
+                  (
+                      expected.constraint_kind IN ('p', 'u')
+                      AND constraint_catalog.confrelid = 0
+                      AND EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_index AS index_catalog
+                          WHERE index_catalog.indexrelid = constraint_catalog.conindid
+                            AND index_catalog.indrelid = expected.table_oid
+                            AND index_catalog.indisunique
+                            AND index_catalog.indisvalid
+                            AND index_catalog.indisready
+                            AND index_catalog.indislive
+                            AND index_catalog.indimmediate
+                            AND index_catalog.indnullsnotdistinct =
+                                expected.nulls_not_distinct
+                            AND index_catalog.indpred IS NULL
+                            AND index_catalog.indexprs IS NULL
+                      )
+                  )
+                  OR
+                  (
+                      expected.constraint_kind = 'f'
+                      AND expected.referenced_count =
+                          pg_catalog.cardinality(expected.referenced_column_names)
+                      AND constraint_catalog.confrelid = expected.referenced_table_oid
+                      AND constraint_catalog.confkey = expected.referenced_attnums
+                      AND constraint_catalog.confupdtype = 'r'
+                      AND constraint_catalog.confdeltype = 'r'
+                      AND constraint_catalog.confmatchtype = 's'
+                  )
+              )
+        ),
+        expected_indexes(
+            index_name,
+            table_name,
+            column_names,
+            is_unique,
+            is_primary,
+            nulls_not_distinct
+        ) AS (
+            VALUES
+                ('authenticator_authority_check_manifest_pkey'::text, 'authenticator_authority_check_manifest'::text, ARRAY['table_name', 'constraint_name']::text[], TRUE, TRUE, FALSE),
+                ('authenticator_authority_generations_pkey'::text, 'authenticator_authority_generations'::text, ARRAY['authenticator_origin_binding_digest']::text[], TRUE, TRUE, FALSE),
+                ('authenticator_authority_generations_digest_path_kind_key', 'authenticator_authority_generations', ARRAY['authenticator_origin_binding_digest', 'path_kind'], TRUE, FALSE, FALSE),
+                ('authenticator_authority_generations_digest_provider_path_key', 'authenticator_authority_generations', ARRAY['authenticator_origin_binding_digest', 'provider_id', 'path_kind'], TRUE, FALSE, FALSE),
+                ('authenticator_authority_generations_complete_preimage_key', 'authenticator_authority_generations', ARRAY['deployment_id', 'trust_domain_id', 'tenant_id', 'provider_id', 'provider_configuration_version', 'provider_configuration_payload_digest', 'provider_lifecycle_record_version', 'provider_lifecycle_state', 'binding_document_id', 'binding_document_version', 'binding_document_digest', 'binding_document_locator', 'provider_policy_binding_digest', 'runtime_binding_digest', 'path_id', 'path_version', 'path_kind'], TRUE, FALSE, TRUE),
+                ('authenticator_authority_current_paths_pkey', 'authenticator_authority_current_paths', ARRAY['provider_id', 'path_kind'], TRUE, TRUE, FALSE),
+                ('authenticator_authority_runtime_mode_pkey', 'authenticator_authority_runtime_mode', ARRAY['singleton'], TRUE, TRUE, FALSE),
+                ('oidc_login_states_v3_pkey', 'oidc_login_states_v3', ARRAY['state'], TRUE, TRUE, FALSE),
+                ('oidc_login_states_v3_state_origin_key', 'oidc_login_states_v3', ARRAY['state', 'authenticator_origin_binding_digest'], TRUE, FALSE, FALSE),
+                ('oidc_login_states_v3_expiry_state_idx', 'oidc_login_states_v3', ARRAY['expires_at', 'state'], FALSE, FALSE, FALSE),
+                ('oidc_login_states_v3_origin_expiry_state_idx', 'oidc_login_states_v3', ARRAY['authenticator_origin_binding_digest', 'expires_at', 'state'], FALSE, FALSE, FALSE),
+                ('sessions_bearer_verifier_uidx', 'sessions', ARRAY['session_bearer_verifier_v3'], TRUE, FALSE, FALSE),
+                ('sessions_authenticator_origin_binding_idx', 'sessions', ARRAY['authenticator_origin_binding_digest'], FALSE, FALSE, FALSE)
+        ),
+        matching_indexes AS (
+            SELECT expected.index_name
+            FROM expected_indexes AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS source_table
+              ON source_table.relnamespace = namespace.oid
+             AND source_table.relname = expected.table_name
+             AND source_table.relkind = 'r'
+            JOIN pg_catalog.pg_class AS index_class
+              ON index_class.relnamespace = namespace.oid
+             AND index_class.relname = expected.index_name
+             AND index_class.relkind = 'i'
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indrelid = source_table.oid
+             AND index_catalog.indexrelid = index_class.oid
+            JOIN pg_catalog.pg_am AS access_method
+              ON access_method.oid = index_class.relam
+            CROSS JOIN LATERAL (
+                SELECT pg_catalog.array_agg(
+                           attribute.attnum
+                           ORDER BY requested.ordinality
+                       ) AS attnums
+                FROM pg_catalog.unnest(expected.column_names)
+                     WITH ORDINALITY AS requested(name, ordinality)
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = source_table.oid
+                 AND attribute.attname = requested.name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+            ) AS resolved
+            WHERE access_method.amname = 'btree'
+              AND index_catalog.indisvalid
+              AND index_catalog.indisready
+              AND index_catalog.indislive
+              AND index_catalog.indisunique = expected.is_unique
+              AND index_catalog.indisprimary = expected.is_primary
+              AND index_catalog.indnullsnotdistinct = expected.nulls_not_distinct
+              AND NOT index_catalog.indisexclusion
+              AND index_catalog.indimmediate
+              AND index_catalog.indexprs IS NULL
+              AND index_catalog.indpred IS NULL
+              AND index_catalog.indnkeyatts =
+                    pg_catalog.cardinality(expected.column_names)
+              AND index_catalog.indnatts =
+                    pg_catalog.cardinality(expected.column_names)
+              AND index_catalog.indkey::text =
+                    pg_catalog.array_to_string(resolved.attnums, ' ')
+              AND index_catalog.indoption::text =
+                    pg_catalog.array_to_string(
+                        pg_catalog.array_fill(
+                            0::smallint,
+                            ARRAY[pg_catalog.cardinality(expected.column_names)]
+                        ),
+                        ' '
+                    )
+        )
+        SELECT (SELECT COUNT(*) FROM matching_checks) =
+                   (SELECT COUNT(*) FROM expected_checks)
+           AND (
+               SELECT COUNT(*)
+               FROM public.authenticator_authority_check_manifest
+           ) = (SELECT COUNT(*) FROM expected_checks)
+           AND (SELECT COUNT(*) FROM matching_keys) =
+                   (SELECT COUNT(*) FROM expected_keys)
+           AND (SELECT COUNT(*) FROM matching_indexes) =
+                   (SELECT COUNT(*) FROM expected_indexes)
+           AND NOT EXISTS (
+               SELECT 1
+               FROM (VALUES
+                    ('authenticator_authority_check_manifest'::text, 1::bigint),
+                    ('authenticator_authority_generations'::text, 20::bigint),
+                    ('authenticator_authority_current_paths'::text, 9::bigint),
+                    ('authenticator_authority_runtime_mode'::text, 4::bigint),
+                    ('oidc_login_states_v3'::text, 10::bigint)
+               ) AS expected(table_name, constraint_count)
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = expected.table_name
+               WHERE (
+                    SELECT COUNT(*)
+                    FROM pg_catalog.pg_constraint AS constraint_catalog
+                    WHERE constraint_catalog.conrelid = class.oid
+                      AND constraint_catalog.contype IN ('p', 'u', 'f', 'c')
+               ) <> expected.constraint_count
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM (VALUES
+                    ('authenticator_authority_check_manifest'::text, 1::bigint),
+                    ('authenticator_authority_generations'::text, 4::bigint),
+                    ('authenticator_authority_current_paths'::text, 1::bigint),
+                    ('authenticator_authority_runtime_mode'::text, 1::bigint),
+                    ('oidc_login_states_v3'::text, 4::bigint)
+               ) AS expected(table_name, index_count)
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = expected.table_name
+               WHERE (
+                    SELECT COUNT(*)
+                    FROM pg_catalog.pg_index AS index_catalog
+                    WHERE index_catalog.indrelid = class.oid
+               ) <> expected.index_count
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM (VALUES
+                    ('authenticator_authority_check_manifest'::text, 0::bigint),
+                    ('authenticator_authority_generations'::text, 0::bigint),
+                    ('authenticator_authority_current_paths'::text, 1::bigint),
+                    ('authenticator_authority_runtime_mode'::text, 0::bigint),
+                    ('oidc_login_states_v3'::text, 0::bigint)
+               ) AS expected(table_name, constraint_trigger_count)
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = expected.table_name
+               WHERE (
+                    SELECT COUNT(*)
+                    FROM pg_catalog.pg_constraint AS constraint_catalog
+                    WHERE constraint_catalog.conrelid = class.oid
+                      AND constraint_catalog.contype = 't'
+               ) <> expected.constraint_trigger_count
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !constraints_and_indexes_are_exact {
+        return Err(role_protocol_error(
+            "authenticator runtime provenance constraints or indexes are not canonical",
+        ));
+    }
+
+    let routines_and_triggers_are_exact: bool = sqlx::query_scalar(
+        r#"
+        WITH expected_routines(
+            signature, source_sha256, security_definer, function_config
+        ) AS (
+            VALUES
+                ('public.reject_authenticator_authority_generation_mutation()'::text, 'ad265f6cf9d6ecd773cd04d08dc14c0f7704ec6cc08b3ab1decd1addc8ada976'::text, FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_authenticator_authority_runtime_mode_transition()', '5ec969be99d4366e938f46d77395044c474a9face3e76ad2d8db9196886c3d16', TRUE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.reject_authenticator_authority_runtime_mode_removal()', '91dd485d2d8acb89f6afda03ab8f58ecaa89557f7c2265ecfb6a9cd8a264faba', FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_authenticator_authority_current_path_transition()', 'faf2c52cdc802813c5b0392229a1c68520b69ee5ea42a1a536cf716f060026a9', TRUE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.validate_authenticator_authority_current_provider()', 'c383796f6817b50e1cccf5532e0b2209a7da91a5ad20821b326314329b4dfecd', TRUE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.reject_authenticator_authority_current_path_removal()', 'f6bda5193e532121f352597779d44622391527e380744a0785487a1d7d7259ca', FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.reject_authenticator_authority_check_manifest_mutation()', '3b2bfc179d2fb3639c52f4cc0f63343d42824cab2a5fe66088cbe391cfa8b285', FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.own_oidc_login_state_v3_timestamps()', '911be7808567b16ccd270acdad7f4fa4b609691381f50366081d83a42a614be0', FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_oidc_login_state_contract_v3()', 'd07806e76329a6a7e66d0d76572f106c98c02deeb285ac5f29cd72e5bd4d89be', FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_oidc_login_state_current_origin_v3()', '164434e9c3010a30a14f196328f08d68a5570e94709ab8179bcb4ab28e2c8289', TRUE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.reject_oidc_login_state_v3_mutation()', '9c88fd5771214dfd977f89f825cb4fa62dc723c69da63adf1c844b6d9bcc9706', FALSE, ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_session_authenticator_origin()', 'ac5d83cad9680c24d79525274cccdd46b3556139ca8fa4e184f214628f35301c', TRUE, ARRAY['search_path=pg_catalog, public']::text[])
+        ),
+        matching_routines AS (
+            SELECT expected.signature
+            FROM expected_routines AS expected
+            JOIN pg_catalog.pg_proc AS procedure
+              ON procedure.oid = pg_catalog.to_regprocedure(expected.signature)
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE procedure.prokind = 'f'
+              AND procedure.prorettype = 'pg_catalog.trigger'::regtype
+              AND NOT procedure.proretset
+              AND procedure.pronargs = 0
+              AND procedure.pronargdefaults = 0
+              AND procedure.provariadic = 0
+              AND procedure.proargnames IS NULL
+              AND procedure.proargmodes IS NULL
+              AND procedure.proallargtypes IS NULL
+              AND procedure.prosecdef = expected.security_definer
+              AND NOT procedure.proleakproof
+              AND NOT procedure.proisstrict
+              AND procedure.provolatile = 'v'
+              AND procedure.proparallel = 'u'
+              AND procedure.proconfig IS NOT DISTINCT FROM expected.function_config
+              AND language.lanname = 'plpgsql'
+              AND pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                    ),
+                    'hex'
+                  ) = expected.source_sha256
+        ),
+        matching_reconcile_routine AS (
+            SELECT procedure.oid
+            FROM pg_catalog.pg_proc AS procedure
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE procedure.oid = pg_catalog.to_regprocedure(
+                      'public.reconcile_authenticator_authority_current_paths_v3(bytea,bytea)'
+                  )
+              AND procedure.prokind = 'f'
+              AND procedure.prorettype = 'pg_catalog.text'::regtype
+              AND NOT procedure.proretset
+              AND procedure.pronargs = 2
+              AND procedure.pronargdefaults = 0
+              AND procedure.provariadic = 0
+              AND procedure.proargtypes[0] = 'pg_catalog.bytea'::regtype
+              AND procedure.proargtypes[1] = 'pg_catalog.bytea'::regtype
+              AND procedure.proargnames = ARRAY[
+                    'exact_bearer_origin_binding_digest',
+                    'exact_browser_origin_binding_digest'
+                  ]::text[]
+              AND procedure.proargmodes IS NULL
+              AND procedure.proallargtypes IS NULL
+              AND procedure.prosecdef
+              AND NOT procedure.proleakproof
+              AND NOT procedure.proisstrict
+              AND procedure.provolatile = 'v'
+              AND procedure.proparallel = 'u'
+              AND procedure.proconfig IS NOT DISTINCT FROM
+                    ARRAY['search_path=pg_catalog, public']::text[]
+              AND language.lanname = 'plpgsql'
+              AND pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                    ),
+                    'hex'
+                  ) = 'a2259c32308426f1fa9fdca31952d46a49bce04bdb19e7a6cebde24e889f5350'
+        ),
+        matching_disable_routine AS (
+            SELECT procedure.oid
+            FROM pg_catalog.pg_proc AS procedure
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = procedure.prolang
+            WHERE procedure.oid = pg_catalog.to_regprocedure(
+                      'public.disable_all_authenticator_authority_current_paths_v3()'
+                  )
+              AND procedure.prokind = 'f'
+              AND procedure.prorettype = 'pg_catalog.int8'::regtype
+              AND NOT procedure.proretset
+              AND procedure.pronargs = 0
+              AND procedure.pronargdefaults = 0
+              AND procedure.provariadic = 0
+              AND procedure.proargnames IS NULL
+              AND procedure.proargmodes IS NULL
+              AND procedure.proallargtypes IS NULL
+              AND procedure.prosecdef
+              AND NOT procedure.proleakproof
+              AND NOT procedure.proisstrict
+              AND procedure.provolatile = 'v'
+              AND procedure.proparallel = 'u'
+              AND procedure.proconfig IS NOT DISTINCT FROM
+                    ARRAY['search_path=pg_catalog, public']::text[]
+              AND language.lanname = 'plpgsql'
+              AND pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to(procedure.prosrc, 'UTF8')
+                    ),
+                    'hex'
+                  ) = '7b9907f12682394137c001d63d6c02ec4ac686a234cf906733703d9dabcda54d'
+        ),
+        expected_triggers(
+            table_name,
+            trigger_name,
+            function_signature,
+            trigger_type,
+            is_constraint,
+            is_deferrable,
+            is_initially_deferred
+        ) AS (
+            VALUES
+                ('authenticator_authority_generations'::text, 'authenticator_authority_generations_append_only'::text, 'public.reject_authenticator_authority_generation_mutation()'::text, 58::smallint, FALSE, FALSE, FALSE),
+                ('authenticator_authority_runtime_mode', 'authenticator_authority_runtime_mode_transition_guard', 'public.enforce_authenticator_authority_runtime_mode_transition()', 23::smallint, FALSE, FALSE, FALSE),
+                ('authenticator_authority_runtime_mode', 'authenticator_authority_runtime_mode_no_removal', 'public.reject_authenticator_authority_runtime_mode_removal()', 42::smallint, FALSE, FALSE, FALSE),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_transition_guard', 'public.enforce_authenticator_authority_current_path_transition()', 23::smallint, FALSE, FALSE, FALSE),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_provider_coherence', 'public.validate_authenticator_authority_current_provider()', 21::smallint, TRUE, TRUE, TRUE),
+                ('authenticator_authority_current_paths', 'authenticator_authority_current_paths_no_removal', 'public.reject_authenticator_authority_current_path_removal()', 42::smallint, FALSE, FALSE, FALSE),
+                ('authenticator_authority_check_manifest', 'authenticator_authority_check_manifest_immutable', 'public.reject_authenticator_authority_check_manifest_mutation()', 62::smallint, FALSE, FALSE, FALSE),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_owned_timestamps', 'public.own_oidc_login_state_v3_timestamps()', 7::smallint, FALSE, FALSE, FALSE),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_writer_contract', 'public.enforce_oidc_login_state_contract_v3()', 14::smallint, FALSE, FALSE, FALSE),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_current_origin_guard', 'public.enforce_oidc_login_state_current_origin_v3()', 7::smallint, FALSE, FALSE, FALSE),
+                ('oidc_login_states_v3', 'oidc_login_states_v3_immutable', 'public.reject_oidc_login_state_v3_mutation()', 50::smallint, FALSE, FALSE, FALSE),
+                ('sessions', 'sessions_authenticator_origin_guard', 'public.enforce_session_authenticator_origin()', 23::smallint, FALSE, FALSE, FALSE)
+        ),
+        matching_triggers AS (
+            SELECT expected.trigger_name
+            FROM expected_triggers AS expected
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = 'public'
+            JOIN pg_catalog.pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = expected.table_name
+             AND class.relkind = 'r'
+            JOIN pg_catalog.pg_trigger AS trigger
+              ON trigger.tgrelid = class.oid
+             AND trigger.tgname = expected.trigger_name
+            WHERE trigger.tgfoid =
+                      pg_catalog.to_regprocedure(expected.function_signature)
+              AND trigger.tgtype = expected.trigger_type
+              AND trigger.tgattr::text = ''
+              AND trigger.tgenabled = 'A'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgparentid = 0
+              AND (trigger.tgconstraint <> 0) = expected.is_constraint
+              AND trigger.tgconstrrelid = 0
+              AND trigger.tgconstrindid = 0
+              AND trigger.tgdeferrable = expected.is_deferrable
+              AND trigger.tginitdeferred = expected.is_initially_deferred
+              AND trigger.tgnargs = 0
+              AND pg_catalog.octet_length(trigger.tgargs) = 0
+              AND trigger.tgqual IS NULL
+              AND trigger.tgoldtable IS NULL
+              AND trigger.tgnewtable IS NULL
+        )
+        SELECT (SELECT COUNT(*) FROM matching_routines) =
+                   (SELECT COUNT(*) FROM expected_routines)
+           AND (SELECT COUNT(*) FROM matching_reconcile_routine) = 1
+           AND (SELECT COUNT(*) FROM matching_disable_routine) = 1
+           AND (SELECT COUNT(*) FROM matching_triggers) =
+                   (SELECT COUNT(*) FROM expected_triggers)
+           AND pg_catalog.to_regprocedure(
+                   'public.enforce_oidc_login_state_admission_v2()'
+               ) IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+               FROM (VALUES
+                    ('authenticator_authority_generations'::text, 1::bigint),
+                    ('authenticator_authority_runtime_mode'::text, 2::bigint),
+                    ('authenticator_authority_current_paths'::text, 3::bigint),
+                    ('authenticator_authority_check_manifest'::text, 1::bigint),
+                    ('oidc_login_states_v3'::text, 4::bigint),
+                    ('sessions'::text, 2::bigint)
+               ) AS expected(table_name, trigger_count)
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = 'public'
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = expected.table_name
+               WHERE (
+                   SELECT COUNT(*)
+                   FROM pg_catalog.pg_trigger AS trigger
+                   WHERE trigger.tgrelid = class.oid
+                     AND NOT trigger.tgisinternal
+               ) <> expected.trigger_count
+           )
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !routines_and_triggers_are_exact {
+        return Err(role_protocol_error(
+            "authenticator runtime provenance routines or ALWAYS triggers are not canonical",
+        ));
+    }
+
+    Ok(())
+}
+
 async fn attest_application_connection(
     connection: &mut PgConnection,
     contract: &ApplicationRoleContract,
@@ -5558,6 +6421,7 @@ async fn attest_application_connection(
     attest_request_authority_version_binding_triggers(connection).await?;
     attest_live_site_execution_authority_chain(connection).await?;
     attest_principal_registry_authority_chain(connection).await?;
+    attest_authenticator_runtime_provenance_chain(connection).await?;
     let safe_boundary: bool = sqlx::query_scalar(
         r#"
         WITH app AS (
@@ -6362,7 +7226,7 @@ async fn reconcile_application_privileges_in_transaction(
 
     // Trigger and validation functions are invoked by PostgreSQL and do not
     // need caller EXECUTE. Deny every direct public routine call, then add back
-    // the six reviewed bounded entry points below.
+    // the eight reviewed bounded entry points below.
     for (object_kind, signature) in public_routines {
         let statement =
             format!("REVOKE ALL PRIVILEGES ON {object_kind} {signature} FROM PUBLIC, {app}");
@@ -6474,6 +7338,18 @@ async fn reconcile_application_privileges_in_transaction(
     ))
     .execute(&mut *connection)
     .await?;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.reconcile_authenticator_authority_current_paths_v3(bytea,bytea) TO {app}"
+    ))
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.disable_all_authenticator_authority_current_paths_v3() TO {app}"
+    ))
+    .execute(&mut *connection)
+    .await?;
 
     // The migration bootstrap already selected the stable migrator role on
     // this physical connection. Re-establish the authenticated login identity
@@ -6485,6 +7361,8 @@ async fn reconcile_application_privileges_in_transaction(
     attest_safe_default_privileges(connection, &contract.expected).await?;
     attest_idempotency_writer_contract(connection, &contract.application, &contract.expected)
         .await?;
+    attest_principal_registry_authority_chain(connection).await?;
+    attest_authenticator_runtime_provenance_chain(connection).await?;
     attest_application_routine_acl(connection, &contract.application).await?;
     attest_application_acl(connection, &contract.application).await
 }
@@ -9465,6 +10343,27 @@ mod tests {
             policies.get("gmsa_host_assignments"),
             Some(&(true, true, true))
         );
+        assert_eq!(
+            policies.get("authenticator_authority_generations"),
+            Some(&(true, false, false))
+        );
+        assert_eq!(
+            policies.get("authenticator_authority_current_paths"),
+            Some(&(false, false, false))
+        );
+        assert_eq!(
+            policies.get("authenticator_authority_runtime_mode"),
+            Some(&(false, false, false))
+        );
+        assert_eq!(
+            policies.get("authenticator_authority_check_manifest"),
+            Some(&(false, false, false))
+        );
+        assert_eq!(
+            policies.get("oidc_login_states_v3"),
+            Some(&(true, false, true))
+        );
+        assert!(!policies.contains_key("oidc_login_states"));
         for name in [
             "audit_log",
             "certificate_site_authority_quarantine",
@@ -9483,6 +10382,84 @@ mod tests {
         ] {
             assert_eq!(policies.get(name), Some(&(false, false, false)));
         }
+    }
+
+    #[test]
+    fn authenticator_runtime_provenance_cutover_is_embedded_and_fail_closed() {
+        let embedded = expected_embedded_migrations();
+        assert!(embedded.contains_key(&201));
+
+        let migration =
+            include_str!("../../../migrations/201_authenticator_runtime_provenance.sql");
+        for required in [
+            "LOCK TABLE sessions, oidc_login_states IN ACCESS EXCLUSIVE MODE",
+            "RENAME COLUMN bearer_verifier TO session_bearer_verifier_v3",
+            "CREATE TABLE authenticator_authority_generations",
+            "CREATE TABLE authenticator_authority_current_paths",
+            "CREATE TABLE authenticator_authority_runtime_mode",
+            "CREATE TABLE authenticator_authority_check_manifest",
+            "CREATE TABLE oidc_login_states_v3",
+            "DROP TABLE oidc_login_states_v2_retired",
+            "authenticator_authority_generations_append_only",
+            "authenticator_authority_generations_complete_preimage_key",
+            "authenticator_authority_generations_digest_provider_path_key",
+            "authenticator_authority_path_kind_check",
+            "authenticator_authority_current_paths_transition_guard",
+            "authenticator_authority_current_provider_coherence",
+            "reconcile_authenticator_authority_current_paths_v3",
+            "disable_all_authenticator_authority_current_paths_v3",
+            "oidc_login_states_v3_state_origin_key",
+            "oidc_login_states_v3_owned_timestamps",
+            "oidc_login_states_v3_writer_contract",
+            "oidc_login_states_v3_current_origin_guard",
+            "oidc_login_states_v3_immutable",
+            "sessions_authenticator_origin_guard",
+            "RENAME COLUMN authority_digest TO authority_digest_v3",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration-201 fence: {required}"
+            );
+        }
+        assert!(!migration.contains("CREATE TABLE oidc_login_states ("));
+    }
+
+    #[test]
+    fn authenticator_current_paths_have_one_monotonic_atomic_advance_surface() {
+        let migration =
+            include_str!("../../../migrations/201_authenticator_runtime_provenance.sql");
+        for required in [
+            "PRIMARY KEY (provider_id, path_kind)",
+            "path_status IN ('active', 'disabled')",
+            "provider_epoch_path_kind = 'bearer'",
+            "current_origin_binding_digest IS NULL",
+            "CREATE FUNCTION reconcile_authenticator_authority_current_paths_v3(",
+            "exact_bearer_origin_binding_digest BYTEA",
+            "exact_browser_origin_binding_digest BYTEA",
+            "RETURNS TEXT",
+            "authenticator provider configuration epoch may not regress",
+            "equal authenticator provider epoch permits exact idempotency only",
+            "ryuki-authenticator-authority-global-transition-v3",
+            "ryuki.authenticator_current_path_contract",
+            "ryuki.authenticator_current_path_disable_contract",
+            "ryuki.authenticator_runtime_mode_disable_contract",
+            "ryuki.principal_bearer_origin_binding_digest_v3",
+            "FOR SHARE OF current_path",
+            "GRANT SELECT ON TABLE public.authenticator_authority_current_paths",
+            "GRANT SELECT ON TABLE public.authenticator_authority_runtime_mode",
+            "GRANT SELECT ON TABLE public.authenticator_authority_check_manifest",
+            "GRANT EXECUTE ON FUNCTION public.reconcile_authenticator_authority_current_paths_v3(BYTEA, BYTEA)",
+            "GRANT EXECUTE ON FUNCTION public.disable_all_authenticator_authority_current_paths_v3()",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing current authenticator-path contract: {required}"
+            );
+        }
+        assert!(!migration.contains(
+            "GRANT INSERT, UPDATE ON TABLE public.authenticator_authority_current_paths"
+        ));
+        assert!(!migration.contains("principal_key_versions.authority_digest_v3"));
     }
 
     #[test]
@@ -10728,6 +11705,11 @@ mod tests {
             callable_public_routines,
             vec![
                 "append_audit_log".to_owned(),
+                "disable_all_authenticator_authority_current_paths_v3".to_owned(),
+                "human_authority_lock_key".to_owned(),
+                "principal_registry_provider_lock_key".to_owned(),
+                "principal_registry_writer_contract_is_held".to_owned(),
+                "reconcile_authenticator_authority_current_paths_v3".to_owned(),
                 "reconcile_noisy_trigger_sites".to_owned(),
                 "ryuki_acquire_live_site_execution_epoch".to_owned(),
             ]

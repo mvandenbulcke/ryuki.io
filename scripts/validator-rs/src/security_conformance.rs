@@ -53,6 +53,16 @@ const AUTHENTICATOR_PROVIDER_POLICY_BINDING_DIGEST_CONTRACT: &str =
 const AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID: &str = "limit:authenticator.clock-skew";
 const AUTHENTICATOR_OIDC_ACCESS_TOKEN_LIFETIME_LIMIT_ID: &str =
     "limit:authenticator.oidc-access-token-lifetime";
+const AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID: &str =
+    "limit:authenticator.browser-state-lifetime";
+const AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID: &str =
+    "limit:authenticator.browser-session-maximum-age";
+const AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID: &str =
+    "limit:authenticator.federated-authority-staleness";
+const AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS: u64 = 600;
+const AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS: u64 = 86_400;
+const AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_PUBLISHED_DEFAULT_SECONDS: u64 = 900;
+const AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_MAXIMUM_SECONDS: u64 = 3_600;
 const AUTHENTICATOR_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/authenticator-runtime-binding.schema.json"
 );
@@ -5603,26 +5613,25 @@ fn authenticator_override_dimension_value<'a>(
     }
 }
 
-fn validate_authenticator_ttl_limit(
+fn resolve_authenticator_ttl_limit(
     profile: &Value,
     deployment: &Value,
     configuration: &Value,
     limit_id: &str,
-    document_maximum: u64,
-    document_field: &str,
+    resolution_subject: &str,
     context: &str,
     errors: &mut Vec<String>,
-) {
+) -> Option<u64> {
     let matching_limits = array(profile, "limits")
         .iter()
         .filter(|limit| string_field(limit, "limit_id") == Some(limit_id))
         .collect::<Vec<_>>();
     if matching_limits.len() != 1 {
         errors.push(format!(
-            "{context}: {document_field} limit {limit_id} must resolve to exactly one security-limit row; found {}",
+            "{context}: {resolution_subject} limit {limit_id} must resolve to exactly one security-limit row; found {}",
             matching_limits.len()
         ));
-        return;
+        return None;
     }
     let limit = matching_limits[0];
     let limit_context = format!("{context}: security limit {limit_id}");
@@ -5663,7 +5672,7 @@ fn validate_authenticator_ttl_limit(
         errors.push(format!(
             "{limit_context}: selected_value must be a nonnegative integer"
         ));
-        return;
+        return None;
     };
     let published_default = limit.get("published_default").and_then(Value::as_u64);
     if published_default.is_none() {
@@ -5772,18 +5781,194 @@ fn validate_authenticator_ttl_limit(
         errors.push(format!(
             "{limit_context}: applicable overrides are ambiguous: {override_ids:?}"
         ));
-        return;
+        return None;
     }
     if !valid {
-        return;
+        return None;
     }
     let applied_value = applicable_overrides
         .first()
         .map_or(selected_value, |(_, selected_value)| *selected_value);
+    Some(applied_value)
+}
+
+fn validate_authenticator_ttl_limit(
+    profile: &Value,
+    deployment: &Value,
+    configuration: &Value,
+    limit_id: &str,
+    document_maximum: u64,
+    document_field: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(applied_value) = resolve_authenticator_ttl_limit(
+        profile,
+        deployment,
+        configuration,
+        limit_id,
+        document_field,
+        context,
+        errors,
+    ) else {
+        return;
+    };
     if document_maximum != applied_value {
         errors.push(format!(
             "{context}: D {document_field} {document_maximum} does not equal applied security-limit value {applied_value} for {limit_id}"
         ));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalAuthenticatorBrowserTtlLimit {
+    limit_id: &'static str,
+    published_default: u64,
+    minimum: u64,
+    maximum: u64,
+    source_symbol: &'static str,
+}
+
+const CANONICAL_AUTHENTICATOR_BROWSER_TTL_LIMITS: [CanonicalAuthenticatorBrowserTtlLimit; 3] = [
+    CanonicalAuthenticatorBrowserTtlLimit {
+        limit_id: AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+        published_default: AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+        minimum: AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+        maximum: AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+        source_symbol: "ResolvedAuthenticatorBrowserLimits::maximum_state_lifetime_seconds",
+    },
+    CanonicalAuthenticatorBrowserTtlLimit {
+        limit_id: AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        published_default: AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS,
+        minimum: 1,
+        maximum: AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS,
+        source_symbol: "ResolvedAuthenticatorBrowserLimits::maximum_session_age_seconds",
+    },
+    CanonicalAuthenticatorBrowserTtlLimit {
+        limit_id: AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        published_default: AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_PUBLISHED_DEFAULT_SECONDS,
+        minimum: 1,
+        maximum: AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_MAXIMUM_SECONDS,
+        source_symbol:
+            "ResolvedAuthenticatorBrowserLimits::maximum_federated_authority_staleness_seconds",
+    },
+];
+
+fn validate_canonical_authenticator_browser_ttl_limit(
+    profile: &Value,
+    deployment: &Value,
+    configuration: &Value,
+    contract: CanonicalAuthenticatorBrowserTtlLimit,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> Option<u64> {
+    let applied_value = resolve_authenticator_ttl_limit(
+        profile,
+        deployment,
+        configuration,
+        contract.limit_id,
+        "browser authority",
+        context,
+        errors,
+    );
+    let matching_limits = array(profile, "limits")
+        .iter()
+        .filter(|limit| string_field(limit, "limit_id") == Some(contract.limit_id))
+        .collect::<Vec<_>>();
+    if matching_limits.len() != 1 {
+        return None;
+    }
+    let limit = matching_limits[0];
+    let limit_context = format!("{context}: security limit {}", contract.limit_id);
+
+    if limit.get("published_default").and_then(Value::as_u64) != Some(contract.published_default) {
+        errors.push(format!(
+            "{limit_context}: published_default must be exactly {}",
+            contract.published_default
+        ));
+    }
+
+    let hard_bounds = limit.get("hard_bounds").unwrap_or(&Value::Null);
+    if hard_bounds.get("minimum").and_then(Value::as_u64) != Some(contract.minimum)
+        || hard_bounds.get("maximum").and_then(Value::as_u64) != Some(contract.maximum)
+        || hard_bounds
+            .get("minimum_inclusive")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || hard_bounds
+            .get("maximum_inclusive")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        errors.push(format!(
+            "{limit_context}: hard bounds must be exactly inclusive {}..={}",
+            contract.minimum, contract.maximum
+        ));
+    }
+
+    let dimensions = limit
+        .pointer("/scope/dimensions")
+        .and_then(strict_string_array);
+    let expected_dimensions = ["deployment_id", "provider_id", "trust_domain_id"];
+    if dimensions.as_deref() != Some(expected_dimensions.as_slice()) {
+        errors.push(format!(
+            "{limit_context}: scope dimensions must be exactly [deployment_id, provider_id, trust_domain_id] in order"
+        ));
+    }
+
+    let source_binding = limit.get("source_binding").unwrap_or(&Value::Null);
+    if string_field(source_binding, "source_file")
+        != Some("sources/ryuki-api/src/security_contracts.rs")
+        || string_field(source_binding, "source_symbol") != Some(contract.source_symbol)
+    {
+        errors.push(format!(
+            "{limit_context}: source_binding must be exactly sources/ryuki-api/src/security_contracts.rs#{}",
+            contract.source_symbol
+        ));
+    }
+
+    applied_value
+}
+
+fn validate_authenticator_browser_limit_authority(
+    profile: &Value,
+    deployment: &Value,
+    configuration: &Value,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let mut applied_values = BTreeMap::new();
+    for contract in CANONICAL_AUTHENTICATOR_BROWSER_TTL_LIMITS {
+        if let Some(applied_value) = validate_canonical_authenticator_browser_ttl_limit(
+            profile,
+            deployment,
+            configuration,
+            contract,
+            context,
+            errors,
+        ) {
+            applied_values.insert(contract.limit_id, applied_value);
+        }
+    }
+
+    if applied_values
+        .get(AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID)
+        .is_some_and(|value| *value != AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS)
+    {
+        errors.push(format!(
+            "{context}: applied browser state lifetime must be exactly {AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS} seconds"
+        ));
+    }
+
+    if let (Some(session_maximum_age), Some(federated_authority_staleness)) = (
+        applied_values.get(AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID),
+        applied_values.get(AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID),
+    ) {
+        if federated_authority_staleness > session_maximum_age {
+            errors.push(format!(
+                "{context}: applied federated authority staleness {federated_authority_staleness} seconds exceeds applied browser session maximum age {session_maximum_age} seconds"
+            ));
+        }
     }
 }
 
@@ -5848,7 +6033,8 @@ fn validate_authenticator_credential_path_limits(
 
     let validate_direct_jwt = requires_direct_jwt && bearer_paths.len() == 1;
     let validate_browser = requires_browser && browser_paths.len() == 1;
-    if !validate_direct_jwt && !validate_browser {
+    let requires_browser_limit_authority = requires_browser || !browser_paths.is_empty();
+    if !validate_direct_jwt && !validate_browser && !requires_browser_limit_authority {
         return;
     }
     let Some(profile) = security_limit_profile else {
@@ -5859,6 +6045,16 @@ fn validate_authenticator_credential_path_limits(
     };
     if !authenticator_limit_profile_is_active_and_applicable(profile, deployment, context, errors) {
         return;
+    }
+
+    if requires_browser_limit_authority {
+        validate_authenticator_browser_limit_authority(
+            profile,
+            deployment,
+            configuration,
+            context,
+            errors,
+        );
     }
 
     if validate_direct_jwt {
@@ -7494,35 +7690,52 @@ mod tests {
             .find(|limit| string_field(limit, "category") == Some("ttl"))
             .expect("checked-in TTL template")
             .clone();
-        let row =
-            |limit_id: &str, description: &str, selected_value: u64, minimum: u64, maximum: u64| {
-                let mut row = ttl_template.clone();
-                row["limit_id"] = json!(limit_id);
-                row["category"] = json!("ttl");
-                row["description"] = json!(description);
-                row["selected_value"] = json!(selected_value);
-                row["published_default"] = json!(selected_value);
-                row["unit"] = json!("seconds");
-                row["scope"] = json!({
-                    "kind": "provider",
-                    "dimensions": ["deployment_id", "trust_domain_id", "provider_id"]
-                });
-                row["hard_bounds"] = json!({
-                    "minimum": minimum,
-                    "maximum": maximum,
-                    "minimum_inclusive": true,
-                    "maximum_inclusive": true
-                });
-                row["enforcement_status"] = json!("enforced");
-                row["source_binding"] = json!({
+        let row = |limit_id: &str,
+                   description: &str,
+                   selected_value: u64,
+                   minimum: u64,
+                   maximum: u64| {
+            let mut row = ttl_template.clone();
+            row["limit_id"] = json!(limit_id);
+            row["category"] = json!("ttl");
+            row["description"] = json!(description);
+            row["selected_value"] = json!(selected_value);
+            row["published_default"] = json!(selected_value);
+            row["unit"] = json!("seconds");
+            row["scope"] = json!({
+                "kind": "provider",
+                "dimensions": ["deployment_id", "provider_id", "trust_domain_id"]
+            });
+            row["hard_bounds"] = json!({
+                "minimum": minimum,
+                "maximum": maximum,
+                "minimum_inclusive": true,
+                "maximum_inclusive": true
+            });
+            row["enforcement_status"] = json!("enforced");
+            row["source_binding"] = match limit_id {
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID => json!({
+                    "source_file": "sources/ryuki-api/src/security_contracts.rs",
+                    "source_symbol": "ResolvedAuthenticatorBrowserLimits::maximum_state_lifetime_seconds"
+                }),
+                AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID => json!({
+                    "source_file": "sources/ryuki-api/src/security_contracts.rs",
+                    "source_symbol": "ResolvedAuthenticatorBrowserLimits::maximum_session_age_seconds"
+                }),
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID => json!({
+                    "source_file": "sources/ryuki-api/src/security_contracts.rs",
+                    "source_symbol": "ResolvedAuthenticatorBrowserLimits::maximum_federated_authority_staleness_seconds"
+                }),
+                _ => json!({
                     "source_file": "scripts/validator-rs/src/security_conformance.rs",
                     "source_symbol": "authenticator_security_limit_profile"
-                });
-                row["overrides"] = json!([]);
-                row["lifecycle"] = json!("active");
-                row["applicability_expression"] = json!("always");
-                row
+                }),
             };
+            row["overrides"] = json!([]);
+            row["lifecycle"] = json!("active");
+            row["applicability_expression"] = json!("always");
+            row
+        };
         for desired in [
             row(
                 "limit:authenticator.clock-skew",
@@ -7537,6 +7750,27 @@ mod tests {
                 3600,
                 1,
                 86400,
+            ),
+            row(
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+                "Exact lifetime of one-use authenticator browser state.",
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+            ),
+            row(
+                AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+                "Maximum age of a browser-derived authenticator session.",
+                AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS,
+                1,
+                AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS,
+            ),
+            row(
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+                "Maximum accepted staleness of federated authenticator authority.",
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_PUBLISHED_DEFAULT_SECONDS,
+                1,
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_MAXIMUM_SECONDS,
             ),
         ] {
             let limits = profile["limits"].as_array_mut().expect("security limits");
@@ -11320,6 +11554,31 @@ mod tests {
             "missing browser path unexpectedly passed: {errors:?}"
         );
 
+        let mut missing_browser_limit_profile = limit_profile.clone();
+        missing_browser_limit_profile["limits"]
+            .as_array_mut()
+            .expect("security limits")
+            .retain(|limit| {
+                string_field(limit, "limit_id").is_none_or(|limit_id| {
+                    limit_id != AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID
+                        && limit_id != AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID
+                        && limit_id != AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID
+                })
+            });
+        let errors = validate_limit_case(&missing_browser_limit_profile, &missing_browser_document);
+        for limit_id in [
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(&format!(
+                    "browser authority limit {limit_id} must resolve to exactly one security-limit row; found 0"
+                ))),
+                "advertised browser-sso without path did not require {limit_id}: {errors:?}"
+            );
+        }
+
         let mut wrong_browser_path_document = document.clone();
         wrong_browser_path_document["credential_paths"][1]["credential_profile"]["token_profile"] =
             json!("jwt-access-token");
@@ -11375,6 +11634,243 @@ mod tests {
                 "authenticator runtime binding must retain exactly one JWT bearer credential path; found 2"
             )),
             "duplicate bearer path unexpectedly passed: {errors:?}"
+        );
+
+        let mut bearer_only_registry = registry.clone();
+        bearer_only_registry["configurations"][0]["capability_descriptor"]
+            ["advertised_capabilities"] = json!(["token-validation"]);
+        let mut bearer_only_document = document.clone();
+        bearer_only_document["capability_ids"] = json!(["token-validation"]);
+        bearer_only_document["credential_paths"]
+            .as_array_mut()
+            .expect("credential path array")
+            .remove(1);
+        let mut bearer_only_profile = limit_profile.clone();
+        bearer_only_profile["limits"]
+            .as_array_mut()
+            .expect("security limits")
+            .retain(|limit| {
+                string_field(limit, "limit_id").is_none_or(|limit_id| {
+                    limit_id != AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID
+                        && limit_id != AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID
+                        && limit_id != AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID
+                })
+            });
+        pin_document(&mut bearer_only_registry, &bearer_only_document);
+        let mut errors = Vec::new();
+        validate_authenticator_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &bearer_only_registry,
+            Some(&bearer_only_profile),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "bearer-only validation changed when browser limit rows were absent: {errors:?}"
+        );
+
+        for limit_id in [
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        ] {
+            let mut missing = limit_profile.clone();
+            missing["limits"]
+                .as_array_mut()
+                .expect("security limits")
+                .retain(|limit| string_field(limit, "limit_id") != Some(limit_id));
+            let errors = validate_limit_case(&missing, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(&format!(
+                    "browser authority limit {limit_id} must resolve to exactly one security-limit row; found 0"
+                ))),
+                "missing browser limit {limit_id} unexpectedly passed: {errors:?}"
+            );
+
+            let mut duplicate = limit_profile.clone();
+            let duplicate_row = authenticator_limit_mut(&mut duplicate, limit_id).clone();
+            duplicate["limits"]
+                .as_array_mut()
+                .expect("security limits")
+                .push(duplicate_row);
+            let errors = validate_limit_case(&duplicate, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(&format!(
+                    "browser authority limit {limit_id} must resolve to exactly one security-limit row; found 2"
+                ))),
+                "duplicate browser limit {limit_id} unexpectedly passed: {errors:?}"
+            );
+
+            let mut wrong_id = limit_profile.clone();
+            authenticator_limit_mut(&mut wrong_id, limit_id)["limit_id"] =
+                json!(format!("{limit_id}-lookalike"));
+            let errors = validate_limit_case(&wrong_id, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(&format!(
+                    "browser authority limit {limit_id} must resolve to exactly one security-limit row; found 0"
+                ))),
+                "noncanonical browser limit ID replacing {limit_id} unexpectedly passed: {errors:?}"
+            );
+        }
+
+        for (limit_id, bound, replacement, expected_bounds) in [
+            (
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+                "maximum",
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS + 1,
+                "inclusive 600..=600",
+            ),
+            (
+                AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+                "minimum",
+                0,
+                "inclusive 1..=86400",
+            ),
+            (
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+                "maximum",
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_MAXIMUM_SECONDS + 1,
+                "inclusive 1..=3600",
+            ),
+        ] {
+            let mut wrong_bounds = limit_profile.clone();
+            authenticator_limit_mut(&mut wrong_bounds, limit_id)["hard_bounds"][bound] =
+                json!(replacement);
+            let errors = validate_limit_case(&wrong_bounds, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_bounds)),
+                "wrong bounds for {limit_id} unexpectedly passed: {errors:?}"
+            );
+        }
+
+        for (limit_id, replacement, expected_default) in [
+            (
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS + 1,
+                AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS,
+            ),
+            (
+                AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+                AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS - 1,
+                AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS,
+            ),
+            (
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_PUBLISHED_DEFAULT_SECONDS + 1,
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_PUBLISHED_DEFAULT_SECONDS,
+            ),
+        ] {
+            let mut wrong_default = limit_profile.clone();
+            authenticator_limit_mut(&mut wrong_default, limit_id)["published_default"] =
+                json!(replacement);
+            let errors = validate_limit_case(&wrong_default, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(&format!(
+                    "published_default must be exactly {expected_default}"
+                ))),
+                "wrong published default for {limit_id} unexpectedly passed: {errors:?}"
+            );
+        }
+
+        let mut wrong_dimension_order = limit_profile.clone();
+        authenticator_limit_mut(
+            &mut wrong_dimension_order,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        )["scope"]["dimensions"] = json!(["deployment_id", "trust_domain_id", "provider_id"]);
+        let errors = validate_limit_case(&wrong_dimension_order, &document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "scope dimensions must be exactly [deployment_id, provider_id, trust_domain_id] in order"
+            )),
+            "wrong browser limit dimension order unexpectedly passed: {errors:?}"
+        );
+
+        for contract in CANONICAL_AUTHENTICATOR_BROWSER_TTL_LIMITS {
+            let mut substituted_source = limit_profile.clone();
+            authenticator_limit_mut(&mut substituted_source, contract.limit_id)["source_binding"]
+                ["source_symbol"] = json!("ResolvedAuthenticatorBrowserLimits::substituted");
+            let errors = validate_limit_case(&substituted_source, &document);
+            let expected = format!(
+                "source_binding must be exactly sources/ryuki-api/src/security_contracts.rs#{}",
+                contract.source_symbol
+            );
+            assert!(
+                errors.iter().any(|error| error.contains(&expected)),
+                "substituted source symbol for {} unexpectedly passed: {errors:?}",
+                contract.limit_id
+            );
+        }
+
+        let mut substituted_source_file = limit_profile.clone();
+        authenticator_limit_mut(
+            &mut substituted_source_file,
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+        )["source_binding"]["source_file"] =
+            json!("sources/ryuki-api/src/authenticator_runtime.rs");
+        let errors = validate_limit_case(&substituted_source_file, &document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "source_binding must be exactly sources/ryuki-api/src/security_contracts.rs#ResolvedAuthenticatorBrowserLimits::maximum_state_lifetime_seconds"
+            )),
+            "substituted browser limit source file unexpectedly passed: {errors:?}"
+        );
+
+        let mut state_plus_one = limit_profile.clone();
+        let state_limit = authenticator_limit_mut(
+            &mut state_plus_one,
+            AUTHENTICATOR_BROWSER_STATE_LIFETIME_LIMIT_ID,
+        );
+        state_limit["selected_value"] = json!(AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS + 1);
+        state_limit["published_default"] = json!(AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS + 1);
+        state_limit["hard_bounds"]["minimum"] =
+            json!(AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS + 1);
+        state_limit["hard_bounds"]["maximum"] =
+            json!(AUTHENTICATOR_BROWSER_STATE_LIFETIME_SECONDS + 1);
+        let errors = validate_limit_case(&state_plus_one, &document);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("applied browser state lifetime must be exactly 600 seconds")),
+            "browser state lifetime +1 unexpectedly passed: {errors:?}"
+        );
+
+        for (limit_id, selected_value, expected_error) in [
+            (
+                AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+                AUTHENTICATOR_BROWSER_SESSION_PUBLISHED_DEFAULT_SECONDS + 1,
+                "selected_value 86401 is outside its integer hard bounds",
+            ),
+            (
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+                AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_MAXIMUM_SECONDS + 1,
+                "selected_value 3601 is outside its integer hard bounds",
+            ),
+        ] {
+            let mut plus_one = limit_profile.clone();
+            authenticator_limit_mut(&mut plus_one, limit_id)["selected_value"] =
+                json!(selected_value);
+            let errors = validate_limit_case(&plus_one, &document);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "upper bound +1 for {limit_id} unexpectedly passed: {errors:?}"
+            );
+        }
+
+        let mut invalid_cross_limit = limit_profile.clone();
+        authenticator_limit_mut(
+            &mut invalid_cross_limit,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        )["selected_value"] = json!(300);
+        authenticator_limit_mut(
+            &mut invalid_cross_limit,
+            AUTHENTICATOR_FEDERATED_AUTHORITY_STALENESS_LIMIT_ID,
+        )["selected_value"] = json!(301);
+        let errors = validate_limit_case(&invalid_cross_limit, &document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "applied federated authority staleness 301 seconds exceeds applied browser session maximum age 300 seconds"
+            )),
+            "invalid selected-value browser cross-limit relation unexpectedly passed: {errors:?}"
         );
 
         let duplicate = {
@@ -11589,6 +12085,36 @@ mod tests {
                 "reason": "validator fixture"
             })
         };
+
+        let mut browser_override_profile = limit_profile.clone();
+        authenticator_limit_mut(
+            &mut browser_override_profile,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        )["overrides"] = json!([applicable_override(
+            "override:authenticator-browser-session-maximum-age",
+            1_200,
+        )]);
+        let errors = validate_limit_case(&browser_override_profile, &document);
+        assert!(
+            errors.is_empty(),
+            "valid effective browser limit override failed: {errors:?}"
+        );
+
+        authenticator_limit_mut(
+            &mut browser_override_profile,
+            AUTHENTICATOR_BROWSER_SESSION_MAXIMUM_AGE_LIMIT_ID,
+        )["overrides"] = json!([applicable_override(
+            "override:authenticator-browser-session-maximum-age-cross-limit",
+            600,
+        )]);
+        let errors = validate_limit_case(&browser_override_profile, &document);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "applied federated authority staleness 900 seconds exceeds applied browser session maximum age 600 seconds"
+            )),
+            "effective override browser cross-limit relation unexpectedly passed: {errors:?}"
+        );
+
         let mut overridden_profile = limit_profile.clone();
         authenticator_limit_mut(&mut overridden_profile, AUTHENTICATOR_CLOCK_SKEW_LIMIT_ID)
             ["overrides"] = json!([applicable_override("override:authenticator-clock-skew", 30)]);

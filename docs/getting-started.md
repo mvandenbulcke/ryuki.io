@@ -231,11 +231,13 @@ that projection exists, the runtime settings are:
    `RYUKI_ENTRA_REDIRECT_URI`; omit it only for deliberate bearer-only use
 5. Restart the API and require `/ready`
 
-For a non-Entra provider, the current release has a single generic OIDC + PKCE
-profile under `RYUKI_OIDC__*`. See [Configuration](configuration.md#generic-oidc-current-single-provider-flow).
-The platform boundary specification defines the remaining multi-provider,
-brokered SAML/LDAP, WebAuthn emergency, service OAuth, and workload-identity
-work.
+The `RYUKI_OIDC__*` generic-provider inputs are reserved but not currently
+admitted: setting `RYUKI_OIDC__ENABLED=true` fails startup until an exact
+D/P/Q/R runtime authority is implemented. See
+[Configuration](configuration.md#generic-oidc-reserved-single-provider-inputs).
+The platform boundary specification defines that provider-registry work along
+with brokered SAML/LDAP, WebAuthn emergency, service OAuth, and workload
+identity.
 
 ## Project Structure
 

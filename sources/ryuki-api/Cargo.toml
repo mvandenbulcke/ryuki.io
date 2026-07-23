@@ -28,6 +28,7 @@ ryuki-runner = { workspace = true }
 rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
+hex = "0.4"
 jsonschema = { workspace = true }
 subtle = "2"
 base64 = "0.22"
@@ -45,4 +46,3 @@ ryuki-agent = { workspace = true }
 # `test-util` enables the paused-clock test runtime (`start_paused = true`) used
 # by the background-loop timeout unit tests; kept dev-only so it never ships.
 tokio = { version = "1", features = ["full", "test-util"] }
-hex = "0.4"

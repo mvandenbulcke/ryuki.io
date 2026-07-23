@@ -9,8 +9,9 @@
 //!   not compete with random misses for admission;
 //! - a fixed-window budget plus a non-queueing semaphore for new verifiers.
 //!
-//! Only the keyed, fixed-width verifier is retained. Plaintext session bearers
-//! are never stored, logged, or used as cache keys. A positive entry is only
+//! Only the keyed, fixed-width verifier and canonical non-secret origin digest
+//! are retained. Plaintext session bearers are never stored, logged, or used
+//! as cache keys. A positive entry is only
 //! admission evidence: every request still performs the exact principal/key/link
 //! version and lifecycle SQL check before it is authenticated.
 
@@ -26,7 +27,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use ryuki_core::config::{AuthMode, RyukiConfig};
+use ryuki_core::config::AuthMode;
+use ryuki_core::security_profile::ProviderLifecycleState;
 use ryuki_core::types::ApiError;
 use ryuki_core::PrincipalId;
 use sqlx::PgPool;
@@ -196,7 +198,356 @@ pub(crate) fn security_limit_readback(max_connections: u32) -> serde_json::Value
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionLookupAdmissionProof {
     verifier: SessionVerifier,
+    origin_partition: SessionLookupOriginPartition,
     authority: Option<SessionAuthorityCacheBinding>,
+}
+
+/// Closed process-local namespace for persisted-session admission.
+///
+/// Browser sessions are partitioned by the exact canonical origin digest
+/// retained by the live authenticator runtime. Local sessions occupy their
+/// own NULL-origin namespace, while `Disabled` can cache only misses and can
+/// never become a positive session authority.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum SessionLookupOriginPartition {
+    Local,
+    Browser([u8; 32]),
+    Disabled,
+}
+
+/// Opaque lookup authority derived only from the retained authenticator
+/// runtime. The browser variant retains the exact sealed origin allocation so
+/// SQL admission and cache partitioning cannot be assembled independently.
+pub(crate) struct SessionLookupOriginAuthority {
+    partition: SessionLookupOriginPartition,
+    browser_origin: Option<Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>>,
+    browser_binding: Option<BrowserOriginDatabaseBinding>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserOriginDatabaseBinding {
+    origin: Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
+    origin_binding_digest: [u8; 32],
+    deployment_id: String,
+    trust_domain_id: String,
+    tenant_id: Option<String>,
+    provider_id: String,
+    provider_configuration_version: i64,
+    provider_configuration_payload_digest: [u8; 32],
+    provider_lifecycle_record_version: i64,
+    binding_document_id: String,
+    binding_document_version: i64,
+    binding_document_digest: [u8; 32],
+    binding_document_locator: String,
+    provider_policy_binding_digest: [u8; 32],
+    runtime_binding_digest: [u8; 32],
+    path_id: String,
+    path_version: i64,
+    path_kind: &'static str,
+}
+
+impl BrowserOriginDatabaseBinding {
+    fn same_values(&self, other: &Self) -> bool {
+        self.origin_binding_digest == other.origin_binding_digest
+            && self.deployment_id == other.deployment_id
+            && self.trust_domain_id == other.trust_domain_id
+            && self.tenant_id == other.tenant_id
+            && self.provider_id == other.provider_id
+            && self.provider_configuration_version == other.provider_configuration_version
+            && self.provider_configuration_payload_digest
+                == other.provider_configuration_payload_digest
+            && self.provider_lifecycle_record_version == other.provider_lifecycle_record_version
+            && self.binding_document_id == other.binding_document_id
+            && self.binding_document_version == other.binding_document_version
+            && self.binding_document_digest == other.binding_document_digest
+            && self.binding_document_locator == other.binding_document_locator
+            && self.provider_policy_binding_digest == other.provider_policy_binding_digest
+            && self.runtime_binding_digest == other.runtime_binding_digest
+            && self.path_id == other.path_id
+            && self.path_version == other.path_version
+            && self.path_kind == other.path_kind
+    }
+
+    pub(crate) fn verify_integrity(&self) -> bool {
+        self.origin.verify_integrity().is_ok()
+            && browser_database_binding(&self.origin)
+                .is_ok_and(|remeasured| self.same_values(&remeasured))
+    }
+
+    pub(crate) fn origin_binding_digest(&self) -> &[u8; 32] {
+        &self.origin_binding_digest
+    }
+
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+
+    pub(crate) fn trust_domain_id(&self) -> &str {
+        &self.trust_domain_id
+    }
+
+    pub(crate) fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub(crate) fn provider_configuration_version(&self) -> i64 {
+        self.provider_configuration_version
+    }
+
+    pub(crate) fn provider_configuration_payload_digest(&self) -> &[u8; 32] {
+        &self.provider_configuration_payload_digest
+    }
+
+    pub(crate) fn provider_lifecycle_record_version(&self) -> i64 {
+        self.provider_lifecycle_record_version
+    }
+
+    pub(crate) fn binding_document_id(&self) -> &str {
+        &self.binding_document_id
+    }
+
+    pub(crate) fn binding_document_version(&self) -> i64 {
+        self.binding_document_version
+    }
+
+    pub(crate) fn binding_document_digest(&self) -> &[u8; 32] {
+        &self.binding_document_digest
+    }
+
+    pub(crate) fn binding_document_locator(&self) -> &str {
+        &self.binding_document_locator
+    }
+
+    pub(crate) fn provider_policy_binding_digest(&self) -> &[u8; 32] {
+        &self.provider_policy_binding_digest
+    }
+
+    pub(crate) fn runtime_binding_digest(&self) -> &[u8; 32] {
+        &self.runtime_binding_digest
+    }
+
+    pub(crate) fn path_id(&self) -> &str {
+        &self.path_id
+    }
+
+    pub(crate) fn path_version(&self) -> i64 {
+        self.path_version
+    }
+
+    pub(crate) fn path_kind(&self) -> &'static str {
+        self.path_kind
+    }
+}
+
+impl PartialEq for BrowserOriginDatabaseBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.origin, &other.origin) && self.same_values(other)
+    }
+}
+
+impl Eq for BrowserOriginDatabaseBinding {}
+
+fn decode_canonical_sha256(value: &str) -> Result<[u8; 32], &'static str> {
+    let encoded = value
+        .strip_prefix("sha256:")
+        .ok_or("origin contains a non-canonical digest")?;
+    if encoded.len() != 64
+        || encoded
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err("origin contains a non-canonical digest");
+    }
+    let mut digest = [0_u8; 32];
+    hex::decode_to_slice(encoded, &mut digest)
+        .map_err(|_| "origin contains a non-canonical digest")?;
+    if digest == [0; 32] {
+        return Err("origin contains a zero digest");
+    }
+    Ok(digest)
+}
+
+fn database_version(value: u64) -> Result<i64, &'static str> {
+    i64::try_from(value).map_err(|_| "origin version exceeds the database range")
+}
+
+fn browser_database_binding(
+    origin: &Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
+) -> Result<BrowserOriginDatabaseBinding, &'static str> {
+    origin
+        .verify_integrity()
+        .map_err(|_| "browser authenticator origin integrity failed")?;
+    let projection = origin.origin_projection();
+    if projection.provider_lifecycle_state != ProviderLifecycleState::Active
+        || projection.provider_id != origin.provider_id()
+        || projection.path_id != origin.path_id()
+        || projection.path_version != origin.path_version()
+    {
+        return Err("browser authenticator origin accessors disagree");
+    }
+    let origin_binding_digest = *origin.origin_binding_digest_bytes();
+    if origin_binding_digest == [0; 32] {
+        return Err("browser authenticator origin digest is zero");
+    }
+    Ok(BrowserOriginDatabaseBinding {
+        origin: Arc::clone(origin),
+        origin_binding_digest,
+        deployment_id: projection.deployment_id.clone(),
+        trust_domain_id: projection.trust_domain_id.clone(),
+        tenant_id: projection.tenant_id.clone(),
+        provider_id: projection.provider_id.clone(),
+        provider_configuration_version: database_version(
+            projection.provider_configuration_version,
+        )?,
+        provider_configuration_payload_digest: decode_canonical_sha256(
+            &projection.provider_configuration_payload_digest,
+        )?,
+        provider_lifecycle_record_version: database_version(
+            projection.provider_lifecycle_record_version,
+        )?,
+        binding_document_id: projection.binding_document_reference.document_id.clone(),
+        binding_document_version: database_version(
+            projection.binding_document_reference.document_version,
+        )?,
+        binding_document_digest: decode_canonical_sha256(
+            &projection.binding_document_reference.content_digest,
+        )?,
+        binding_document_locator: projection
+            .binding_document_reference
+            .artifact_locator
+            .clone(),
+        provider_policy_binding_digest: decode_canonical_sha256(
+            &projection.provider_policy_binding_digest,
+        )?,
+        runtime_binding_digest: decode_canonical_sha256(&projection.runtime_binding_digest)?,
+        path_id: projection.path_id.clone(),
+        path_version: database_version(projection.path_version)?,
+        path_kind: origin.path_kind(),
+    })
+}
+
+impl SessionLookupOriginAuthority {
+    pub(crate) fn from_runtime(
+        runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    ) -> Result<Self, &'static str> {
+        let browser_origin = runtime.browser_authenticator_origin();
+        if !runtime.retains_browser_authenticator_origin(&browser_origin) {
+            return Err("authenticator runtime did not retain its browser origin");
+        }
+        match (runtime.auth_mode(), browser_origin) {
+            (AuthMode::Local, None) => Ok(Self {
+                partition: SessionLookupOriginPartition::Local,
+                browser_origin: None,
+                browser_binding: None,
+            }),
+            (AuthMode::EntraId, Some(origin)) => {
+                let binding = browser_database_binding(&origin)?;
+                Ok(Self {
+                    partition: SessionLookupOriginPartition::Browser(binding.origin_binding_digest),
+                    browser_origin: Some(origin),
+                    browser_binding: Some(binding),
+                })
+            }
+            (AuthMode::EntraId, None) | (AuthMode::MockDryRun | AuthMode::StaticDryRun, None) => {
+                Ok(Self {
+                    partition: SessionLookupOriginPartition::Disabled,
+                    browser_origin: None,
+                    browser_binding: None,
+                })
+            }
+            _ => Err("authenticator mode and browser origin disagree"),
+        }
+    }
+
+    #[cfg(test)]
+    fn local_fixture() -> Self {
+        Self {
+            partition: SessionLookupOriginPartition::Local,
+            browser_origin: None,
+            browser_binding: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_auth_mode(auth_mode: &AuthMode) -> Self {
+        match auth_mode {
+            AuthMode::Local => Self::local_fixture(),
+            AuthMode::MockDryRun | AuthMode::StaticDryRun | AuthMode::EntraId => Self {
+                partition: SessionLookupOriginPartition::Disabled,
+                browser_origin: None,
+                browser_binding: None,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browser_fixture(label: &str) -> Self {
+        let origin =
+            crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(label);
+        let binding = browser_database_binding(&origin)
+            .expect("browser-origin fixture must produce an exact database binding");
+        Self {
+            partition: SessionLookupOriginPartition::Browser(binding.origin_binding_digest),
+            browser_origin: Some(origin),
+            browser_binding: Some(binding),
+        }
+    }
+
+    pub(crate) fn is_local(&self) -> bool {
+        self.partition == SessionLookupOriginPartition::Local
+    }
+
+    pub(crate) fn permits_persisted_sessions(&self) -> bool {
+        !matches!(self.partition, SessionLookupOriginPartition::Disabled)
+    }
+
+    pub(crate) fn origin_binding_digest(&self) -> Option<&[u8; 32]> {
+        match &self.partition {
+            SessionLookupOriginPartition::Browser(digest) => Some(digest),
+            SessionLookupOriginPartition::Local | SessionLookupOriginPartition::Disabled => None,
+        }
+    }
+
+    pub(crate) fn browser_binding(&self) -> Option<&BrowserOriginDatabaseBinding> {
+        match (&self.browser_origin, &self.browser_binding) {
+            (Some(origin), Some(binding))
+                if origin.origin_binding_digest_bytes() == &binding.origin_binding_digest
+                    && Arc::ptr_eq(origin, &binding.origin)
+                    && binding.verify_integrity() =>
+            {
+                Some(binding)
+            }
+            (None, None) => None,
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SessionLookupCacheKey {
+    verifier: SessionVerifier,
+    origin_partition: SessionLookupOriginPartition,
+}
+
+impl SessionLookupCacheKey {
+    fn new(verifier: SessionVerifier, origin: &SessionLookupOriginAuthority) -> Self {
+        Self {
+            verifier,
+            origin_partition: origin.partition,
+        }
+    }
+
+    #[cfg(test)]
+    fn local(verifier: SessionVerifier) -> Self {
+        Self {
+            verifier,
+            origin_partition: SessionLookupOriginPartition::Local,
+        }
+    }
 }
 
 /// Exact, provider-independent authority captured by a persisted session.
@@ -245,11 +596,11 @@ struct NegativeEntry {
 }
 
 struct AdmissionInner {
-    positive: HashMap<SessionVerifier, PositiveEntry>,
-    positive_order: VecDeque<(SessionVerifier, u64)>,
-    negative: HashMap<SessionVerifier, NegativeEntry>,
-    negative_order: VecDeque<(SessionVerifier, u64)>,
-    in_flight: HashSet<SessionVerifier>,
+    positive: HashMap<SessionLookupCacheKey, PositiveEntry>,
+    positive_order: VecDeque<(SessionLookupCacheKey, u64)>,
+    negative: HashMap<SessionLookupCacheKey, NegativeEntry>,
+    negative_order: VecDeque<(SessionLookupCacheKey, u64)>,
+    in_flight: HashSet<SessionLookupCacheKey>,
     window_started_at: Instant,
     window_used: usize,
     generation: u64,
@@ -262,10 +613,10 @@ impl AdmissionInner {
     }
 
     fn prune_expired(&mut self, now: Instant) {
-        while let Some((verifier, generation)) = self.positive_order.front().copied() {
+        while let Some((key, generation)) = self.positive_order.front().copied() {
             let expired = self
                 .positive
-                .get(&verifier)
+                .get(&key)
                 .is_none_or(|entry| entry.generation != generation || entry.expires_at <= now);
             if !expired {
                 break;
@@ -273,16 +624,16 @@ impl AdmissionInner {
             self.positive_order.pop_front();
             if self
                 .positive
-                .get(&verifier)
+                .get(&key)
                 .is_some_and(|entry| entry.generation == generation && entry.expires_at <= now)
             {
-                self.positive.remove(&verifier);
+                self.positive.remove(&key);
             }
         }
-        while let Some((verifier, generation)) = self.negative_order.front().copied() {
+        while let Some((key, generation)) = self.negative_order.front().copied() {
             let expired = self
                 .negative
-                .get(&verifier)
+                .get(&key)
                 .is_none_or(|entry| entry.generation != generation || entry.expires_at <= now);
             if !expired {
                 break;
@@ -290,40 +641,40 @@ impl AdmissionInner {
             self.negative_order.pop_front();
             if self
                 .negative
-                .get(&verifier)
+                .get(&key)
                 .is_some_and(|entry| entry.generation == generation && entry.expires_at <= now)
             {
-                self.negative.remove(&verifier);
+                self.negative.remove(&key);
             }
         }
     }
 
     fn trim_positive(&mut self, capacity: usize) {
         while self.positive_order.len() > capacity {
-            let Some((verifier, generation)) = self.positive_order.pop_front() else {
+            let Some((key, generation)) = self.positive_order.pop_front() else {
                 break;
             };
             if self
                 .positive
-                .get(&verifier)
+                .get(&key)
                 .is_some_and(|entry| entry.generation == generation)
             {
-                self.positive.remove(&verifier);
+                self.positive.remove(&key);
             }
         }
     }
 
     fn trim_negative(&mut self, capacity: usize) {
         while self.negative_order.len() > capacity {
-            let Some((verifier, generation)) = self.negative_order.pop_front() else {
+            let Some((key, generation)) = self.negative_order.pop_front() else {
                 break;
             };
             if self
                 .negative
-                .get(&verifier)
+                .get(&key)
                 .is_some_and(|entry| entry.generation == generation)
             {
-                self.negative.remove(&verifier);
+                self.negative.remove(&key);
             }
         }
     }
@@ -467,7 +818,7 @@ pub(crate) enum SessionLookupRejection {
 /// received a response (or the direct resolver's database call completes).
 pub(crate) struct SessionLookupGuard {
     admission: Arc<SessionLookupAdmission>,
-    verifier: SessionVerifier,
+    key: SessionLookupCacheKey,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -478,7 +829,7 @@ impl Drop for SessionLookupGuard {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        inner.in_flight.remove(&self.verifier);
+        inner.in_flight.remove(&self.key);
     }
 }
 
@@ -538,23 +889,53 @@ impl SessionLookupAdmission {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_admit(self: &Arc<Self>, verifier: SessionVerifier) -> SessionLookupDecision {
-        self.try_admit_at(verifier, Instant::now(), false)
+        self.try_admit_key(
+            SessionLookupCacheKey::local(verifier),
+            Instant::now(),
+            false,
+        )
+    }
+
+    pub(crate) fn try_admit_for_origin(
+        self: &Arc<Self>,
+        verifier: SessionVerifier,
+        origin: &SessionLookupOriginAuthority,
+    ) -> SessionLookupDecision {
+        self.try_admit_key(
+            SessionLookupCacheKey::new(verifier, origin),
+            Instant::now(),
+            false,
+        )
     }
 
     /// Logout must distinguish "not currently authenticating" from
     /// "durably absent". An authority/mode join miss may still have a session
     /// row that must be deleted, so only a post-commit absence entry is reused.
+    #[cfg(test)]
     pub(crate) fn try_admit_revocation(
         self: &Arc<Self>,
         verifier: SessionVerifier,
     ) -> SessionLookupDecision {
-        self.try_admit_at(verifier, Instant::now(), true)
+        self.try_admit_key(SessionLookupCacheKey::local(verifier), Instant::now(), true)
     }
 
-    fn try_admit_at(
+    pub(crate) fn try_admit_revocation_for_origin(
         self: &Arc<Self>,
         verifier: SessionVerifier,
+        origin: &SessionLookupOriginAuthority,
+    ) -> SessionLookupDecision {
+        self.try_admit_key(
+            SessionLookupCacheKey::new(verifier, origin),
+            Instant::now(),
+            true,
+        )
+    }
+
+    fn try_admit_key(
+        self: &Arc<Self>,
+        key: SessionLookupCacheKey,
         now: Instant,
         require_confirmed_absence: bool,
     ) -> SessionLookupDecision {
@@ -563,14 +944,14 @@ impl SessionLookupAdmission {
 
         if inner
             .positive
-            .get(&verifier)
+            .get(&key)
             .is_some_and(|entry| entry.expires_at > now && entry.authority.is_well_formed())
         {
             saturating_increment(&self.telemetry.known_positive);
-            return SessionLookupDecision::KnownPositive(Some(inner.positive[&verifier].authority));
+            return SessionLookupDecision::KnownPositive(Some(inner.positive[&key].authority));
         }
-        inner.positive.remove(&verifier);
-        let negative = inner.negative.get(&verifier).copied();
+        inner.positive.remove(&key);
+        let negative = inner.negative.get(&key).copied();
         if let Some(entry) = negative.filter(|entry| entry.expires_at > now) {
             if !require_confirmed_absence || entry.confirmed_absent {
                 saturating_increment(&self.telemetry.cached_miss);
@@ -578,9 +959,9 @@ impl SessionLookupAdmission {
             }
         }
         if negative.is_some() {
-            inner.negative.remove(&verifier);
+            inner.negative.remove(&key);
         }
-        if inner.in_flight.contains(&verifier) {
+        if inner.in_flight.contains(&key) {
             saturating_increment(&self.telemetry.rejected_duplicate_in_flight);
             return SessionLookupDecision::Rejected(SessionLookupRejection::DuplicateInFlight);
         }
@@ -600,13 +981,13 @@ impl SessionLookupAdmission {
             }
         };
         inner.window_used += 1;
-        inner.in_flight.insert(verifier);
+        inner.in_flight.insert(key);
         drop(inner);
         saturating_increment(&self.telemetry.admitted_unknown);
 
         SessionLookupDecision::Unknown(SessionLookupGuard {
             admission: Arc::clone(self),
-            verifier,
+            key,
             _permit: permit,
         })
     }
@@ -614,58 +995,106 @@ impl SessionLookupAdmission {
     pub(crate) fn admit_for_resolver(
         self: &Arc<Self>,
         verifier: SessionVerifier,
+        origin: &SessionLookupOriginAuthority,
         proof: Option<SessionLookupAdmissionProof>,
     ) -> SessionLookupDecision {
         if let Some(proof) = proof.filter(|proof| {
             proof.verifier == verifier
+                && proof.origin_partition == origin.partition
                 && proof
                     .authority
                     .is_none_or(SessionAuthorityCacheBinding::is_well_formed)
         }) {
             SessionLookupDecision::KnownPositive(proof.authority)
         } else {
-            self.try_admit(verifier)
+            self.try_admit_for_origin(verifier, origin)
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_hit(
         &self,
         verifier: SessionVerifier,
         valid_for: Duration,
         authority: SessionAuthorityCacheBinding,
     ) {
+        self.record_hit_key(SessionLookupCacheKey::local(verifier), valid_for, authority);
+    }
+
+    pub(crate) fn record_hit_for_origin(
+        &self,
+        verifier: SessionVerifier,
+        origin: &SessionLookupOriginAuthority,
+        valid_for: Duration,
+        authority: SessionAuthorityCacheBinding,
+    ) {
+        self.record_hit_key(
+            SessionLookupCacheKey::new(verifier, origin),
+            valid_for,
+            authority,
+        );
+    }
+
+    fn record_hit_key(
+        &self,
+        key: SessionLookupCacheKey,
+        valid_for: Duration,
+        authority: SessionAuthorityCacheBinding,
+    ) {
         if !authority.is_well_formed() {
-            self.record_miss(verifier);
+            self.record_negative_key(key, false);
+            return;
+        }
+        if matches!(key.origin_partition, SessionLookupOriginPartition::Disabled) {
+            self.record_negative_key(key, false);
             return;
         }
         let now = Instant::now();
         let valid_for = valid_for.min(self.positive_max_ttl);
         if valid_for.is_zero() {
-            self.record_miss(verifier);
+            self.record_negative_key(key, false);
             return;
         }
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner.prune_expired(now);
-        inner.negative.remove(&verifier);
+        inner.negative.remove(&key);
         let generation = inner.next_generation();
         inner.positive.insert(
-            verifier,
+            key,
             PositiveEntry {
                 expires_at: now + valid_for,
                 generation,
                 authority,
             },
         );
-        inner.positive_order.push_back((verifier, generation));
+        inner.positive_order.push_back((key, generation));
         inner.trim_positive(self.positive_capacity);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_miss(&self, verifier: SessionVerifier) {
-        self.record_negative(verifier, false);
+        self.record_negative_key(SessionLookupCacheKey::local(verifier), false);
     }
 
+    pub(crate) fn record_miss_for_origin(
+        &self,
+        verifier: SessionVerifier,
+        origin: &SessionLookupOriginAuthority,
+    ) {
+        self.record_negative_key(SessionLookupCacheKey::new(verifier, origin), false);
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_confirmed_absence(&self, verifier: SessionVerifier) {
-        self.record_negative(verifier, true);
+        self.record_negative_key(SessionLookupCacheKey::local(verifier), true);
+    }
+
+    pub(crate) fn record_confirmed_absence_for_origin(
+        &self,
+        verifier: SessionVerifier,
+        origin: &SessionLookupOriginAuthority,
+    ) {
+        self.record_negative_key(SessionLookupCacheKey::new(verifier, origin), true);
     }
 
     #[cfg(test)]
@@ -691,26 +1120,26 @@ impl SessionLookupAdmission {
         inner.positive_order.clear();
     }
 
-    fn record_negative(&self, verifier: SessionVerifier, confirmed_absent: bool) {
+    fn record_negative_key(&self, key: SessionLookupCacheKey, confirmed_absent: bool) {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner.prune_expired(now);
-        inner.positive.remove(&verifier);
-        if let Some(existing) = inner.negative.get(&verifier) {
+        inner.positive.remove(&key);
+        if let Some(existing) = inner.negative.get(&key) {
             if existing.expires_at > now && (existing.confirmed_absent || !confirmed_absent) {
                 return;
             }
         }
         let generation = inner.next_generation();
         inner.negative.insert(
-            verifier,
+            key,
             NegativeEntry {
                 expires_at: now + self.negative_ttl,
                 generation,
                 confirmed_absent,
             },
         );
-        inner.negative_order.push_back((verifier, generation));
+        inner.negative_order.push_back((key, generation));
         inner.trim_negative(self.negative_capacity);
     }
 
@@ -918,13 +1347,25 @@ fn verifier_from_slice(verifier: &[u8]) -> Option<SessionVerifier> {
     verifier.try_into().ok()
 }
 
+#[cfg(not(test))]
+fn global_origin_authority() -> Result<SessionLookupOriginAuthority, &'static str> {
+    let runtime = crate::config_store::get_api_authenticator_runtime();
+    SessionLookupOriginAuthority::from_runtime(&runtime)
+}
+
+#[cfg(test)]
+fn global_origin_authority() -> Result<SessionLookupOriginAuthority, &'static str> {
+    Ok(SessionLookupOriginAuthority::local_fixture())
+}
+
 pub(crate) fn register_positive_global(
     verifier: &[u8],
     valid_for: Duration,
     authority: SessionAuthorityCacheBinding,
 ) {
-    if let Some(verifier) = verifier_from_slice(verifier) {
-        global_admission().record_hit(verifier, valid_for, authority);
+    if let (Some(verifier), Ok(origin)) = (verifier_from_slice(verifier), global_origin_authority())
+    {
+        global_admission().record_hit_for_origin(verifier, &origin, valid_for, authority);
     }
 }
 
@@ -933,8 +1374,9 @@ pub(crate) fn clear_positive_global() {
 }
 
 pub(crate) fn mark_negative_global(verifier: &[u8]) {
-    if let Some(verifier) = verifier_from_slice(verifier) {
-        global_admission().record_confirmed_absence(verifier);
+    if let (Some(verifier), Ok(origin)) = (verifier_from_slice(verifier), global_origin_authority())
+    {
+        global_admission().record_confirmed_absence_for_origin(verifier, &origin);
     }
 }
 
@@ -943,21 +1385,33 @@ pub(crate) struct PrewarmReport {
     pub truncated: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionLookupPrewarmError {
+    #[error("persisted-session origin authority is invalid: {0}")]
+    InvalidOrigin(&'static str),
+    #[error("persisted-session prewarm database operation failed")]
+    Database(#[from] sqlx::Error),
+}
+
 /// Bounded restart prewarm. Only sessions whose exact principal, key, and link
-/// generations are still active are considered. Provider tombstones and a
-/// configuration mismatch fail closed. The SQL reads one extra row solely to
-/// make capacity truncation observable.
+/// generations are still active are considered. Provider tombstones and any
+/// mismatch against the retained browser origin's D/P/Q/R/path preimage fail
+/// closed. The SQL reads one extra row solely to make capacity truncation
+/// observable.
 pub(crate) async fn prewarm(
     pool: &PgPool,
-    config: &RyukiConfig,
-) -> Result<PrewarmReport, sqlx::Error> {
+    runtime: &Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+) -> Result<PrewarmReport, SessionLookupPrewarmError> {
+    let origin = SessionLookupOriginAuthority::from_runtime(runtime)
+        .map_err(SessionLookupPrewarmError::InvalidOrigin)?;
     let admission = global_admission();
     let prewarm_limit = admission
         .positive_capacity
         .saturating_add(admission.prewarm_lookahead_rows);
-    let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
+    let browser = origin.browser_binding();
     let rows = sqlx::query_as::<_, (Vec<u8>, DateTime<Utc>, Uuid, i64, i64, Uuid, i64, Uuid, i64)>(
-        "SELECT s.bearer_verifier, s.expires_at, s.principal_id, \
+        "SELECT s.session_bearer_verifier_v3 AS bearer_verifier, \
+                s.expires_at, s.principal_id, \
                 s.principal_lifecycle_version, s.principal_authority_version, \
                 s.principal_key_id, s.principal_key_version, \
                 s.principal_link_id, s.principal_link_version \
@@ -974,6 +1428,12 @@ pub(crate) async fn prewarm(
           AND l.link_version = s.principal_link_version \
           AND l.principal_key_id = s.principal_key_id \
           AND l.principal_id = s.principal_id \
+         LEFT JOIN authenticator_authority_generations registered_origin \
+           ON registered_origin.authenticator_origin_binding_digest = \
+              s.authenticator_origin_binding_digest \
+         LEFT JOIN authenticator_authority_current_paths current_browser \
+           ON current_browser.provider_id = registered_origin.provider_id \
+          AND current_browser.path_kind = 'browser-derived-session' \
          WHERE s.expires_at > NOW() \
            AND p.principal_kind = 'human' \
            AND p.lifecycle_state = 'active' \
@@ -984,19 +1444,55 @@ pub(crate) async fn prewarm(
              WHERE pt.provider_id = k.provider_id \
            ) \
            AND ( \
-             ($1 = 'local' AND k.provider_id = 'local' AND k.issuer = $2) \
-             OR ($1 = 'entra-id' AND ( \
-               (k.provider_id = 'entra-id' AND k.issuer = $3) \
-               OR ($4 AND k.provider_id = 'oidc' AND k.issuer = $5) \
-             )) \
+             ($1 AND s.authenticator_origin_binding_digest IS NULL \
+                 AND registered_origin.authenticator_origin_binding_digest IS NULL \
+                 AND current_browser.current_origin_binding_digest IS NULL \
+                 AND k.provider_id = 'local' AND k.issuer = $2) \
+             OR ($3::BYTEA IS NOT NULL \
+                 AND s.authenticator_origin_binding_digest = $3 \
+                 AND registered_origin.authenticator_origin_binding_digest = $3 \
+                 AND current_browser.path_status = 'active' \
+                 AND current_browser.current_origin_binding_digest = $3 \
+                 AND registered_origin.deployment_id = $4 \
+                 AND registered_origin.trust_domain_id = $5 \
+                 AND registered_origin.tenant_id IS NOT DISTINCT FROM $6 \
+                 AND registered_origin.provider_id = $7 \
+                 AND k.provider_id = registered_origin.provider_id \
+                 AND registered_origin.provider_configuration_version = $8 \
+                 AND registered_origin.provider_configuration_payload_digest = $9 \
+                 AND registered_origin.provider_lifecycle_record_version = $10 \
+                 AND registered_origin.provider_lifecycle_state = 'active' \
+                 AND registered_origin.binding_document_id = $11 \
+                 AND registered_origin.binding_document_version = $12 \
+                 AND registered_origin.binding_document_digest = $13 \
+                 AND registered_origin.binding_document_locator = $14 \
+                 AND registered_origin.provider_policy_binding_digest = $15 \
+                 AND registered_origin.runtime_binding_digest = $16 \
+                 AND registered_origin.path_id = $17 \
+                 AND registered_origin.path_version = $18 \
+                 AND registered_origin.path_kind = $19) \
            ) \
-         ORDER BY s.created_at DESC LIMIT $6",
+         ORDER BY s.created_at DESC LIMIT $20",
     )
-    .bind(config.auth_mode.as_str())
+    .bind(origin.is_local())
     .bind(crate::identity_authority::LOCAL_ISSUER)
-    .bind(entra_issuer)
-    .bind(config.oidc.enabled)
-    .bind(&config.oidc.issuer)
+    .bind(browser.map(|binding| binding.origin_binding_digest.as_slice()))
+    .bind(browser.map(|binding| binding.deployment_id.as_str()))
+    .bind(browser.map(|binding| binding.trust_domain_id.as_str()))
+    .bind(browser.and_then(|binding| binding.tenant_id.as_deref()))
+    .bind(browser.map(|binding| binding.provider_id.as_str()))
+    .bind(browser.map(|binding| binding.provider_configuration_version))
+    .bind(browser.map(|binding| binding.provider_configuration_payload_digest.as_slice()))
+    .bind(browser.map(|binding| binding.provider_lifecycle_record_version))
+    .bind(browser.map(|binding| binding.binding_document_id.as_str()))
+    .bind(browser.map(|binding| binding.binding_document_version))
+    .bind(browser.map(|binding| binding.binding_document_digest.as_slice()))
+    .bind(browser.map(|binding| binding.binding_document_locator.as_str()))
+    .bind(browser.map(|binding| binding.provider_policy_binding_digest.as_slice()))
+    .bind(browser.map(|binding| binding.runtime_binding_digest.as_slice()))
+    .bind(browser.map(|binding| binding.path_id.as_str()))
+    .bind(browser.map(|binding| binding.path_version))
+    .bind(browser.map(|binding| binding.path_kind))
     .bind(i64::try_from(prewarm_limit).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await?;
@@ -1027,8 +1523,9 @@ pub(crate) async fn prewarm(
         let Ok(principal_id) = PrincipalId::from_uuid(principal_id) else {
             continue;
         };
-        admission.record_hit(
+        admission.record_hit_for_origin(
             verifier,
+            &origin,
             valid_for,
             SessionAuthorityCacheBinding {
                 principal_id,
@@ -1152,12 +1649,18 @@ pub(crate) async fn session_lookup_admission_middleware(
         Ok(verifier) => verifier,
         Err(_) => return next.run(request).await,
     };
+    let origin = match SessionLookupOriginAuthority::from_runtime(&state.authenticator_runtime) {
+        Ok(origin) => origin,
+        Err(_) => return lookup_capacity_response(),
+    };
 
     let logout = is_logout_path(request.uri().path());
     let decision = if logout {
-        state.admission.try_admit_revocation(verifier)
+        state
+            .admission
+            .try_admit_revocation_for_origin(verifier, &origin)
     } else {
-        state.admission.try_admit(verifier)
+        state.admission.try_admit_for_origin(verifier, &origin)
     };
     match decision {
         SessionLookupDecision::KnownPositive(authority) => {
@@ -1165,6 +1668,7 @@ pub(crate) async fn session_lookup_admission_middleware(
                 .extensions_mut()
                 .insert(SessionLookupAdmissionProof {
                     verifier,
+                    origin_partition: origin.partition,
                     authority,
                 });
             next.run(request).await
@@ -1174,6 +1678,7 @@ pub(crate) async fn session_lookup_admission_middleware(
                 .extensions_mut()
                 .insert(SessionLookupAdmissionProof {
                     verifier,
+                    origin_partition: origin.partition,
                     authority: None,
                 });
             let response = next.run(request).await;
@@ -1480,6 +1985,24 @@ mod tests {
     }
 
     #[test]
+    fn positive_admission_is_partitioned_by_exact_browser_origin_digest() {
+        let admission = SessionLookupAdmission::for_tests(8, 8, 2, 8);
+        let origin_a = SessionLookupOriginAuthority::browser_fixture("origin-a");
+        let origin_b = SessionLookupOriginAuthority::browser_fixture("origin-b");
+        let verifier = verifier(41);
+        admission.record_hit_for_origin(verifier, &origin_a, Duration::from_secs(60), authority(9));
+
+        assert!(matches!(
+            admission.try_admit_for_origin(verifier, &origin_a),
+            SessionLookupDecision::KnownPositive(Some(_))
+        ));
+        assert!(matches!(
+            admission.try_admit_for_origin(verifier, &origin_b),
+            SessionLookupDecision::Unknown(_)
+        ));
+    }
+
+    #[test]
     fn repeated_confirmed_miss_never_consumes_a_second_budget_slot() {
         let admission = SessionLookupAdmission::for_tests(4, 4, 1, 1);
         let candidate = verifier(1);
@@ -1681,5 +2204,38 @@ mod tests {
             include_str!("session_lookup_admission.rs").contains("try_acquire_owned()"),
             "unknown lookup admission must never await capacity"
         );
+    }
+
+    #[test]
+    fn live_session_paths_require_the_durable_current_origin_pointer() {
+        let main = include_str!("main.rs");
+        let admission = include_str!("session_lookup_admission.rs");
+        let request_authority = include_str!("request_authority.rs");
+        let principal_registry = include_str!("principal_registry.rs");
+        let migration =
+            include_str!("../../../migrations/201_authenticator_runtime_provenance.sql");
+        let current_paths = ["authenticator_authority_current", "_paths"].concat();
+        let active_browser = ["current_browser.path_status", " = 'active'"].concat();
+        let authority_reader = ["prepare_authority_", "reader(tx, principal).await?"].concat();
+        let shared_advisory_lock = ["pg_advisory_xact_", "lock_shared"].concat();
+        let provider_lock_key = ["principal_registry_provider_", "lock_key"].concat();
+
+        assert!(main.contains(current_paths.as_str()));
+        assert!(admission.contains(current_paths.as_str()));
+        assert!(request_authority.matches(current_paths.as_str()).count() >= 2);
+        assert!(main.contains(active_browser.as_str()));
+        assert!(admission.contains(active_browser.as_str()));
+        assert!(request_authority.contains(active_browser.as_str()));
+        assert!(request_authority.matches(authority_reader.as_str()).count() >= 2);
+        assert!(principal_registry.contains(shared_advisory_lock.as_str()));
+        assert!(principal_registry.contains(provider_lock_key.as_str()));
+        assert!(migration.contains(provider_lock_key.as_str()));
+
+        let legacy_current = ["reconcile_current_browser_authenticator", "_origin"].concat();
+        let legacy_disabled = ["reconcile_disabled_browser", "_authenticator"].concat();
+        let atomic_runtime = ["reconcile_current_authenticator", "_runtime"].concat();
+        assert!(!main.contains(legacy_current.as_str()));
+        assert!(!main.contains(legacy_disabled.as_str()));
+        assert!(main.contains(atomic_runtime.as_str()));
     }
 }

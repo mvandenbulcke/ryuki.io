@@ -107,12 +107,12 @@ fn resolve_auth_metadata(header: Option<&str>, provider_mode: &'static str) -> A
 async fn resolve_request_session(
     auth_mode: AuthMode,
     auth_header: Option<&str>,
-    validator: Option<&EntraTokenValidator>,
+    validator: Option<&Arc<EntraTokenValidator>>,
 ) -> (
     AuthSession,
     Option<&'static str>,
     Option<crate::request_authority::DirectFederatedCredential>,
-    Option<String>,
+    Option<crate::entra_auth::VerifiedEntraBearerIdentity>,
 ) {
     match auth_mode {
         AuthMode::MockDryRun | AuthMode::StaticDryRun => {
@@ -139,7 +139,7 @@ async fn resolve_request_session(
                         outcome.session,
                         outcome.failure_reason,
                         outcome.request_read_credential,
-                        outcome.external_subject,
+                        outcome.verified_identity,
                     )
                 }
                 None => (
@@ -166,7 +166,7 @@ async fn resolve_request_session(
 async fn auth_session_for_request(
     auth_mode: AuthMode,
     auth_header: Option<&str>,
-    validator: &EntraTokenValidator,
+    validator: &Arc<EntraTokenValidator>,
 ) -> AuthSession {
     resolve_request_session(auth_mode, auth_header, Some(validator))
         .await
@@ -195,6 +195,48 @@ struct DbAuthSessionRow {
     site_scope: Vec<String>,
     environment_authority_mode: String,
     environment_scope: Vec<String>,
+    authenticator_origin_binding_digest: Option<Vec<u8>>,
+    registered_origin_binding_digest: Option<Vec<u8>>,
+    current_origin_binding_digest: Option<Vec<u8>>,
+}
+
+fn session_row_matches_origin(
+    row: &DbAuthSessionRow,
+    origin: &crate::session_lookup_admission::SessionLookupOriginAuthority,
+) -> bool {
+    use subtle::ConstantTimeEq;
+
+    match origin.origin_binding_digest() {
+        None if origin.is_local() => {
+            row.authenticator_origin_binding_digest.is_none()
+                && row.registered_origin_binding_digest.is_none()
+                && row.current_origin_binding_digest.is_none()
+        }
+        Some(expected) => {
+            let session_matches = row
+                .authenticator_origin_binding_digest
+                .as_deref()
+                .is_some_and(|actual| {
+                    actual.len() == expected.len() && bool::from(actual.ct_eq(expected.as_slice()))
+                });
+            let registered_matches =
+                row.registered_origin_binding_digest
+                    .as_deref()
+                    .is_some_and(|actual| {
+                        actual.len() == expected.len()
+                            && bool::from(actual.ct_eq(expected.as_slice()))
+                    });
+            let current_matches =
+                row.current_origin_binding_digest
+                    .as_deref()
+                    .is_some_and(|actual| {
+                        actual.len() == expected.len()
+                            && bool::from(actual.ct_eq(expected.as_slice()))
+                    });
+            session_matches && registered_matches && current_matches
+        }
+        None => false,
+    }
 }
 
 fn authority_context_from_db_row(
@@ -278,6 +320,7 @@ fn persisted_request_read_authority(
     session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
     session: &AuthSession,
     authority: &crate::human_authority::InteractiveHumanAuthorityContext,
+    origin: &crate::session_lookup_admission::SessionLookupOriginAuthority,
 ) -> Result<
     crate::request_authority::RequestReadAuthority,
     crate::request_authority::RequestAuthorityError,
@@ -298,7 +341,7 @@ fn persisted_request_read_authority(
     let principal_key_version = row.principal_key_version.to_be_bytes();
     let principal_link_version = row.principal_link_version.to_be_bytes();
     let identity_authority_digest = request_read_digest(
-        b"ryuki-request-read-principal-binding-v1",
+        b"ryuki-request-read-principal-binding-v2",
         &[
             row.principal_id.as_bytes(),
             &principal_lifecycle_version,
@@ -310,6 +353,10 @@ fn persisted_request_read_authority(
             row.provider_id.as_bytes(),
             row.issuer.as_bytes(),
             row.subject.as_bytes(),
+            origin
+                .origin_binding_digest()
+                .map(|digest| digest.as_slice())
+                .unwrap_or(&[]),
         ],
     );
     // A persisted federated session is minted only after a fresh provider
@@ -383,6 +430,7 @@ fn persisted_request_read_authority(
     let credential = PersistedSessionCredential::new(
         row.session_record_id,
         bearer_verifier,
+        origin.browser_binding().cloned(),
         row.created_at,
         window,
         digests,
@@ -395,26 +443,49 @@ fn persisted_request_read_authority(
 fn direct_request_read_authority(
     admitted: &crate::identity_authority::AdmittedFederatedBearer,
     credential: crate::request_authority::DirectFederatedCredential,
-    config: &RyukiConfig,
-    session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
 ) -> Result<
     crate::request_authority::RequestReadAuthority,
     crate::request_authority::RequestAuthorityError,
 > {
     use crate::request_authority::{InteractiveRequestReadPrincipal, RequestAuthorityError};
 
-    let staleness = i64::try_from(session_credentials.federated_authority_max_staleness_seconds())
-        .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
+    let staleness = i64::try_from(
+        admitted
+            .authenticator_origin
+            .federated_authority_max_staleness_seconds()
+            .map_err(|_| RequestAuthorityError::InvalidBinding("direct bearer origin"))?,
+    )
+    .map_err(|_| RequestAuthorityError::InvalidBinding("federated freshness bound"))?;
     let identity_fresh_until = admitted
         .identity_last_asserted_at
         .checked_add_signed(chrono::Duration::seconds(staleness))
         .ok_or(RequestAuthorityError::InvalidBinding(
             "federated freshness bound overflow",
         ))?;
+    admitted
+        .authenticator_origin
+        .verify_integrity()
+        .map_err(|_| RequestAuthorityError::InvalidBinding("direct bearer origin"))?;
+    if admitted.authenticator_origin.provider_id() != admitted.authority.provider
+        || !admitted
+            .authenticator_origin
+            .matches_validated_issuer(&admitted.authority.issuer)
+    {
+        return Err(RequestAuthorityError::InvalidBinding(
+            "direct bearer origin provenance",
+        ));
+    }
+    let identity_authority_digest = request_read_digest(
+        b"ryuki-request-read-direct-identity-authority-v2",
+        &[
+            &admitted.identity_authority_digest,
+            admitted.authenticator_origin.origin_binding_digest_bytes(),
+        ],
+    );
     let principal = InteractiveRequestReadPrincipal::new(
         &admitted.session,
         &admitted.authority,
-        admitted.identity_authority_digest,
+        identity_authority_digest,
         Some(admitted.identity_last_asserted_at),
         Some(identity_fresh_until),
     )?;
@@ -422,7 +493,10 @@ fn direct_request_read_authority(
         .ok_or(RequestAuthorityError::InvalidBinding(
             "security-contract context is unavailable",
         ))?
-        .request_read_security_namespace(&config.auth_mode, &admitted.authority.provider)
+        .request_read_security_namespace(
+            &AuthMode::EntraId,
+            admitted.authenticator_origin.provider_id(),
+        )
         .map_err(|reason| {
             tracing::warn!(
                 reason,
@@ -431,7 +505,10 @@ fn direct_request_read_authority(
             RequestAuthorityError::InvalidBinding("security-contract namespace")
         })?;
     crate::request_authority::RequestReadAuthority::from_direct_federated(
-        namespace, principal, credential,
+        namespace,
+        principal,
+        credential,
+        Arc::clone(&admitted.authenticator_origin),
     )
 }
 
@@ -781,6 +858,10 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
             &config.session,
         )
         .expect("test config must construct session credential runtime");
+    let origin_authority =
+        crate::session_lookup_admission::SessionLookupOriginAuthority::for_test_auth_mode(
+            &config.auth_mode,
+        );
     auth_session_from_persisted_session_with_authority_admission(
         headers,
         auth_header,
@@ -789,6 +870,7 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
         proof,
         &session_parser,
         session_credentials.as_ref(),
+        &origin_authority,
     )
     .await
     .map(|(session, source, _authority, _request_read)| (session, source))
@@ -812,6 +894,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
     session_parser: &cookie_runtime::ApiSessionAuthParser,
     session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
+    origin_authority: &crate::session_lookup_admission::SessionLookupOriginAuthority,
 ) -> Option<(
     AuthSession,
     SessionIdSource,
@@ -885,7 +968,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
         }
     };
     let mut cached_authority = None;
-    let _lookup_guard = match admission.admit_for_resolver(verifier, proof) {
+    let _lookup_guard = match admission.admit_for_resolver(verifier, origin_authority, proof) {
         crate::session_lookup_admission::SessionLookupDecision::KnownPositive(authority) => {
             cached_authority = authority;
             None
@@ -908,23 +991,34 @@ async fn auth_session_from_persisted_session_with_authority_admission(
             ));
         }
     };
-    // Each interactive auth mode honors ONLY the sessions minted by its own
-    // login flow, and every non-local authority assertion must remain within
-    // the configured freshness bound. A stale session from a previous mode or
-    // a delayed provider lifecycle feed therefore fails closed. Local mode →
-    // local sessions; Entra mode → the
-    // cryptographically-validated SSO providers ('entra-id', and the generic
-    // 'oidc' flow that shares its validator) — never a mock/dry-run/local
-    // session, which would otherwise let a leftover admin cookie in.
-    let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
+    // The disabled browser namespace never admits a persisted session. Local
+    // sessions retain NULL provenance; federated sessions must join the exact
+    // append-only origin generation derived from the retained runtime Arc.
+    if !origin_authority.permits_persisted_sessions() {
+        admission.record_miss_for_origin(verifier, origin_authority);
+        return Some((
+            unverified_session("browser-session-auth-disabled"),
+            source,
+            None,
+            None,
+        ));
+    }
+    let browser_origin = origin_authority.browser_binding();
     let query = "SELECT s.session_record_id, s.principal_id, \
                 s.principal_lifecycle_version, s.principal_authority_version, \
                 s.principal_key_id, s.principal_key_version, \
                 s.principal_link_id, s.principal_link_version, \
-                s.display_name, s.roles, s.bearer_verifier, s.expires_at, s.created_at, \
+                s.display_name, s.roles, \
+                s.session_bearer_verifier_v3 AS bearer_verifier, \
+                s.expires_at, s.created_at, \
                 k.provider_id, k.issuer, k.subject, \
                 s.site_authority_mode, s.site_scope, \
-                s.environment_authority_mode, s.environment_scope \
+                s.environment_authority_mode, s.environment_scope, \
+                s.authenticator_origin_binding_digest, \
+                registered_origin.authenticator_origin_binding_digest \
+                    AS registered_origin_binding_digest, \
+                current_browser.current_origin_binding_digest \
+                    AS current_origin_binding_digest \
          FROM sessions s \
          JOIN principal_keys k \
            ON k.principal_key_id = s.principal_key_id \
@@ -942,7 +1036,13 @@ async fn auth_session_from_persisted_session_with_authority_admission(
           AND p.authority_version = s.principal_authority_version \
           AND p.lifecycle_state = 'active' \
           AND p.principal_kind = 'human' \
-         WHERE s.bearer_verifier = $1 AND s.expires_at > NOW() \
+         LEFT JOIN authenticator_authority_generations registered_origin \
+           ON registered_origin.authenticator_origin_binding_digest = \
+              s.authenticator_origin_binding_digest \
+         LEFT JOIN authenticator_authority_current_paths current_browser \
+           ON current_browser.provider_id = registered_origin.provider_id \
+          AND current_browser.path_kind = 'browser-derived-session' \
+         WHERE s.session_bearer_verifier_v3 = $1 AND s.expires_at > NOW() \
            AND cardinality(s.roles) > 0 \
            AND s.roles <@ p.role_allowlist \
            AND NOT EXISTS ( \
@@ -959,21 +1059,60 @@ async fn auth_session_from_persisted_session_with_authority_admission(
            AND (k.provider_id = 'local' OR \
                 s.created_at >= NOW() - make_interval(secs => $2)) \
            AND ( \
-             ($3 = 'local' AND k.provider_id = 'local' AND k.issuer = $4) \
-             OR ($3 = 'entra-id' AND ( \
-               (k.provider_id = 'entra-id' AND k.issuer = $5) \
-               OR ($6 AND k.provider_id = 'oidc' AND k.issuer = $7) \
-             )) \
+             ($3 AND s.authenticator_origin_binding_digest IS NULL \
+                 AND registered_origin.authenticator_origin_binding_digest IS NULL \
+                 AND current_browser.current_origin_binding_digest IS NULL \
+                 AND k.provider_id = 'local' AND k.issuer = $4) \
+             OR ($5::BYTEA IS NOT NULL \
+                 AND s.authenticator_origin_binding_digest = $5 \
+                 AND registered_origin.authenticator_origin_binding_digest = $5 \
+                 AND current_browser.path_status = 'active' \
+                 AND current_browser.current_origin_binding_digest = $5 \
+                 AND registered_origin.deployment_id = $6 \
+                 AND registered_origin.trust_domain_id = $7 \
+                 AND registered_origin.tenant_id IS NOT DISTINCT FROM $8 \
+                 AND registered_origin.provider_id = $9 \
+                 AND k.provider_id = registered_origin.provider_id \
+                 AND registered_origin.provider_configuration_version = $10 \
+                 AND registered_origin.provider_configuration_payload_digest = $11 \
+                 AND registered_origin.provider_lifecycle_record_version = $12 \
+                 AND registered_origin.provider_lifecycle_state = 'active' \
+                 AND registered_origin.binding_document_id = $13 \
+                 AND registered_origin.binding_document_version = $14 \
+                 AND registered_origin.binding_document_digest = $15 \
+                 AND registered_origin.binding_document_locator = $16 \
+                 AND registered_origin.provider_policy_binding_digest = $17 \
+                 AND registered_origin.runtime_binding_digest = $18 \
+                 AND registered_origin.path_id = $19 \
+                 AND registered_origin.path_version = $20 \
+                 AND registered_origin.path_kind = $21) \
            )";
     let lookup_observation = admission.start_database_lookup();
     let lookup_result = sqlx::query_as::<_, DbAuthSessionRow>(query)
         .bind(verifier.as_slice())
         .bind(session_credentials.federated_authority_max_staleness_seconds() as f64)
-        .bind(auth_mode.as_str())
+        .bind(origin_authority.is_local())
         .bind(crate::identity_authority::LOCAL_ISSUER)
-        .bind(entra_issuer)
-        .bind(config.oidc.enabled)
-        .bind(&config.oidc.issuer)
+        .bind(browser_origin.map(|binding| binding.origin_binding_digest().as_slice()))
+        .bind(browser_origin.map(|binding| binding.deployment_id()))
+        .bind(browser_origin.map(|binding| binding.trust_domain_id()))
+        .bind(browser_origin.and_then(|binding| binding.tenant_id()))
+        .bind(browser_origin.map(|binding| binding.provider_id()))
+        .bind(browser_origin.map(|binding| binding.provider_configuration_version()))
+        .bind(
+            browser_origin
+                .map(|binding| binding.provider_configuration_payload_digest().as_slice()),
+        )
+        .bind(browser_origin.map(|binding| binding.provider_lifecycle_record_version()))
+        .bind(browser_origin.map(|binding| binding.binding_document_id()))
+        .bind(browser_origin.map(|binding| binding.binding_document_version()))
+        .bind(browser_origin.map(|binding| binding.binding_document_digest().as_slice()))
+        .bind(browser_origin.map(|binding| binding.binding_document_locator()))
+        .bind(browser_origin.map(|binding| binding.provider_policy_binding_digest().as_slice()))
+        .bind(browser_origin.map(|binding| binding.runtime_binding_digest().as_slice()))
+        .bind(browser_origin.map(|binding| binding.path_id()))
+        .bind(browser_origin.map(|binding| binding.path_version()))
+        .bind(browser_origin.map(|binding| binding.path_kind()))
         .fetch_optional(pool)
         .await;
     let lookup_outcome = match &lookup_result {
@@ -985,7 +1124,9 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     match lookup_result {
         Ok(Some(row)) => {
             use subtle::ConstantTimeEq;
-            if bool::from(verifier.as_slice().ct_eq(row.bearer_verifier.as_slice())) {
+            if bool::from(verifier.as_slice().ct_eq(row.bearer_verifier.as_slice()))
+                && session_row_matches_origin(&row, origin_authority)
+            {
                 let authority_binding =
                     crate::session_lookup_admission::SessionAuthorityCacheBinding {
                         principal_id: PrincipalId::from_uuid(row.principal_id).ok()?,
@@ -1010,9 +1151,14 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                 let valid_for = (row.expires_at - chrono::Utc::now())
                     .to_std()
                     .unwrap_or(Duration::ZERO);
-                admission.record_hit(verifier, valid_for, authority_binding);
+                admission.record_hit_for_origin(
+                    verifier,
+                    origin_authority,
+                    valid_for,
+                    authority_binding,
+                );
                 let Some(authority) = authority_context_from_db_row(&row) else {
-                    admission.record_miss(verifier);
+                    admission.record_miss_for_origin(verifier, origin_authority);
                     return Some((
                         unverified_session("session-authority-shape-invalid"),
                         source,
@@ -1021,7 +1167,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                     ));
                 };
                 let Some(admitted_session) = session_from_db_row(&row) else {
-                    admission.record_miss(verifier);
+                    admission.record_miss_for_origin(verifier, origin_authority);
                     return Some((
                         unverified_session("session-principal-id-invalid"),
                         source,
@@ -1035,6 +1181,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                     session_credentials,
                     &admitted_session,
                     &authority,
+                    origin_authority,
                 ) {
                     Ok(authority) => Some(authority),
                     Err(error) => {
@@ -1044,7 +1191,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                 };
                 Some((admitted_session, source, Some(authority), request_read))
             } else {
-                admission.record_miss(verifier);
+                admission.record_miss_for_origin(verifier, origin_authority);
                 Some((
                     unverified_session("session-verifier-mismatch"),
                     source,
@@ -1054,7 +1201,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
             }
         }
         Ok(None) => {
-            admission.record_miss(verifier);
+            admission.record_miss_for_origin(verifier, origin_authority);
             Some((unverified_session("session-not-found"), source, None, None))
         }
         Err(error) => {
@@ -1134,6 +1281,40 @@ fn is_auth_exempt_path(path: &str) -> bool {
             | "/api/auth/entra/authorize-url"
             | "/api/auth/entra/callback"
     )
+}
+
+/// Preserve the explicit, permanent 400 response for Entra browser endpoints
+/// when this process has no sealed browser handler authority. A deployment
+/// with a declared browser path is rejected during startup; this middleware is
+/// therefore reachable only for non-Entra mode or an intentionally disabled
+/// Entra browser path and never fabricates dependencies or origin provenance.
+async fn unavailable_entra_browser_routes(
+    request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    if !matches!(
+        request.uri().path(),
+        "/api/auth/entra/authorize-url" | "/api/auth/entra/callback"
+    ) {
+        return next.run(request).await;
+    }
+    let config = crate::config_store::get_app_config();
+    let (error, message) = if config.auth_mode == AuthMode::EntraId {
+        (
+            "ENTRA_SSO_NOT_CONFIGURED",
+            "Entra ID SSO is not fully configured (tenant id, client id, and redirect URI are required)",
+        )
+    } else {
+        (
+            "ENTRA_AUTH_DISABLED",
+            "Entra ID sign-in requires auth_mode entra-id",
+        )
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": error, "message": message })),
+    )
+        .into_response()
 }
 
 fn auth_session_allows_unsafe_method(session: &AuthSession) -> bool {
@@ -2072,6 +2253,16 @@ async fn auth_middleware(
         .extensions()
         .get::<crate::session_lookup_admission::SessionLookupAdmissionProof>()
         .copied();
+    let session_origin_authority =
+        match crate::session_lookup_admission::SessionLookupOriginAuthority::from_runtime(
+            &authenticator_runtime,
+        ) {
+            Ok(authority) => authority,
+            Err(reason) => {
+                tracing::error!(reason, "persisted-session origin authority is unavailable");
+                return auth_required_response();
+            }
+        };
 
     // Logout owns its caller-credential delete/audit transaction in the
     // handler and is auth-exempt specifically so expired sessions can be
@@ -2096,6 +2287,7 @@ async fn auth_middleware(
                 lookup_proof,
                 &session_auth_parser,
                 session_credentials.as_ref(),
+                &session_origin_authority,
             )
             .await
             {
@@ -2104,11 +2296,11 @@ async fn auth_middleware(
                 }
                 None => {
                     let entra_bearer_validator = authenticator_runtime.entra_bearer_validator();
-                    let (validated, reason, direct_credential, external_subject) =
+                    let (validated, reason, direct_credential, verified_identity) =
                         resolve_request_session(
                             auth_mode.clone(),
                             auth_header,
-                            entra_bearer_validator.as_deref(),
+                            entra_bearer_validator.as_ref(),
                         )
                         .await;
                     if auth_mode == AuthMode::EntraId
@@ -2130,39 +2322,39 @@ async fn auth_middleware(
                             None,
                         )
                     } else if auth_mode == AuthMode::EntraId && validated.token_valid {
-                        let normalized = if let (Some(pool), Some(external_subject)) =
-                            (crate::database::get_db(), external_subject.as_deref())
+                        let verified_runtime_binding =
+                            authenticator_runtime.verified_entra_runtime_binding();
+                        let normalized = if authenticator_runtime
+                            .retains_verified_entra_runtime_binding(&verified_runtime_binding)
                         {
-                            crate::identity_authority::admit_federated_bearer(
-                                pool,
-                                "entra-id",
-                                &crate::identity_authority::configured_entra_issuer(app_config),
-                                external_subject,
-                                &validated.display_name,
-                                &validated.roles,
-                                validated.actor_class,
-                                session_credentials.as_ref(),
-                            )
-                            .await
+                            if let (Some(pool), Some(runtime_binding), Some(identity)) = (
+                                crate::database::get_db(),
+                                verified_runtime_binding.as_ref(),
+                                verified_identity.as_ref(),
+                            ) {
+                                crate::identity_authority::admit_federated_bearer(
+                                    pool,
+                                    runtime_binding,
+                                    identity,
+                                )
+                                .await
+                            } else {
+                                Err(crate::identity_authority::IdentityAuthorityError::AssertionRejected)
+                            }
                         } else {
                             Err(crate::identity_authority::IdentityAuthorityError::AssertionRejected)
                         };
                         match normalized {
                             Ok(admitted) => {
                                 let request_read = direct_credential.and_then(|credential| {
-                                match direct_request_read_authority(
-                                    &admitted,
-                                    credential,
-                                    app_config,
-                                    session_credentials.as_ref(),
-                                ) {
-                                    Ok(authority) => Some(authority),
-                                    Err(error) => {
-                                        tracing::warn!(reason = %error, "direct bearer has no request-read authority");
-                                        None
+                                    match direct_request_read_authority(&admitted, credential) {
+                                        Ok(authority) => Some(authority),
+                                        Err(error) => {
+                                            tracing::warn!(reason = %error, "direct bearer has no request-read authority");
+                                            None
+                                        }
                                     }
-                                }
-                            });
+                                });
                                 (
                                     admitted.session,
                                     None,
@@ -3593,39 +3785,29 @@ async fn main() {
             eprintln!("API cookie runtime binding failed: {error}");
             std::process::exit(1);
         });
-    let authenticator_bearer_limits_identity = if app_config.auth_mode == AuthMode::EntraId {
+    let entra_authenticator_authority_identity = if app_config.auth_mode == AuthMode::EntraId {
         Some(
             security_contract
-                .resolved_entra_bearer_limits()
+                .resolved_entra_authenticator_authority(!app_config.entra_redirect_uri.is_empty())
                 .unwrap_or_else(|error| {
-                    eprintln!("Entra bearer-limit authority admission failed: {error}");
+                    eprintln!("Entra authenticator authority admission failed: {error}");
                     std::process::exit(1);
                 }),
         )
     } else {
         None
     };
-    let authenticator_browser_limits_identity =
-        if app_config.auth_mode == AuthMode::EntraId && !app_config.entra_redirect_uri.is_empty() {
-            Some(
-                security_contract
-                    .resolved_entra_browser_limits()
-                    .unwrap_or_else(|error| {
-                        eprintln!("Entra browser-limit authority admission failed: {error}");
-                        std::process::exit(1);
-                    }),
-            )
-        } else {
-            None
-        };
+    let authenticator_bearer_limits_identity = entra_authenticator_authority_identity
+        .as_ref()
+        .map(|authority| Arc::clone(authority.bearer_limits()));
+    let authenticator_browser_limits_identity = entra_authenticator_authority_identity
+        .as_ref()
+        .and_then(|authority| authority.browser_limits().map(Arc::clone));
     let api_authenticator_runtime =
         authenticator_runtime::ApiAuthenticatorRuntime::from_admitted_config(
             &app_config,
             Arc::clone(&api_cookie_runtime),
-            authenticator_bearer_limits_identity
-                .as_ref()
-                .map(Arc::clone),
-            authenticator_browser_limits_identity
+            entra_authenticator_authority_identity
                 .as_ref()
                 .map(Arc::clone),
             security_contract.is_production(),
@@ -3642,17 +3824,31 @@ async fn main() {
                 std::process::exit(1);
             });
     }
+    security_contract
+        .verify_non_development_authenticator_runtime_guard(&api_authenticator_runtime)
+        .unwrap_or_else(|error| {
+            eprintln!("non-development authenticator runtime guard failed: {error}");
+            std::process::exit(1);
+        });
     let authenticator_observation_identity =
         Arc::clone(api_authenticator_runtime.operational_observation());
+    let retained_entra_authenticator_authority_identity =
+        api_authenticator_runtime.entra_authenticator_authority();
     let entra_bearer_validator_identity = api_authenticator_runtime.entra_bearer_validator();
     let entra_bearer_observation_identity = api_authenticator_runtime.entra_bearer_observation();
     let derived_session_credentials_identity =
         api_authenticator_runtime.derived_session_credentials();
     let derived_session_observation_identity =
         api_authenticator_runtime.derived_session_observation();
+    let verified_entra_runtime_binding_identity =
+        api_authenticator_runtime.verified_entra_runtime_binding();
+    let browser_authenticator_origin_identity =
+        api_authenticator_runtime.browser_authenticator_origin();
     let oidc_callback_dependencies_identity =
         api_authenticator_runtime.oidc_callback_dependencies();
     let entra_sso_dependencies_identity = api_authenticator_runtime.entra_sso_dependencies();
+    let entra_sso_handler_dependencies_identity =
+        api_authenticator_runtime.entra_sso_handler_dependencies();
     let local_login_throttle_identity = api_authenticator_runtime.local_login_throttle();
     security_contract
         .verify_secure_cookie_runtime_guard(&api_cookie_runtime)
@@ -3737,6 +3933,10 @@ async fn main() {
         || !api_authenticator_runtime_identity
             .retains_operational_observation(&authenticator_observation_identity)
         || !api_authenticator_runtime_identity
+            .retains_entra_authenticator_authority(&entra_authenticator_authority_identity)
+        || !api_authenticator_runtime_identity
+            .retains_entra_authenticator_authority(&retained_entra_authenticator_authority_identity)
+        || !api_authenticator_runtime_identity
             .retains_authenticator_bearer_limits(&authenticator_bearer_limits_identity)
         || !api_authenticator_runtime_identity
             .retains_authenticator_browser_limits(&authenticator_browser_limits_identity)
@@ -3750,6 +3950,10 @@ async fn main() {
         || !api_authenticator_runtime_identity
             .retains_derived_session_observation(&derived_session_observation_identity)
         || !api_authenticator_runtime_identity.remeasures_derived_session_observation()
+        || !api_authenticator_runtime_identity
+            .retains_verified_entra_runtime_binding(&verified_entra_runtime_binding_identity)
+        || !api_authenticator_runtime_identity
+            .retains_browser_authenticator_origin(&browser_authenticator_origin_identity)
         || !Arc::ptr_eq(
             &derived_session_credentials_identity,
             &config_store::get_derived_session_credentials(),
@@ -3758,6 +3962,8 @@ async fn main() {
             .retains_oidc_callback_dependencies(&oidc_callback_dependencies_identity)
         || !api_authenticator_runtime_identity
             .retains_entra_sso_dependencies(&entra_sso_dependencies_identity)
+        || !api_authenticator_runtime_identity
+            .retains_entra_sso_handler_dependencies(&entra_sso_handler_dependencies_identity)
         || !oidc_callback_dependencies_identity
             .retains_session_credentials(&derived_session_credentials_identity)
         || !oidc_callback_dependencies_identity.retains_cookie_runtime(&api_cookie_runtime_identity)
@@ -3771,6 +3977,31 @@ async fn main() {
     {
         eprintln!("API authenticator runtime identity changed during startup retention");
         std::process::exit(1);
+    }
+    let declared_entra_browser_path = entra_authenticator_authority_identity
+        .as_ref()
+        .is_some_and(|authority| authority.browser_path_id().is_some());
+    if declared_entra_browser_path != browser_authenticator_origin_identity.is_some()
+        || declared_entra_browser_path != entra_sso_handler_dependencies_identity.is_some()
+    {
+        eprintln!(
+            "Entra browser routes require one exact retained runtime, origin, and handler authority"
+        );
+        std::process::exit(1);
+    }
+    match (
+        app_config.auth_mode == AuthMode::EntraId,
+        verified_entra_runtime_binding_identity.is_some(),
+    ) {
+        (true, true) | (false, false) => {}
+        (true, false) => {
+            eprintln!("Entra startup has no sealed authenticator runtime R");
+            std::process::exit(1);
+        }
+        (false, true) => {
+            eprintln!("non-Entra startup retained an Entra authenticator runtime R");
+            std::process::exit(1);
+        }
     }
     let session_lookup_admission =
         crate::session_lookup_admission::initialize_global(app_config.server.pool_max_connections);
@@ -3938,8 +4169,9 @@ async fn main() {
     // Reconcile identity authority before serving any request. Local account
     // password/role/removal/rollback changes advance a monotonic epoch. When
     // Local mode is disabled, its complete authority namespace is revoked.
-    // Sessions for disabled providers or prior issuer/tenant configurations
-    // are deleted, so a later configuration rollback cannot resurrect them.
+    // Browser credentials are then reconciled by exact sealed authenticator
+    // origin rather than ambient issuer/tenant labels, so a configuration
+    // rollback cannot make an older D/P/Q/R/path generation current again.
     if let Some(pool) = crate::database::get_db() {
         let local_result = if app_config.auth_mode == AuthMode::Local {
             crate::identity_authority::reconcile_local_authorities(
@@ -3961,22 +4193,50 @@ async fn main() {
             tracing::error!(%error, "local identity-authority reconciliation failed");
             std::process::exit(1);
         }
-        match crate::identity_authority::reconcile_session_provider_admission(pool, &app_config)
-            .await
-        {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(
-                    removed,
-                    "sessions outside active provider admission removed"
-                )
+        // Entra advances bearer and browser current-path pointers atomically
+        // from one exact sealed R before any persisted-session prewarm or
+        // listener publication. Browser-disabled state is an explicit durable
+        // pointer anchored to that same bearer generation. Every non-Entra
+        // mode durably disables external provider pointers so an Entra-to-local
+        // rollback cannot leave a previous runtime active.
+        match (
+            app_config.auth_mode == AuthMode::EntraId,
+            verified_entra_runtime_binding_identity.as_ref(),
+        ) {
+            (true, Some(runtime_binding)) => {
+                if let Err(error) =
+                    crate::identity_authority::reconcile_current_authenticator_runtime(
+                        pool,
+                        runtime_binding,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "current authenticator runtime reconciliation failed");
+                    std::process::exit(1);
+                }
+                tracing::info!("current authenticator runtime reconciled");
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::error!(%error, "session provider-admission reconciliation failed");
+            (true, None) => {
+                tracing::error!("Entra startup has no sealed authenticator runtime R");
+                std::process::exit(1);
+            }
+            (false, None) => {
+                if let Err(error) =
+                    crate::identity_authority::disable_current_authenticator_runtimes(pool).await
+                {
+                    tracing::error!(%error, "external authenticator runtime disable failed");
+                    std::process::exit(1);
+                }
+                tracing::info!("external authenticator runtimes disabled");
+            }
+            (false, Some(_)) => {
+                tracing::error!("non-Entra startup retained an Entra authenticator runtime R");
                 std::process::exit(1);
             }
         }
-        match crate::session_lookup_admission::prewarm(pool, &app_config).await {
+        match crate::session_lookup_admission::prewarm(pool, &api_authenticator_runtime_identity)
+            .await
+        {
             Ok(report) => tracing::info!(
                 truncated = report.truncated,
                 "persisted-session lookup admission prewarmed"
@@ -4276,12 +4536,15 @@ async fn main() {
         .merge(human_gated_app)
         .fallback(not_found)
         .layer(Extension(local_login_throttle.clone()))
-        .layer(Extension(oidc_callback_dependencies_identity))
-        // EntraSsoDeps: built once at startup. The handlers gate on
-        // auth_mode == entra-id (and on a complete tenant/client/redirect-uri
-        // config) before touching the exchanger/validator, so a non-Entra
-        // deployment never dereferences these network deps.
-        .layer(Extension(entra_sso_dependencies_identity))
+        .layer(Extension(oidc_callback_dependencies_identity));
+    // Entra handlers receive one post-seal wrapper that retains both their
+    // measured dependency graph and exact browser origin. Never expose the
+    // independently swappable base EntraSsoDeps as an Extension.
+    let app = match entra_sso_handler_dependencies_identity {
+        Some(handler) => app.layer(Extension(handler)),
+        None => app.layer(middleware::from_fn(unavailable_entra_browser_routes)),
+    };
+    let app = app
         .layer(middleware::from_fn_with_state(
             GlobalConcurrencyAdmission::new(app_config.server.max_concurrent_connections),
             global_concurrency_middleware,
@@ -5678,14 +5941,14 @@ mod tests {
     /// Builds an enabled, network-backed validator with no usable keyset. It is
     /// used by middleware-arm tests that never expect a successful validation
     /// (mock arm short-circuits; the unsigned-entra token fails to decode).
-    fn test_validator() -> EntraTokenValidator {
-        EntraTokenValidator::from_app_config(
+    fn test_validator() -> Arc<EntraTokenValidator> {
+        Arc::new(EntraTokenValidator::from_app_config(
             "test-tenant",
             "test-client",
             "https://login.microsoftonline.com",
             86_400,
             crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(60, 3_600),
-        )
+        ))
     }
 
     #[tokio::test]
@@ -5718,7 +5981,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_entra_auth_mode_without_bound_validator_stays_unverified() {
-        let (session, failure_reason, direct_credential, external_subject) =
+        let (session, failure_reason, direct_credential, verified_identity) =
             resolve_request_session(
                 AuthMode::EntraId,
                 Some("Bearer header.payload.signature"),
@@ -5731,7 +5994,7 @@ mod tests {
         assert!(!session.token_valid);
         assert_eq!(failure_reason, Some("unbound-verifier"));
         assert!(direct_credential.is_none());
-        assert!(external_subject.is_none());
+        assert!(verified_identity.is_none());
     }
 
     const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
@@ -6182,6 +6445,9 @@ mod tests {
             site_scope: vec!["SITE-A".into()],
             environment_authority_mode: "global".into(),
             environment_scope: vec![],
+            authenticator_origin_binding_digest: None,
+            registered_origin_binding_digest: None,
+            current_origin_binding_digest: None,
         })
         .expect("generated row has a non-nil principal id");
 
@@ -6346,8 +6612,8 @@ mod tests {
         assert!(!auth_session_allows_unsafe_method(&unverified));
     }
 
-    fn verified_persisted_session() -> AuthSession {
-        session_from_db_row(&DbAuthSessionRow {
+    fn persisted_session_row_fixture() -> DbAuthSessionRow {
+        DbAuthSessionRow {
             session_record_id: Uuid::new_v4(),
             principal_id: Uuid::new_v4(),
             principal_lifecycle_version: 1,
@@ -6368,8 +6634,43 @@ mod tests {
             site_scope: vec![],
             environment_authority_mode: "global".into(),
             environment_scope: vec![],
-        })
-        .expect("generated row has a non-nil principal id")
+            authenticator_origin_binding_digest: None,
+            registered_origin_binding_digest: None,
+            current_origin_binding_digest: None,
+        }
+    }
+
+    fn verified_persisted_session() -> AuthSession {
+        session_from_db_row(&persisted_session_row_fixture())
+            .expect("generated row has a non-nil principal id")
+    }
+
+    #[test]
+    fn persisted_session_origin_requires_the_exact_active_current_pointer() {
+        let origin = crate::session_lookup_admission::SessionLookupOriginAuthority::browser_fixture(
+            "current-pointer",
+        );
+        let expected = origin
+            .origin_binding_digest()
+            .expect("browser fixture has an origin digest")
+            .to_vec();
+        let mut row = persisted_session_row_fixture();
+        row.authenticator_origin_binding_digest = Some(expected.clone());
+        row.registered_origin_binding_digest = Some(expected.clone());
+        row.current_origin_binding_digest = Some(expected);
+        assert!(session_row_matches_origin(&row, &origin));
+
+        row.current_origin_binding_digest = None;
+        assert!(
+            !session_row_matches_origin(&row, &origin),
+            "a disabled browser pointer must reject its former session generation"
+        );
+
+        row.current_origin_binding_digest = Some(vec![0x5a; 32]);
+        assert!(
+            !session_row_matches_origin(&row, &origin),
+            "a stale current pointer must reject the old process-local origin"
+        );
     }
 
     fn random_bearer_verifier_fixture() -> Vec<u8> {
@@ -8492,6 +8793,28 @@ mod tests {
                 "gate permission for {path} must match handler guard {expected}"
             );
         }
+    }
+
+    #[test]
+    fn non_entra_startup_cannot_leave_external_authenticator_paths_active() {
+        let source = include_str!("main.rs");
+        let disable = ["disable_current_authenticator", "_runtimes"].concat();
+        let call = source
+            .find(disable.as_str())
+            .expect("non-Entra startup must durably disable external authenticator paths");
+        let branch = source[..call]
+            .rfind("(false, None) => {")
+            .expect("disable call must be in the non-Entra/no-R branch");
+        let prewarm_needle = ["session_lookup_admission::", "prewarm"].concat();
+        let prewarm = source[call..]
+            .find(prewarm_needle.as_str())
+            .map(|offset| call + offset)
+            .expect("session prewarm must remain after external-path disable");
+        assert!(branch < call && call < prewarm);
+
+        let fail_closed = &source[branch..prewarm];
+        assert!(fail_closed.contains("if let Err(error)"));
+        assert!(fail_closed.contains("std::process::exit(1)"));
     }
 }
 

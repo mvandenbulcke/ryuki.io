@@ -51,7 +51,7 @@ const AUTHENTICATOR_LEAF_DIGEST_CONTRACT: &[u8] = b"ryuki-authenticator-runtime-
 const ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN: &[u8] = b"entra-issuer-authority-binding";
 const ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN: &[u8] = b"entra-audience-client-binding";
 const ENTRA_JWKS_KEY_SOURCE_BINDING_DOMAIN: &[u8] = b"entra-jwks-key-source-binding";
-const ENTRA_REQUIRED_CLAIM_IDS: [&str; 6] = ["aud", "exp", "iat", "iss", "nbf", "sub"];
+const ENTRA_REQUIRED_CLAIM_IDS: [&str; 7] = ["aud", "exp", "iat", "iss", "nbf", "oid", "sub"];
 
 /// Claims we extract from a validated Entra token. `sub` remains a required
 /// signed OIDC claim, while `oid` is the canonical Entra account key selected
@@ -215,7 +215,7 @@ pub(crate) struct EntraBearerRuntimeObservation {
     credential_lifetime_limit_id: String,
     maximum_credential_lifetime_seconds: u64,
     accepted_algorithm_ids: [&'static str; 1],
-    required_claim_ids: [&'static str; 6],
+    required_claim_ids: [&'static str; 7],
     provider_subject_claim_id: &'static str,
     expiration_required: bool,
     not_before_required: bool,
@@ -551,11 +551,11 @@ fn authenticator_leaf_binding_digest(domain: &[u8], values: &[&[u8]]) -> String 
 pub struct ValidationOutcome {
     pub session: AuthSession,
     pub failure_reason: Option<&'static str>,
-    /// Canonical provider subject proven by this validation attempt. This is
-    /// lookup provenance for the principal registry, not an authorization ID.
-    /// It is populated only after signature, issuer, audience, lifetime, and
-    /// canonical Entra object-ID validation all succeed.
-    pub(crate) external_subject: Option<String>,
+    /// Opaque proof that the canonical issuer/subject pair came from this
+    /// exact retained validator allocation. The identity registry accepts
+    /// this seal together with the sealed live Entra runtime; it never accepts
+    /// a caller-provided provider alias or ambient issuer string.
+    pub(crate) verified_identity: Option<VerifiedEntraBearerIdentity>,
     pub(crate) request_read_credential: Option<crate::request_authority::DirectFederatedCredential>,
 }
 
@@ -564,9 +564,110 @@ impl ValidationOutcome {
         Self {
             session: AuthSession::unverified_entra(),
             failure_reason: Some(reason),
-            external_subject: None,
+            verified_identity: None,
             request_read_credential: None,
         }
+    }
+}
+
+/// Canonical subject evidence emitted only by one exact validator allocation
+/// after its complete JOSE/issuer/audience/time/subject pipeline succeeds.
+///
+/// Retaining the validator `Arc` is deliberate: equal-looking validator
+/// configuration is not interchangeable with the allocation sealed into the
+/// live authenticator runtime.
+pub(crate) struct VerifiedEntraBearerIdentity {
+    source_validator: Arc<EntraTokenValidator>,
+    issuer: String,
+    subject: String,
+    display_name: String,
+    roles: Vec<String>,
+    actor_class: ActorClass,
+}
+
+impl fmt::Debug for VerifiedEntraBearerIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedEntraBearerIdentity")
+            .field("source_validator", &"[RETAINED]")
+            .field("issuer", &"[REDACTED]")
+            .field("subject", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl VerifiedEntraBearerIdentity {
+    fn seal(
+        source_validator: Arc<EntraTokenValidator>,
+        issuer: String,
+        subject: String,
+        display_name: String,
+        roles: Vec<String>,
+        actor_class: ActorClass,
+    ) -> Result<Self, &'static str> {
+        let sealed = Self {
+            source_validator,
+            issuer,
+            subject,
+            display_name,
+            roles,
+            actor_class,
+        };
+        sealed.verify_integrity()?;
+        Ok(sealed)
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<(), &'static str> {
+        if self.issuer != self.source_validator.issuer
+            || canonical_entra_oid(Some(&self.subject)) != Some(self.subject.as_str())
+        {
+            return Err("validated issuer/subject no longer matches its source validator");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn source_validator(&self) -> &Arc<EntraTokenValidator> {
+        &self.source_validator
+    }
+
+    pub(crate) fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub(crate) fn roles(&self) -> &[String] {
+        &self.roles
+    }
+
+    pub(crate) fn actor_class(&self) -> ActorClass {
+        self.actor_class
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        source_validator: Arc<EntraTokenValidator>,
+        subject: &str,
+        display_name: &str,
+        roles: &[String],
+        actor_class: ActorClass,
+    ) -> Self {
+        let issuer = source_validator.issuer.clone();
+        Self::seal(
+            source_validator,
+            issuer,
+            subject.to_owned(),
+            display_name.to_owned(),
+            roles.to_vec(),
+            actor_class,
+        )
+        .expect("test bearer identity must satisfy canonical production invariants")
     }
 }
 
@@ -807,7 +908,7 @@ impl EntraTokenValidator {
     /// Convenience wrapper over [`Self::validate_with_reason`] for callers that
     /// do not need the (safe) failure-reason string.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn validate(&self, raw_authorization_header: &str) -> AuthSession {
+    pub async fn validate(self: &Arc<Self>, raw_authorization_header: &str) -> AuthSession {
         self.validate_with_reason(raw_authorization_header)
             .await
             .session
@@ -815,7 +916,10 @@ impl EntraTokenValidator {
 
     /// Validates a raw `Authorization` header value, returning the session plus
     /// a safe failure-reason string (for logging) on any failure path.
-    pub async fn validate_with_reason(&self, raw_authorization_header: &str) -> ValidationOutcome {
+    pub async fn validate_with_reason(
+        self: &Arc<Self>,
+        raw_authorization_header: &str,
+    ) -> ValidationOutcome {
         // Short-circuit when Entra is not configured/enabled.
         if !self.config.enabled {
             return ValidationOutcome::unverified("disabled");
@@ -931,7 +1035,6 @@ impl EntraTokenValidator {
             crate::request_authority::DirectFederatedCredential::new(
                 window,
                 digests,
-                "entra-id".to_string(),
                 claims.iss.clone(),
                 entra_account_key.clone(),
             )
@@ -948,6 +1051,17 @@ impl EntraTokenValidator {
             .clone()
             .or_else(|| claims.preferred_username.clone())
             .unwrap_or_else(|| external_subject.clone());
+        let verified_identity = match VerifiedEntraBearerIdentity::seal(
+            Arc::clone(self),
+            claims.iss.clone(),
+            external_subject.clone(),
+            display_name.clone(),
+            claims.roles.clone(),
+            actor_class,
+        ) {
+            Ok(identity) => identity,
+            Err(_) => return ValidationOutcome::unverified("invalid-token"),
+        };
 
         ValidationOutcome {
             session: AuthSession {
@@ -965,7 +1079,7 @@ impl EntraTokenValidator {
                 ..Default::default()
             },
             failure_reason: None,
-            external_subject: Some(external_subject),
+            verified_identity: Some(verified_identity),
             request_read_credential,
         }
     }
@@ -1229,8 +1343,8 @@ mod tests {
         state.last_refresh_attempt = last_refresh_attempt;
     }
 
-    fn network_validator(cache: JwksCache) -> EntraTokenValidator {
-        EntraTokenValidator {
+    fn network_validator(cache: JwksCache) -> Arc<EntraTokenValidator> {
+        Arc::new(EntraTokenValidator {
             config: test_config(true),
             issuer: expected_issuer(),
             audiences: vec![TEST_CLIENT.to_string(), format!("api://{TEST_CLIENT}")],
@@ -1238,7 +1352,7 @@ mod tests {
             bearer_limits: crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(
                 60, 3_600,
             ),
-        }
+        })
     }
 
     #[tokio::test]
@@ -1474,7 +1588,7 @@ mod tests {
     }
 
     /// Builds a validator with a single static key under TEST_KID.
-    fn static_validator(decoding: DecodingKey, enabled: bool) -> EntraTokenValidator {
+    fn static_validator(decoding: DecodingKey, enabled: bool) -> Arc<EntraTokenValidator> {
         static_validator_with_leeway(decoding, enabled, 60)
     }
 
@@ -1482,7 +1596,7 @@ mod tests {
         decoding: DecodingKey,
         enabled: bool,
         leeway_secs: u64,
-    ) -> EntraTokenValidator {
+    ) -> Arc<EntraTokenValidator> {
         static_validator_with_limits(decoding, enabled, leeway_secs, 3_600)
     }
 
@@ -1491,17 +1605,17 @@ mod tests {
         enabled: bool,
         clock_skew_seconds: u64,
         maximum_credential_lifetime_seconds: u64,
-    ) -> EntraTokenValidator {
+    ) -> Arc<EntraTokenValidator> {
         let mut map = HashMap::new();
         map.insert(TEST_KID.to_string(), decoding);
-        EntraTokenValidator::with_static_keys_and_limits(
+        Arc::new(EntraTokenValidator::with_static_keys_and_limits(
             test_config(enabled),
             map,
             crate::security_contracts::ResolvedAuthenticatorBearerLimits::fixture(
                 clock_skew_seconds,
                 maximum_credential_lifetime_seconds,
             ),
-        )
+        ))
     }
 
     #[test]
@@ -1523,6 +1637,10 @@ mod tests {
             retained.clock_skew_limit_id()
         );
         assert_eq!(observed.maximum_clock_skew_seconds(), 17);
+        assert_eq!(
+            observed.required_claim_ids(),
+            ["aud", "exp", "iat", "iss", "nbf", "oid", "sub"]
+        );
         assert_eq!(
             observed.credential_lifetime_limit_id(),
             retained.credential_lifetime_limit_id()
@@ -1570,12 +1688,24 @@ mod tests {
     #[tokio::test]
     async fn test_valid_token_yields_validated_but_unbound_session() {
         let (enc, dec, _) = make_keypair();
+        let substituted_validator = static_validator(dec.clone(), true);
         let validator = static_validator(dec, true);
         let token = sign(&enc, valid_claims());
 
         let outcome = validator.validate_with_reason(&auth(&token)).await;
         assert_eq!(outcome.failure_reason, None);
-        assert_eq!(outcome.external_subject.as_deref(), Some(TEST_OBJECT_ID));
+        let identity = outcome
+            .verified_identity
+            .as_ref()
+            .expect("valid token must retain exact validator identity evidence");
+        assert!(identity.verify_integrity().is_ok());
+        assert_eq!(identity.issuer(), expected_issuer());
+        assert_eq!(identity.subject(), TEST_OBJECT_ID);
+        assert!(Arc::ptr_eq(identity.source_validator(), &validator));
+        assert!(!Arc::ptr_eq(
+            identity.source_validator(),
+            &substituted_validator
+        ));
         assert!(outcome.request_read_credential.is_some());
         assert!(outcome.session.token_valid);
         assert_eq!(
@@ -1957,7 +2087,7 @@ mod tests {
             outcome.session.display_user_id,
             "signed-sub-must-not-become-the-account-key"
         );
-        assert!(outcome.external_subject.is_none());
+        assert!(outcome.verified_identity.is_none());
         assert!(outcome.request_read_credential.is_none());
         assert_eq!(outcome.failure_reason, Some("invalid-token"));
         let log_reason = outcome.failure_reason.unwrap_or_default();

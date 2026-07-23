@@ -26,8 +26,9 @@ replayed under a different scope. The production signing key is the validated
 persisted-session verifier key. Credential-free, loopback-only mock/static
 dry-run modes use one CSPRNG-generated process-ephemeral key, so their
 continuations remain valid until restart without relying on a default secret;
-persisted auth modes and enabled generic OIDC fail closed when the configured
-key is unavailable or malformed. Rotating the dedicated key invalidates
+persisted auth modes fail closed when the configured key is unavailable or
+malformed; the reserved generic-OIDC enable flag is rejected before serving.
+Rotating the dedicated key invalidates
 outstanding continuations. Tests use a fixed non-production key and separately
 exercise the production key selector.
 

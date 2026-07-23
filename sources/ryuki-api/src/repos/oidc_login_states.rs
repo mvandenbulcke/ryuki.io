@@ -1,12 +1,13 @@
 //! Single-use OIDC login-state store.
 //!
-//! Each row corresponds to one in-flight authorization-code flow initiated by
-//! generic OIDC or Entra. The `state` value is the opaque CSPRNG token forwarded
-//! to the IdP as `?state=`; it is the primary key and is deleted on first use
-//! (`take`) to enforce single-use semantics.
+//! Each row corresponds to one in-flight browser authorization-code flow bound
+//! to the exact authenticator origin that initiated it. The `state` value is
+//! the opaque CSPRNG token forwarded to the IdP as `?state=`; it is the primary
+//! key and is deleted on first use (`take`) to enforce single-use semantics.
 //!
-//! Rows expire after 10 minutes (`expires_at`); `take` filters on `expires_at >
-//! NOW()` so a replayed or stale state is treated as absent.
+//! Rows expire after 10 minutes (`expires_at`). Redemption always burns the row
+//! first and exposes protocol material only when the caller presents the same
+//! current authenticator-origin digest and the row is still live.
 
 use axum::http::HeaderMap;
 use governor::clock::DefaultClock;
@@ -16,6 +17,7 @@ use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
+use subtle::ConstantTimeEq;
 
 /// Mandatory process-local admission for the two public login-initiation
 /// routes. These limits remain active even when the optional general API rate
@@ -30,20 +32,22 @@ const LOGIN_MAX_IN_FLIGHT: usize = 16;
 // this budget. The 64-request burst preserves ordinary corporate SSO fan-out;
 // sustained admission remains two initiations per second per source.
 
-/// Exact durable active-state ceilings. The provider quota prevents one login
-/// flow from consuming every slot; the aggregate quota bounds the shared table
-/// across generic OIDC and Entra and across every API replica.
-const MAX_OUTSTANDING_LOGIN_STATES_PER_FLOW: i64 = 2_048;
+/// Exact durable active-state ceilings. The per-origin quota prevents one
+/// retained browser authenticator generation from consuming every slot; the
+/// aggregate quota bounds the shared table across every origin and API replica.
+const MAX_OUTSTANDING_LOGIN_STATES_PER_ORIGIN: i64 = 2_048;
 const MAX_OUTSTANDING_LOGIN_STATES_GLOBAL: i64 = 4_096;
 const LOGIN_STATE_CLEANUP_BATCH: i64 = 512;
+const LOGIN_STATE_CONTRACT_VERSION: &str = "3";
+const BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND: &str = "browser-derived-session";
 const _: () = {
     assert!(LOGIN_CLIENT_REQUESTS_PER_SECOND > 0);
     assert!(LOGIN_CLIENT_BURST > 0);
     assert!(LOGIN_GLOBAL_REQUESTS_PER_SECOND > 0);
     assert!(LOGIN_GLOBAL_BURST > 0);
     assert!(LOGIN_MAX_IN_FLIGHT > 0);
-    assert!(MAX_OUTSTANDING_LOGIN_STATES_PER_FLOW > 0);
-    assert!(MAX_OUTSTANDING_LOGIN_STATES_GLOBAL >= MAX_OUTSTANDING_LOGIN_STATES_PER_FLOW);
+    assert!(MAX_OUTSTANDING_LOGIN_STATES_PER_ORIGIN > 0);
+    assert!(MAX_OUTSTANDING_LOGIN_STATES_GLOBAL >= MAX_OUTSTANDING_LOGIN_STATES_PER_ORIGIN);
     assert!(LOGIN_STATE_CLEANUP_BATCH > 0);
 };
 
@@ -193,27 +197,12 @@ pub fn admit_public_login_initiation(
     admission.try_admit_from_headers(peer_addr, headers)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoginFlow {
-    GenericOidc,
-    Entra,
-}
-
-impl LoginFlow {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::GenericOidc => "oidc",
-            Self::Entra => "entra",
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum LoginStateInsertError {
     #[error("login-state admission is busy")]
     Busy,
-    #[error("login-state provider capacity is full")]
-    FlowCapacity,
+    #[error("login-state authenticator-origin capacity is full")]
+    OriginCapacity,
     #[error("login-state aggregate capacity is full")]
     GlobalCapacity,
     #[error(transparent)]
@@ -228,6 +217,24 @@ pub struct LoginStateMaterial {
     pub nonce: String,
     pub pkce_verifier: String,
     pub binding: String,
+}
+
+/// Result of atomically burning one login-state row.
+///
+/// Protocol material exists only in `Redeemed`; origin mismatch, stale origin,
+/// and expiry outcomes deliberately carry no nonce, PKCE verifier, or browser
+/// binding. `OriginMismatch` intentionally covers an exact historical origin
+/// that is no longer the active browser pointer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginStateTakeOutcome {
+    Redeemed {
+        nonce: String,
+        pkce_verifier: String,
+        binding: String,
+    },
+    OriginMismatch,
+    Expired,
+    Absent,
 }
 
 fn random_b64url_256() -> String {
@@ -249,16 +256,30 @@ fn generate_login_state_material() -> LoginStateMaterial {
     }
 }
 
-/// Admit and persist one new login-state row. The 10-minute TTL is supplied by
-/// PostgreSQL's migration default and is therefore based on database time.
+async fn set_login_state_contract_v3(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config($1, $2, TRUE)")
+        .bind(LOGIN_STATE_CONTRACT_SETTING)
+        .bind(LOGIN_STATE_CONTRACT_VERSION)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Admit and persist one new login-state row. The v3 database trigger owns the
+/// exact 10-minute lifetime and derives both timestamps from database time.
+/// The digest is an opaque, exact SHA-256 value for one retained
+/// browser-derived authenticator origin; the database foreign key rejects
+/// unknown origins and bearer-path substitution.
 pub async fn create(
     pool: &PgPool,
-    flow: LoginFlow,
+    authenticator_origin_binding_digest: &[u8; 32],
 ) -> Result<LoginStateMaterial, LoginStateInsertError> {
     create_with_limits(
         pool,
-        flow,
-        MAX_OUTSTANDING_LOGIN_STATES_PER_FLOW,
+        authenticator_origin_binding_digest,
+        MAX_OUTSTANDING_LOGIN_STATES_PER_ORIGIN,
         MAX_OUTSTANDING_LOGIN_STATES_GLOBAL,
     )
     .await
@@ -271,27 +292,26 @@ pub async fn create(
 #[cfg(test)]
 pub async fn insert_test_material(
     pool: &PgPool,
-    flow: LoginFlow,
+    authenticator_origin_binding_digest: &[u8; 32],
     state: &str,
     login_nonce: &str,
     pkce_verifier: &str,
     binding: &str,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT set_config($1, '2', TRUE)")
-        .bind(LOGIN_STATE_CONTRACT_SETTING)
-        .execute(&mut *tx)
-        .await?;
+    set_login_state_contract_v3(&mut tx).await?;
     sqlx::query(
-        "INSERT INTO oidc_login_states \
-         (state, nonce, pkce_verifier, binding, flow_kind) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO oidc_login_states_v3 \
+         (state, nonce, pkce_verifier, binding, \
+          authenticator_origin_binding_digest, authenticator_path_kind) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(state)
     .bind(login_nonce)
     .bind(pkce_verifier)
     .bind(binding)
-    .bind(flow.as_str())
+    .bind(authenticator_origin_binding_digest.as_slice())
+    .bind(BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -299,22 +319,19 @@ pub async fn insert_test_material(
 }
 
 /// Serialize cleanup, exact active-state quota checks, and insertion across
-/// replicas. Every time predicate uses PostgreSQL `NOW()` so API clock skew
-/// cannot create inconsistent admission decisions.
+/// replicas. Every time predicate uses PostgreSQL `statement_timestamp()` so
+/// API clock skew cannot create inconsistent admission decisions.
 async fn create_with_limits(
     pool: &PgPool,
-    flow: LoginFlow,
-    max_per_flow: i64,
+    authenticator_origin_binding_digest: &[u8; 32],
+    max_per_origin: i64,
     max_global: i64,
 ) -> Result<LoginStateMaterial, LoginStateInsertError> {
-    debug_assert!(max_per_flow > 0);
-    debug_assert!(max_global >= max_per_flow);
+    debug_assert!(max_per_origin > 0);
+    debug_assert!(max_global >= max_per_origin);
 
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT set_config($1, '2', TRUE)")
-        .bind(LOGIN_STATE_CONTRACT_SETTING)
-        .execute(&mut *tx)
-        .await?;
+    set_login_state_contract_v3(&mut tx).await?;
 
     let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
         .bind(LOGIN_STATE_ADVISORY_LOCK_KEY)
@@ -327,13 +344,13 @@ async fn create_with_limits(
 
     sqlx::query(
         "WITH expired AS ( \
-             SELECT state FROM oidc_login_states \
-             WHERE expires_at <= NOW() \
+             SELECT state FROM oidc_login_states_v3 \
+             WHERE expires_at <= statement_timestamp() \
              ORDER BY expires_at, state \
              FOR UPDATE SKIP LOCKED \
              LIMIT $1 \
          ) \
-         DELETE FROM oidc_login_states AS target \
+         DELETE FROM oidc_login_states_v3 AS target \
          USING expired \
          WHERE target.state = expired.state",
     )
@@ -343,8 +360,8 @@ async fn create_with_limits(
 
     let active_global: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ( \
-             SELECT 1 FROM oidc_login_states \
-             WHERE expires_at > NOW() \
+             SELECT 1 FROM oidc_login_states_v3 \
+             WHERE expires_at > statement_timestamp() \
              LIMIT $1 \
          ) AS active",
     )
@@ -356,20 +373,21 @@ async fn create_with_limits(
         return Err(LoginStateInsertError::GlobalCapacity);
     }
 
-    let active_for_flow: i64 = sqlx::query_scalar(
+    let active_for_origin: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ( \
-             SELECT 1 FROM oidc_login_states \
-             WHERE flow_kind = $1 AND expires_at > NOW() \
+             SELECT 1 FROM oidc_login_states_v3 \
+             WHERE authenticator_origin_binding_digest = $1 \
+               AND expires_at > statement_timestamp() \
              LIMIT $2 \
          ) AS active",
     )
-    .bind(flow.as_str())
-    .bind(max_per_flow)
+    .bind(authenticator_origin_binding_digest.as_slice())
+    .bind(max_per_origin)
     .fetch_one(&mut *tx)
     .await?;
-    if active_for_flow >= max_per_flow {
+    if active_for_origin >= max_per_origin {
         tx.rollback().await?;
-        return Err(LoginStateInsertError::FlowCapacity);
+        return Err(LoginStateInsertError::OriginCapacity);
     }
 
     // Capacity is reserved under the still-held advisory lock before entropy
@@ -377,28 +395,78 @@ async fn create_with_limits(
     // verifier, binding, row, redirect, or cookie material.
     let material = generate_login_state_material();
     sqlx::query(
-        "INSERT INTO oidc_login_states \
-         (state, nonce, pkce_verifier, binding, flow_kind) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO oidc_login_states_v3 \
+         (state, nonce, pkce_verifier, binding, \
+          authenticator_origin_binding_digest, authenticator_path_kind) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&material.state)
     .bind(&material.nonce)
     .bind(&material.pkce_verifier)
     .bind(&material.binding)
-    .bind(flow.as_str())
+    .bind(authenticator_origin_binding_digest.as_slice())
+    .bind(BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(material)
 }
 
-/// Atomically consume a login-state row and return `(nonce, pkce_verifier,
-/// binding)`.
+#[derive(Debug, sqlx::FromRow)]
+struct BurnedLoginStateRow {
+    stored_origin_binding_digest: Vec<u8>,
+    is_live: bool,
+    is_current: bool,
+    nonce: Option<String>,
+    pkce_verifier: Option<String>,
+    binding: Option<String>,
+}
+
+fn classify_burned_login_state(
+    row: Option<BurnedLoginStateRow>,
+    expected_origin_binding_digest: &[u8; 32],
+) -> Result<LoginStateTakeOutcome, sqlx::Error> {
+    let Some(row) = row else {
+        return Ok(LoginStateTakeOutcome::Absent);
+    };
+
+    let exact_origin = row.stored_origin_binding_digest.len() == 32
+        && bool::from(
+            row.stored_origin_binding_digest
+                .as_slice()
+                .ct_eq(expected_origin_binding_digest.as_slice()),
+        );
+    if !exact_origin {
+        return Ok(LoginStateTakeOutcome::OriginMismatch);
+    }
+    if !row.is_live {
+        return Ok(LoginStateTakeOutcome::Expired);
+    }
+    if !row.is_current {
+        return Ok(LoginStateTakeOutcome::OriginMismatch);
+    }
+
+    match (row.nonce, row.pkce_verifier, row.binding) {
+        (Some(nonce), Some(pkce_verifier), Some(binding)) => Ok(LoginStateTakeOutcome::Redeemed {
+            nonce,
+            pkce_verifier,
+            binding,
+        }),
+        _ => Err(sqlx::Error::Protocol(
+            "live exact-origin login state returned incomplete protocol material".into(),
+        )),
+    }
+}
+
+/// Atomically burn a login-state row and classify the result against the exact
+/// current browser authenticator origin. The current pointer is held `FOR
+/// SHARE`, so redemption linearizes before or after a concurrent startup
+/// epoch transition and never exposes material across that transition.
 ///
-/// Returns `None` when the row is absent **or** expired (`expires_at <=
-/// NOW()`).  The `DELETE … RETURNING` is a single atomic statement: a
-/// concurrent second call with the same `state` will find no row and also
-/// return `None`, enforcing single-use without a separate SELECT.
+/// The `DELETE ... RETURNING` always deletes by state, so presenting a state at
+/// the wrong origin cannot preserve it for a later retry. SQL conditionally
+/// returns nonce/PKCE/binding only for an exact, live origin. A concurrent
+/// second call therefore returns [`LoginStateTakeOutcome::Absent`].
 ///
 /// `binding` is the per-browser CSRF token: the callback handler must compare it
 /// to the mode-selected login-binding cookie that the login-initiation handler
@@ -409,21 +477,56 @@ async fn create_with_limits(
 pub async fn take(
     pool: &PgPool,
     state: &str,
-) -> Result<Option<(String, String, String)>, sqlx::Error> {
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "DELETE FROM oidc_login_states \
-         WHERE state = $1 AND expires_at > NOW() \
-         RETURNING nonce, pkce_verifier, binding",
+    expected_origin_binding_digest: &[u8; 32],
+) -> Result<LoginStateTakeOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    set_login_state_contract_v3(&mut tx).await?;
+    let row = sqlx::query_as::<_, BurnedLoginStateRow>(
+        "WITH expected_current AS MATERIALIZED ( \
+             SELECT current_path.current_origin_binding_digest \
+             FROM authenticator_authority_current_paths AS current_path \
+             WHERE current_path.path_kind = 'browser-derived-session' \
+               AND current_path.path_status = 'active' \
+               AND current_path.current_origin_binding_digest = $2 \
+             FOR SHARE OF current_path \
+         ), burned AS ( \
+             DELETE FROM oidc_login_states_v3 \
+             WHERE state = $1 \
+             RETURNING authenticator_origin_binding_digest, expires_at, \
+                       nonce, pkce_verifier, binding \
+         ) \
+         SELECT \
+             burned.authenticator_origin_binding_digest \
+                 AS stored_origin_binding_digest, \
+             burned.expires_at > statement_timestamp() AS is_live, \
+             burned.authenticator_origin_binding_digest = $2 \
+                 AND EXISTS (SELECT 1 FROM expected_current) AS is_current, \
+             CASE WHEN burned.authenticator_origin_binding_digest = $2 \
+                       AND burned.expires_at > statement_timestamp() \
+                       AND EXISTS (SELECT 1 FROM expected_current) \
+                  THEN burned.nonce END AS nonce, \
+             CASE WHEN burned.authenticator_origin_binding_digest = $2 \
+                       AND burned.expires_at > statement_timestamp() \
+                       AND EXISTS (SELECT 1 FROM expected_current) \
+                  THEN burned.pkce_verifier END AS pkce_verifier, \
+             CASE WHEN burned.authenticator_origin_binding_digest = $2 \
+                       AND burned.expires_at > statement_timestamp() \
+                       AND EXISTS (SELECT 1 FROM expected_current) \
+                  THEN burned.binding END AS binding \
+         FROM burned",
     )
     .bind(state)
-    .fetch_optional(pool)
+    .bind(expected_origin_binding_digest.as_slice())
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row)
+    tx.commit().await?;
+    classify_burned_login_state(row, expected_origin_binding_digest)
 }
 
 /// Delete at most one bounded batch of expired rows using database time.
 pub async fn cleanup_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    set_login_state_contract_v3(&mut tx).await?;
     let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
         .bind(LOGIN_STATE_ADVISORY_LOCK_KEY)
         .fetch_one(&mut *tx)
@@ -434,13 +537,13 @@ pub async fn cleanup_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
     }
     let result = sqlx::query(
         "WITH expired AS ( \
-             SELECT state FROM oidc_login_states \
-             WHERE expires_at <= NOW() \
+             SELECT state FROM oidc_login_states_v3 \
+             WHERE expires_at <= statement_timestamp() \
              ORDER BY expires_at, state \
              FOR UPDATE SKIP LOCKED \
              LIMIT $1 \
          ) \
-         DELETE FROM oidc_login_states AS target \
+         DELETE FROM oidc_login_states_v3 AS target \
          USING expired \
          WHERE target.state = expired.state",
     )
@@ -732,25 +835,98 @@ mod oidc_login_states_db_tests {
         Some(pool)
     }
 
-    async fn insert_expired_test_row(pool: &PgPool, state: &str, age: &str) {
-        let mut tx = pool.begin().await.expect("begin expired-row fixture");
-        sqlx::query("SELECT set_config($1, '2', TRUE)")
-            .bind(LOGIN_STATE_CONTRACT_SETTING)
+    fn random_distinct_test_digest(excluded: &[[u8; 32]]) -> [u8; 32] {
+        loop {
+            let candidate: [u8; 32] = rand::random();
+            if candidate.iter().any(|byte| *byte != 0) && !excluded.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    async fn provision_test_browser_origin_fixture(
+        pool: &PgPool,
+    ) -> Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin> {
+        let origin = crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin::fixture(
+            &format!("test{}", uuid::Uuid::new_v4().simple()),
+        );
+        crate::identity_authority::reconcile_test_authenticator_runtime(pool, &origin)
+            .await
+            .expect("publish paired current authenticator fixture");
+        origin
+    }
+
+    async fn provision_test_browser_origin(pool: &PgPool) -> [u8; 32] {
+        let origin = provision_test_browser_origin_fixture(pool).await;
+        *origin.origin_binding_digest_bytes()
+    }
+
+    async fn delete_test_states(pool: &PgPool, states: &[String]) {
+        if states.is_empty() {
+            return;
+        }
+        let mut tx = pool.begin().await.expect("begin login-state cleanup");
+        set_login_state_contract_v3(&mut tx)
+            .await
+            .expect("activate v3 login-state contract for cleanup");
+        sqlx::query("DELETE FROM oidc_login_states_v3 WHERE state = ANY($1)")
+            .bind(states)
             .execute(&mut *tx)
             .await
-            .expect("activate login-state contract for fixture");
-        sqlx::query(
-            "INSERT INTO oidc_login_states \
-             (state, nonce, pkce_verifier, binding, flow_kind, expires_at) \
-             VALUES ($1, 'nonce-expired', 'pkce-expired', 'binding-expired', \
-                     'oidc', NOW() - $2::interval)",
+            .expect("delete login-state test fixtures");
+        tx.commit().await.expect("commit login-state cleanup");
+    }
+
+    #[test]
+    fn burned_row_classification_never_exposes_non_success_material() {
+        let expected_origin = random_distinct_test_digest(&[]);
+        let other_origin = random_distinct_test_digest(&[expected_origin]);
+
+        let mismatched = classify_burned_login_state(
+            Some(BurnedLoginStateRow {
+                stored_origin_binding_digest: other_origin.to_vec(),
+                is_live: true,
+                is_current: true,
+                nonce: None,
+                pkce_verifier: None,
+                binding: None,
+            }),
+            &expected_origin,
         )
-        .bind(state)
-        .bind(age)
-        .execute(&mut *tx)
-        .await
-        .expect("insert expired test row using DB time");
-        tx.commit().await.expect("commit expired-row fixture");
+        .expect("classify mismatch");
+        assert_eq!(mismatched, LoginStateTakeOutcome::OriginMismatch);
+
+        let expired = classify_burned_login_state(
+            Some(BurnedLoginStateRow {
+                stored_origin_binding_digest: expected_origin.to_vec(),
+                is_live: false,
+                is_current: true,
+                nonce: None,
+                pkce_verifier: None,
+                binding: None,
+            }),
+            &expected_origin,
+        )
+        .expect("classify expiry");
+        assert_eq!(expired, LoginStateTakeOutcome::Expired);
+
+        let stale = classify_burned_login_state(
+            Some(BurnedLoginStateRow {
+                stored_origin_binding_digest: expected_origin.to_vec(),
+                is_live: true,
+                is_current: false,
+                nonce: None,
+                pkce_verifier: None,
+                binding: None,
+            }),
+            &expected_origin,
+        )
+        .expect("classify stale origin");
+        assert_eq!(stale, LoginStateTakeOutcome::OriginMismatch);
+
+        let absent = classify_burned_login_state(None, &expected_origin)
+            .expect("classify absent login state");
+        assert_eq!(absent, LoginStateTakeOutcome::Absent);
     }
 
     #[tokio::test]
@@ -760,15 +936,20 @@ mod oidc_login_states_db_tests {
             return;
         };
 
-        let material = create(&pool, LoginFlow::GenericOidc)
-            .await
-            .expect("create should succeed");
+        let origin = provision_test_browser_origin(&pool).await;
+        let material = create(&pool, &origin).await.expect("create should succeed");
 
-        let result = take(&pool, &material.state)
+        let result = take(&pool, &material.state, &origin)
             .await
             .expect("take should not error");
-        assert!(result.is_some(), "take should return the row");
-        let (got_nonce, got_pkce, got_binding) = result.unwrap();
+        let LoginStateTakeOutcome::Redeemed {
+            nonce: got_nonce,
+            pkce_verifier: got_pkce,
+            binding: got_binding,
+        } = result
+        else {
+            panic!("exact live origin must redeem its state")
+        };
         assert_eq!(got_nonce, material.nonce);
         assert_eq!(got_pkce, material.pkce_verifier);
         assert_eq!(got_binding, material.binding);
@@ -781,85 +962,109 @@ mod oidc_login_states_db_tests {
             return;
         };
 
-        let material = create(&pool, LoginFlow::GenericOidc).await.expect("create");
+        let origin = provision_test_browser_origin(&pool).await;
+        let material = create(&pool, &origin).await.expect("create");
 
-        let first = take(&pool, &material.state).await.expect("first take");
-        assert!(first.is_some(), "first take should succeed");
+        let first = take(&pool, &material.state, &origin)
+            .await
+            .expect("first take");
+        assert!(matches!(first, LoginStateTakeOutcome::Redeemed { .. }));
 
-        let second = take(&pool, &material.state).await.expect("second take");
-        assert!(
-            second.is_none(),
-            "second take must return None (single-use)"
-        );
+        let second = take(&pool, &material.state, &origin)
+            .await
+            .expect("second take");
+        assert_eq!(second, LoginStateTakeOutcome::Absent);
     }
 
     #[tokio::test]
-    async fn test_take_expired_row_returns_none() {
+    async fn wrong_origin_attempt_burns_state_without_protocol_material() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             return;
         };
 
-        let state = format!("st-exp-{}", uuid::Uuid::new_v4());
-        insert_expired_test_row(&pool, &state, "1 second").await;
+        let issuing_origin = provision_test_browser_origin(&pool).await;
+        let wrong_origin = provision_test_browser_origin(&pool).await;
+        let material = create(&pool, &issuing_origin).await.expect("create state");
 
-        let result = take(&pool, &state).await.expect("take of expired row");
-        assert!(result.is_none(), "expired row must not be returned by take");
+        let mismatch = take(&pool, &material.state, &wrong_origin)
+            .await
+            .expect("burn state at wrong origin");
+        assert_eq!(mismatch, LoginStateTakeOutcome::OriginMismatch);
 
-        // Cleanup: remove the expired row we left behind.
-        let _ = sqlx::query("DELETE FROM oidc_login_states WHERE state = $1")
-            .bind(&state)
-            .execute(&pool)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_expired_removes_old_rows() {
-        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = global_pool().await else {
-            return;
-        };
-
-        let state = format!("st-cl-{}", uuid::Uuid::new_v4());
-        insert_expired_test_row(&pool, &state, "1 hour").await;
-
-        let expired_at_or_before_fixture: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oidc_login_states \
-             WHERE expires_at <= ( \
-                 SELECT expires_at FROM oidc_login_states WHERE state = $1 \
-             )",
-        )
-        .bind(&state)
-        .fetch_one(&pool)
-        .await
-        .expect("count expired rows ahead of cleanup fixture");
-        let max_sweeps = ((expired_at_or_before_fixture + LOGIN_STATE_CLEANUP_BATCH - 1)
-            / LOGIN_STATE_CLEANUP_BATCH)
-            + 1;
-        for _ in 0..max_sweeps {
-            cleanup_expired(&pool).await.expect("cleanup_expired");
-            let remains: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM oidc_login_states WHERE state = $1")
-                    .bind(&state)
-                    .fetch_one(&pool)
-                    .await
-                    .expect("check cleanup fixture");
-            if remains == 0 {
-                break;
-            }
-        }
-
-        // The row should now be gone.
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM oidc_login_states WHERE state = $1")
-                .bind(&state)
-                .fetch_one(&pool)
-                .await
-                .expect("count query");
+        let retry = take(&pool, &material.state, &issuing_origin)
+            .await
+            .expect("retry at issuing origin");
         assert_eq!(
-            count.0, 0,
-            "cleanup_expired should have removed the stale row"
+            retry,
+            LoginStateTakeOutcome::Absent,
+            "wrong-origin redemption must burn the state"
         );
+    }
+
+    #[tokio::test]
+    async fn rolled_origin_rejects_old_inserts_and_returns_no_old_protocol_material() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            return;
+        };
+
+        let origin = provision_test_browser_origin_fixture(&pool).await;
+        let old_digest = *origin.origin_binding_digest_bytes();
+        let material = create(&pool, &old_digest)
+            .await
+            .expect("create state under initial current origin");
+        let reconciliation = crate::identity_authority::reconcile_test_authenticator_epoch(
+            &pool,
+            &origin,
+            2,
+            true,
+            "oidc-state-rollover-v2",
+        )
+        .await
+        .expect("advance the paired provider epoch");
+        assert_eq!(reconciliation.stale_login_states_deleted, 1);
+
+        let stale_insert = generate_login_state_material();
+        let error = insert_test_material(
+            &pool,
+            &old_digest,
+            &stale_insert.state,
+            &stale_insert.nonce,
+            &stale_insert.pkce_verifier,
+            &stale_insert.binding,
+        )
+        .await
+        .expect_err("an old browser origin may not create new login state");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.constraint()),
+            Some("oidc_login_states_v3_current_origin_binding")
+        );
+
+        let outcome = take(&pool, &material.state, &old_digest)
+            .await
+            .expect("old state lookup remains fail closed");
+        assert_eq!(outcome, LoginStateTakeOutcome::Absent);
+    }
+
+    #[tokio::test]
+    async fn cleanup_contract_preserves_live_rows() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            return;
+        };
+
+        let origin = provision_test_browser_origin(&pool).await;
+        let material = create(&pool, &origin).await.expect("create live state");
+        cleanup_expired(&pool)
+            .await
+            .expect("v3-marked cleanup succeeds");
+        let outcome = take(&pool, &material.state, &origin)
+            .await
+            .expect("redeem state after cleanup");
+        assert!(matches!(outcome, LoginStateTakeOutcome::Redeemed { .. }));
     }
 
     #[tokio::test]
@@ -869,74 +1074,75 @@ mod oidc_login_states_db_tests {
             return;
         };
 
-        let state = format!("st-unmarked-{}", uuid::Uuid::new_v4());
+        let origin = provision_test_browser_origin(&pool).await;
+        let material = generate_login_state_material();
         let result = sqlx::query(
-            "INSERT INTO oidc_login_states \
-             (state, nonce, pkce_verifier, binding, flow_kind) \
-             VALUES ($1, 'nonce', 'pkce', 'binding', 'oidc')",
+            "INSERT INTO oidc_login_states_v3 \
+             (state, nonce, pkce_verifier, binding, \
+              authenticator_origin_binding_digest, authenticator_path_kind) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
-        .bind(&state)
+        .bind(&material.state)
+        .bind(&material.nonce)
+        .bind(&material.pkce_verifier)
+        .bind(&material.binding)
+        .bind(origin.as_slice())
+        .bind(BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND)
         .execute(&pool)
         .await;
-        assert!(
-            result.is_err(),
-            "an older replica must not bypass serialized admission"
+        let error = result.expect_err("an unmarked writer must fail closed");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("oidc_login_states_v3_writer_contract")
         );
     }
 
     #[tokio::test]
-    async fn db_provider_and_global_outstanding_quotas_reject_growth() {
+    async fn db_origin_and_global_outstanding_quotas_reject_growth() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             return;
         };
 
-        let active_global: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM oidc_login_states WHERE expires_at > NOW()")
-                .fetch_one(&pool)
-                .await
-                .expect("count global active login states");
-        let active_oidc: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oidc_login_states \
-             WHERE flow_kind = 'oidc' AND expires_at > NOW()",
+        let first_origin = provision_test_browser_origin(&pool).await;
+        let other_origin = provision_test_browser_origin(&pool).await;
+        let active_global: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oidc_login_states_v3 \
+             WHERE expires_at > statement_timestamp()",
         )
         .fetch_one(&pool)
         .await
-        .expect("count OIDC active login states");
-        let active_entra: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oidc_login_states \
-             WHERE flow_kind = 'entra' AND expires_at > NOW()",
+        .expect("count global active login states");
+        let active_first_origin: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oidc_login_states_v3 \
+             WHERE authenticator_origin_binding_digest = $1 \
+               AND expires_at > statement_timestamp()",
         )
+        .bind(first_origin.as_slice())
         .fetch_one(&pool)
         .await
-        .expect("count Entra active login states");
-        let (capped_flow, other_flow) = if active_oidc >= active_entra {
-            (LoginFlow::GenericOidc, LoginFlow::Entra)
-        } else {
-            (LoginFlow::Entra, LoginFlow::GenericOidc)
-        };
-        let per_flow_limit = active_oidc.max(active_entra) + 1;
+        .expect("count first-origin active login states");
+        let per_origin_limit = active_first_origin + 1;
         let global_limit = active_global + 2;
 
-        let first = create_with_limits(&pool, capped_flow, per_flow_limit, global_limit)
+        let first = create_with_limits(&pool, &first_origin, per_origin_limit, global_limit)
             .await
-            .expect("the final provider slot is admitted");
+            .expect("the final origin slot is admitted");
 
-        let result = create_with_limits(&pool, capped_flow, per_flow_limit, global_limit).await;
-        assert!(matches!(result, Err(LoginStateInsertError::FlowCapacity)));
+        let result = create_with_limits(&pool, &first_origin, per_origin_limit, global_limit).await;
+        assert!(matches!(result, Err(LoginStateInsertError::OriginCapacity)));
 
-        let other = create_with_limits(&pool, other_flow, per_flow_limit, global_limit)
+        let other = create_with_limits(&pool, &other_origin, per_origin_limit, global_limit)
             .await
-            .expect("the other provider retains its reserved capacity");
+            .expect("an independent origin retains its own capacity");
 
-        let result = create_with_limits(&pool, other_flow, per_flow_limit + 1, global_limit).await;
+        let result =
+            create_with_limits(&pool, &other_origin, per_origin_limit + 1, global_limit).await;
         assert!(matches!(result, Err(LoginStateInsertError::GlobalCapacity)));
 
-        sqlx::query("DELETE FROM oidc_login_states WHERE state = ANY($1)")
-            .bind(&[first.state, other.state] as &[String])
-            .execute(&pool)
-            .await
-            .expect("cleanup quota fixtures");
+        delete_test_states(&pool, &[first.state, other.state]).await;
     }
 
     #[tokio::test]
@@ -946,28 +1152,33 @@ mod oidc_login_states_db_tests {
             return;
         };
 
-        let active_global: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM oidc_login_states WHERE expires_at > NOW()")
-                .fetch_one(&pool)
-                .await
-                .expect("count global active login states");
-        let active_oidc: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oidc_login_states \
-             WHERE flow_kind = 'oidc' AND expires_at > NOW()",
+        let origin = provision_test_browser_origin(&pool).await;
+        let active_global: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oidc_login_states_v3 \
+             WHERE expires_at > statement_timestamp()",
         )
         .fetch_one(&pool)
         .await
-        .expect("count OIDC active login states");
-        let per_flow_limit = active_oidc + 1;
+        .expect("count global active login states");
+        let active_origin: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oidc_login_states_v3 \
+             WHERE authenticator_origin_binding_digest = $1 \
+               AND expires_at > statement_timestamp()",
+        )
+        .bind(origin.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count origin active login states");
+        let per_origin_limit = active_origin + 1;
         let global_limit = active_global + 1;
 
         const CALLERS: usize = 8;
         let mut tasks = Vec::with_capacity(CALLERS);
         for _ in 0..CALLERS {
             let pool = pool.clone();
+            let origin = origin;
             tasks.push(tokio::spawn(async move {
-                create_with_limits(&pool, LoginFlow::GenericOidc, per_flow_limit, global_limit)
-                    .await
+                create_with_limits(&pool, &origin, per_origin_limit, global_limit).await
             }));
         }
 
@@ -981,7 +1192,7 @@ mod oidc_login_states_db_tests {
                     states.push(material.state);
                 }
                 Err(LoginStateInsertError::Busy)
-                | Err(LoginStateInsertError::FlowCapacity)
+                | Err(LoginStateInsertError::OriginCapacity)
                 | Err(LoginStateInsertError::GlobalCapacity) => {}
                 Err(error) => panic!("unexpected concurrent admission error: {error}"),
             }
@@ -991,17 +1202,15 @@ mod oidc_login_states_db_tests {
             "serialized count-and-insert must admit exactly the final slot"
         );
 
-        let active_after: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM oidc_login_states WHERE expires_at > NOW()")
-                .fetch_one(&pool)
-                .await
-                .expect("count active states after race");
+        let active_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oidc_login_states_v3 \
+                 WHERE expires_at > statement_timestamp()",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count active states after race");
         assert_eq!(active_after, active_global + 1);
 
-        sqlx::query("DELETE FROM oidc_login_states WHERE state = ANY($1)")
-            .bind(&states as &[String])
-            .execute(&pool)
-            .await
-            .expect("cleanup concurrency fixtures");
+        delete_test_states(&pool, &states).await;
     }
 }
