@@ -8,12 +8,12 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "limit"] }
+tower-http = { version = "0.7", features = ["cors", "compression-gzip", "compression-br", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono", "uuid"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tempfile = "3"
 figment = { workspace = true }
@@ -25,22 +25,22 @@ ryuki-core = { workspace = true }
 ryuki-engine = { workspace = true }
 ryuki-protocol = { workspace = true }
 ryuki-runner = { workspace = true }
-rand = "0.8"
-hmac = "0.12"
-sha2 = "0.10"
+rand = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 jsonschema = { workspace = true }
 subtle = "2"
 base64 = "0.22"
 url = "2"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 
 [dev-dependencies]
 aws-lc-rs = "1"
-pkcs8 = "0.10"
+pkcs8 = "0.11"
 ryuki-core = { workspace = true, features = ["security-test-support"] }
 ryuki-agent = { workspace = true }
 # `test-util` enables the paused-clock test runtime (`start_paused = true`) used

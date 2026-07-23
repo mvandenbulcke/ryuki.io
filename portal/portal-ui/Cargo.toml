@@ -19,7 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ryuki-core = { path = "../../sources/ryuki-core" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"], optional = true }
-tower-http = { version = "0.6", features = ["limit"], optional = true }
+tower-http = { version = "0.7", features = ["limit"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", features = ["Window", "Document", "HtmlDocument", "HtmlElement", "HtmlInputElement", "Element", "Storage", "MediaQueryList", "Location"], optional = true }
 

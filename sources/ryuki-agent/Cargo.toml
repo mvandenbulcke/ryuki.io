@@ -29,8 +29,8 @@ thiserror       = "2"
 
 # ed25519-dalek v2 — needed to persist/load SigningKey from its 32-byte secret seed.
 # `rand_core` feature exposes the CryptoRngCore bound used by generate_keypair.
-ed25519-dalek   = { version = "2", features = ["rand_core"] }
-rand            = "0.8"
+ed25519-dalek   = { version = "3", features = ["rand_core"] }
+rand            = "0.10"
 
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
