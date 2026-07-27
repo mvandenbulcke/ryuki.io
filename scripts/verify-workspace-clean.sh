@@ -443,27 +443,34 @@ run_gate() {
 }
 
 validate_focused_cargo_command() {
-  local argument previous=""
+  local argument subcommand
 
   if [[ "${1:-}" != "cargo" ]]; then
     echo "error: focused verification accepts only a direct cargo command" >&2
     return 64
   fi
 
+  subcommand="${2:-}"
+  if [[ "$subcommand" == +* ]]; then
+    subcommand="${3:-}"
+  fi
+  case "$subcommand" in
+    build|check|clippy|test) ;;
+    *)
+      echo "error: focused verification accepts only cargo build, check, clippy, or test" >&2
+      return 64
+      ;;
+  esac
+
   for argument in "$@"; do
     if [[ "$argument" == "--target-dir" || "$argument" == --target-dir=* ]]; then
       echo "error: focused verification forbids overriding CARGO_TARGET_DIR" >&2
       return 64
     fi
-    if [[ "$previous" == "--config" && "$argument" == *target-dir* ]]; then
-      echo "error: focused verification forbids target-dir Cargo configuration" >&2
+    if [[ "$argument" == "--config" || "$argument" == --config=* ]]; then
+      echo "error: focused verification forbids Cargo --config overrides" >&2
       return 64
     fi
-    if [[ "$argument" == --config=*target-dir* ]]; then
-      echo "error: focused verification forbids target-dir Cargo configuration" >&2
-      return 64
-    fi
-    previous="$argument"
   done
 }
 

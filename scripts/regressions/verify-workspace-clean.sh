@@ -237,9 +237,31 @@ if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   > "$OUTPUT_FILE" 2>&1; then
   fail "focused verification accepted target-dir Cargo configuration"
 fi
-grep -q "forbids target-dir Cargo configuration" "$OUTPUT_FILE" \
+grep -q "forbids Cargo --config overrides" "$OUTPUT_FILE" \
   || fail "focused Cargo configuration refusal was not reported"
 [[ ! -e "$unmanaged_target" ]] \
   || fail "focused Cargo configuration created an unmanaged target"
+
+config_override="${WORK_DIR}/cargo-config.toml"
+printf '[build]\ntarget-dir = "%s"\n' "$unmanaged_target" > "$config_override"
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+  -- cargo test --config "$config_override" > "$OUTPUT_FILE" 2>&1; then
+  fail "focused verification accepted a Cargo configuration file"
+fi
+grep -q "forbids Cargo --config overrides" "$OUTPUT_FILE" \
+  || fail "focused Cargo configuration-file refusal was not reported"
+[[ ! -e "$unmanaged_target" ]] \
+  || fail "focused Cargo configuration file created an unmanaged target"
+
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+  -- cargo untrusted-plugin > "$OUTPUT_FILE" 2>&1; then
+  fail "focused verification accepted an unapproved Cargo subcommand"
+fi
+grep -q "accepts only cargo build, check, clippy, or test" "$OUTPUT_FILE" \
+  || fail "focused Cargo subcommand refusal was not reported"
 
 echo "verify-workspace-clean regression passed"
