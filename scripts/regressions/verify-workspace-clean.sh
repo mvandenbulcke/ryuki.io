@@ -119,6 +119,7 @@ TMPDIR="$TMP_A" \
   RYUKI_VERIFY_TEST_MODE=1 \
   RYUKI_VERIFY_KEEP_TARGET=0 \
   RYUKI_VERIFY_PREFLIGHT_ONLY=0 \
+  RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=1 \
   RYUKI_VERIFY_TEST_BLOCKER_PID="$BLOCKER_PID_FILE" \
   RYUKI_VERIFY_TEST_READY="$READY_FILE" \
   RYUKI_VERIFY_TEST_RELEASE="$RELEASE_FILE" \
@@ -136,17 +137,12 @@ grep -q "verification is already running" "$OUTPUT_FILE" \
 kill -KILL "$WRAPPER_PID"
 wait "$WRAPPER_PID" 2>/dev/null || true
 WRAPPER_PID=""
-if run_preflight "$TMP_B" > "$OUTPUT_FILE" 2>&1; then
-  fail "wrapper death released the lock while a gate child was alive"
-fi
-grep -q "verification is already running" "$OUTPUT_FILE" \
-  || fail "surviving gate child did not retain the repository lock"
-
 blocker_pid="$(sed -n '1p' "$BLOCKER_PID_FILE")"
-touch "$RELEASE_FILE"
-wait_for_exit "$blocker_pid" || fail "blocking gate child did not exit"
+wait_for_exit "$blocker_pid" \
+  || fail "supervisor did not stop the gate child after wrapper death"
 rm -f "$BLOCKER_PID_FILE"
-wait_for_preflight "$TMP_B" || fail "repository lock was not released after the gate child exited"
+wait_for_preflight "$TMP_B" \
+  || fail "repository lock was not released after supervised shutdown"
 grep -q "removing stale verification target" "$OUTPUT_FILE" \
   || fail "interrupted target was not reported as reclaimed"
 if [[ -d "$VERIFY_TARGET_ROOT" \
@@ -210,5 +206,40 @@ if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
 fi
 grep -q "RYUKI_VERIFY_KEEP_TARGET must be 0 or 1" "$OUTPUT_FILE" \
   || fail "invalid keep-target value was not reported"
+
+unmanaged_target="${WORK_DIR}/unmanaged-cargo-target"
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+  -- cargo test --target-dir "$unmanaged_target" > "$OUTPUT_FILE" 2>&1; then
+  fail "focused verification accepted a Cargo target override"
+fi
+grep -q "forbids overriding CARGO_TARGET_DIR" "$OUTPUT_FILE" \
+  || fail "focused target override refusal was not reported"
+[[ ! -e "$unmanaged_target" ]] \
+  || fail "focused target override created an unmanaged target"
+
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+  -- env CARGO_TARGET_DIR="$unmanaged_target" cargo test > "$OUTPUT_FILE" 2>&1; then
+  fail "focused verification accepted an environment wrapper"
+fi
+grep -q "accepts only a direct cargo command" "$OUTPUT_FILE" \
+  || fail "focused environment-wrapper refusal was not reported"
+[[ ! -e "$unmanaged_target" ]] \
+  || fail "focused environment wrapper created an unmanaged target"
+
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+  -- cargo test --config=build.target-dir="$unmanaged_target" \
+  > "$OUTPUT_FILE" 2>&1; then
+  fail "focused verification accepted target-dir Cargo configuration"
+fi
+grep -q "forbids target-dir Cargo configuration" "$OUTPUT_FILE" \
+  || fail "focused Cargo configuration refusal was not reported"
+[[ ! -e "$unmanaged_target" ]] \
+  || fail "focused Cargo configuration created an unmanaged target"
 
 echo "verify-workspace-clean regression passed"

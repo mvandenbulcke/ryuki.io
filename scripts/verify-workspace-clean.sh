@@ -25,6 +25,9 @@ MAX_TARGET_GIB="${RYUKI_VERIFY_MAX_TARGET_GIB:-64}"
 KEEP_TARGET="${RYUKI_VERIFY_KEEP_TARGET:-0}"
 WATCH_INTERVAL_SECONDS="${RYUKI_VERIFY_WATCH_INTERVAL_SECONDS:-5}"
 ACTIVE_GATE_PID=""
+SUPERVISED_COMMAND_PID=""
+RETAIN_CURRENT_TARGET=0
+WRAPPER_PID="$$"
 VERIFY_NAMESPACE="${STATE_BASE_ROOT}/ryuki-verify-$(id -u)"
 VERIFY_TARGET_ROOT="${VERIFY_NAMESPACE}/${REPOSITORY_ID}"
 VERIFY_LOCK_FILE="${VERIFY_NAMESPACE}/${REPOSITORY_ID}.lock"
@@ -80,15 +83,33 @@ is_managed_verify_dir() {
   [[ "$parent" == "$VERIFY_TARGET_ROOT" && "$base" == run.* ]]
 }
 
-write_verify_sentinel_temp() {
+write_verify_sentinel() {
+  local destination="$1"
+  local keep_target="$2"
   {
     printf 'version=1\n'
     printf 'repository_id=%s\n' "$REPOSITORY_ID"
     printf 'run_id=%s\n' "$RUN_ID"
     printf 'workspace=%s\n' "$ROOT_DIR"
-    printf 'keep_target=%s\n' "$KEEP_TARGET"
-  } > "$SENTINEL_TMP"
+    printf 'keep_target=%s\n' "$keep_target"
+  } > "$destination"
+}
+
+write_verify_sentinel_temp() {
+  # A run is disposable until every requested gate has succeeded. This keeps
+  # an interrupted `KEEP_TARGET=1` run reclaimable after an untrappable death.
+  write_verify_sentinel "$SENTINEL_TMP" 0
   SENTINEL_TMP_CREATED=1
+}
+
+mark_current_target_retained() {
+  local sentinel="${VERIFY_DIR}/.ryuki-verify-owner"
+  local replacement="${VERIFY_DIR}/.ryuki-verify-owner.next"
+
+  [[ "$KEEP_TARGET" == "1" ]] || return 0
+  write_verify_sentinel "$replacement" 1
+  mv -f -- "$replacement" "$sentinel"
+  RETAIN_CURRENT_TARGET=1
 }
 
 prepare_verify_namespace() {
@@ -209,7 +230,7 @@ cleanup() {
     rm -f -- "$SENTINEL_TMP" || status=75
   fi
   if [[ "$VERIFY_DIR_CREATED" == "1" && "$SENTINEL_PUBLISHED" == "1" \
-    && "$KEEP_TARGET" == "1" ]]; then
+    && "$RETAIN_CURRENT_TARGET" == "1" ]]; then
     echo "verification target retained at ${CARGO_TARGET_DIR}" >&2
   elif [[ "$VERIFY_DIR_CREATED" == "1" && -e "$VERIFY_DIR" ]]; then
     if is_managed_verify_dir "$VERIFY_DIR"; then
@@ -229,7 +250,9 @@ disk_guard() {
   local announce="${1:-1}"
   local free_kib target_kib min_free_kib max_target_kib
   free_kib="$(df -Pk "$CARGO_TARGET_DIR" | awk 'END {print $4}')"
-  target_kib="$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | awk '{print $1}')"
+  # Bound the complete repository verification namespace, including any
+  # explicitly retained successful run, rather than just this invocation.
+  target_kib="$(du -sk "$VERIFY_TARGET_ROOT" 2>/dev/null | awk '{print $1}')"
   target_kib="${target_kib:-0}"
   min_free_kib=$((MIN_FREE_GIB * 1024 * 1024))
   max_target_kib=$((MAX_TARGET_GIB * 1024 * 1024))
@@ -239,12 +262,12 @@ disk_guard() {
     return 75
   fi
   if (( target_kib > max_target_kib )); then
-    echo "error: verification stopped: disposable target exceeded ${MAX_TARGET_GIB} GiB" >&2
+    echo "error: verification stopped: managed targets exceeded ${MAX_TARGET_GIB} GiB" >&2
     return 75
   fi
 
   if [[ "$announce" == "1" ]]; then
-    echo "disk guard: $((free_kib / 1024 / 1024)) GiB free; target $((target_kib / 1024 / 1024)) GiB"
+    echo "disk guard: $((free_kib / 1024 / 1024)) GiB free; managed targets $((target_kib / 1024 / 1024)) GiB"
   fi
 }
 
@@ -334,25 +357,46 @@ SENTINEL_TMP_CREATED=0
 SENTINEL_PUBLISHED=1
 mkdir -p "$CARGO_TARGET_DIR"
 
-run_gate_command() {
-  # Keep the advisory-lock descriptor alive in a supervisor process even if
-  # the gate executable closes inherited descriptors and the wrapper is killed.
-  # The supervisor must not inherit the wrapper's EXIT cleanup trap.
-  trap - EXIT INT TERM
-  "$@"
+supervisor_stop_command() {
+  local pid="${SUPERVISED_COMMAND_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    terminate_process_tree "$pid"
+  fi
+  wait "$pid" 2>/dev/null || true
+  SUPERVISED_COMMAND_PID=""
 }
 
-run_gate() {
-  local label="$1"
-  local command_pid command_status guard_status
-  shift
-  disk_guard
-  echo "==> ${label}"
+supervisor_signal() {
+  local status="$1"
+  trap - INT TERM
+  supervisor_stop_command
+  exit "$status"
+}
 
-  run_gate_command "$@" &
+run_gate_command() {
+  local wrapper_pid="$1"
+  local label="$2"
+  local command_pid command_status guard_status
+  shift 2
+
+  # This supervisor retains the repository lock and the disk watcher if the
+  # outer wrapper is killed. It then stops the actual gate within one watch
+  # interval, so an orphaned Cargo process cannot grow without a ceiling.
+  trap - EXIT
+  trap 'supervisor_signal 130' INT
+  trap 'supervisor_signal 143' TERM
+
+  "$@" &
   command_pid=$!
-  ACTIVE_GATE_PID="$command_pid"
+  SUPERVISED_COMMAND_PID="$command_pid"
   while kill -0 "$command_pid" 2>/dev/null; do
+    if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+      echo "error: stopping ${label}: verification wrapper no longer exists" >&2
+      supervisor_stop_command
+      return 75
+    fi
+
     sleep "$WATCH_INTERVAL_SECONDS"
     if ! kill -0 "$command_pid" 2>/dev/null; then
       break
@@ -362,11 +406,30 @@ run_gate() {
     else
       guard_status=$?
       echo "error: stopping ${label} before it can exhaust the disk" >&2
-      stop_active_gate
+      supervisor_stop_command
       return "$guard_status"
     fi
   done
 
+  if wait "$command_pid"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  SUPERVISED_COMMAND_PID=""
+  return "$command_status"
+}
+
+run_gate() {
+  local label="$1"
+  local command_pid command_status
+  shift
+  disk_guard
+  echo "==> ${label}"
+
+  run_gate_command "$WRAPPER_PID" "$label" "$@" &
+  command_pid=$!
+  ACTIVE_GATE_PID="$command_pid"
   if wait "$command_pid"; then
     command_status=0
   else
@@ -379,11 +442,57 @@ run_gate() {
   disk_guard
 }
 
+validate_focused_cargo_command() {
+  local argument previous=""
+
+  if [[ "${1:-}" != "cargo" ]]; then
+    echo "error: focused verification accepts only a direct cargo command" >&2
+    return 64
+  fi
+
+  for argument in "$@"; do
+    if [[ "$argument" == "--target-dir" || "$argument" == --target-dir=* ]]; then
+      echo "error: focused verification forbids overriding CARGO_TARGET_DIR" >&2
+      return 64
+    fi
+    if [[ "$previous" == "--config" && "$argument" == *target-dir* ]]; then
+      echo "error: focused verification forbids target-dir Cargo configuration" >&2
+      return 64
+    fi
+    if [[ "$argument" == --config=*target-dir* ]]; then
+      echo "error: focused verification forbids target-dir Cargo configuration" >&2
+      return 64
+    fi
+    previous="$argument"
+  done
+}
+
 cd "$ROOT_DIR"
 disk_guard
 
 if [[ "${RYUKI_VERIFY_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   echo "verification preflight passed; no build commands were run"
+  exit 0
+fi
+
+# Focused coding checks need the same serialization, disk ceiling, signal
+# cleanup, and disposable target as the complete verification wave. Accept an
+# explicit command only after `--`; this keeps normal `make verify-clean`
+# behavior unchanged while avoiding ad-hoc CARGO_TARGET_DIR trees.
+if (( $# > 0 )); then
+  if [[ "$1" != "--" ]]; then
+    echo "usage: $0 [-- command [args...]]" >&2
+    exit 64
+  fi
+  shift
+  if (( $# == 0 )); then
+    echo "error: focused verification requires a command after --" >&2
+    exit 64
+  fi
+  validate_focused_cargo_command "$@"
+  run_gate "focused verification" "$@"
+  mark_current_target_retained
+  echo "focused verification passed; disposable Cargo target will now be removed"
   exit 0
 fi
 
@@ -398,4 +507,5 @@ run_gate "dependency audit" ./scripts/dependency-audit.sh
 run_gate "secret scan" ./scripts/no-secret-scan.sh
 run_gate "patch hygiene" git diff --check
 
+mark_current_target_retained
 echo "workspace verification passed; disposable Cargo target will now be removed"

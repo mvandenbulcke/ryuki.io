@@ -180,6 +180,14 @@ pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION_ENV: &str
     "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION";
 pub(crate) const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST_ENV: &str =
     "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST";
+pub(crate) const FIRST_OWNER_AUTHORITY_ID_ENV: &str = "RYUKI_FIRST_OWNER_AUTHORITY_ID";
+pub(crate) const FIRST_OWNER_AUTHORITY_KEY_ID_ENV: &str = "RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID";
+pub(crate) const FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV: &str =
+    "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64";
+pub(crate) const FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV: &str =
+    "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT";
+pub(crate) const FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV: &str =
+    "RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_PATH_ENV: &str = "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_DIGEST_ENV: &str =
     "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST";
@@ -291,6 +299,18 @@ pub(crate) struct StartupPostgresqlInfrastructureAttestationPins {
     pub(crate) attestation_profile_digest: String,
 }
 
+/// Independently provisioned trust anchor for the permanent first-owner
+/// closure certificate. It has no runtime-discovered defaults and is never
+/// sourced from the rollbackable security-contract root or database row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupFirstOwnerAuthorityPins {
+    pub(crate) authority_id: String,
+    pub(crate) key_id: String,
+    pub(crate) public_key_base64: String,
+    pub(crate) public_key_fingerprint: String,
+    pub(crate) minimum_authority_epoch: u64,
+}
+
 /// Detached build identity selected by independently governed deployment
 /// configuration. The manifest deliberately lives outside the rollbackable
 /// security-contract root and is bound by the digest supplied here.
@@ -312,6 +332,7 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) public_ingress_attestation: Option<StartupPublicIngressAttestationPins>,
     pub(crate) postgresql_infrastructure_attestation:
         Option<StartupPostgresqlInfrastructureAttestationPins>,
+    pub(crate) first_owner_authority: Option<StartupFirstOwnerAuthorityPins>,
     pub(crate) production_build_manifest: Option<StartupProductionBuildManifestPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
@@ -361,6 +382,7 @@ impl StartupSecurityPins {
         let public_ingress_attestation = optional_public_ingress_attestation(&mut get)?;
         let postgresql_infrastructure_attestation =
             optional_postgresql_infrastructure_attestation(&mut get)?;
+        let first_owner_authority = optional_first_owner_authority(&mut get)?;
         let production_build_manifest = optional_production_build_manifest(&mut get)?;
 
         if let Some(postgresql) = postgresql_infrastructure_attestation.as_ref() {
@@ -398,6 +420,42 @@ impl StartupSecurityPins {
                 if postgresql.public_key_fingerprint.as_str() == public_key_fingerprint {
                     return Err(format!(
                         "{POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV} must use a cryptographically distinct key from the {label} authority"
+                    ));
+                }
+            }
+        }
+
+        if let Some(first_owner) = first_owner_authority.as_ref() {
+            let other_authorities = [
+                conformance_trust_checkpoint_authority.as_ref().map(|pins| {
+                    (
+                        "conformance trust-checkpoint",
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+                deployed_workload_attestation.as_ref().map(|pins| {
+                    (
+                        "deployed-workload attestation",
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+                public_ingress_attestation.as_ref().map(|pins| {
+                    (
+                        "public-ingress attestation",
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+                postgresql_infrastructure_attestation.as_ref().map(|pins| {
+                    (
+                        "PostgreSQL-infrastructure attestation",
+                        pins.public_key_fingerprint.as_str(),
+                    )
+                }),
+            ];
+            for (label, public_key_fingerprint) in other_authorities.into_iter().flatten() {
+                if first_owner.public_key_fingerprint == public_key_fingerprint {
+                    return Err(format!(
+                        "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV} must use a cryptographically distinct key from the {label} authority"
                     ));
                 }
             }
@@ -442,6 +500,11 @@ impl StartupSecurityPins {
                 "production {SECURITY_PROFILE_ENV} requires the complete independently pinned PostgreSQL-infrastructure attestation binding beginning with {POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV}"
             ));
         }
+        if security_profile.is_production() && first_owner_authority.is_none() {
+            return Err(format!(
+                "production {SECURITY_PROFILE_ENV} requires the complete independently pinned first-owner authority binding beginning with {FIRST_OWNER_AUTHORITY_ID_ENV}"
+            ));
+        }
         if !security_profile.is_production() && production_build_manifest.is_some() {
             return Err(format!(
                 "{PRODUCTION_BUILD_MANIFEST_PATH_ENV} and {PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} are production-only and must be unset for {profile_raw}"
@@ -462,6 +525,11 @@ impl StartupSecurityPins {
                 "the PostgreSQL-infrastructure attestation binding beginning with {POSTGRESQL_INFRASTRUCTURE_ATTESTATION_SOCKET_ENV} is production-only and must be unset for {profile_raw}"
             ));
         }
+        if !security_profile.is_production() && first_owner_authority.is_some() {
+            return Err(format!(
+                "the first-owner authority binding beginning with {FIRST_OWNER_AUTHORITY_ID_ENV} is production-only and must be unset for {profile_raw}"
+            ));
+        }
 
         Ok(Self {
             contract_root,
@@ -473,6 +541,7 @@ impl StartupSecurityPins {
             deployed_workload_attestation,
             public_ingress_attestation,
             postgresql_infrastructure_attestation,
+            first_owner_authority,
             production_build_manifest,
             deployment_id,
             security_profile,
@@ -3466,10 +3535,9 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
-const REMAINING_PRODUCTION_RUNTIME_GUARDS: [GuardId; 3] = [
+const REMAINING_PRODUCTION_RUNTIME_GUARDS: [GuardId; 2] = [
     GuardId::ExternalSigningKeyMaterial,
     GuardId::MockDependenciesDisabled,
-    GuardId::FirstOwnerPathClosed,
 ];
 
 /// Non-cloneable publication capability emitted only by the complete
@@ -3500,8 +3568,8 @@ impl CompleteProductionRuntimeAdmissionToken {
 }
 
 // HttpsPublicUrls, SecureCookies, ApprovedSecretProvider,
-// NonDevelopmentAuthenticator, and DurablePostgresql have live production
-// verifiers. The remaining three nominal witness types and the final
+// NonDevelopmentAuthenticator, DurablePostgresql, and FirstOwnerPathClosed
+// have live production verifiers. The remaining two nominal witness types and the final
 // eight-witness aggregate stay under this temporary dead-code allowance until
 // their guard-specific verifiers are implemented.
 #[allow(dead_code)]
@@ -4012,6 +4080,235 @@ mod runtime_admission {
             return Err(ProductionRuntimeAdmissionError::TrustedTimeRollback);
         }
         recheck_durable_postgresql_guard(boundary, witness, verified_at)
+    }
+
+    /// Exact signature-verifying permanent-closure runtime retained with the
+    /// same PostgreSQL allocation that satisfied `DurablePostgresql` and the
+    /// independently provisioned first-owner trust anchor used to authenticate
+    /// its canonical certificate bytes.
+    pub(super) struct VerifiedFirstOwnerPathClosedRuntimeHandle {
+        runtime: crate::first_owner_runtime::VerifiedFirstOwnerClosureRuntime,
+        profile: DeploymentSecurityProfile,
+        authority_pins: StartupFirstOwnerAuthorityPins,
+        authority: crate::first_owner_runtime::FirstOwnerAuthorityAnchor,
+    }
+
+    impl fmt::Debug for VerifiedFirstOwnerPathClosedRuntimeHandle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedFirstOwnerPathClosedRuntimeHandle")
+                .field("runtime", &self.runtime)
+                .field("profile", &"[RECEIPT-BOUND]")
+                .field("authority", &"[INDEPENDENTLY-PINNED]")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl VerifiedFirstOwnerPathClosedRuntimeHandle {
+        pub(super) fn retains_postgresql_runtime(
+            &self,
+            candidate: &crate::database::RetainedPostgresqlRuntime,
+        ) -> bool {
+            self.runtime.runtime().same_runtime(candidate) && self.runtime.same_runtime(candidate)
+        }
+    }
+
+    pub(super) type VerifiedFirstOwnerPathClosedRuntimeWitness =
+        VerifiedFirstOwnerPathClosedGuardWitness<VerifiedFirstOwnerPathClosedRuntimeHandle>;
+
+    fn first_owner_path_closed_measurement_failed() -> ProductionRuntimeAdmissionError {
+        ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+            guard_id: GuardId::FirstOwnerPathClosed,
+        }
+    }
+
+    fn first_owner_authority_from_pins(
+        pins: &StartupFirstOwnerAuthorityPins,
+    ) -> Result<
+        crate::first_owner_runtime::FirstOwnerAuthorityAnchor,
+        ProductionRuntimeAdmissionError,
+    > {
+        validate_namespaced_id(
+            FIRST_OWNER_AUTHORITY_ID_ENV,
+            &pins.authority_id,
+            "first-owner-authority:",
+        )
+        .map_err(|_| first_owner_path_closed_measurement_failed())?;
+        validate_namespaced_id(
+            FIRST_OWNER_AUTHORITY_KEY_ID_ENV,
+            &pins.key_id,
+            "first-owner-authority-key:",
+        )
+        .map_err(|_| first_owner_path_closed_measurement_failed())?;
+        let public_key = decode_first_owner_authority_public_key(pins)
+            .map_err(|_| first_owner_path_closed_measurement_failed())?;
+        crate::first_owner_runtime::FirstOwnerAuthorityAnchor::new(
+            pins.authority_id.clone(),
+            pins.key_id.clone(),
+            pins.public_key_fingerprint.clone(),
+            pins.minimum_authority_epoch,
+            public_key,
+        )
+        .map_err(|_| first_owner_path_closed_measurement_failed())
+    }
+
+    fn validate_first_owner_path_closed_runtime_handle(
+        boundary: &VerifiedProductionBoundary,
+        profile: &DeploymentSecurityProfile,
+        durable_postgresql: &VerifiedDurablePostgresqlRuntimeWitness,
+        handle: &VerifiedFirstOwnerPathClosedRuntimeHandle,
+    ) -> Result<RuntimeGuardExpectedValue, ProductionRuntimeAdmissionError> {
+        if &handle.profile != profile
+            || profile.deployment_id != boundary.deployed_workload.deployment_id()
+        {
+            return Err(first_owner_path_closed_measurement_failed());
+        }
+        let authority = first_owner_authority_from_pins(&handle.authority_pins)?;
+        if authority != handle.authority {
+            return Err(first_owner_path_closed_measurement_failed());
+        }
+        handle
+            .runtime
+            .verify_integrity()
+            .map_err(|_| first_owner_path_closed_measurement_failed())?;
+        if !handle
+            .runtime
+            .same_runtime(durable_postgresql.handle().runtime())
+        {
+            return Err(first_owner_path_closed_measurement_failed());
+        }
+        let challenge = exact_challenge(boundary, GuardId::FirstOwnerPathClosed)?;
+        if handle.runtime.observed_value() != challenge.expected_value() {
+            return Err(ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::FirstOwnerPathClosed,
+            });
+        }
+        Ok(handle.runtime.observed_value().clone())
+    }
+
+    pub(super) fn recheck_first_owner_path_closed_guard(
+        boundary: &VerifiedProductionBoundary,
+        profile: &DeploymentSecurityProfile,
+        durable_postgresql: &VerifiedDurablePostgresqlRuntimeWitness,
+        witness: &VerifiedFirstOwnerPathClosedRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        recheck_durable_postgresql_guard(boundary, durable_postgresql, trusted_now)?;
+        let remeasured = validate_first_owner_path_closed_runtime_handle(
+            boundary,
+            profile,
+            durable_postgresql,
+            witness.handle(),
+        )?;
+        if witness.0.observed_value != remeasured {
+            return Err(first_owner_path_closed_measurement_failed());
+        }
+        witness.recheck(boundary, trusted_now)
+    }
+
+    /// Authenticate and measure the closure record from the exact pool already
+    /// sealed by DurablePostgresql. The observed certificate, atomic evidence,
+    /// and assignment set must match both the receipt and independent anchor.
+    pub(super) async fn verify_first_owner_path_closed_guard(
+        boundary: &VerifiedProductionBoundary,
+        profile: &DeploymentSecurityProfile,
+        durable_postgresql: &VerifiedDurablePostgresqlRuntimeWitness,
+        authority_pins: &StartupFirstOwnerAuthorityPins,
+    ) -> Result<VerifiedFirstOwnerPathClosedRuntimeWitness, ProductionRuntimeAdmissionError> {
+        let observed_at_not_before = Utc::now();
+        let initial_time = trusted_time_point(observed_at_not_before);
+        recheck_durable_postgresql_guard(boundary, durable_postgresql, initial_time)?;
+        let challenge = exact_challenge(boundary, GuardId::FirstOwnerPathClosed)?;
+        let expected_value = challenge.expected_value().clone();
+        let requirement_digest = challenge.requirement_digest().to_owned();
+        let challenge_binding_digest = challenge.challenge_binding_digest().to_owned();
+        let retained_postgresql = Arc::new(durable_postgresql.handle().runtime().clone());
+        let authority = first_owner_authority_from_pins(authority_pins)?;
+        let runtime = crate::first_owner_runtime::verify_first_owner_path_closed(
+            retained_postgresql,
+            profile,
+            &expected_value,
+            authority.clone(),
+        )
+        .await
+        .map_err(|_| first_owner_path_closed_measurement_failed())?;
+        let observed_at_not_after = Utc::now();
+        if observed_at_not_after < observed_at_not_before {
+            return Err(ProductionRuntimeAdmissionError::TrustedTimeRollback);
+        }
+        let verification_time = trusted_time_point(observed_at_not_after);
+        recheck_durable_postgresql_guard(boundary, durable_postgresql, verification_time)?;
+        let handle = VerifiedFirstOwnerPathClosedRuntimeHandle {
+            runtime,
+            profile: profile.clone(),
+            authority_pins: authority_pins.clone(),
+            authority,
+        };
+        let observed_value = validate_first_owner_path_closed_runtime_handle(
+            boundary,
+            profile,
+            durable_postgresql,
+            &handle,
+        )?;
+        let valid_until = observed_at_not_before
+            .checked_add_signed(chrono::TimeDelta::seconds(
+                MAX_RUNTIME_GUARD_WITNESS_LIFETIME_SECONDS,
+            ))
+            .ok_or(ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                guard_id: GuardId::FirstOwnerPathClosed,
+            })?;
+        VerifiedFirstOwnerPathClosedGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::FirstOwnerPathClosed,
+                observed_value,
+                requirement_digest,
+                challenge_binding_digest,
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle,
+            },
+            verification_time,
+        )
+    }
+
+    /// Repeat the signed live closure query through the same retained
+    /// PostgreSQL channel. Synchronous witness and infrastructure checks fence
+    /// both sides of the await so neither authority, runtime identity, nor
+    /// trusted time can be substituted during remeasurement.
+    pub(super) async fn remeasure_first_owner_path_closed_guard_exact(
+        boundary: &VerifiedProductionBoundary,
+        profile: &DeploymentSecurityProfile,
+        durable_postgresql: &VerifiedDurablePostgresqlRuntimeWitness,
+        witness: &VerifiedFirstOwnerPathClosedRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        recheck_first_owner_path_closed_guard(
+            boundary,
+            profile,
+            durable_postgresql,
+            witness,
+            trusted_now,
+        )?;
+        let challenge = exact_challenge(boundary, GuardId::FirstOwnerPathClosed)?;
+        witness
+            .handle()
+            .runtime
+            .remeasure_exact(profile, challenge.expected_value())
+            .await
+            .map_err(|_| first_owner_path_closed_measurement_failed())?;
+        let verified_at = trusted_time_point(Utc::now());
+        if verified_at.not_before < trusted_now.not_after {
+            return Err(ProductionRuntimeAdmissionError::TrustedTimeRollback);
+        }
+        recheck_first_owner_path_closed_guard(
+            boundary,
+            profile,
+            durable_postgresql,
+            witness,
+            verified_at,
+        )
     }
 
     pub(super) type VerifiedHttpsPublicUrlsRuntimeWitness =
@@ -6213,6 +6510,11 @@ pub(crate) struct SecurityContractContext {
     /// infrastructure proof used by its local receipt comparison.
     verified_durable_postgresql_guard:
         Option<runtime_admission::VerifiedDurablePostgresqlRuntimeWitness>,
+    /// Independently authenticated permanent first-owner closure, atomic audit
+    /// evidence, and five initial privileged-domain assignments measured
+    /// through the exact retained DurablePostgresql runtime.
+    verified_first_owner_path_closed_guard:
+        Option<runtime_admission::VerifiedFirstOwnerPathClosedRuntimeWitness>,
     /// Exact active security-limit document selected by the deployment root.
     /// Runtime owners receive only opaque policies resolved from this retained
     /// authority and the verified provider D document.
@@ -6596,9 +6898,11 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if !self.profile.security_profile.is_production() {
-            if self.verified_durable_postgresql_guard.is_some() {
+            if self.verified_durable_postgresql_guard.is_some()
+                || self.verified_first_owner_path_closed_guard.is_some()
+            {
                 return Err(
-                    "non-production serving startup retained DurablePostgresql production authority"
+                    "non-production serving startup retained DurablePostgresql or first-owner production authority"
                         .into(),
                 );
             }
@@ -6625,6 +6929,23 @@ impl SecurityContractContext {
         )
         .map_err(|error| {
             format!("DurablePostgresql runtime guard freshness recheck failed: {error}")
+        })?;
+        let first_owner_path_closed = self
+            .verified_first_owner_path_closed_guard
+            .as_ref()
+            .ok_or_else(|| {
+                "production serving startup has no verified first-owner-path-closed runtime guard"
+                    .to_string()
+            })?;
+        runtime_admission::recheck_first_owner_path_closed_guard(
+            boundary,
+            &self.profile,
+            durable_postgresql_guard,
+            first_owner_path_closed,
+            trusted_now,
+        )
+        .map_err(|error| {
+            format!("first-owner-path-closed runtime guard freshness recheck failed: {error}")
         })?;
         if let Some(witness) = &self.verified_https_public_urls_guard {
             runtime_admission::recheck_https_public_urls_guard(boundary, witness, trusted_now)
@@ -7148,6 +7469,145 @@ impl SecurityContractContext {
         Ok(unpublished)
     }
 
+    /// Authenticate and seal the permanent first-owner closure through the
+    /// exact unpublished PostgreSQL runtime already retained by
+    /// DurablePostgresql and the independently provisioned Ed25519 authority.
+    pub(crate) async fn verify_first_owner_path_closed_runtime_guard(
+        &mut self,
+        pins: &StartupSecurityPins,
+        unpublished: &crate::database::UnpublishedPostgresqlRuntime,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_first_owner_path_closed_guard.is_some()
+                || self.verified_durable_postgresql_guard.is_some()
+                || pins.first_owner_authority.is_some()
+            {
+                return Err(
+                    "non-production startup retained first-owner or DurablePostgresql production authority"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        if self.verified_first_owner_path_closed_guard.is_some() {
+            return Err(
+                "production first-owner-path-closed runtime guard was verified more than once"
+                    .into(),
+            );
+        }
+        if self.profile.security_profile != pins.security_profile
+            || self.profile.deployment_id != pins.deployment_id
+        {
+            return Err(
+                "first-owner startup pins differ from the loaded deployment identity".into(),
+            );
+        }
+        if !unpublished.is_unpublished() {
+            return Err(
+                "first-owner closure verification requires the unpublished production database"
+                    .into(),
+            );
+        }
+        let authority_pins = pins.first_owner_authority.as_ref().ok_or_else(|| {
+            "production startup has no independently pinned first-owner authority".to_string()
+        })?;
+        let other_authorities = [
+            (
+                "conformance trust-checkpoint",
+                pins.conformance_trust_checkpoint_authority
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "production first-owner verification has no checkpoint authority pins"
+                            .to_string()
+                    })?
+                    .public_key_fingerprint
+                    .as_str(),
+            ),
+            (
+                "deployed-workload attestation",
+                pins.deployed_workload_attestation
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "production first-owner verification has no workload authority pins"
+                            .to_string()
+                    })?
+                    .public_key_fingerprint
+                    .as_str(),
+            ),
+            (
+                "public-ingress attestation",
+                pins.public_ingress_attestation
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "production first-owner verification has no ingress authority pins"
+                            .to_string()
+                    })?
+                    .public_key_fingerprint
+                    .as_str(),
+            ),
+            (
+                "PostgreSQL-infrastructure attestation",
+                pins.postgresql_infrastructure_attestation
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "production first-owner verification has no PostgreSQL authority pins"
+                            .to_string()
+                    })?
+                    .public_key_fingerprint
+                    .as_str(),
+            ),
+        ];
+        for (label, public_key_fingerprint) in other_authorities {
+            if authority_pins.public_key_fingerprint == public_key_fingerprint {
+                return Err(format!(
+                    "first-owner authority must use a cryptographically distinct key from the {label} authority"
+                ));
+            }
+        }
+        let witness = {
+            let ConformanceState::Production(boundary) = &self.conformance_state else {
+                return Err("production startup has no sealed production-boundary proof".into());
+            };
+            let durable_postgresql =
+                self.verified_durable_postgresql_guard
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "production first-owner verification has no DurablePostgresql runtime guard"
+                            .to_string()
+                    })?;
+            let candidate = unpublished.retained_handle();
+            if !durable_postgresql
+                .handle()
+                .runtime()
+                .same_runtime(&candidate)
+            {
+                return Err(
+                    "first-owner closure verification received a PostgreSQL runtime other than the DurablePostgresql authority"
+                        .into(),
+                );
+            }
+            let witness = runtime_admission::verify_first_owner_path_closed_guard(
+                boundary,
+                &self.profile,
+                durable_postgresql,
+                authority_pins,
+            )
+            .await
+            .map_err(|error| {
+                format!("first-owner-path-closed runtime guard verification failed: {error}")
+            })?;
+            if !witness.handle().retains_postgresql_runtime(&candidate) {
+                return Err(
+                    "first-owner-path-closed witness did not retain the DurablePostgresql runtime"
+                        .into(),
+                );
+            }
+            witness
+        };
+        self.verified_first_owner_path_closed_guard = Some(witness);
+        Ok(())
+    }
+
     /// Repeat the exact channel-bound SQL/session observation at an
     /// asynchronous serving fence. This is intentionally separate from the
     /// value-free synchronous checkpoint recheck.
@@ -7181,6 +7641,52 @@ impl SecurityContractContext {
         .map_err(|error| format!("DurablePostgresql exact runtime remeasurement failed: {error}"))
     }
 
+    /// Repeat the independently authenticated permanent-closure observation at
+    /// an asynchronous fence through the same retained PostgreSQL channel.
+    pub(crate) async fn remeasure_first_owner_path_closed_runtime_guard(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_first_owner_path_closed_guard.is_some()
+                || self.verified_durable_postgresql_guard.is_some()
+            {
+                return Err(
+                    "non-production startup retained first-owner or DurablePostgresql production authority"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        let durable_postgresql =
+            self.verified_durable_postgresql_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production startup has no verified DurablePostgresql runtime guard".to_string()
+                })?;
+        let first_owner_path_closed = self
+            .verified_first_owner_path_closed_guard
+            .as_ref()
+            .ok_or_else(|| {
+                "production startup has no verified first-owner-path-closed runtime guard"
+                    .to_string()
+            })?;
+        runtime_admission::remeasure_first_owner_path_closed_guard_exact(
+            boundary,
+            &self.profile,
+            durable_postgresql,
+            first_owner_path_closed,
+            trusted_time_point(now),
+        )
+        .await
+        .map_err(|error| {
+            format!("first-owner-path-closed exact runtime remeasurement failed: {error}")
+        })
+    }
+
     pub(crate) fn validate_runtime_bindings(
         &self,
         config: &RyukiConfig,
@@ -7188,10 +7694,12 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if !self.profile.security_profile.is_production()
-            && self.verified_durable_postgresql_guard.is_some()
+            && (self.verified_durable_postgresql_guard.is_some()
+                || self.verified_first_owner_path_closed_guard.is_some())
         {
             return Err(
-                "non-production startup retained DurablePostgresql production authority".into(),
+                "non-production startup retained DurablePostgresql or first-owner production authority"
+                    .into(),
             );
         }
         // Production authority always comes from the authenticated provider
@@ -7238,6 +7746,13 @@ impl SecurityContractContext {
                 .ok_or_else(|| {
                     "production startup has no verified DurablePostgresql runtime guard".to_string()
                 })?;
+            let first_owner_path_closed_guard = self
+                .verified_first_owner_path_closed_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production startup has no verified first-owner-path-closed runtime guard"
+                        .to_string()
+                })?;
             let (secret_provider, _) = self.exact_production_secret_provider()?;
             let trusted_now = trusted_time_point(now);
             runtime_admission::recheck_https_public_urls_guard(
@@ -7283,6 +7798,16 @@ impl SecurityContractContext {
             .map_err(|error| {
                 format!("DurablePostgresql runtime guard freshness recheck failed: {error}")
             })?;
+            runtime_admission::recheck_first_owner_path_closed_guard(
+                boundary,
+                &self.profile,
+                durable_postgresql_guard,
+                first_owner_path_closed_guard,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!("first-owner-path-closed runtime guard freshness recheck failed: {error}")
+            })?;
             let selected = self.select_authentication_provider(&config.auth_mode)?;
             self.validate_selected_provider(selected, config)?;
             let provider_applicability = format!(
@@ -7291,7 +7816,7 @@ impl SecurityContractContext {
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and DurablePostgresql, HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and DurablePostgresql, the independently signed FirstOwnerPathClosed permanent closure, HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: external-signing-key-material, mock-dependencies-disabled",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
@@ -8300,6 +8825,27 @@ fn decode_postgresql_infrastructure_authority_public_key(
     })
 }
 
+fn decode_first_owner_authority_public_key(
+    pins: &StartupFirstOwnerAuthorityPins,
+) -> Result<[u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES], String> {
+    let decoded = BASE64_STANDARD
+        .decode(&pins.public_key_base64)
+        .map_err(|_| {
+            "configured first-owner authority public key is not canonical base64".to_string()
+        })?;
+    if BASE64_STANDARD.encode(&decoded) != pins.public_key_base64
+        || raw_digest(&decoded) != pins.public_key_fingerprint
+    {
+        return Err(
+            "configured first-owner authority public key does not match its canonical independent fingerprint pin"
+                .into(),
+        );
+    }
+    decoded
+        .try_into()
+        .map_err(|_| "configured first-owner authority public key is not 32 bytes".to_string())
+}
+
 fn conformance_document_digests(
     documents: &BTreeMap<String, Value>,
     raw_document_bytes: &BTreeMap<String, Vec<u8>>,
@@ -8494,6 +9040,7 @@ fn finalize_startup_security_contract(
         verified_approved_secret_provider_guard: None,
         verified_non_development_authenticator_guard: None,
         verified_durable_postgresql_guard: None,
+        verified_first_owner_path_closed_guard: None,
         verified_security_limit_profile: prepared.verified_security_limit_profile,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
@@ -9764,6 +10311,110 @@ fn optional_postgresql_infrastructure_attestation(
         attestation_profile_id,
         attestation_profile_version,
         attestation_profile_digest,
+    }))
+}
+
+fn optional_first_owner_authority(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupFirstOwnerAuthorityPins>, String> {
+    let authority_id = optional_unicode(get, FIRST_OWNER_AUTHORITY_ID_ENV)?;
+    let key_id = optional_unicode(get, FIRST_OWNER_AUTHORITY_KEY_ID_ENV)?;
+    let public_key_base64 = optional_unicode(get, FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV)?;
+    let public_key_fingerprint =
+        optional_unicode(get, FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV)?;
+    let minimum_authority_epoch = optional_unicode(get, FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV)?;
+
+    let any_present = [
+        authority_id.as_ref(),
+        key_id.as_ref(),
+        public_key_base64.as_ref(),
+        public_key_fingerprint.as_ref(),
+        minimum_authority_epoch.as_ref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    if !any_present {
+        return Ok(None);
+    }
+
+    let required = |value: Option<String>, name: &str| {
+        value.ok_or_else(|| {
+            format!("{name} is required when any first-owner authority binding is configured")
+        })
+    };
+    let authority_id = required(authority_id, FIRST_OWNER_AUTHORITY_ID_ENV)?;
+    let key_id = required(key_id, FIRST_OWNER_AUTHORITY_KEY_ID_ENV)?;
+    let public_key_base64 = required(
+        public_key_base64,
+        FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV,
+    )?;
+    let public_key_fingerprint = required(
+        public_key_fingerprint,
+        FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV,
+    )?;
+    let minimum_authority_epoch =
+        required(minimum_authority_epoch, FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV)?;
+
+    validate_namespaced_id(
+        FIRST_OWNER_AUTHORITY_ID_ENV,
+        &authority_id,
+        "first-owner-authority:",
+    )?;
+    validate_namespaced_id(
+        FIRST_OWNER_AUTHORITY_KEY_ID_ENV,
+        &key_id,
+        "first-owner-authority-key:",
+    )?;
+    validate_digest_pin(
+        FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV,
+        &public_key_fingerprint,
+    )?;
+    let public_key = BASE64_STANDARD.decode(&public_key_base64).map_err(|_| {
+        format!(
+            "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        )
+    })?;
+    if public_key.len() != ED25519_AUTHORITY_PUBLIC_KEY_BYTES
+        || BASE64_STANDARD.encode(&public_key) != public_key_base64
+    {
+        return Err(format!(
+            "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        ));
+    }
+    if raw_digest(&public_key) != public_key_fingerprint {
+        return Err(format!(
+            "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV} does not match the decoded authority public key"
+        ));
+    }
+    let key_bytes: [u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES] = public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV} must encode a valid Ed25519 public key"
+            )
+        })?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| {
+        format!(
+            "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV} must encode a valid Ed25519 public key"
+        )
+    })?;
+    if verifying_key.is_weak() {
+        return Err(format!(
+            "{FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV} must not encode a weak Ed25519 public key"
+        ));
+    }
+    let minimum_authority_epoch = parse_positive_exact_json_integer(
+        FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV,
+        &minimum_authority_epoch,
+    )?;
+
+    Ok(Some(StartupFirstOwnerAuthorityPins {
+        authority_id,
+        key_id,
+        public_key_base64,
+        public_key_fingerprint,
+        minimum_authority_epoch,
     }))
 }
 
@@ -14264,7 +14915,6 @@ mod tests {
             [
                 GuardId::ExternalSigningKeyMaterial,
                 GuardId::MockDependenciesDisabled,
-                GuardId::FirstOwnerPathClosed,
             ]
         );
     }
@@ -15114,6 +15764,7 @@ mod tests {
                 deployed_workload_attestation: None,
                 public_ingress_attestation: None,
                 postgresql_infrastructure_attestation: None,
+                first_owner_authority: None,
                 production_build_manifest: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
@@ -16071,6 +16722,38 @@ mod tests {
         for (name, value) in &postgresql_group {
             production_complete.insert((*name).into(), OsString::from(value));
         }
+        assert!(
+            StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
+                .unwrap_err()
+                .contains(FIRST_OWNER_AUTHORITY_ID_ENV)
+        );
+
+        let first_owner_key = SigningKey::from_bytes(&rand::random());
+        let first_owner_public_key =
+            BASE64_STANDARD.encode(first_owner_key.verifying_key().to_bytes());
+        let first_owner_fingerprint = raw_digest(&first_owner_key.verifying_key().to_bytes());
+        let first_owner_group = [
+            (
+                FIRST_OWNER_AUTHORITY_ID_ENV,
+                "first-owner-authority:runtime-test".to_string(),
+            ),
+            (
+                FIRST_OWNER_AUTHORITY_KEY_ID_ENV,
+                "first-owner-authority-key:runtime-test".to_string(),
+            ),
+            (
+                FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV,
+                first_owner_public_key,
+            ),
+            (
+                FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV,
+                first_owner_fingerprint,
+            ),
+            (FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV, "19".to_string()),
+        ];
+        for (name, value) in &first_owner_group {
+            production_complete.insert((*name).into(), OsString::from(value));
+        }
         let production_pins =
             StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
                 .expect("production pins are complete");
@@ -16116,6 +16799,40 @@ mod tests {
                 "{label}: {error}"
             );
         }
+        for (label, public_key) in [
+            (
+                "conformance trust-checkpoint",
+                checkpoint_key.verifying_key().to_bytes(),
+            ),
+            (
+                "deployed-workload attestation",
+                workload_key.verifying_key().to_bytes(),
+            ),
+            (
+                "public-ingress attestation",
+                ingress_key.verifying_key().to_bytes(),
+            ),
+            (
+                "PostgreSQL-infrastructure attestation",
+                postgresql_key.verifying_key().to_bytes(),
+            ),
+        ] {
+            let mut reused_key = production_complete.clone();
+            reused_key.insert(
+                FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV.into(),
+                OsString::from(BASE64_STANDARD.encode(public_key)),
+            );
+            reused_key.insert(
+                FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+                OsString::from(raw_digest(&public_key)),
+            );
+            let error =
+                StartupSecurityPins::from_source(|name| reused_key.get(name).cloned()).unwrap_err();
+            assert!(
+                error.contains("cryptographically distinct key"),
+                "{label}: {error}"
+            );
+        }
         let workload_pins = production_pins
             .deployed_workload_attestation
             .as_ref()
@@ -16135,6 +16852,15 @@ mod tests {
             .expect("production PostgreSQL-infrastructure attestation binding");
         assert_eq!(postgresql_pins.minimum_authority_epoch, 17);
         assert_eq!(postgresql_pins.attestation_profile_version, 7);
+        let first_owner_pins = production_pins
+            .first_owner_authority
+            .as_ref()
+            .expect("production first-owner authority binding");
+        assert_eq!(first_owner_pins.minimum_authority_epoch, 19);
+        assert_eq!(
+            first_owner_pins.authority_id,
+            "first-owner-authority:runtime-test"
+        );
         let build_pins = production_pins
             .production_build_manifest
             .expect("production build manifest binding");
@@ -16186,6 +16912,16 @@ mod tests {
         .unwrap_err()
         .contains("production-only"));
 
+        let mut nonproduction_with_first_owner = values.clone();
+        for (name, value) in &first_owner_group {
+            nonproduction_with_first_owner.insert((*name).into(), OsString::from(value));
+        }
+        assert!(StartupSecurityPins::from_source(|name| {
+            nonproduction_with_first_owner.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("production-only"));
+
         for (missing, _) in &workload_group {
             assert!(StartupSecurityPins::from_source(|name| {
                 (name != *missing)
@@ -16207,6 +16943,16 @@ mod tests {
         }
 
         for (missing, _) in &postgresql_group {
+            assert!(StartupSecurityPins::from_source(|name| {
+                (name != *missing)
+                    .then(|| production_complete.get(name).cloned())
+                    .flatten()
+            })
+            .unwrap_err()
+            .contains(*missing));
+        }
+
+        for (missing, _) in &first_owner_group {
             assert!(StartupSecurityPins::from_source(|name| {
                 (name != *missing)
                     .then(|| production_complete.get(name).cloned())
@@ -16257,6 +17003,30 @@ mod tests {
                     .contains("canonical positive")
             );
         }
+        for invalid_counter in ["0", "03", "9007199254740992"] {
+            let mut invalid = production_complete.clone();
+            invalid.insert(
+                FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV.into(),
+                OsString::from(invalid_counter),
+            );
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains("canonical positive")
+            );
+        }
+        for (name, value) in [
+            (FIRST_OWNER_AUTHORITY_ID_ENV, "authority:wrong-prefix"),
+            (FIRST_OWNER_AUTHORITY_KEY_ID_ENV, "key:wrong-prefix"),
+        ] {
+            let mut invalid = production_complete.clone();
+            invalid.insert(name.into(), OsString::from(value));
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains(name)
+            );
+        }
         for invalid_socket in [
             "run/ryuki/workload-attestation.sock".to_string(),
             "/run//ryuki/workload-attestation.sock".to_string(),
@@ -16297,6 +17067,31 @@ mod tests {
             StartupSecurityPins::from_source(|name| invalid_postgresql_key.get(name).cloned())
                 .unwrap_err()
                 .contains("Ed25519 public key")
+        );
+        let weak_first_owner_key = [0u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES];
+        let mut invalid_first_owner_key = production_complete.clone();
+        invalid_first_owner_key.insert(
+            FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64_ENV.into(),
+            OsString::from(BASE64_STANDARD.encode(weak_first_owner_key)),
+        );
+        invalid_first_owner_key.insert(
+            FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+            OsString::from(raw_digest(&weak_first_owner_key)),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| invalid_first_owner_key.get(name).cloned())
+                .unwrap_err()
+                .contains("weak Ed25519 public key")
+        );
+        let mut mismatched_first_owner_key = production_complete.clone();
+        mismatched_first_owner_key.insert(
+            FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+            OsString::from(format!("sha256:{}", "b".repeat(64))),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| mismatched_first_owner_key.get(name).cloned())
+                .unwrap_err()
+                .contains("does not match")
         );
         let mut zero_build_digest = production_complete;
         zero_build_digest.insert(
@@ -16688,17 +17483,21 @@ mod tests {
     }
 
     #[test]
-    fn durable_postgresql_has_a_concrete_guard_and_three_guards_remain() {
+    fn first_owner_path_closed_has_a_concrete_guard_and_two_guards_remain() {
         assert_eq!(
             REMAINING_PRODUCTION_RUNTIME_GUARDS,
             [
                 GuardId::ExternalSigningKeyMaterial,
                 GuardId::MockDependenciesDisabled,
-                GuardId::FirstOwnerPathClosed,
             ]
         );
-        let _verify_api = SecurityContractContext::verify_durable_postgresql_runtime_guard;
-        let _remeasure_api = SecurityContractContext::remeasure_durable_postgresql_runtime_guard;
+        let _verify_database_api = SecurityContractContext::verify_durable_postgresql_runtime_guard;
+        let _remeasure_database_api =
+            SecurityContractContext::remeasure_durable_postgresql_runtime_guard;
+        let _verify_first_owner_api =
+            SecurityContractContext::verify_first_owner_path_closed_runtime_guard;
+        let _remeasure_first_owner_api =
+            SecurityContractContext::remeasure_first_owner_path_closed_runtime_guard;
     }
 
     #[test]

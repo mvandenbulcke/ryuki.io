@@ -14,6 +14,7 @@ pub mod cp_identity;
 pub mod database;
 mod entra_auth;
 mod entra_sso;
+mod first_owner_runtime;
 mod human_authority;
 mod idempotency;
 mod identity_authority;
@@ -3890,6 +3891,15 @@ async fn main() {
     } else {
         None
     };
+    if let Some(unpublished) = unpublished_production_database.as_ref() {
+        security_contract
+            .verify_first_owner_path_closed_runtime_guard(&security_pins, unpublished)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("first-owner-path-closed runtime guard failed: {error}");
+                std::process::exit(1);
+            });
+    }
     if let Err(error) = security_contract.validate_runtime_bindings(
         &app_config,
         std::env::var_os("RYUKI_AUTH_MODE").is_some(),
@@ -4117,6 +4127,13 @@ async fn main() {
         .await
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "durable-postgresql exact remeasurement failed before database startup");
+            std::process::exit(1);
+        });
+    config_store::get_security_contract_context()
+        .remeasure_first_owner_path_closed_runtime_guard(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "first-owner-path-closed exact remeasurement failed before database startup");
             std::process::exit(1);
         });
     match migration_mode {
@@ -4428,6 +4445,13 @@ async fn main() {
             tracing::error!(error = %error, "durable-postgresql exact remeasurement failed before worker startup");
             std::process::exit(1);
         });
+    config_store::get_security_contract_context()
+        .remeasure_first_owner_path_closed_runtime_guard(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "first-owner-path-closed exact remeasurement failed before worker startup");
+            std::process::exit(1);
+        });
 
     // Spawn background sweeps (lease-expiry + idempotency retention). Only when
     // a DB pool is available. Both are idempotent and cancelled automatically
@@ -4665,6 +4689,13 @@ async fn main() {
         .await
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "durable-postgresql exact remeasurement failed before listener bind");
+            std::process::exit(1);
+        });
+    config_store::get_security_contract_context()
+        .remeasure_first_owner_path_closed_runtime_guard(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "first-owner-path-closed exact remeasurement failed before listener bind");
             std::process::exit(1);
         });
     // The approved-secret-provider witness retains the exact initial lease Arc.
