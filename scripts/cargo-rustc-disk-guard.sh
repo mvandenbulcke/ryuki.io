@@ -58,7 +58,7 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
 done
 
 find_target_root() {
-  local candidate parent attempt configured_target
+  local candidate parent attempt configured_target configured_real out_real
 
   if [[ -n "$out_dir" ]]; then
     candidate="$out_dir"
@@ -78,15 +78,33 @@ find_target_root() {
     configured_target="$PWD/$configured_target"
   fi
   if [[ -d "$configured_target" ]]; then
-    (cd "$configured_target" && pwd -P)
-    return 0
+    configured_real="$(cd "$configured_target" && pwd -P)"
+    if [[ -z "$out_dir" ]]; then
+      printf '%s\n' "$configured_real"
+      return 0
+    fi
+    if [[ -d "$out_dir" ]]; then
+      out_real="$(cd "$out_dir" && pwd -P)"
+      case "$out_real/" in
+        "$configured_real/"*)
+          printf '%s\n' "$configured_real"
+          return 0
+          ;;
+      esac
+    fi
   fi
   return 1
 }
 
 # Cargo also uses the wrapper for compiler capability probes that have no
-# output directory. Delegate those immediately when no target exists yet.
+# output directory. Only those probes may run without a target supervisor. A
+# real compiler invocation with `--out-dir` fails closed if its target cannot
+# be identified, rather than writing into an unmonitored tree.
 if ! target_root="$(find_target_root)"; then
+  if [[ -n "$out_dir" ]]; then
+    echo "error: Cargo compilation refused: unable to identify the target root" >&2
+    exit 75
+  fi
   exec "$@"
 fi
 
@@ -114,7 +132,8 @@ trip_guard() {
 # below both limits (normally after `make clean`).
 guard_check() (
   local force="${1:-0}"
-  local now last_check lock_timestamp target_kib free_kib
+  local now last_check target_kib free_kib owner_pid lock_attempt max_lock_attempts
+  local lock_acquired=0
 
   now="$(date +%s)"
   last_check=0
@@ -130,26 +149,51 @@ guard_check() (
     return 0
   fi
 
-  # A dead checker's lock is reclaimable; lock contention never disables
-  # supervision because the other wrappers still observe `trip_file`.
-  if ! mkdir "$lock_dir" 2>/dev/null; then
-    lock_timestamp=0
-    if [[ -f "$lock_dir/timestamp" ]]; then
-      read -r lock_timestamp < "$lock_dir/timestamp" || lock_timestamp=0
+  # A dead checker's lock is reclaimable by owner PID. Never age out a live
+  # `du`: traversing a near-limit target can legitimately take longer than the
+  # normal monitor interval. Forced pre/postflight checks wait briefly for a
+  # live checker and fail closed if it cannot finish; background checks defer
+  # to that live checker and keep observing the shared trip marker.
+  max_lock_attempts=1
+  [[ "$force" == "1" ]] && max_lock_attempts=100
+  for ((lock_attempt = 0; lock_attempt < max_lock_attempts; lock_attempt++)); do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      # Bash 3.2 has no BASHPID and keeps `$$` unchanged in a subshell. A
+      # short-lived child reports its actual parent, which is this checker.
+      /bin/sh -c 'printf "%s\n" "$PPID"' > "$lock_dir/owner-pid"
+      lock_acquired=1
+      break
     fi
-    if [[ "$lock_timestamp" =~ ^[0-9]+$ ]] \
-      && (( now - lock_timestamp > CHECK_INTERVAL_SECONDS * 2 )); then
+
+    [[ ! -f "$trip_file" ]] || return 75
+    owner_pid=""
+    if [[ -f "$lock_dir/owner-pid" ]]; then
+      read -r owner_pid < "$lock_dir/owner-pid" || owner_pid=""
+    fi
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
       rm -rf -- "$lock_dir"
-      mkdir "$lock_dir" 2>/dev/null || {
-        [[ ! -f "$trip_file" ]]
-        return
-      }
-    else
-      [[ ! -f "$trip_file" ]]
-      return
+      continue
+    fi
+    [[ "$force" == "1" ]] || return 0
+    sleep 0.1
+  done
+  if (( lock_acquired == 0 )) && [[ "$force" == "1" ]]; then
+    owner_pid=""
+    if [[ -f "$lock_dir/owner-pid" ]]; then
+      read -r owner_pid < "$lock_dir/owner-pid" || owner_pid=""
+    fi
+    # A checker killed between mkdir and owner publication can leave an
+    # ownerless lock. Reclaim only that invalid form after the bounded wait;
+    # a numeric live owner always wins and makes this check fail closed.
+    if [[ ! "$owner_pid" =~ ^[0-9]+$ ]]; then
+      rm -rf -- "$lock_dir"
+      if mkdir "$lock_dir" 2>/dev/null; then
+        /bin/sh -c 'printf "%s\n" "$PPID"' > "$lock_dir/owner-pid"
+        lock_acquired=1
+      fi
     fi
   fi
-  printf '%s\n' "$now" > "$lock_dir/timestamp"
+  (( lock_acquired == 1 )) || return 75
   trap 'rm -rf -- "$lock_dir"' EXIT INT TERM
 
   target_kib="$(du -sk "$target_root" | awk '{print $1}')"
@@ -170,49 +214,36 @@ guard_check() (
   printf '%s\n' "$now" > "$stamp_file"
 )
 
-collect_process_tree() {
-  local pid="$1"
-  local child
-  if command -v pgrep >/dev/null 2>&1; then
-    while IFS= read -r child; do
-      [[ -n "$child" ]] && collect_process_tree "$child"
-    done < <(pgrep -P "$pid" 2>/dev/null || true)
-  fi
-  printf '%s\n' "$pid"
-}
-
 compiler_pid=""
+compiler_pgid=""
 
 stop_compiler_tree() {
   local pid="${compiler_pid:-}"
-  local child attempt alive
-  local tree_pids=()
+  local pgid="${compiler_pgid:-}"
+  local attempt
   [[ -n "$pid" ]] || return 0
 
-  while IFS= read -r child; do
-    [[ -n "$child" ]] && tree_pids+=("$child")
-  done < <(collect_process_tree "$pid")
-  for child in "${tree_pids[@]}"; do
-    kill -TERM "$child" 2>/dev/null || true
-  done
+  if [[ -n "$pgid" ]]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
   for attempt in {1..20}; do
-    alive=0
-    for child in "${tree_pids[@]}"; do
-      if kill -0 "$child" 2>/dev/null; then
-        alive=1
-        break
-      fi
-    done
-    (( alive == 0 )) && break
+    if [[ -n "$pgid" ]]; then
+      kill -0 -- "-$pgid" 2>/dev/null || break
+    else
+      kill -0 "$pid" 2>/dev/null || break
+    fi
     sleep 0.1
   done
-  if (( alive != 0 )); then
-    for child in "${tree_pids[@]}"; do
-      kill -KILL "$child" 2>/dev/null || true
-    done
+  if [[ -n "$pgid" ]] && kill -0 -- "-$pgid" 2>/dev/null; then
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  elif kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
   compiler_pid=""
+  compiler_pgid=""
 }
 
 handle_signal() {
@@ -228,17 +259,23 @@ if ! guard_check 1; then
   exit 75
 fi
 
+# Monitor mode gives this one compiler and every inherited linker/descendant a
+# dedicated process group. Turning monitor mode off immediately preserves the
+# wrapper's normal non-interactive behavior while retaining group ownership.
+set -m
 "$@" &
 compiler_pid=$!
+compiler_pgid="$compiler_pid"
+set +m
 trap 'handle_signal 130' INT
 trap 'handle_signal 143' TERM
 
 next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
-while kill -0 "$compiler_pid" 2>/dev/null; do
+while kill -0 -- "-$compiler_pgid" 2>/dev/null; do
   # Poll child completion separately from the relatively expensive aggregate
   # size check so short compiler probes do not inherit a multi-second delay.
   sleep 0.2
-  kill -0 "$compiler_pid" 2>/dev/null || break
+  kill -0 -- "-$compiler_pgid" 2>/dev/null || break
   if (( SECONDS < next_guard_check )); then
     continue
   fi
@@ -257,5 +294,10 @@ else
   compiler_status=$?
 fi
 compiler_pid=""
+compiler_pgid=""
 trap - INT TERM
+if ! guard_check 1; then
+  echo "error: Cargo compiler output crossed the repository disk ceiling" >&2
+  exit 75
+fi
 exit "$compiler_status"

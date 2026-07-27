@@ -14,6 +14,8 @@ PEER_STARTED="$TEST_ROOT/peer-started"
 PEER_FINISHED="$TEST_ROOT/peer-finished"
 FAKE_GROWER="$TEST_ROOT/fake-growing-rustc"
 FAKE_PEER="$TEST_ROOT/fake-peer-rustc"
+FAST_GROWER_FINISHED="$TEST_ROOT/fast-grower-finished"
+FAKE_FAST_GROWER="$TEST_ROOT/fake-fast-growing-rustc"
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -28,7 +30,9 @@ printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf started > %q\ndd if=/dev
   "$GROWER_STARTED" "$TARGET/runtime-oversized.bin" "$GROWER_FINISHED" > "$FAKE_GROWER"
 printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf started > %q\nsleep 10\nprintf finished > %q\n' \
   "$PEER_STARTED" "$PEER_FINISHED" > "$FAKE_PEER"
-chmod +x "$FAKE_GROWER" "$FAKE_PEER"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ndd if=/dev/zero of=%q bs=1024 count=128 status=none\nprintf finished > %q\n' \
+  "$TARGET/fast-oversized.bin" "$FAST_GROWER_FINISHED" > "$FAKE_FAST_GROWER"
+chmod +x "$FAKE_GROWER" "$FAKE_PEER" "$FAKE_FAST_GROWER"
 
 # Use real allocated blocks so the same `du -sk` semantics are exercised.
 dd if=/dev/zero of="$TARGET/oversized.bin" bs=1024 count=32 status=none
@@ -43,6 +47,25 @@ fi
 grep -q "Cargo compilation refused" "$TEST_ROOT/refused.log"
 [[ ! -e "$MARKER" ]] || {
   echo "error: rustc ran after the target ceiling was exceeded" >&2
+  exit 1
+}
+
+# An output directory outside the configured target, with no Cargo target tag,
+# must never fall back to supervising some other existing target.
+UNMARKED_OUT_DIR="$TEST_ROOT/unmarked/debug/deps"
+mkdir -p "$UNMARKED_OUT_DIR"
+if CARGO_TARGET_DIR="$TARGET" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$UNMARKED_OUT_DIR" 2>"$TEST_ROOT/unidentified.log"; then
+  echo "error: unidentified compiler output ran without its own target supervisor" >&2
+  exit 1
+fi
+grep -q "unable to identify the target root" "$TEST_ROOT/unidentified.log"
+[[ ! -e "$MARKER" ]] || {
+  echo "error: unidentified compiler output was allowed to run" >&2
   exit 1
 }
 
@@ -92,12 +115,17 @@ set -e
   echo "error: peer compiler ignored the shared target-limit trip" >&2
   exit 1
 }
-grep -q "stopping Cargo compiler processes" "$TEST_ROOT/grower.log" "$TEST_ROOT/peer.log"
+grep -q "stopping Cargo compiler processes" "$TEST_ROOT/grower.log"
+grep -q "stopping Cargo compiler processes" "$TEST_ROOT/peer.log"
 
 # Removing the generated target growth must clear the trip on the next forced
 # preflight so normal compilation can resume without deleting source state.
+TRIP_FILE="$TARGET/.ryuki-cargo-disk-guard/target-limit-tripped"
+[[ -f "$TRIP_FILE" ]] || {
+  echo "error: runtime breach did not persist the shared trip marker" >&2
+  exit 1
+}
 rm -f "$TARGET/runtime-oversized.bin"
-rm -rf "$TARGET/.ryuki-cargo-disk-guard"
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
   RYUKI_CARGO_MIN_FREE_GIB=1 \
@@ -105,6 +133,42 @@ RYUKI_CARGO_GUARD_TEST_MODE=1 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR"
 [[ -f "$MARKER" ]] || {
   echo "error: healthy target did not delegate to rustc" >&2
+  exit 1
+}
+[[ ! -e "$TRIP_FILE" ]] || {
+  echo "error: healthy forced preflight did not clear the prior trip" >&2
+  exit 1
+}
+
+# A compiler can cross the cap and exit successfully before the first periodic
+# sample. The wrapper's forced postflight must still turn that apparent success
+# into a disk-guard failure.
+set +e
+RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=64 \
+  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_FAST_GROWER" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/fast-grower.log"
+fast_grower_status=$?
+set -e
+[[ "$fast_grower_status" -eq 75 && -f "$FAST_GROWER_FINISHED" ]] || {
+  echo "error: short-lived target growth escaped the postflight ceiling" >&2
+  exit 1
+}
+grep -q "compiler output crossed" "$TEST_ROOT/fast-grower.log"
+[[ -f "$TRIP_FILE" ]] || {
+  echo "error: short-lived target breach did not persist its trip" >&2
+  exit 1
+}
+
+rm -f "$TARGET/fast-oversized.bin"
+RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR"
+[[ ! -e "$TRIP_FILE" ]] || {
+  echo "error: target cleanup did not recover from a postflight trip" >&2
   exit 1
 }
 
