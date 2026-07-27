@@ -109,7 +109,7 @@ if ! target_root="$(find_target_root)"; then
 fi
 
 state_dir="$target_root/.ryuki-cargo-disk-guard"
-lock_dir="$state_dir/check.lock"
+lock_path="$state_dir/check.lock"
 stamp_file="$state_dir/last-check"
 trip_file="$state_dir/target-limit-tripped"
 mkdir -p "$state_dir"
@@ -133,7 +133,21 @@ trip_guard() {
 guard_check() (
   local force="${1:-0}"
   local now last_check target_kib free_kib owner_pid lock_attempt max_lock_attempts
+  local owner_token owner_dir current_token current_owner_dir
   local lock_acquired=0
+
+  release_guard_lock() {
+    local published_token=""
+    if [[ -L "$lock_path" ]]; then
+      published_token="$(readlink "$lock_path" 2>/dev/null || true)"
+    fi
+    if [[ -n "${owner_token:-}" && "$published_token" == "$owner_token" ]]; then
+      rm -f -- "$lock_path"
+    fi
+    if [[ -n "${owner_dir:-}" ]]; then
+      rm -rf -- "$owner_dir"
+    fi
+  }
 
   now="$(date +%s)"
   last_check=0
@@ -149,55 +163,76 @@ guard_check() (
     return 0
   fi
 
-  # A dead checker's lock is reclaimable by owner PID. Never age out a live
-  # `du`: traversing a near-limit target can legitimately take longer than the
-  # normal monitor interval. Forced pre/postflight checks wait briefly for a
-  # live checker and fail closed if it cannot finish; background checks defer
-  # to that live checker and keep observing the shared trip marker.
+  # The published lock is one atomic symlink to an owner-specific directory.
+  # Releasing it is one unlink, so an exiting checker cannot recursively delete
+  # a successor's lock. Never age out a live `du`: traversing a near-limit
+  # target can legitimately take longer than the normal monitor interval.
   max_lock_attempts=1
   [[ "$force" == "1" ]] && max_lock_attempts=100
   for ((lock_attempt = 0; lock_attempt < max_lock_attempts; lock_attempt++)); do
-    if mkdir "$lock_dir" 2>/dev/null; then
-      # Bash 3.2 has no BASHPID and keeps `$$` unchanged in a subshell. A
-      # short-lived child reports its actual parent, which is this checker.
-      /bin/sh -c 'printf "%s\n" "$PPID"' > "$lock_dir/owner-pid"
+    owner_token="check-owner.$$.$RANDOM.$RANDOM"
+    owner_dir="$state_dir/$owner_token"
+    if ! mkdir "$owner_dir" 2>/dev/null; then
+      [[ "$force" == "1" ]] || return 0
+      sleep 0.1
+      continue
+    fi
+    # Bash 3.2 has no BASHPID and keeps `$$` unchanged in a subshell. A
+    # short-lived child reports its actual parent, which is this checker.
+    /bin/sh -c 'printf "%s\n" "$PPID"' > "$owner_dir/owner-pid"
+    if ln -s "$owner_token" "$lock_path" 2>/dev/null; then
       lock_acquired=1
       break
     fi
+    rm -rf -- "$owner_dir"
+    owner_dir=""
 
     [[ ! -f "$trip_file" ]] || return 75
     owner_pid=""
-    if [[ -f "$lock_dir/owner-pid" ]]; then
-      read -r owner_pid < "$lock_dir/owner-pid" || owner_pid=""
+    current_token=""
+    current_owner_dir=""
+    if [[ -L "$lock_path" ]]; then
+      current_token="$(readlink "$lock_path" 2>/dev/null || true)"
+      case "$current_token" in
+        check-owner.*)
+          if [[ "$current_token" != */* ]]; then
+            current_owner_dir="$state_dir/$current_token"
+          fi
+          ;;
+      esac
+    fi
+    if [[ -n "$current_owner_dir" && -f "$current_owner_dir/owner-pid" ]]; then
+      read -r owner_pid < "$current_owner_dir/owner-pid" || owner_pid=""
+    fi
+    if [[ -L "$lock_path" && ( ! "$owner_pid" =~ ^[0-9]+$ || ! -d "$current_owner_dir" ) ]]; then
+      rm -f -- "$lock_path"
+      [[ -z "$current_owner_dir" ]] || rm -rf -- "$current_owner_dir"
+      continue
     fi
     if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-      rm -rf -- "$lock_dir"
+      if [[ -L "$lock_path" && "$(readlink "$lock_path" 2>/dev/null || true)" == "$current_token" ]]; then
+        rm -f -- "$lock_path"
+      fi
+      [[ -z "$current_owner_dir" ]] || rm -rf -- "$current_owner_dir"
       continue
     fi
     [[ "$force" == "1" ]] || return 0
     sleep 0.1
   done
-  if (( lock_acquired == 0 )) && [[ "$force" == "1" ]]; then
-    owner_pid=""
-    if [[ -f "$lock_dir/owner-pid" ]]; then
-      read -r owner_pid < "$lock_dir/owner-pid" || owner_pid=""
-    fi
-    # A checker killed between mkdir and owner publication can leave an
-    # ownerless lock. Reclaim only that invalid form after the bounded wait;
-    # a numeric live owner always wins and makes this check fail closed.
-    if [[ ! "$owner_pid" =~ ^[0-9]+$ ]]; then
-      rm -rf -- "$lock_dir"
-      if mkdir "$lock_dir" 2>/dev/null; then
-        /bin/sh -c 'printf "%s\n" "$PPID"' > "$lock_dir/owner-pid"
-        lock_acquired=1
-      fi
-    fi
-  fi
   (( lock_acquired == 1 )) || return 75
-  trap 'rm -rf -- "$lock_dir"' EXIT INT TERM
+  trap release_guard_lock EXIT INT TERM
 
-  target_kib="$(du -sk "$target_root" | awk '{print $1}')"
+  target_kib=""
+  if ! target_kib="$(du -sk "$target_root" 2>/dev/null | awk 'END {print $1}')"; then
+    : # Concurrent Cargo renames can make `du` nonzero while retaining a total.
+  fi
   free_kib="$(df -Pk "$target_root" | awk 'END {print $4}')"
+
+  if [[ ! "$target_kib" =~ ^[0-9]+$ || ! "$free_kib" =~ ^[0-9]+$ ]]; then
+    trip_guard
+    echo "error: Cargo target size or free space could not be measured" >&2
+    return 75
+  fi
 
   if (( target_kib > max_target_kib )); then
     trip_guard

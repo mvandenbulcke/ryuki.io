@@ -172,4 +172,36 @@ RYUKI_CARGO_GUARD_TEST_MODE=1 \
   exit 1
 }
 
+# Stress the atomic checker handoff with many short compilers. A recursive
+# lock-directory release can delete its successor under this exact workload;
+# the owner-token symlink must leave every wrapper successful and no lock
+# artifacts behind.
+stress_pids=()
+for index in {1..32}; do
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+    RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+    RYUKI_CARGO_MIN_FREE_GIB=1 \
+    RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+    "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" \
+    2>"$TEST_ROOT/stress-${index}.log" &
+  stress_pids+=("$!")
+done
+for stress_pid in "${stress_pids[@]}"; do
+  wait "$stress_pid"
+done
+if grep -q "No such file or directory" "$TEST_ROOT"/stress-*.log; then
+  echo "error: concurrent checker handoff deleted live lock state" >&2
+  exit 1
+fi
+[[ ! -e "$TARGET/.ryuki-cargo-disk-guard/check.lock" \
+  && ! -L "$TARGET/.ryuki-cargo-disk-guard/check.lock" ]] || {
+  echo "error: checker lock remained after concurrent compilers exited" >&2
+  exit 1
+}
+if find "$TARGET/.ryuki-cargo-disk-guard" -maxdepth 1 -name 'check-owner.*' -print -quit \
+  | grep -q .; then
+  echo "error: checker owner state remained after concurrent compilers exited" >&2
+  exit 1
+fi
+
 echo "cargo rustc disk guard regression passed"
