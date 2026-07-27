@@ -25,6 +25,7 @@ metadata:
     ryuki.io/pin-deployed-workload-attestation-receipt: RENDER_REQUIRED
     ryuki.io/pin-public-ingress-attestation-receipt: RENDER_REQUIRED
     ryuki.io/pin-postgresql-infrastructure-attestation-receipt: RENDER_REQUIRED
+    ryuki.io/pin-first-owner-authority-receipt: RENDER_REQUIRED
     ryuki.io/pin-socket-projection-authority-receipt: RENDER_REQUIRED
     ryuki.io/socket-projection-receipt-digest: RENDER_REQUIRED
     ryuki.io/socket-contract-digest: sha256:369bca5b159d7535a2b3523796ff3632e9e7ca44f9a94b4140cc572163767697
@@ -104,7 +105,7 @@ spec:
             # Source-template placeholder only. The diagnostic final-render
             # shape rewrites this to
             # platform-api-migration-config-<release-digest-prefix>, requires
-            # immutable API readback, and binds it as one of eight pin receipts.
+            # immutable API readback, and binds it as one of nine pin receipts.
             - configMapRef:
                 name: platform-api-migration-config
           # The digest-scoped VaultDynamicSecret and independently governed
@@ -337,6 +338,35 @@ spec:
                 configMapKeyRef:
                   name: platform-postgresql-infrastructure-attestation-pins-111111111111
                   key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST
+            # The first-owner closure authority is an independently governed
+            # Ed25519 trust anchor, not a live socket authority. Its five pins
+            # are receipt-bound through a ninth immutable ConfigMap while the
+            # final-render socket projection inventory remains exactly four.
+            - name: RYUKI_FIRST_OWNER_AUTHORITY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_AUTHORITY_ID
+            - name: RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID
+            - name: RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64
+            - name: RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT
+            - name: RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH
           resources:
             requests:
               cpu: 50m

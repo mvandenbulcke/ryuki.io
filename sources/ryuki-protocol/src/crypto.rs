@@ -59,7 +59,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
 use crate::types::{
-    ExecutionTrustProfile, JobMode, JobResultStatus, SignedEnvelope, VerifiedLiveContext,
+    ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ControlPlaneGrantVerifyingKey,
+    ExecutionTrustProfile, JobMode, JobResultStatus, MAX_CONTROL_PLANE_GRANT_KEYS, SignedEnvelope,
+    VerifiedLiveContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +80,16 @@ pub enum VerifyError {
     InvalidSignature,
     #[error("key material error: {0}")]
     KeyMaterial(String),
+    #[error("control-plane grant key id is invalid")]
+    InvalidControlPlaneGrantKeyId,
+    #[error("control-plane grant keyset is invalid: {0}")]
+    InvalidControlPlaneGrantKeyset(&'static str),
+    #[error("control-plane grant references an unknown or revoked key id")]
+    UnknownControlPlaneGrantKey,
+    #[error("control-plane grant keyset version rolled back from {current} to {candidate}")]
+    ControlPlaneGrantKeysetRollback { current: u64, candidate: u64 },
+    #[error("control-plane grant keyset version {0} was reused for different content")]
+    ControlPlaneGrantKeysetVersionReuse(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -392,13 +404,12 @@ pub fn verify(envelope: &SignedEnvelope, vk: &VerifyingKey) -> Result<(), Verify
 /// approved plan job/attempt, approver, expiry, step_job_id, assigned
 /// agent/enrollment/key/profile.
 ///
-/// The v7 domain makes the request resource version an explicit protocol
-/// boundary: a legacy v6 grant cannot authorize a mutation after the request's
-/// security-relevant state changes.
+/// The v8 domain binds the exact key id selected from the versioned CP keyset.
+/// A legacy v7 grant cannot be reinterpreted as keyring-aware authority.
 pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(512);
 
-    write_bytes(&mut buf, b"ryuki-v7/verified-live-context");
+    write_bytes(&mut buf, b"ryuki-v8/verified-live-context");
     write_str(&mut buf, &ctx.request_id.hyphenated().to_string());
     write_u64(&mut buf, ctx.request_resource_version.get());
     write_str(&mut buf, &ctx.platform);
@@ -428,12 +439,14 @@ pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
         &mut buf,
         &ctx.execution_authority.execution_trust_profile_digest,
     );
+    write_str(&mut buf, &ctx.signing_key_id);
 
     buf
 }
 
 /// Signs a [`VerifiedLiveContext`] with the CP's signing key.
 pub fn sign_vlc(mut ctx: VerifiedLiveContext, key: &SigningKey) -> VerifiedLiveContext {
+    ctx.signing_key_id = control_plane_grant_key_id(&key.verifying_key());
     let bytes = signing_bytes_vlc(&ctx);
     let sig: Signature = key.sign(&bytes);
     ctx.signature = B64.encode(sig.to_bytes());
@@ -442,6 +455,9 @@ pub fn sign_vlc(mut ctx: VerifiedLiveContext, key: &SigningKey) -> VerifiedLiveC
 
 /// Verifies the CP's signature on a [`VerifiedLiveContext`].
 pub fn verify_vlc(ctx: &VerifiedLiveContext, vk: &VerifyingKey) -> Result<(), VerifyError> {
+    if ctx.signing_key_id != control_plane_grant_key_id(vk) {
+        return Err(VerifyError::UnknownControlPlaneGrantKey);
+    }
     let raw = B64.decode(&ctx.signature)?;
     let sig_bytes: [u8; 64] = raw
         .try_into()
@@ -452,6 +468,121 @@ pub fn verify_vlc(ctx: &VerifiedLiveContext, vk: &VerifyingKey) -> Result<(), Ve
     // (ed25519-dalek v2).
     vk.verify_strict(&bytes, &sig)
         .map_err(|_| VerifyError::InvalidSignature)
+}
+
+/// Deterministic, non-secret `kid` for one Ed25519 control-plane grant key.
+/// Binding the id to the canonical wire public key prevents key/id substitution
+/// even before a signature is checked.
+pub fn control_plane_grant_key_id(vk: &VerifyingKey) -> String {
+    format!(
+        "signing-key:sha256-{}",
+        sha256_hex(encode_verifying_key(vk).as_bytes())
+    )
+}
+
+/// Build one canonical public keyset entry from an Ed25519 verifying key.
+pub fn control_plane_grant_verifying_key(
+    vk: &VerifyingKey,
+    disposition: ControlPlaneGrantKeyDisposition,
+) -> ControlPlaneGrantVerifyingKey {
+    ControlPlaneGrantVerifyingKey {
+        key_id: control_plane_grant_key_id(vk),
+        public_key: encode_verifying_key(vk),
+        disposition,
+    }
+}
+
+/// Validate the closed, bounded public keyset and every key-id/public-key
+/// cross-binding. Entries must be strictly sorted so all consumers see one
+/// canonical representation.
+pub fn validate_control_plane_grant_keyset(
+    keyset: &ControlPlaneGrantKeyset,
+) -> Result<(), VerifyError> {
+    if keyset.keyset_version == 0 {
+        return Err(VerifyError::InvalidControlPlaneGrantKeyset(
+            "keyset_version must be positive",
+        ));
+    }
+    if keyset.keys.is_empty() || keyset.keys.len() > MAX_CONTROL_PLANE_GRANT_KEYS {
+        return Err(VerifyError::InvalidControlPlaneGrantKeyset(
+            "key count is outside the bounded nonempty range",
+        ));
+    }
+    if !keyset
+        .keys
+        .windows(2)
+        .all(|pair| pair[0].key_id < pair[1].key_id)
+    {
+        return Err(VerifyError::InvalidControlPlaneGrantKeyset(
+            "keys must be strictly sorted and unique",
+        ));
+    }
+
+    let mut active_count = 0usize;
+    for entry in &keyset.keys {
+        let verifying_key = decode_verifying_key(&entry.public_key)?;
+        if encode_verifying_key(&verifying_key) != entry.public_key
+            || control_plane_grant_key_id(&verifying_key) != entry.key_id
+        {
+            return Err(VerifyError::InvalidControlPlaneGrantKeyId);
+        }
+        if entry.disposition == ControlPlaneGrantKeyDisposition::Active {
+            active_count += 1;
+            if entry.key_id != keyset.active_key_id {
+                return Err(VerifyError::InvalidControlPlaneGrantKeyset(
+                    "active entry differs from active_key_id",
+                ));
+            }
+        } else if entry.key_id == keyset.active_key_id {
+            return Err(VerifyError::InvalidControlPlaneGrantKeyset(
+                "active_key_id names a verify-only key",
+            ));
+        }
+    }
+    if active_count != 1 {
+        return Err(VerifyError::InvalidControlPlaneGrantKeyset(
+            "exactly one key must be active",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a newly observed keyset relative to the currently pinned set.
+/// Lower versions are rollback; equal versions must be byte-for-byte equal.
+pub fn validate_control_plane_grant_keyset_update(
+    current: &ControlPlaneGrantKeyset,
+    candidate: &ControlPlaneGrantKeyset,
+) -> Result<(), VerifyError> {
+    validate_control_plane_grant_keyset(current)?;
+    validate_control_plane_grant_keyset(candidate)?;
+    if candidate.keyset_version < current.keyset_version {
+        return Err(VerifyError::ControlPlaneGrantKeysetRollback {
+            current: current.keyset_version,
+            candidate: candidate.keyset_version,
+        });
+    }
+    if candidate.keyset_version == current.keyset_version && candidate != current {
+        return Err(VerifyError::ControlPlaneGrantKeysetVersionReuse(
+            candidate.keyset_version,
+        ));
+    }
+    Ok(())
+}
+
+/// Select the exact public key named by the signed grant and verify it. Missing
+/// keys—including keys removed by revocation—fail closed as unknown `kid`s.
+pub fn verify_vlc_with_keyset(
+    ctx: &VerifiedLiveContext,
+    keyset: &ControlPlaneGrantKeyset,
+) -> Result<(), VerifyError> {
+    validate_control_plane_grant_keyset(keyset)?;
+    let entry = keyset
+        .keys
+        .iter()
+        .find(|entry| entry.key_id == ctx.signing_key_id)
+        .ok_or(VerifyError::UnknownControlPlaneGrantKey)?;
+    let verifying_key = decode_verifying_key(&entry.public_key)?;
+    verify_vlc(ctx, &verifying_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,9 +782,34 @@ mod tests {
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: None,
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         sign_vlc(unsigned, key)
+    }
+
+    fn grant_keyset(
+        keyset_version: u64,
+        active: &SigningKey,
+        verify_only: &[&SigningKey],
+    ) -> ControlPlaneGrantKeyset {
+        let active_key_id = control_plane_grant_key_id(&active.verifying_key());
+        let mut keys = vec![control_plane_grant_verifying_key(
+            &active.verifying_key(),
+            ControlPlaneGrantKeyDisposition::Active,
+        )];
+        keys.extend(verify_only.iter().map(|key| {
+            control_plane_grant_verifying_key(
+                &key.verifying_key(),
+                ControlPlaneGrantKeyDisposition::VerifyOnly,
+            )
+        }));
+        keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        ControlPlaneGrantKeyset {
+            keyset_version,
+            active_key_id,
+            keys,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -877,6 +1033,7 @@ mod tests {
                 expiry: Utc::now(),
                 step_job_id: None,
                 execution_authority: test_execution_authority(),
+                signing_key_id: String::new(),
                 signature: String::new(),
             }),
             "enrollment proofs must not share another protocol signing domain"
@@ -1048,10 +1205,45 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v7_is_the_only_accepted_wire_contract() {
-        assert_eq!(PROTOCOL_VERSION, 7);
-        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, &[7]);
-        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&6));
+    fn protocol_v8_is_the_only_accepted_wire_contract() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, &[8]);
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&7));
+    }
+
+    #[test]
+    fn grant_keyset_rotation_overlap_revocation_and_rollback_fail_closed() {
+        let old = generate_keypair(&mut OsRng);
+        let active = generate_keypair(&mut OsRng);
+        let current = grant_keyset(7, &old, &[]);
+        let overlap = grant_keyset(8, &active, &[&old]);
+        let revoked = grant_keyset(9, &active, &[]);
+
+        validate_control_plane_grant_keyset_update(&current, &overlap)
+            .expect("a higher-version overlap keyset is valid");
+        validate_control_plane_grant_keyset_update(&overlap, &revoked)
+            .expect("a higher-version revocation keyset is valid");
+
+        let old_grant = make_vlc(&old);
+        let active_grant = make_vlc(&active);
+        verify_vlc_with_keyset(&old_grant, &overlap)
+            .expect("verify-only overlap key must validate existing grants");
+        verify_vlc_with_keyset(&active_grant, &overlap)
+            .expect("active overlap key must validate new grants");
+        assert!(matches!(
+            verify_vlc_with_keyset(&old_grant, &revoked),
+            Err(VerifyError::UnknownControlPlaneGrantKey)
+        ));
+        assert!(matches!(
+            validate_control_plane_grant_keyset_update(&overlap, &current),
+            Err(VerifyError::ControlPlaneGrantKeysetRollback { .. })
+        ));
+
+        let reused_version = grant_keyset(overlap.keyset_version, &active, &[]);
+        assert!(matches!(
+            validate_control_plane_grant_keyset_update(&overlap, &reused_version),
+            Err(VerifyError::ControlPlaneGrantKeysetVersionReuse(8))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1491,13 +1683,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v7 grant layout, legacy fencing, and step binding
+    // v8 grant layout, legacy fencing, key selection, and step binding
     // -----------------------------------------------------------------------
 
-    /// Pin the v7 signing layout, including request version, exact plan-row,
-    /// and execution authority.
+    /// Pin the v8 signing layout, including request version, exact plan-row,
+    /// execution authority, and key id.
     #[test]
-    fn vlc_v7_signing_bytes_bind_request_version_plan_and_execution_authority() {
+    fn vlc_v8_signing_bytes_bind_request_version_plan_authority_and_key_id() {
         let request_id = Uuid::new_v4();
         let request_resource_version = request_version(7);
         let platform = "defra".to_string();
@@ -1520,12 +1712,13 @@ mod tests {
             expiry,
             step_job_id: None,
             execution_authority: test_execution_authority(),
+            signing_key_id: "signing-key:sha256-test-fixture".to_string(),
             signature: String::new(),
         };
 
-        // Hand-roll the canonical v7 field order to catch accidental drift.
+        // Hand-roll the canonical v8 field order to catch accidental drift.
         let mut baseline: Vec<u8> = Vec::new();
-        write_bytes(&mut baseline, b"ryuki-v7/verified-live-context");
+        write_bytes(&mut baseline, b"ryuki-v8/verified-live-context");
         write_str(&mut baseline, &request_id.hyphenated().to_string());
         write_u64(&mut baseline, request_resource_version.get());
         write_str(&mut baseline, &platform);
@@ -1558,16 +1751,17 @@ mod tests {
             &mut baseline,
             &vlc.execution_authority.execution_trust_profile_digest,
         );
+        write_str(&mut baseline, &vlc.signing_key_id);
 
         assert_eq!(
             signing_bytes_vlc(&vlc),
             baseline,
-            "v7 signing bytes must include the request version, exact plan row, destination, spec, and authority"
+            "v8 signing bytes must include the request version, exact plan row, destination, spec, authority, and key id"
         );
     }
 
     #[test]
-    fn legacy_v6_vlc_without_request_version_is_rejected_by_the_v7_domain() {
+    fn legacy_v6_vlc_without_request_version_is_rejected_by_the_v8_domain() {
         let key = generate_keypair(&mut OsRng);
         let mut legacy = make_vlc(&key);
         let mut legacy_bytes = Vec::new();
@@ -1614,8 +1808,74 @@ mod tests {
 
         assert!(
             verify_vlc(&legacy, &key.verifying_key()).is_err(),
-            "a legacy v6 grant without a request version must not verify under the v7 domain"
+            "a legacy v6 grant without a request version must not verify under the v8 domain"
         );
+    }
+
+    #[test]
+    fn legacy_v7_vlc_without_signing_key_id_is_rejected_by_the_v8_domain() {
+        let key = generate_keypair(&mut OsRng);
+        let mut legacy = make_vlc(&key);
+        let mut legacy_bytes = Vec::new();
+        write_bytes(&mut legacy_bytes, b"ryuki-v7/verified-live-context");
+        write_str(
+            &mut legacy_bytes,
+            &legacy.request_id.hyphenated().to_string(),
+        );
+        write_u64(&mut legacy_bytes, legacy.request_resource_version.get());
+        write_str(&mut legacy_bytes, &legacy.platform);
+        write_str(&mut legacy_bytes, &legacy.job_spec_digest);
+        write_str(&mut legacy_bytes, &legacy.approved_plan_digest);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.approved_plan_job_id.hyphenated().to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.approved_plan_attempt_id.hyphenated().to_string(),
+        );
+        write_str(&mut legacy_bytes, &legacy.approver);
+        write_str(&mut legacy_bytes, &datetime_bytes(&legacy.expiry));
+        write_opt_uuid(&mut legacy_bytes, &legacy.step_job_id);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.assigned_agent_id,
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy
+                .execution_authority
+                .assigned_agent_enrollment_id
+                .hyphenated()
+                .to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.assigned_agent_key_fingerprint,
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.execution_trust_profile_digest,
+        );
+        legacy.signature = B64.encode(key.sign(&legacy_bytes).to_bytes());
+
+        assert!(
+            verify_vlc(&legacy, &key.verifying_key()).is_err(),
+            "a legacy v7 grant without the signed key id must not verify under the v8 domain"
+        );
+    }
+
+    #[test]
+    fn tampered_vlc_signing_key_id_fails_without_exposing_the_id() {
+        let key = generate_keypair(&mut OsRng);
+        let mut grant = make_vlc(&key);
+        grant.signing_key_id =
+            control_plane_grant_key_id(&generate_keypair(&mut OsRng).verifying_key());
+
+        let error = verify_vlc(&grant, &key.verifying_key())
+            .expect_err("a substituted key id must fail before signature verification");
+        assert!(matches!(error, VerifyError::UnknownControlPlaneGrantKey));
+        assert!(!error.to_string().contains(&grant.signing_key_id));
     }
 
     #[test]
@@ -1684,6 +1944,7 @@ mod tests {
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: Some(step_job_id),
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         let vlc = sign_vlc(unsigned, &key);
@@ -1724,6 +1985,7 @@ mod tests {
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: Some(step_a),
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         let mut vlc = sign_vlc(unsigned, &key);
@@ -1757,6 +2019,7 @@ mod tests {
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: Some(step_a),
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         let mut vlc = sign_vlc(unsigned, &key);

@@ -73,6 +73,7 @@ const MIGRATION_JOB_RYUKI_ANNOTATIONS: &[&str] = &[
     "ryuki.io/pin-deployed-workload-attestation-receipt",
     "ryuki.io/pin-public-ingress-attestation-receipt",
     "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    "ryuki.io/pin-first-owner-authority-receipt",
     "ryuki.io/pin-socket-projection-authority-receipt",
     SOCKET_PROJECTION_RECEIPT_DIGEST_ANNOTATION,
     SOCKET_CONTRACT_DIGEST_ANNOTATION,
@@ -269,6 +270,14 @@ const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS: &[&str] = &[
     "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION",
     "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST",
 ];
+const FIRST_OWNER_AUTHORITY_CONFIG_MAP: &str = "platform-first-owner-authority-pins";
+const FIRST_OWNER_AUTHORITY_KEYS: &[&str] = &[
+    "RYUKI_FIRST_OWNER_AUTHORITY_ID",
+    "RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID",
+    "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64",
+    "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH",
+];
 const SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP: &str =
     "platform-migration-socket-projection-authority-pins";
 const SOCKET_PROJECTION_AUTHORITY_KEYS: &[&str] = &[
@@ -312,6 +321,11 @@ const MIGRATION_APP_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
         POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
         "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
     ),
+    (
+        FIRST_OWNER_AUTHORITY_CONFIG_MAP,
+        FIRST_OWNER_AUTHORITY_KEYS,
+        "ryuki.io/pin-first-owner-authority-receipt",
+    ),
 ];
 const MIGRATION_RENDER_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
     (
@@ -348,6 +362,11 @@ const MIGRATION_RENDER_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
         POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP,
         POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
         "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    ),
+    (
+        FIRST_OWNER_AUTHORITY_CONFIG_MAP,
+        FIRST_OWNER_AUTHORITY_KEYS,
+        "ryuki.io/pin-first-owner-authority-receipt",
     ),
     (
         SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP,
@@ -393,7 +412,7 @@ const MIGRATION_AUTHORITY_SOCKET_PROJECTIONS: &[(&str, &str, &str, &str, &str, &
         "postgresql-infrastructure-attestation",
     ),
 ];
-const MIGRATION_JOB_ENV_COUNT: usize = 44;
+const MIGRATION_JOB_ENV_COUNT: usize = 49;
 const EXPECTED_SERVICE_ACCOUNTS: &[&str] = &[
     "portal-ui",
     "platform-api",
@@ -933,9 +952,11 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
             && str_at(portal, &["data", "RYUKI_API_URL"]) == Some(expected_origin.as_str())
             && str_at(portal, &["data", "RYUKI_PORTAL_PUBLIC_ORIGIN"])
                 == Some(expected_origin.as_str())
+            && str_at(portal, &["data", "RYUKI_PORTAL_EXECUTION_MODE"])
+                == Some("live-provider")
             && str_at(portal, &["data", "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK"]) == Some("false"),
         errors,
-        "portal-ui-config must contain only the exact reviewed keys and use the exact HTTPS ingress origin with insecure-loopback disabled",
+        "portal-ui-config must contain only the exact reviewed keys, use live-provider mode, and use the exact HTTPS ingress origin with insecure-loopback disabled",
     );
 
     for config_map in manifests
@@ -1334,7 +1355,7 @@ fn validate_migration_job(
                 == Some("RYUKI_MIGRATION_DATABASE_URL")
             && value_at(migration_url, &["value"]).is_none(),
         errors,
-        "migration Job must import the digest-scoped migrator URL key plus all 43 production pin keys",
+        "migration Job must import the digest-scoped migrator URL key plus all 48 production pin keys",
     );
     expect(
         migration_identity.as_ref().is_some_and(|identity| {
@@ -1762,7 +1783,7 @@ fn validate_final_render_socket_receipt_inner(
         "socketProjections": expected_socket_receipt_projections(manifests, identity)?,
     });
     if payload != &expected_payload {
-        return Err("signed receipt payload does not exactly bind the rendered Job, eight ConfigMap receipts, authority pins, and four socket projections".to_string());
+        return Err("signed receipt payload does not exactly bind the rendered Job, nine ConfigMap receipts, authority pins, and four socket projections".to_string());
     }
 
     let signature = value_at(&receipt, &["signature"])
@@ -2364,7 +2385,7 @@ fn validate_final_render_cutover_contract(contract: &Value, errors: &mut Vec<Str
                     "jobCarriesReceiptDigestOnly",
                     "renderedJobPreimageExcludesOnlyReceiptDigestAnnotation",
                     "receiptDigestForbiddenInCsiAttributes",
-                    "receiptBindsReleaseImageAndAllEightPinConfigMapReceipts",
+                    "receiptBindsReleaseImageAndAllNinePinConfigMapReceipts",
                     "receiptBindsExactRenderedJobPreimageDigest",
                     "receiptBindsExactSocketPathsAuthoritiesKeysAndFingerprints",
                     "receiptMaximumAuthorizationSeconds",
@@ -2432,7 +2453,7 @@ fn validate_final_render_cutover_contract(contract: &Value, errors: &mut Vec<Str
                 "jobCarriesReceiptDigestOnly",
                 "renderedJobPreimageExcludesOnlyReceiptDigestAnnotation",
                 "receiptDigestForbiddenInCsiAttributes",
-                "receiptBindsReleaseImageAndAllEightPinConfigMapReceipts",
+                "receiptBindsReleaseImageAndAllNinePinConfigMapReceipts",
                 "receiptBindsExactRenderedJobPreimageDigest",
                 "receiptBindsExactSocketPathsAuthoritiesKeysAndFingerprints",
                 "finalSocketsReachableBeforeRunnerStartRequired",
@@ -2554,6 +2575,7 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
     let ingress_config_map = scoped_pin_config_map(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP);
     let postgresql_config_map =
         scoped_pin_config_map(POSTGRESQL_INFRASTRUCTURE_ATTESTATION_CONFIG_MAP);
+    let first_owner_config_map = scoped_pin_config_map(FIRST_OWNER_AUTHORITY_CONFIG_MAP);
     expect(
         str_at(contract, &["contractVersion"]) == Some("migration-cutover-v1")
             && str_at(contract, &["release", "namespace"]) == Some(NAMESPACE)
@@ -2683,6 +2705,7 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
                     "conformanceTrustCheckpoint",
                     "deployedWorkloadAttestation",
                     "publicIngressAttestation",
+                    "firstOwnerAuthority",
                     "completeGroupsRequired",
                     "exactPinConfigMapReceiptCount",
                     "releaseDigestPrefixBoundNamesRequired",
@@ -2802,6 +2825,53 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
                 PUBLIC_INGRESS_ATTESTATION_KEYS,
                 "ryuki.io/pin-public-ingress-attestation-receipt",
             )
+            && object_at(contract, &["productionPinProjections", "firstOwnerAuthority"])
+                .is_some_and(|group| {
+                    object_has_exact_keys(
+                        group,
+                        &[
+                            "configMapName",
+                            "contentDigest",
+                            "uid",
+                            "resourceVersion",
+                            "jobReceiptAnnotation",
+                            "configKeys",
+                            "productionOnly",
+                            "independentlyGovernedAuthorityRequired",
+                            "ed25519Required",
+                            "privateKeyInWorkloadForbidden",
+                            "socketProjectionRequired",
+                        ],
+                    )
+                })
+            && cutover_pin_group_fields_match(
+                contract,
+                &["productionPinProjections", "firstOwnerAuthority"],
+                &first_owner_config_map,
+                FIRST_OWNER_AUTHORITY_KEYS,
+                "ryuki.io/pin-first-owner-authority-receipt",
+            )
+            && [
+                "productionOnly",
+                "independentlyGovernedAuthorityRequired",
+                "ed25519Required",
+                "privateKeyInWorkloadForbidden",
+            ]
+            .iter()
+            .all(|flag| {
+                bool_at(
+                    contract,
+                    &["productionPinProjections", "firstOwnerAuthority", flag],
+                ) == Some(true)
+            })
+            && bool_at(
+                contract,
+                &[
+                    "productionPinProjections",
+                    "firstOwnerAuthority",
+                    "socketProjectionRequired",
+                ],
+            ) == Some(false)
             && [
                 "completeGroupsRequired",
                 "releaseDigestPrefixBoundNamesRequired",
@@ -2821,7 +2891,7 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
             && int_at(
                 contract,
                 &["productionPinProjections", "exactPinConfigMapReceiptCount"],
-            ) == Some(8),
+            ) == Some(9),
         errors,
         "cutover contract must retain complete independently governed production pin groups, file bindings, and exact pre-start Unix-socket projection gates without hostPath fallback",
     );
@@ -6910,6 +6980,7 @@ mod tests {
                     "ryuki.io/pin-deployed-workload-attestation-receipt": RENDER_REQUIRED_SENTINEL,
                     "ryuki.io/pin-public-ingress-attestation-receipt": RENDER_REQUIRED_SENTINEL,
                     "ryuki.io/pin-postgresql-infrastructure-attestation-receipt": RENDER_REQUIRED_SENTINEL,
+                    "ryuki.io/pin-first-owner-authority-receipt": RENDER_REQUIRED_SENTINEL,
                     "ryuki.io/pin-socket-projection-authority-receipt": RENDER_REQUIRED_SENTINEL,
                     "ryuki.io/socket-projection-receipt-digest": RENDER_REQUIRED_SENTINEL,
                     "ryuki.io/socket-contract-digest": SOCKET_CONTRACT_DIGEST

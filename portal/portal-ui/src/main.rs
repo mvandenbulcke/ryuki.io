@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum::routing::any;
     use axum::{middleware, routing::get, Router};
     use leptos::prelude::*;
-    use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
+    use leptos_axum::{file_and_error_handler_with_context, generate_route_list, LeptosRoutes};
     use ryuki_portal_ui::app::{shell, App};
     use ryuki_portal_ui::security::{
         protect_server_function_routes, PortalPublicOrigin, PortalServerFunctionLimits,
@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     validate_live_provider_auth_posture(&upstream, &public_origin).await?;
     let upstream_for_server_fns = upstream.clone();
     let upstream_for_routes = upstream.clone();
+    let upstream_for_fallback = upstream.clone();
 
     let server_function_routes = protect_server_function_routes(
         Router::new().route(
@@ -69,7 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 move || shell(leptos_options.clone())
             },
         )
-        .fallback(file_and_error_handler(shell))
+        .fallback(file_and_error_handler_with_context(
+            move || provide_context(upstream_for_fallback.clone()),
+            shell,
+        ))
         .layer(middleware::from_fn(security_headers_middleware))
         .with_state(leptos_options);
 

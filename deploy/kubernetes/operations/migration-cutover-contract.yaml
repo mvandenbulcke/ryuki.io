@@ -52,6 +52,7 @@ finalRender:
       - ryuki.io/pin-deployed-workload-attestation-receipt
       - ryuki.io/pin-public-ingress-attestation-receipt
       - ryuki.io/pin-postgresql-infrastructure-attestation-receipt
+      - ryuki.io/pin-first-owner-authority-receipt
       - ryuki.io/pin-socket-projection-authority-receipt
       - ryuki.io/socket-projection-receipt-digest
       - ryuki.io/socket-contract-digest
@@ -101,7 +102,7 @@ finalRender:
     jobCarriesReceiptDigestOnly: true
     renderedJobPreimageExcludesOnlyReceiptDigestAnnotation: true
     receiptDigestForbiddenInCsiAttributes: true
-    receiptBindsReleaseImageAndAllEightPinConfigMapReceipts: true
+    receiptBindsReleaseImageAndAllNinePinConfigMapReceipts: true
     receiptBindsExactRenderedJobPreimageDigest: true
     receiptBindsExactSocketPathsAuthoritiesKeysAndFingerprints: true
     receiptMaximumAuthorizationSeconds: 300
@@ -222,7 +223,7 @@ socketProjectionReceiptResource:
         - publicKeyFingerprint
       futureAdmissionAuthorityAndProfileMustExactlyMatchTrustAnchor: true
       authorityEpochAtLeastPinnedMinimum: true
-      pinConfigMapReceiptExactCount: 8
+      pinConfigMapReceiptExactCount: 9
       pinConfigMapReceiptExactOrderByAnnotation:
         - ryuki.io/pin-migration-config-receipt
         - ryuki.io/pin-security-admission-receipt
@@ -231,6 +232,7 @@ socketProjectionReceiptResource:
         - ryuki.io/pin-deployed-workload-attestation-receipt
         - ryuki.io/pin-public-ingress-attestation-receipt
         - ryuki.io/pin-postgresql-infrastructure-attestation-receipt
+        - ryuki.io/pin-first-owner-authority-receipt
         - ryuki.io/pin-socket-projection-authority-receipt
       pinConfigMapReceiptEntryExactFields:
         - annotation
@@ -254,7 +256,7 @@ socketProjectionReceiptResource:
       renderedJobPreimageCanonicalization: ryuki-canonical-json-v1
       renderedJobPreimageExcludesOnlyAnnotation: ryuki.io/socket-projection-receipt-digest
       receiptDigestForbiddenInRenderedJobOutsideExcludedAnnotation: true
-      offlineSnapshotAllEightPinReceiptsMustMatchApiReadback: true
+      offlineSnapshotAllNinePinReceiptsMustMatchApiReadback: true
       offlineSnapshotAllSocketProjectionsMustMatchPinsAndRenderedJob: true
     signature:
       exactFields:
@@ -402,8 +404,25 @@ productionPinProjections:
       - RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID
       - RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION
       - RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST
+  firstOwnerAuthority:
+    configMapName: platform-first-owner-authority-pins-111111111111
+    contentDigest: RENDER_REQUIRED
+    uid: RENDER_REQUIRED
+    resourceVersion: RENDER_REQUIRED
+    jobReceiptAnnotation: ryuki.io/pin-first-owner-authority-receipt
+    configKeys:
+      - RYUKI_FIRST_OWNER_AUTHORITY_ID
+      - RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID
+      - RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64
+      - RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT
+      - RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH
+    productionOnly: true
+    independentlyGovernedAuthorityRequired: true
+    ed25519Required: true
+    privateKeyInWorkloadForbidden: true
+    socketProjectionRequired: false
   completeGroupsRequired: true
-  exactPinConfigMapReceiptCount: 8
+  exactPinConfigMapReceiptCount: 9
   releaseDigestPrefixBoundNamesRequired: true
   immutableConfigMapsRequired: true
   contentDigestAnnotationsRequired: true

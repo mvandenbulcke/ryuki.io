@@ -9,8 +9,11 @@
 //! names / secret-row FK, and the persisted health-check `message` is the stub's
 //! secret-free output (it names the credential SOURCE type, never the ref).
 
-use crate::integration::{parse_persisted_credential_binding, PersistedCredentialSourceError};
-use ryuki_engine::integration_connections::{ExecutionMode, IntegrationConnection};
+use crate::integration::{
+    parse_persisted_credential_binding, parse_persisted_execution_mode,
+    PersistedIntegrationConnectionError,
+};
+use ryuki_engine::integration_connections::IntegrationConnection;
 use serde_json::Value;
 
 /// SELECT column list for `integration_connections`. Mirrors the handler's
@@ -44,7 +47,7 @@ struct IntegrationConnectionRow {
 }
 
 impl IntegrationConnectionRow {
-    fn try_into_model(self) -> Result<IntegrationConnection, PersistedCredentialSourceError> {
+    fn try_into_model(self) -> Result<IntegrationConnection, PersistedIntegrationConnectionError> {
         let (credential_source, _) = parse_persisted_credential_binding(
             &self.credential_source,
             &self.credential_ref,
@@ -61,8 +64,7 @@ impl IntegrationConnectionRow {
             credential_ref: self.credential_ref,
             status: self.status,
             readiness: self.readiness,
-            execution_mode: ExecutionMode::parse(&self.execution_mode)
-                .unwrap_or(ExecutionMode::StaticDryRun),
+            execution_mode: parse_persisted_execution_mode(&self.execution_mode)?,
             last_test_at: self.last_test_at,
             last_test_result: self.last_test_result,
             created_by: self.created_by,
@@ -151,7 +153,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryuki_engine::integration_connections::CredentialSource;
+    use ryuki_engine::integration_connections::{CredentialSource, ExecutionMode};
 
     fn row(credential_source: &str) -> IntegrationConnectionRow {
         IntegrationConnectionRow {
@@ -187,5 +189,40 @@ mod tests {
         assert!(row("").try_into_model().is_err());
         assert!(row("future-provider").try_into_model().is_err());
         assert!(row(" env-var ").try_into_model().is_err());
+    }
+
+    #[test]
+    fn scheduler_row_decoder_requires_an_explicit_valid_execution_mode() {
+        for (raw, expected) in [
+            ("static-dry-run", ExecutionMode::StaticDryRun),
+            ("live", ExecutionMode::Live),
+        ] {
+            let mut row = row("vault");
+            row.execution_mode = raw.to_string();
+            assert_eq!(
+                row.try_into_model()
+                    .expect("explicit persisted execution mode")
+                    .execution_mode,
+                expected
+            );
+        }
+
+        let raw = "future-mode-with-sensitive-marker-DO-NOT-LOG";
+        let mut row = row("vault");
+        row.execution_mode = raw.to_string();
+        let error = row
+            .try_into_model()
+            .expect_err("unknown persisted execution mode must stop scheduler row decoding");
+
+        assert!(matches!(
+            &error,
+            PersistedIntegrationConnectionError::ExecutionMode(_)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "persisted integration execution mode is invalid"
+        );
+        assert!(!format!("{error:?}").contains(raw));
+        assert!(!format!("{error:?}").contains("DO-NOT-LOG"));
     }
 }

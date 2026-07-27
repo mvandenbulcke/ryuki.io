@@ -55,9 +55,9 @@
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-agents-cp-public-key"><span class="method-chip m-get">GET</span><code>/api/agents/cp-public-key</code></h2>
 <p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
-<p class="ep-summary">Return the CP's Ed25519 public key as base64.</p>
+<p class="ep-summary">Return the CP's versioned active/verify-only Ed25519 public keyset.</p>
 <p class="ep-doc-heading">Auth posture</p>
-<p><strong>Unauthenticated</strong> — intentionally.  A public key is not a secret; any agent (or observer) may fetch it.  Agents use this to pin the CP public key for verifying [<code>VerifiedLiveContext</code>] grants.  This endpoint is mounted via <code>agent_routes()</code>, which sits OUTSIDE the human <code>auth_middleware</code> layer in <code>main.rs</code>, so no session or agent-token is required.</p>
+<p><strong>Unauthenticated</strong> — intentionally.  A public key is not a secret; any agent (or observer) may fetch it. Agents use this to pin the CP public keyset for verifying [<code>VerifiedLiveContext</code>] grants. This endpoint is mounted via <code>agent_routes()</code>, which sits OUTSIDE the human <code>auth_middleware</code> layer in <code>main.rs</code>, so no session or agent-token is required.</p>
 <p>Returns 503 if the CP signing key was not initialised at startup (e.g. the key file was unreadable and the server continued in degraded mode).</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
@@ -72,10 +72,10 @@
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<h4><code>200</code> response body</h4>
-<p>Structure: <code>Value</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>public_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>public_key</code> returned in the response body.</td></tr><tr><td><code>protocol_version</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>protocol_version</code> returned in the response body.</td></tr></tbody></table>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td>Response body schema unavailable</td></tr></tbody></table>
+<p class="ep-note">For <code>200</code>, the response body could not be resolved from the route contract. It is not documented as bodyless.</p>
+<h4><code>200</code> response headers</h4>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cache-Control</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>The handler directly marks this response <code>no-store</code>, preventing persistence or idempotency replay of the returned value.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -83,13 +83,6 @@
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
   <span class="hl-cmd">--request</span> GET \
   <span class="hl-s">'https://&lt;your-host&gt;/api/agents/cp-public-key'</span></code></pre>
-<h4>Schematic response body</h4>
-<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
-<p>Success status: <code>200</code></p>
-<pre><code class="lang-json">{
-  <span class="hl-k">"public_key"</span>: <span class="hl-n">null</span>,
-  <span class="hl-k">"protocol_version"</span>: <span class="hl-n">null</span>
-}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-agents-openapi-json"><span class="method-chip m-get">GET</span><code>/api/agents/openapi.json</code></h2>

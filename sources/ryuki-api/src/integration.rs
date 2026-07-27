@@ -1612,10 +1612,34 @@ async fn resolve_credentials(
 #[error("persisted integration credential binding is invalid")]
 pub(crate) struct PersistedCredentialSourceError;
 
+/// A persisted execution-mode value is also untrusted database input. Keep
+/// this error value-free: the raw column must not be reflected into logs or
+/// API responses when a corrupt row is rejected.
+#[derive(Debug, thiserror::Error)]
+#[error("persisted integration execution mode is invalid")]
+pub(crate) struct PersistedExecutionModeError;
+
+/// Complete decode failure for one persisted integration connection. Row
+/// consumers use this shared error so every read path rejects malformed
+/// authority-bearing fields instead of substituting a safer-looking mode.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PersistedIntegrationConnectionError {
+    #[error(transparent)]
+    CredentialBinding(#[from] PersistedCredentialSourceError),
+    #[error(transparent)]
+    ExecutionMode(#[from] PersistedExecutionModeError),
+}
+
 pub(crate) fn parse_persisted_credential_source(
     raw: &str,
 ) -> Result<CredentialSource, PersistedCredentialSourceError> {
     CredentialSource::parse(raw).map_err(|_| PersistedCredentialSourceError)
+}
+
+pub(crate) fn parse_persisted_execution_mode(
+    raw: &str,
+) -> Result<ExecutionMode, PersistedExecutionModeError> {
+    ExecutionMode::parse(raw).map_err(|_| PersistedExecutionModeError)
 }
 
 pub(crate) fn parse_persisted_credential_binding(
@@ -1692,7 +1716,9 @@ fn persisted_typed_binding_matches_exactly(
 }
 
 impl IntegrationConnectionRow {
-    fn try_into_connection(self) -> Result<IntegrationConnection, PersistedCredentialSourceError> {
+    fn try_into_connection(
+        self,
+    ) -> Result<IntegrationConnection, PersistedIntegrationConnectionError> {
         self.try_into_connection_with_typed_binding()
             .map(|(connection, _)| connection)
     }
@@ -1701,7 +1727,7 @@ impl IntegrationConnectionRow {
         self,
     ) -> Result<
         (IntegrationConnection, Option<SecretRef>, Option<i64>),
-        PersistedCredentialSourceError,
+        PersistedIntegrationConnectionError,
     > {
         let (connection, binding) = self.try_into_connection_with_typed_binding()?;
         let (secret_ref, generation) = match binding {
@@ -1721,7 +1747,7 @@ impl IntegrationConnectionRow {
         self,
     ) -> Result<
         (IntegrationConnection, Option<PersistedTypedSecretBinding>),
-        PersistedCredentialSourceError,
+        PersistedIntegrationConnectionError,
     > {
         let generation = self.credential_secret_ref_generation;
         let (credential_source, secret_ref) = parse_persisted_credential_binding(
@@ -1740,8 +1766,7 @@ impl IntegrationConnectionRow {
             credential_ref: self.credential_ref,
             status: self.status,
             readiness: self.readiness,
-            execution_mode: ExecutionMode::parse(&self.execution_mode)
-                .unwrap_or(ExecutionMode::StaticDryRun),
+            execution_mode: parse_persisted_execution_mode(&self.execution_mode)?,
             last_test_at: self.last_test_at,
             last_test_result: self.last_test_result,
             created_by: self.created_by,
@@ -1757,7 +1782,7 @@ impl IntegrationConnectionRow {
                 .ok_or(PersistedCredentialSourceError)?,
             }),
             (None, None) => None,
-            _ => return Err(PersistedCredentialSourceError),
+            _ => return Err(PersistedCredentialSourceError.into()),
         };
         Ok((connection, binding))
     }
@@ -7886,6 +7911,52 @@ mod unit_tests {
             error.to_string(),
             "persisted integration credential binding is invalid"
         );
+    }
+
+    #[test]
+    fn persisted_execution_modes_are_exact_and_fail_closed() {
+        for (raw, expected) in [
+            ("static-dry-run", ExecutionMode::StaticDryRun),
+            ("live", ExecutionMode::Live),
+        ] {
+            let mut row = persisted_connection_row("vault");
+            row.execution_mode = raw.to_string();
+            assert_eq!(
+                row.try_into_connection()
+                    .expect("explicit persisted execution mode")
+                    .execution_mode,
+                expected
+            );
+        }
+
+        for raw in [
+            "",
+            "dry-run",
+            "future-mode-with-sensitive-marker-DO-NOT-LOG",
+            " static-dry-run ",
+            "LIVE",
+            "live\0static-dry-run",
+        ] {
+            let mut row = persisted_connection_row("vault");
+            row.execution_mode = raw.to_string();
+            let error = row
+                .try_into_connection()
+                .expect_err("malformed persisted execution mode must stop row decoding");
+
+            assert!(matches!(
+                &error,
+                PersistedIntegrationConnectionError::ExecutionMode(_)
+            ));
+            assert_eq!(
+                error.to_string(),
+                "persisted integration execution mode is invalid"
+            );
+            let debug = format!("{error:?}");
+            if !raw.is_empty() {
+                assert!(!debug.contains(raw));
+            }
+            assert!(!debug.contains("DO-NOT-LOG"));
+        }
     }
 
     #[test]

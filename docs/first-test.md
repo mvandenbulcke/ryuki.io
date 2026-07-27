@@ -318,13 +318,21 @@ Acceptance requires:
   persists its token, exits pending approval, and enters its poll loop only
   after the admin verifies `cryptographically_admitted: true` and approves the
   matching fingerprint and platform;
-- control plane and agent negotiate protocol v7. Missing and v1-v6
+- control plane and agent negotiate protocol v8. Missing and v1-v7
   protocol headers are rejected rather than treated as compatible. Record the
   approved agent's startup log entry `CP wire protocol is compatible` with both
-  `cp_protocol_version=7` and `agent_protocol_version=7`; the protocol rejection
+  `cp_protocol_version=8` and `agent_protocol_version=8`; the protocol rejection
   tests in Gate 1 are the evidence for older-version fail-closed behavior and
   for rejection of legacy live grants without exact destination, planning-agent
-  enrollment/key, reviewed execution-profile, and exact plan-row bindings.
+  enrollment/key, reviewed execution-profile, exact plan-row, request-version,
+  and signed control-plane key-id bindings. Record that the agent validated and
+  pinned the positive-versioned active/verify-only keyset and will reject an
+  unknown or removed `kid`;
+- do not treat `RYUKI_CP_SIGNING_KEY_PATH`, the default local
+  `cp-signing.key`, or its create-on-first-boot behavior as production evidence.
+  Those paths are development-only. `ExternalSigningKeyMaterial` remains
+  unverified, so protocol-v8 keyset behavior alone does not close production
+  signing-key custody;
 - direct vSphere inventory inspection proves all four recorded VM names are
   absent from the approved target folder/placement before any LivePlan;
 - the host/control-plane clock evidence satisfies the five-second skew bound.
@@ -348,7 +356,8 @@ Keep live mode disabled for this entire gate.
    statuses become `validated`, then `planned`.
 3. Review the plan, approve the request, and lock it. The statuses become
    `approved`, then `locked`.
-4. Exercise enrollment, polling, protocol-v7 negotiation, result signing, and
+4. Exercise enrollment, polling, protocol-v8 negotiation, signed-`kid` keyset
+   selection, result signing, and
    evidence handling only through pure/stub tests that do not spawn Terraform
    or Ansible. Preserve their value-free evidence.
 5. Confirm the production runner reports the missing sealed containment
@@ -358,9 +367,10 @@ Keep live mode disabled for this entire gate.
    acceptance wave rather than claiming it reached `verifying` or `completed`.
 
 Pass the current milestone only when the audit trail attributes creation and
-approval to different principals, the v6 enrollment/signing/evidence seams are
-exercised without an external child, and no provider resource or Terraform
-state was created.
+approval to different principals, the enrollment/signing/evidence seams
+introduced through historical protocol v6 plus the current protocol-v8
+signed-`kid` keyset contract are exercised without an external child, and no
+provider resource or Terraform state was created.
 
 After the reviewed containment adapter exists, extend this gate with the
 external `OfflineDryRun`: dispatch it, wait for the signed successful result,

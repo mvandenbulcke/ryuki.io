@@ -50,12 +50,14 @@ inventory, verifies the exact semantic receipt closure, and consumes the
 checkpoint, current SB-9 root, authenticated documents, pinned profile/build,
 and workload proof into one non-cloneable production-boundary proof. Production
 serving now retains verified `HttpsPublicUrls`, `SecureCookies`,
-`ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, and
-`DurablePostgresql` witnesses. It still exits before database publication,
-workers, routing, or listeners until exactly three receipt-bound live runtime
-guards are implemented and verified: `external-signing-key-material`,
-`mock-dependencies-disabled`, and `first-owner-path-closed`. The overall
-proposed normative production boundary is not complete.
+`ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, `DurablePostgresql`,
+and `FirstOwnerPathClosed` witnesses. It still exits before database
+publication, workers, routing, or listeners until exactly two receipt-bound
+live runtime guards are implemented and verified:
+`external-signing-key-material` and `mock-dependencies-disabled`. The overall
+proposed normative production boundary is not complete. In particular, the
+closed-state witness does not complete the broader SB-BOOT/AC-023 bootstrap,
+ownership-transfer, recovery, and break-glass acceptance program.
 
 Production additionally requires these external checkpoint bindings:
 
@@ -183,6 +185,46 @@ fallback route, substituted role, or changed observation fails closed. The
 pool allocation remains unpublished until the complete eight-guard runtime
 admission succeeds, and it is remeasured at the serving startup fences.
 
+Production also requires this independently pinned first-owner closure
+authority binding:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_FIRST_OWNER_AUTHORITY_ID` | Independently pinned canonical id beginning `first-owner-authority:` |
+| `RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID` | Independently pinned canonical Ed25519 key id beginning `first-owner-authority-key:` |
+| `RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64` | Canonical Base64 of exactly 32 raw, non-weak Ed25519 public-key bytes |
+| `RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT` | Nonzero `sha256:<64 lowercase hex>` digest of those decoded public-key bytes |
+| `RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH` | Canonical positive base-10 independently held minimum authority fencing epoch, at most 9,007,199,254,740,991 |
+
+These five variables are one complete-or-none group. They are mandatory for
+every production process and forbidden in development/test. Provision them
+through the independently governed deployment channel; none may be inferred
+from the rollbackable contract tree, build manifest, closure certificate, or
+database row. The key fingerprint must be cryptographically distinct from the
+checkpoint, deployed-workload, public-ingress, and PostgreSQL-infrastructure
+authority keys. There is no first-owner authority socket: the configured key
+authenticates the permanent closure certificate stored in PostgreSQL.
+
+Startup measures that certificate in a bounded, read-only, repeatable-read
+snapshot through the exact retained `DurablePostgresql` application-serving
+runtime. It requires exact canonical JSON with the closed schema. The pinned
+authority at or above the epoch floor must strictly verify a signature over the
+length-framed domain and exact canonical unsigned certificate after removing
+only top-level `signature_base64`. The certificate bytes and digest, every
+duplicated database
+column, authority namespace and closure-record digests, the exact sorted set of
+five privileged-domain assignments, and the linked atomic audit/domain-event
+rows must agree with the receipt-bound `FirstOwnerPathClosed` expectation.
+Startup retains that same PostgreSQL allocation and repeats the live snapshot
+at the applicable pre-database, pre-worker, and final-listener fences; changed
+content, channel identity, pool/session allocation, or receipt projection fails
+closed.
+
+This witness authenticates permanent closed-state evidence only. It does not
+establish that the one-time claim ceremony, concurrent-winner/replay behavior,
+ownership transfer, last-owner protection, recovery, or break-glass workflows
+required by SB-BOOT and AC-023 are complete.
+
 Production execution is currently contained: `apply-only` exits before reading
 the migration credential until live Kubernetes render admission, one-use
 attempt consumption, materialized-pin binding, and runtime receipt freshness
@@ -247,9 +289,9 @@ Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
 authority, and cannot start the API or migration runner. Even a valid sealed
 semantic closure, build manifest, and deployed-workload proof cannot start
-production until the remaining three receipt-bound live runtime guards are
-implemented and verified: `external-signing-key-material`,
-`mock-dependencies-disabled`, and `first-owner-path-closed`. The proving ground
+production until the remaining two receipt-bound live runtime guards are
+implemented and verified: `external-signing-key-material` and
+`mock-dependencies-disabled`. The proving ground
 likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
 runnable profile digest.
@@ -680,6 +722,13 @@ PostgreSQL is the **only** supported database — there is no MySQL, SQLite, or 
 `RYUKI_DATABASE_PROVIDER` selects the PostgreSQL *deployment* (CloudNativePG, a local container, AWS RDS, Azure Database for PostgreSQL, or GCP Cloud SQL) — every option is PostgreSQL.
 
 ## Admin Portal
+
+`RYUKI_PORTAL_EXECUTION_MODE` is mandatory and accepts exactly
+`live-provider` or `static-dry-run`. External public origins must select
+`live-provider`; `static-dry-run` is a preview-only mode accepted only when
+`RYUKI_PORTAL_PUBLIC_ORIGIN` is explicitly loopback. A missing, blank, unknown,
+or legacy `external-static` value fails portal startup instead of selecting
+synthetic data implicitly.
 
 ### Logo and Branding
 

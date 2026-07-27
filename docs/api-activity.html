@@ -55,8 +55,8 @@
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-activity-audit"><span class="method-chip m-get">GET</span><code>/api/activity/audit</code></h2>
 <p class="badges"><span class="badge">audit access</span></p>
-<p class="ep-summary">The global, newest-first, actor-attributed audit feed across all requests.</p>
-<p>Same audit-tier gate as the per-request trail: who-acted-when is sensitive identity data. Static/mock sessions carry PlatformAdmin (audit via the admin superuser), so the demo is unaffected.</p>
+<p class="ep-summary">The global-only, newest-first, actor-attributed audit feed across all requests.</p>
+<p>Same audit-tier gate as the per-request trail: who-acted-when is sensitive identity data. Principals carrying any site or environment scope are refused because the global feed cannot enforce that narrower authority; they must use the scoped per-request audit path.</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>

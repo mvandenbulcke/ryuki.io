@@ -66,7 +66,6 @@ use std::{
     time::Duration,
 };
 
-use ed25519_dalek::VerifyingKey;
 use serde_json::Value;
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -86,7 +85,10 @@ use crate::{
     },
 };
 use ryuki_engine::runners::RunStatus;
-use ryuki_protocol::{AgentHeartbeatResponse, Job, JobLease, JobMode};
+use ryuki_protocol::{
+    control_plane_grant_verifying_key, AgentHeartbeatResponse, ControlPlaneGrantKeyDisposition,
+    ControlPlaneGrantKeyset, Job, JobLease, JobMode,
+};
 
 /// Renew well inside the control plane's lease window. A single failed fenced
 /// renewal marks the local attempt lost; it is never treated as a best-effort
@@ -459,7 +461,7 @@ pub async fn process_job_live(
     agent_id: &str,
     outbox: &Outbox,
     job: &Job,
-    cp_verifying_key: Option<&VerifyingKey>,
+    cp_verifying_key: Option<&ControlPlaneGrantKeyset>,
     allow_live: bool,
 ) -> Result<(), AgentError> {
     let lease = job.lease.as_ref().ok_or(AgentError::NoLease)?;
@@ -650,9 +652,16 @@ pub async fn process_job_live(
             // Use a synthetic zeroed key when we have no pinned key — the gate
             // won't reach the signature check for LivePlan (it only checks
             // allow_live), so passing any key is safe here.
-            let dummy_vk = VerifyingKey::from_bytes(&[0u8; 32])
-                .unwrap_or_else(|_| identity.signing_key().verifying_key());
-            let vk = cp_verifying_key.unwrap_or(&dummy_vk);
+            let dummy_entry = control_plane_grant_verifying_key(
+                &identity.signing_key().verifying_key(),
+                ControlPlaneGrantKeyDisposition::Active,
+            );
+            let dummy_keyset = ControlPlaneGrantKeyset {
+                keyset_version: 1,
+                active_key_id: dummy_entry.key_id.clone(),
+                keys: vec![dummy_entry],
+            };
+            let vk = cp_verifying_key.unwrap_or(&dummy_keyset);
 
             match evaluate_live_execution(job, vk, allow_live, None) {
                 crate::live::LiveDecision::Refused(reason) => {
@@ -1236,7 +1245,7 @@ pub async fn replay_outbox(client: &CpClient, outbox: &Outbox, max_attempts: u32
 /// ## CP key pin (`cp_verifying_key`)
 ///
 /// When `allow_live` is `true`, the caller should attempt
-/// `client.fetch_cp_public_key()` → `pin_cp_key()` BEFORE calling `run_loop`
+/// `client.fetch_cp_public_keyset()` → `pin_cp_keyset()` BEFORE calling `run_loop`
 /// and pass the result here.  If the fetch/pin fails, pass `None` — live
 /// `LiveApply` jobs will be refused (the gate requires the pinned key);
 /// `LivePlan` jobs are still allowed (they only check `allow_live`).
@@ -1251,7 +1260,7 @@ pub async fn run_loop(
     agent_id: &str,
     outbox: &Outbox,
     poll_interval: Duration,
-    cp_verifying_key: Option<&VerifyingKey>,
+    cp_verifying_key: Option<&ControlPlaneGrantKeyset>,
     allow_live: bool,
     max_outbox_attempts: u32,
     outbox_drain_interval: Duration,
@@ -1786,10 +1795,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Generate a fresh CP keypair (parallel-safe: no global state).
-    fn cp_keypair() -> (ed25519_dalek::SigningKey, VerifyingKey) {
+    fn cp_keypair() -> (ed25519_dalek::SigningKey, ControlPlaneGrantKeyset) {
         let sk = generate_keypair(&mut OsRng);
-        let vk = sk.verifying_key();
-        (sk, vk)
+        let entry = control_plane_grant_verifying_key(
+            &sk.verifying_key(),
+            ControlPlaneGrantKeyDisposition::Active,
+        );
+        let keyset = ControlPlaneGrantKeyset {
+            keyset_version: 1,
+            active_key_id: entry.key_id.clone(),
+            keys: vec![entry],
+        };
+        (sk, keyset)
     }
 
     fn exact_test_execution_authority(
@@ -1860,6 +1877,7 @@ mod tests {
             expiry,
             step_job_id: None,
             execution_authority,
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -2727,6 +2745,7 @@ mod tests {
             expiry,
             step_job_id: Some(step_job_id),
             execution_authority,
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)

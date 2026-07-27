@@ -210,19 +210,19 @@ pub(crate) const STATIC_PREVIEW_PLATFORM_SETTINGS_SENTINEL: &str =
     "preview-only in static dry-run mode";
 
 /// Recovers the process-wide upstream client provided through Leptos context
-/// by `main.rs`. Falls back to building one from the environment so SSR
-/// renders outside the context-providing routes (for example the file/error
-/// fallback handler) stay functional.
+/// by `main.rs`. Missing context is a programming/startup-boundary failure: a
+/// request must never reconstruct a second authority-bearing client from
+/// mutable process environment after the startup client has been validated.
 #[cfg(feature = "ssr")]
 fn upstream_context() -> UpstreamClient {
     use leptos::prelude::use_context;
 
-    use_context::<UpstreamClient>().unwrap_or_else(|| {
-        let public_origin = crate::security::PortalPublicOrigin::from_env()
-            .expect("portal public origin must be validated during startup");
-        UpstreamClient::from_env(&public_origin)
-            .expect("portal upstream configuration must be validated during startup")
-    })
+    require_upstream_context(use_context::<UpstreamClient>())
+}
+
+#[cfg(feature = "ssr")]
+fn require_upstream_context(candidate: Option<UpstreamClient>) -> UpstreamClient {
+    candidate.expect("portal request is missing the startup-validated upstream runtime")
 }
 
 /// Extracts the canonical `{"error","message"}` text from an upstream 4xx
@@ -4630,6 +4630,13 @@ pub async fn test_integration(id: String) -> Result<IntegrationTestResult, Serve
 mod tests {
     use super::*;
     use crate::api::RequestListQuery;
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    #[should_panic(expected = "portal request is missing the startup-validated upstream runtime")]
+    fn missing_upstream_context_cannot_reconstruct_authority_from_environment() {
+        let _ = require_upstream_context(None);
+    }
 
     fn integration_response_row() -> serde_json::Value {
         serde_json::json!({

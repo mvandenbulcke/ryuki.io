@@ -57,6 +57,7 @@
 <p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Returns a backward-compatible bare request-summary array.</p>
 <p><code>include_total</code> defaults to false; when true, <code>X-Total-Count</code> is returned if the tightly budgeted capped aggregate completes, otherwise <code>X-Total-Count-Unavailable: true</code> is returned. <code>X-Total-Count-Capped: true</code> marks the navigation ceiling. <code>X-Next-Cursor</code> is emitted only when another deterministic <code>(created_at, id)</code> page exists.</p>
+<p>Interactive session/federated credentials and the development fixture are admitted here. Derived <code>ryk_</code> API tokens remain rejected until the provider registry can prove their exact audience, action allowlist, and lifecycle.</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
@@ -74,9 +75,6 @@ Numeric offset remains available inside its bounded compatibility window.</td></
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
 <p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
-<h4><code>200</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>X-Total-Count</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Filtered, capped total; present only when include_total=true and the aggregate finishes within its statement budget.</td></tr><tr><td><code>X-Total-Count-Capped</code></td><td><code>boolean</code></td><td><span class="req req-optional">Optional</span></td><td>True when X-Total-Count reached the supported request-list navigation ceiling.</td></tr><tr><td><code>X-Total-Count-Unavailable</code></td><td><code>boolean</code></td><td><span class="req req-optional">Optional</span></td><td>True when include_total=true but the optional aggregate exceeded its statement budget; the bounded page is still returned.</td></tr><tr><td><code>X-Next-Cursor</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque continuation emitted only when another deterministic request-list page exists.</td></tr></tbody></table>
-<p>Returns a bare JSON array; include_total defaults to false, so total-count headers are conditional, and X-Next-Cursor is emitted only when another deterministic page exists.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>

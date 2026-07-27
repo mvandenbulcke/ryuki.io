@@ -4401,21 +4401,28 @@ async fn main() {
     //
     // The control plane's Ed25519 keypair is used to sign `VerifiedLiveContext`
     // grants that authorise `LiveApply` jobs (S5a-2). The 32-byte raw seed is
-    // persisted create-only at mode 0600; the public key is logged at startup
-    // (NOT the secret) so operators can confirm the key fingerprint.
+    // persisted create-only at mode 0600. Only the deterministic non-secret key
+    // id is logged; raw encoded key material is not copied into logs.
     {
         let key_path_str = std::env::var("RYUKI_CP_SIGNING_KEY_PATH")
             .unwrap_or_else(|_| "cp-signing.key".to_string());
         let key_path = std::path::Path::new(&key_path_str);
         match cp_identity::load_or_generate_cp_key(key_path) {
             Ok(key) => {
-                let pubkey_b64 = ryuki_protocol::encode_verifying_key(&key.verifying_key());
+                let key_id = ryuki_protocol::control_plane_grant_key_id(&key.verifying_key());
                 tracing::info!(
-                    cp_pubkey = %pubkey_b64,
+                    cp_signing_key_id = %key_id,
+                    keyset_version = 1_u64,
                     key_path = %key_path_str,
-                    "CP signing key loaded (public key fingerprint logged; secret NOT logged)"
+                    "CP signing key loaded"
                 );
-                cp_identity::init_cp_key(key);
+                if let Err(error) = cp_identity::init_cp_key(key) {
+                    tracing::error!(
+                        error = %error,
+                        "CP signing keyring initialization conflicted; refusing to start"
+                    );
+                    std::process::exit(1);
+                }
             }
             Err(e) => {
                 tracing::error!(

@@ -21,12 +21,12 @@ hard-coded latest version.
 Before interpreting `RYUKI_MIGRATION_MODE` or opening a database connection,
 every mode admits the same seven baseline deployment-security pins documented
 in `docs/configuration.md`; production additionally requires its complete
-build, checkpoint, deployed-workload, and operation-specific attestation pin
-groups. The one-shot Job uses the same root-owned contract tree baked into the
-release image and imports every external value by an exact `ConfigMap` or
-`Secret` key reference. A missing, inactive, unresolved, partial, or digest-
-mismatched contract therefore exits before migration credentials or PostgreSQL
-are touched.
+build, checkpoint, deployed-workload, public-ingress, PostgreSQL-infrastructure,
+and first-owner authority pin groups. The one-shot Job uses the same root-owned
+contract tree baked into the release image and imports every external value by
+an exact `ConfigMap` or `Secret` key reference. A missing, inactive, unresolved,
+partial, or digest-mismatched contract therefore exits before migration
+credentials or PostgreSQL are touched.
 
 `RYUKI_MIGRATION_MODE` is a closed enum:
 
@@ -90,7 +90,8 @@ disabled with the rest of the one-shot migration credential after readback.
 ## Production pin resources and socket projection
 
 The checked-in Job is a suspended `source-template`, not an admissible Job. It
-contains `RENDER_REQUIRED` receipt sentinels and intentionally omits dynamic
+contains exactly nine `RENDER_REQUIRED` pin-ConfigMap receipt sentinels plus one
+socket-projection receipt-digest sentinel, and intentionally omits dynamic
 socket mounts. Accidental submission therefore cannot start a Pod; the signed
 final-render shape is retained only for diagnostic parsing and is always
 rejected, including when it sets `spec.suspend: false`. The hardened source Pod
@@ -120,6 +121,7 @@ means of bypassing the current execution block:
 | `platform-deployed-workload-attestation-pins-<digest-prefix>` | The complete ten-value workload authority, measurement-profile, and expected-workload binding |
 | `platform-public-ingress-attestation-pins-<digest-prefix>` | The complete nine-value public-ingress authority/profile binding required by production startup |
 | `platform-postgresql-infrastructure-attestation-pins-<digest-prefix>` | The complete nine-value PostgreSQL infrastructure authority/profile binding |
+| `platform-first-owner-authority-pins-<digest-prefix>` | The complete five-value first-owner Ed25519 authority binding; it is imported key-by-key as application environment and deliberately has no socket projection |
 | `platform-migration-socket-projection-authority-pins-<digest-prefix>` | The exact eight `RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_*` authority/key/profile values; it is render-verification input only and is never imported as application environment or mounted into the Job |
 
 These resources contain reviewed non-secret settings, selectors, public keys,
@@ -128,7 +130,7 @@ socket paths only. They contain no database password, bearer credential,
 private signing key, or raw provider data. The sole migration connection
 string remains the one exact key in the digest-scoped VaultDynamicSecret.
 
-Each of the eight pin ConfigMap names ends in the same first 12 image-digest hex
+Each of the nine pin ConfigMap names ends in the same first 12 image-digest hex
 characters as the Job. Its metadata carries `ryuki.io/release-digest-prefix` and
 `ryuki.io/content-digest`; the content digest is SHA-256 of the canonical,
 key-sorted JSON `data` object, and `binaryData` is forbidden. After creating
@@ -143,7 +145,7 @@ in one offline snapshot. They do not fence deletion/recreation after validation:
 the Job still dereferences names when Kubernetes materializes the Pod.
 `immutable: true` prevents mutation of one object but does not prevent deletion
 and name reuse. The missing in-cluster admission capability must hold that fence
-through Pod materialization for all eight maps.
+through Pod materialization for all nine maps.
 
 Kubernetes cannot project a live Unix socket from a ConfigMap or Secret. The
 authority deployment mechanism is intentionally external to this repository.
@@ -161,7 +163,7 @@ The authority emits a strict canonical root object with exactly `payload` and
 `ryuki-canonical-json-v1`; it binds the approved authority epoch and profile,
 positive Unix-second `[notBefore, expiresAt)` validity interval of at most 300
 seconds, exact release image and digest prefix, closed socket-contract digest,
-all eight live ConfigMap receipts in the contract's annotation order, the exact
+all nine live ConfigMap receipts in the contract's annotation order, the exact
 four path/authority/key/fingerprint/CSI projections, and the SHA-256 digest of
 the canonical rendered Job preimage. The signature object contains only
 `algorithm: ed25519` and a canonical padded `signatureBase64`; its
@@ -304,7 +306,7 @@ capability closes all of these boundaries:
 
 1. In-cluster admission uses a trust anchor provisioned outside the render
    request and atomically validates the live Job, receipt, socket projections,
-   and all eight ConfigMap identities through Pod materialization.
+   and all nine ConfigMap identities through Pod materialization.
 2. One immutable attempt identity is signed, consumed exactly once, and bound to
    a non-replayable Kubernetes Job identity; a replay cannot create a second
    generated Job.

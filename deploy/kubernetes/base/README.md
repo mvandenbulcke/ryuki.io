@@ -85,8 +85,10 @@ that source mode is not admissible for execution. The diagnostic final-render
 shape rewrites `envFrom` to immutable
 `platform-api-migration-config-<digest-prefix>` and receipt-binds its exact five
 reviewed keys and API identity. The other six application/security pin groups
-are imported key-by-key from their immutable digest-scoped ConfigMaps. The
-eighth, non-environment pin ConfigMap describes the socket-projection receipt
+are imported key-by-key from their immutable digest-scoped ConfigMaps. The new
+first-owner authority group adds five public trust-anchor pins through a
+seventh application/security ConfigMap and deliberately adds no socket. The
+ninth, non-environment pin ConfigMap describes the socket-projection receipt
 authority. Its key is not a trust anchor merely because the manifest supplies
 it, and the production validator no longer accepts an inline or context-selected
 anchor. A future in-cluster admission capability must receive its independently
@@ -97,7 +99,7 @@ canonical `data`-object digest and raw receipt digest. It is neither mounted nor
 imported as application environment; within the rendered Job and CSI graph,
 only the excluded Job annotation carries the raw digest. See
 `../operations/migration-cutover-contract.yaml` and
-`../../../docs/runbooks/database-migration-cutover.md` for the eight pin receipts,
+`../../../docs/runbooks/database-migration-cutover.md` for the nine pin receipts,
 signed-envelope diagnostic validation, socket CSI projection shape, and the
 currently unavailable runtime fences.
 

@@ -37,7 +37,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use ryuki_protocol::{AgentHeartbeat, AgentHeartbeatResponse, AgentRegistration, Job, JobLease};
+use ryuki_protocol::{
+    AgentHeartbeat, AgentHeartbeatResponse, AgentRegistration, ControlPlaneGrantKeysetResponse,
+    Job, JobLease,
+};
 
 // ---------------------------------------------------------------------------
 // Wire types mirroring ryuki-api/src/agents.rs
@@ -88,6 +91,11 @@ pub enum ClientError {
         cp_version: u32,
         supported: &'static [u32],
     },
+    /// The unauthenticated bootstrap response did not match the closed protocol
+    /// schema. Keep this error value-free: the response is remotely supplied
+    /// and must not be reflected into agent logs.
+    #[error("control-plane keyset bootstrap response is invalid")]
+    InvalidControlPlaneKeysetResponse,
     /// The configured endpoint does not meet the credential-transport policy.
     /// The raw value is deliberately omitted because rejected userinfo may
     /// itself contain a credential.
@@ -114,34 +122,15 @@ async fn require_2xx(resp: reqwest::Response) -> Result<reqwest::Response, Clien
     Err(ClientError::ErrorStatus { status: code, body })
 }
 
-/// Stamp the CP↔agent wire protocol version onto EVERY request (authed or not,
-/// incl. `register_new` and the cp-public-key fetch). Centralised here so no call
-/// site can forget it — the CP reads this header before deserialising the body and
-/// rejects an unsupported version with a clear error instead of an opaque 400.
+/// Stamp the CP↔agent wire protocol version onto every request. The bootstrap
+/// endpoint accepts this as optional diagnostic metadata; every other agent
+/// endpoint reads it before body deserialization and rejects unsupported values
+/// with a clear error instead of an opaque 400.
 fn with_protocol_version(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     rb.header(
         ryuki_protocol::PROTOCOL_VERSION_HEADER,
         ryuki_protocol::PROTOCOL_VERSION.to_string(),
     )
-}
-
-/// Extract the CP's advertised wire protocol version from a cp-public-key JSON
-/// body, FAIL-CLOSED. A CP predating version advertisement OMITS the field →
-/// [`ryuki_protocol::PROTOCOL_VERSION_LEGACY`]. A field that is PRESENT but not a
-/// valid `u32` (string, `null`, negative, fractional, or `> u32::MAX`) is NOT
-/// silently downgraded to legacy — it returns an error, so a garbled advertisement
-/// can never masquerade as a compatible v1 CP.
-fn parse_advertised_protocol_version(body: &serde_json::Value) -> Result<u32, ClientError> {
-    match body.get("protocol_version") {
-        None => Ok(ryuki_protocol::PROTOCOL_VERSION_LEGACY),
-        Some(v) => v
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| ClientError::ErrorStatus {
-                status: 200,
-                body: format!("cp-public-key advertised an invalid protocol_version: {v}"),
-            }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -450,12 +439,13 @@ impl CpClient {
 
     /// GET /api/agents/cp-public-key
     ///
-    /// Fetches the control plane's Ed25519 verifying (public) key as a
-    /// base64-encoded string. This endpoint is **intentionally unauthenticated**
-    /// on the CP side, so the client deliberately omits the reusable bearer.
+    /// Fetches the control plane's protocol version and versioned Ed25519
+    /// verification keyset atomically. This endpoint is **intentionally
+    /// unauthenticated** on the CP side, so the client deliberately omits the
+    /// reusable bearer.
     ///
     /// The caller should pin the returned key at startup (via
-    /// `ryuki_agent::live::pin_cp_key`) and use it to verify every
+    /// `ryuki_agent::live::pin_cp_keyset`) and use it to verify every
     /// [`VerifiedLiveContext`] grant before a `LiveApply` execution.
     ///
     /// ## TOFU note
@@ -464,48 +454,35 @@ impl CpClient {
     /// loopback-only development policy, so a remote MITM cannot substitute the
     /// key during this fetch.
     ///
-    /// Returns the raw base64 string (suitable for passing to `pin_cp_key`).
-    pub async fn fetch_cp_public_key(&self) -> Result<String, ClientError> {
+    /// Returns the closed typed bootstrap response. Malformed JSON and schema
+    /// drift map to one value-free error so untrusted response content cannot
+    /// be reflected into logs.
+    pub async fn fetch_cp_keyset_response(
+        &self,
+    ) -> Result<ControlPlaneGrantKeysetResponse, ClientError> {
         let url = self.endpoint.join("api/agents/cp-public-key");
         // This endpoint is intentionally unauthenticated. Do not send the
-        // reusable bearer when the protocol-version header is sufficient.
+        // reusable bearer. The header is useful to a current CP for diagnostics,
+        // but bootstrap compatibility comes from the typed response and the
+        // endpoint does not require a request protocol header.
         let resp = with_protocol_version(self.http.get(url)).send().await?;
         let resp = require_2xx(resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        body.get("public_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| ClientError::ErrorStatus {
-                status: 200,
-                body: "response missing 'public_key' field".to_owned(),
-            })
+        let body = resp.bytes().await?;
+        serde_json::from_slice(&body).map_err(|_| ClientError::InvalidControlPlaneKeysetResponse)
     }
 
-    /// GET /api/agents/cp-public-key — extract the CP's advertised wire protocol
-    /// version. A CP that predates version advertisement omits the field; per the
-    /// wire contract such a CP speaks [`ryuki_protocol::PROTOCOL_VERSION_LEGACY`].
-    pub async fn fetch_cp_protocol_version(&self) -> Result<u32, ClientError> {
-        let url = self.endpoint.join("api/agents/cp-public-key");
-        let resp = with_protocol_version(self.http.get(url)).send().await?;
-        let resp = require_2xx(resp).await?;
-        let body: serde_json::Value = resp.json().await?;
-        parse_advertised_protocol_version(&body)
-    }
-
-    /// Confirm the CP speaks a wire protocol version this agent supports. Returns
-    /// the CP's version on success, or [`ClientError::IncompatibleProtocol`] when
-    /// it is outside [`ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS`] so the caller
-    /// can refuse to start. Fail-closed — this is the CP→agent half of the
-    /// compatibility handshake (the CP-side extractor is the agent→CP half).
-    pub async fn ensure_cp_protocol_compatible(&self) -> Result<u32, ClientError> {
-        let cp_version = self.fetch_cp_protocol_version().await?;
+    /// Confirm that the version from an already fetched bootstrap response is
+    /// supported. Keeping this pure prevents callers from issuing a second GET
+    /// and accidentally checking compatibility against a different keyset
+    /// publication.
+    pub fn require_compatible_protocol(cp_version: u32) -> Result<(), ClientError> {
         if !ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&cp_version) {
             return Err(ClientError::IncompatibleProtocol {
                 cp_version,
                 supported: ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS,
             });
         }
-        Ok(cp_version)
+        Ok(())
     }
 
     /// POST /api/agents/{agent_id}/jobs/{job_id}/result
@@ -556,8 +533,11 @@ impl CpClient {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use rand::rngs::OsRng;
     use ryuki_protocol::{
-        AgentRegistration, Capabilities, Job, JobLease, JobMode, JobSpec, JobStatus,
+        control_plane_grant_verifying_key, generate_keypair, AgentRegistration, Capabilities,
+        ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, Job, JobLease, JobMode, JobSpec,
+        JobStatus,
     };
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -614,6 +594,22 @@ mod tests {
             String::from_utf8(request).expect("HTTP request must be UTF-8 in this fixture")
         });
         (format!("http://{addr}"), task)
+    }
+
+    fn test_keyset_response() -> ControlPlaneGrantKeysetResponse {
+        let signing_key = generate_keypair(&mut OsRng);
+        let active = control_plane_grant_verifying_key(
+            &signing_key.verifying_key(),
+            ControlPlaneGrantKeyDisposition::Active,
+        );
+        ControlPlaneGrantKeysetResponse {
+            keyset: ControlPlaneGrantKeyset {
+                keyset_version: 1,
+                active_key_id: active.key_id.clone(),
+                keys: vec![active],
+            },
+            protocol_version: ryuki_protocol::PROTOCOL_VERSION,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -730,25 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn advertised_version_absent_field_is_legacy() {
-        // Only a COMPLETELY ABSENT field means "old CP" → legacy 1.
-        let body = serde_json::json!({ "public_key": "abc" });
-        assert_eq!(
-            parse_advertised_protocol_version(&body).unwrap(),
-            ryuki_protocol::PROTOCOL_VERSION_LEGACY
-        );
-    }
-
-    #[test]
-    fn advertised_version_valid_is_returned() {
-        let body = serde_json::json!({
-            "public_key": "abc",
-            "protocol_version": ryuki_protocol::PROTOCOL_VERSION
-        });
-        assert_eq!(
-            parse_advertised_protocol_version(&body).unwrap(),
-            ryuki_protocol::PROTOCOL_VERSION
-        );
+    fn current_bootstrap_protocol_version_is_accepted() {
+        CpClient::require_compatible_protocol(ryuki_protocol::PROTOCOL_VERSION)
+            .expect("current protocol version must remain supported");
     }
 
     #[test]
@@ -759,30 +739,23 @@ mod tests {
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&4));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&5));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&6));
-        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 7);
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 8);
         assert!(
             ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&ryuki_protocol::PROTOCOL_VERSION)
         );
     }
 
     #[test]
-    fn advertised_version_present_but_invalid_is_rejected_not_downgraded() {
-        // FAIL-CLOSED: a present-but-garbled value must NOT silently become legacy 1
-        // (which would falsely report the CP as compatible). Each of these is an error.
-        let invalid = [
-            serde_json::json!({ "protocol_version": "1" }), // string
-            serde_json::json!({ "protocol_version": null }), // null
-            serde_json::json!({ "protocol_version": -1 }),  // negative
-            serde_json::json!({ "protocol_version": 1.5 }), // fractional
-            serde_json::json!({ "protocol_version": true }), // bool
-            serde_json::json!({ "protocol_version": 4_294_967_296_u64 }), // > u32::MAX
-        ];
-        for body in invalid {
-            assert!(
-                parse_advertised_protocol_version(&body).is_err(),
-                "a present-but-invalid protocol_version must be an error, not legacy: {body}"
-            );
-        }
+    fn unsupported_bootstrap_protocol_version_is_rejected() {
+        let error = CpClient::require_compatible_protocol(ryuki_protocol::PROTOCOL_VERSION_LEGACY)
+            .expect_err("a legacy CP must be rejected after the v8 cutover");
+        assert!(matches!(
+            error,
+            ClientError::IncompatibleProtocol {
+                cp_version: ryuki_protocol::PROTOCOL_VERSION_LEGACY,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -887,8 +860,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_key_fetch_omits_the_reusable_bearer() {
-        let body = r#"{"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#;
+    async fn keyset_bootstrap_is_one_unauthenticated_typed_request() {
+        let expected = test_keyset_response();
+        let body = serde_json::to_string(&expected).expect("serialize typed bootstrap response");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -898,10 +872,11 @@ mod tests {
         let client = CpClient::from_endpoint(&endpoint, "agent", "rya_must_not_be_sent")
             .expect("client must initialize");
 
-        client
-            .fetch_cp_public_key()
+        let actual = client
+            .fetch_cp_keyset_response()
             .await
-            .expect("public-key response must parse");
+            .expect("typed bootstrap response must parse");
+        assert_eq!(actual, expected);
         let request = server.await.expect("test server task");
         assert!(
             !request.to_ascii_lowercase().contains("authorization:"),
@@ -913,6 +888,32 @@ mod tests {
                 .contains("x-ryuki-protocol-version:"),
             "wire protocol header must remain present"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_keyset_bootstrap_returns_a_value_free_error() {
+        let hostile_marker = "attacker-controlled-bootstrap-value";
+        let body =
+            format!(r#"{{"keyset":{{"unexpected":"{hostile_marker}"}},"protocol_version":8}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, server) = one_response_server(response).await;
+        let endpoint = ControlPlaneEndpoint::parse(&base_url, true).expect("loopback opt-in");
+        let client = CpClient::from_endpoint(&endpoint, "agent", "rya_must_not_be_sent")
+            .expect("client must initialize");
+
+        let error = client
+            .fetch_cp_keyset_response()
+            .await
+            .expect_err("schema-invalid bootstrap must fail closed");
+        assert!(matches!(
+            &error,
+            ClientError::InvalidControlPlaneKeysetResponse
+        ));
+        assert!(!error.to_string().contains(hostile_marker));
+        let _request = server.await.expect("test server task");
     }
 
     // -----------------------------------------------------------------------
@@ -1055,7 +1056,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // fetch_cp_public_key — URL construction + response parsing (no live server)
+    // fetch_cp_keyset_response — URL construction + typed response contract
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1071,32 +1072,24 @@ mod tests {
     }
 
     #[test]
-    fn cp_public_key_response_parses_public_key_field() {
-        // Simulate the JSON body that the CP returns.
-        let body =
-            serde_json::json!({"public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
-        let key = body
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned());
-        assert_eq!(
-            key,
-            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()),
-            "public_key field must be extracted correctly"
-        );
+    fn cp_keyset_response_roundtrips_as_one_closed_document() {
+        let expected = test_keyset_response();
+        let encoded = serde_json::to_vec(&expected).expect("serialize typed response");
+        let decoded: ControlPlaneGrantKeysetResponse =
+            serde_json::from_slice(&encoded).expect("deserialize typed response");
+        assert_eq!(decoded, expected);
     }
 
     #[test]
-    fn cp_public_key_response_missing_field_returns_error() {
-        // A body without "public_key" must map to an ErrorStatus.
-        let body = serde_json::json!({"status": "ok"});
-        let key = body
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned());
-        assert!(
-            key.is_none(),
-            "missing public_key field must produce None → ErrorStatus"
-        );
+    fn cp_keyset_response_requires_both_version_and_keyset() {
+        for body in [
+            serde_json::json!({"protocol_version": ryuki_protocol::PROTOCOL_VERSION}),
+            serde_json::json!({"keyset": test_keyset_response().keyset}),
+        ] {
+            assert!(
+                serde_json::from_value::<ControlPlaneGrantKeysetResponse>(body).is_err(),
+                "the atomic bootstrap document must require both fields"
+            );
+        }
     }
 }

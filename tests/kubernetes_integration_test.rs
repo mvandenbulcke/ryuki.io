@@ -499,6 +499,14 @@ const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS: &[&str] = &[
     "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION",
     "RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST",
 ];
+const FIRST_OWNER_AUTHORITY_CONFIG_MAP: &str = "platform-first-owner-authority-pins";
+const FIRST_OWNER_AUTHORITY_KEYS: &[&str] = &[
+    "RYUKI_FIRST_OWNER_AUTHORITY_ID",
+    "RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID",
+    "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64",
+    "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT",
+    "RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH",
+];
 const MIGRATION_PRODUCTION_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
     (
         SECURITY_ADMISSION_CONFIG_MAP,
@@ -530,6 +538,11 @@ const MIGRATION_PRODUCTION_PIN_GROUPS: &[(&str, &[&str], &str)] = &[
         POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS,
         "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
     ),
+    (
+        FIRST_OWNER_AUTHORITY_CONFIG_MAP,
+        FIRST_OWNER_AUTHORITY_KEYS,
+        "ryuki.io/pin-first-owner-authority-receipt",
+    ),
 ];
 const SOCKET_PROJECTION_AUTHORITY_CONFIG_MAP: &str =
     "platform-migration-socket-projection-authority-pins";
@@ -543,7 +556,7 @@ const SOCKET_PROJECTION_AUTHORITY_KEYS: &[&str] = &[
     "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_VERSION",
     "RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_PROFILE_DIGEST",
 ];
-const MIGRATION_RENDER_PIN_RECEIPT_ANNOTATIONS: [&str; 8] = [
+const MIGRATION_RENDER_PIN_RECEIPT_ANNOTATIONS: [&str; 9] = [
     "ryuki.io/pin-migration-config-receipt",
     "ryuki.io/pin-security-admission-receipt",
     "ryuki.io/pin-production-build-manifest-receipt",
@@ -551,9 +564,10 @@ const MIGRATION_RENDER_PIN_RECEIPT_ANNOTATIONS: [&str; 8] = [
     "ryuki.io/pin-deployed-workload-attestation-receipt",
     "ryuki.io/pin-public-ingress-attestation-receipt",
     "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    "ryuki.io/pin-first-owner-authority-receipt",
     "ryuki.io/pin-socket-projection-authority-receipt",
 ];
-const MIGRATION_JOB_RYUKI_ANNOTATIONS: [&str; 14] = [
+const MIGRATION_JOB_RYUKI_ANNOTATIONS: [&str; 15] = [
     "ryuki.io/cutover-contract",
     "ryuki.io/release-image",
     "ryuki.io/render-contract",
@@ -565,11 +579,12 @@ const MIGRATION_JOB_RYUKI_ANNOTATIONS: [&str; 14] = [
     "ryuki.io/pin-deployed-workload-attestation-receipt",
     "ryuki.io/pin-public-ingress-attestation-receipt",
     "ryuki.io/pin-postgresql-infrastructure-attestation-receipt",
+    "ryuki.io/pin-first-owner-authority-receipt",
     "ryuki.io/pin-socket-projection-authority-receipt",
     "ryuki.io/socket-projection-receipt-digest",
     "ryuki.io/socket-contract-digest",
 ];
-const MIGRATION_JOB_ENV_COUNT: usize = 44;
+const MIGRATION_JOB_ENV_COUNT: usize = 49;
 const FINAL_RENDER_CONTRACT: &str = "migration-final-render-v1";
 const SOURCE_TEMPLATE_MODE: &str = "source-template";
 const FINAL_RENDER_MODE: &str = "final-render";
@@ -1957,7 +1972,7 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
         MIGRATION_JOB_RYUKI_ANNOTATIONS.iter().copied().collect();
     assert_eq!(
         actual_annotation_keys, expected_annotation_keys,
-        "Job annotation inventory must contain exactly 14 keys"
+        "Job annotation inventory must contain exactly 15 keys"
     );
     assert_eq!(
         job["metadata"]["annotations"]["ryuki.io/render-contract"],
@@ -1990,8 +2005,8 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
             .values()
             .filter(|value| value.as_str() == Some(RENDER_REQUIRED_SENTINEL))
             .count(),
-        9,
-        "source template must retain eight pin receipts plus one socket receipt digest sentinel"
+        10,
+        "source template must retain nine pin receipts plus one socket receipt digest sentinel"
     );
 
     let pod = &job["spec"]["template"]["spec"];
@@ -2491,6 +2506,23 @@ fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
         300
     );
     assert_eq!(
+        final_render["socketProjectionReceipt"]["receiptBindsReleaseImageAndAllNinePinConfigMapReceipts"],
+        true
+    );
+    let receipt_payload = &contract["socketProjectionReceiptResource"]["envelope"]["payload"];
+    assert_eq!(receipt_payload["pinConfigMapReceiptExactCount"], 9);
+    let receipt_order: Vec<&str> = receipt_payload["pinConfigMapReceiptExactOrderByAnnotation"]
+        .as_sequence()
+        .expect("ordered pin ConfigMap receipt annotations")
+        .iter()
+        .map(|annotation| annotation.as_str().expect("pin receipt annotation"))
+        .collect();
+    assert_eq!(receipt_order, MIGRATION_RENDER_PIN_RECEIPT_ANNOTATIONS);
+    assert_eq!(
+        receipt_payload["offlineSnapshotAllNinePinReceiptsMustMatchApiReadback"],
+        true
+    );
+    assert_eq!(
         final_render["closedSocketContractDigest"],
         SOCKET_CONTRACT_DIGEST
     );
@@ -2598,6 +2630,11 @@ fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
             digest_scoped_pin_config_map_name(PUBLIC_INGRESS_ATTESTATION_CONFIG_MAP, digest_prefix),
             PUBLIC_INGRESS_ATTESTATION_KEYS,
         ),
+        (
+            "firstOwnerAuthority",
+            digest_scoped_pin_config_map_name(FIRST_OWNER_AUTHORITY_CONFIG_MAP, digest_prefix),
+            FIRST_OWNER_AUTHORITY_KEYS,
+        ),
     ] {
         assert_eq!(projections[field]["configMapName"], config_map.as_str());
         let actual_keys: Vec<&str> = projections[field]["configKeys"]
@@ -2627,7 +2664,22 @@ fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
             "production pin projection gate {flag} must stay fail-closed"
         );
     }
-    assert_eq!(projections["exactPinConfigMapReceiptCount"], 8);
+    assert_eq!(projections["exactPinConfigMapReceiptCount"], 9);
+    for flag in [
+        "productionOnly",
+        "independentlyGovernedAuthorityRequired",
+        "ed25519Required",
+        "privateKeyInWorkloadForbidden",
+    ] {
+        assert_eq!(
+            projections["firstOwnerAuthority"][flag], true,
+            "first-owner projection gate {flag} must stay fail-closed"
+        );
+    }
+    assert_eq!(
+        projections["firstOwnerAuthority"]["socketProjectionRequired"], false,
+        "the first-owner authority is pinned data and must not widen the four-socket inventory"
+    );
 
     let socket_authority = &contract["socketProjectionAuthority"];
     assert_eq!(

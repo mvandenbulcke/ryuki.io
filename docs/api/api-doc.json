@@ -13,8 +13,8 @@
           "tier": "audit",
           "auth_exempt": false,
           "handler": "activity_audit_feed",
-          "summary": "GET /api/activity/audit — the global, newest-first, actor-attributed audit feed across all requests.",
-          "description": "GET /api/activity/audit — the global, newest-first, actor-attributed audit\nfeed across all requests. Same audit-tier gate as the per-request trail:\nwho-acted-when is sensitive identity data. Static/mock sessions carry\nPlatformAdmin (audit via the admin superuser), so the demo is unaffected.",
+          "summary": "GET /api/activity/audit — the global-only, newest-first, actor-attributed audit feed across all requests.",
+          "description": "GET /api/activity/audit — the global-only, newest-first, actor-attributed\naudit feed across all requests. Same audit-tier gate as the per-request\ntrail: who-acted-when is sensitive identity data. Principals carrying any\nsite or environment scope are refused because the global feed cannot enforce\nthat narrower authority; they must use the scoped per-request audit path.",
           "path_params": [],
           "query_params_state": "known",
           "query_params": [
@@ -2867,7 +2867,7 @@
                     "doc": null
                   },
                   {
-                    "name": "user_id",
+                    "name": "principal_id",
                     "type": "Value",
                     "optional": false,
                     "doc": null
@@ -2885,7 +2885,7 @@
                     "doc": null
                   },
                   {
-                    "name": "provider",
+                    "name": "provider_id",
                     "type": "Value",
                     "optional": false,
                     "doc": null
@@ -3584,12 +3584,6 @@
                 "doc": "Operator-facing credential name stored with the token metadata."
               },
               {
-                "name": "owner_principal",
-                "type": "String",
-                "optional": false,
-                "doc": "Audited actor for the credential. Until a governed service-principal\nregistry exists this must exactly equal the authenticated human subject."
-              },
-              {
                 "name": "roles",
                 "type": "Vec<String>",
                 "optional": true,
@@ -3636,7 +3630,7 @@
                     "doc": null
                   },
                   {
-                    "name": "owner_principal",
+                    "name": "issuing_principal_id",
                     "type": "Value",
                     "optional": false,
                     "doc": null
@@ -3770,8 +3764,8 @@
           "tier": "admin",
           "auth_exempt": false,
           "handler": "admin_tokens_get",
-          "summary": "GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/owner/expiry before revoking).",
-          "description": "GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/owner/expiry\nbefore revoking). Mirrors `admin_tokens_list`'s secret-safe projection via the\nshared `token_row_to_json`. `WHERE id = $1` only (NO `revoked_at` filter), so a\nrevoked token is still readable like the list; a genuinely-absent id is 404.",
+          "summary": "GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/issuer/expiry before revoking).",
+          "description": "GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/issuer/expiry\nbefore revoking). Mirrors `admin_tokens_list`'s secret-safe projection via the\nshared `token_row_to_json`. `WHERE id = $1` only (NO `revoked_at` filter), so a\nrevoked token is still readable like the list; a genuinely-absent id is 404.",
           "path_params": [
             {
               "name": "id",
@@ -3939,8 +3933,8 @@
           "tier": "public",
           "auth_exempt": true,
           "handler": "cp_public_key",
-          "summary": "Return the CP's Ed25519 public key as base64.",
-          "description": "Return the CP's Ed25519 public key as base64.\n\n## Auth posture\n\n**Unauthenticated** — intentionally.  A public key is not a secret; any\nagent (or observer) may fetch it.  Agents use this to pin the CP public key\nfor verifying [`VerifiedLiveContext`] grants.  This endpoint is mounted via\n`agent_routes()`, which sits OUTSIDE the human `auth_middleware` layer in\n`main.rs`, so no session or agent-token is required.\n\nReturns 503 if the CP signing key was not initialised at startup (e.g. the\nkey file was unreadable and the server continued in degraded mode).",
+          "summary": "Return the CP's versioned active/verify-only Ed25519 public keyset.",
+          "description": "Return the CP's versioned active/verify-only Ed25519 public keyset.\n\n## Auth posture\n\n**Unauthenticated** — intentionally.  A public key is not a secret; any\nagent (or observer) may fetch it. Agents use this to pin the CP public\nkeyset for verifying [`VerifiedLiveContext`] grants. This endpoint is mounted via\n`agent_routes()`, which sits OUTSIDE the human `auth_middleware` layer in\n`main.rs`, so no session or agent-token is required.\n\nReturns 503 if the CP signing key was not initialised at startup (e.g. the\nkey file was unreadable and the server continued in degraded mode).",
           "path_params": [],
           "query_params_state": "none",
           "query_params": null,
@@ -3951,25 +3945,16 @@
             {
               "status": 200,
               "description": "OK",
-              "body_state": "json",
-              "body": {
-                "type": "Value",
-                "fields": [
-                  {
-                    "name": "public_key",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  },
-                  {
-                    "name": "protocol_version",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  }
-                ]
-              },
-              "headers": []
+              "body_state": "unknown",
+              "body": null,
+              "headers": [
+                {
+                  "name": "Cache-Control",
+                  "type": "string",
+                  "required": true,
+                  "description": "The handler directly marks this response `no-store`, preventing persistence or idempotency replay of the returned value."
+                }
+              ]
             }
           ],
           "response_notes": null
@@ -7273,7 +7258,7 @@
           "auth_exempt": true,
           "handler": "crate::entra_sso::entra_authorize_url",
           "summary": "GET /api/auth/entra/authorize-url — begins a browser sign-in.",
-          "description": "GET /api/auth/entra/authorize-url — begins a browser sign-in.\n\nPersists `(state, nonce, pkce_verifier, binding)` via the single-use\n`oidc_login_states` store, then returns the tenant authorize URL plus the\nper-browser binding as JSON. The binding is ALSO set as the HttpOnly\nmode-selected binding cookie for direct same-origin browser callers; the\nportal server function (which cannot forward upstream Set-Cookie headers)\nreads the JSON field and sets an identical cookie on its own response. The\nbinding value never reaches page JavaScript either way. Mandatory shared\nsource/global admission precedes PostgreSQL; serialized DB-time cleanup and\nprovider/global quotas precede entropy generation. A 429 carries a bounded\n`Retry-After` response header.",
+          "description": "GET /api/auth/entra/authorize-url — begins a browser sign-in.\n\nPersists `(state, nonce, pkce_verifier, binding)` via the single-use\n`oidc_login_states_v3` store, then returns the tenant authorize URL plus the\nper-browser binding as JSON. The binding is ALSO set as the HttpOnly\nmode-selected binding cookie for direct same-origin browser callers; the\nportal server function (which cannot forward upstream Set-Cookie headers)\nreads the JSON field and sets an identical cookie on its own response. The\nbinding value never reaches page JavaScript either way. Mandatory shared\nsource/global admission precedes PostgreSQL; serialized DB-time cleanup and\nprovider/global quotas precede entropy generation. A 429 carries a bounded\n`Retry-After` response header.",
           "path_params": [],
           "query_params_state": "none",
           "query_params": null,
@@ -32795,7 +32780,7 @@
           "auth_exempt": false,
           "handler": "user_preferences_get",
           "summary": "GET /api/me/preferences — the CURRENT user's scope preferences (#59).",
-          "description": "GET /api/me/preferences — the CURRENT user's scope preferences (#59).\nKeyed on the verified `session.user_id`; returns nulls when none are set.\nSelf-service (any authenticated user); empty + `durable:false` with no DB.",
+          "description": "GET /api/me/preferences — the CURRENT user's scope preferences (#59).\nKeyed on the verified opaque session principal; returns nulls when none are set.\nSelf-service (any authenticated user); empty + `durable:false` with no DB.",
           "path_params": [],
           "query_params_state": "none",
           "query_params": null,
@@ -32855,7 +32840,7 @@
           "auth_exempt": false,
           "handler": "user_preferences_put",
           "summary": "PUT /api/me/preferences — set the CURRENT user's scope preferences (#59).",
-          "description": "PUT /api/me/preferences — set the CURRENT user's scope preferences (#59).\nFull replace (absent/null/empty clears a field). Keyed on the verified\n`session.user_id` — a client cannot write another user's preferences.\nSelf-service; 503 with no DB.",
+          "description": "PUT /api/me/preferences — set the CURRENT user's scope preferences (#59).\nFull replace (absent/null/empty clears a field). Keyed on the verified\nopaque session principal — a client cannot write another user's preferences.\nSelf-service; 503 with no DB.",
           "path_params": [],
           "query_params_state": "none",
           "query_params": null,
@@ -57946,9 +57931,9 @@
           "path": "/api/requests",
           "tier": "request",
           "auth_exempt": false,
-          "handler": "requests_list",
+          "handler": "requests_list_authorized",
           "summary": "GET /api/requests — returns a backward-compatible bare request-summary array.",
-          "description": "GET /api/requests — returns a backward-compatible bare request-summary array.\n`include_total` defaults to false; when true, `X-Total-Count` is returned if\nthe tightly budgeted capped aggregate completes, otherwise\n`X-Total-Count-Unavailable: true` is returned. `X-Total-Count-Capped: true`\nmarks the navigation ceiling. `X-Next-Cursor` is emitted only when another\ndeterministic `(created_at, id)` page exists.",
+          "description": "GET /api/requests — returns a backward-compatible bare request-summary array.\n`include_total` defaults to false; when true, `X-Total-Count` is returned if\nthe tightly budgeted capped aggregate completes, otherwise\n`X-Total-Count-Unavailable: true` is returned. `X-Total-Count-Capped: true`\nmarks the navigation ceiling. `X-Next-Cursor` is emitted only when another\ndeterministic `(created_at, id)` page exists.\n\nInteractive session/federated credentials and the development fixture are\nadmitted here. Derived `ryk_` API tokens remain rejected until the provider\nregistry can prove their exact audience, action allowlist, and lifecycle.",
           "path_params": [],
           "query_params_state": "known",
           "query_params": [
@@ -58050,35 +58035,10 @@
                 "type": "Value",
                 "fields": null
               },
-              "headers": [
-                {
-                  "name": "X-Total-Count",
-                  "type": "integer",
-                  "required": false,
-                  "description": "Filtered, capped total; present only when include_total=true and the aggregate finishes within its statement budget."
-                },
-                {
-                  "name": "X-Total-Count-Capped",
-                  "type": "boolean",
-                  "required": false,
-                  "description": "True when X-Total-Count reached the supported request-list navigation ceiling."
-                },
-                {
-                  "name": "X-Total-Count-Unavailable",
-                  "type": "boolean",
-                  "required": false,
-                  "description": "True when include_total=true but the optional aggregate exceeded its statement budget; the bounded page is still returned."
-                },
-                {
-                  "name": "X-Next-Cursor",
-                  "type": "string",
-                  "required": false,
-                  "description": "Opaque continuation emitted only when another deterministic request-list page exists."
-                }
-              ]
+              "headers": []
             }
           ],
-          "response_notes": "Returns a bare JSON array; include_total defaults to false, so total-count headers are conditional, and X-Next-Cursor is emitted only when another deterministic page exists."
+          "response_notes": null
         },
         {
           "method": "POST",

@@ -158,6 +158,11 @@ unset. Startup sends one request containing a fresh nonce, computes the digest
 of its exact canonical bytes, then accepts only the pinned authority's short-
 lived signed response that echoes both values, so an attestation cannot be
 replayed as a later admission.
+Production also requires the complete five-value first-owner authority binding
+described below. It has no authority socket: the independent Ed25519 anchor
+authenticates the permanent closure certificate measured through the exact
+retained PostgreSQL serving runtime. Development and test must leave the group
+unset.
 The checked-in `implementation_only` fixtures are validation inputs and cannot
 start the runtime. See [Configuration](docs/configuration.md#deployment-security-startup-admission)
 before using the API command above; no runnable digest is inferred from Git.
@@ -174,7 +179,11 @@ fixture on literal loopback; legacy `local` and `entra-id` runtime values are
 not yet projected by the content-addressed provider contract and therefore
 fail closed. The Compose API remains intentionally blocked until that typed
 projection is implemented. When run independently, the portal can still serve
-its labeled static dry-run data at `http://127.0.0.1:18000`.
+its labeled static dry-run data at `http://127.0.0.1:18000` only when
+`RYUKI_PORTAL_EXECUTION_MODE=static-dry-run` and the public origin is explicitly
+loopback. Portal execution mode is mandatory and closed: external origins must
+select `live-provider`, while a missing, blank, unknown, or legacy
+`external-static` value fails startup.
 
 ### Validation
 
@@ -285,6 +294,11 @@ for explicit local dry-run compatibility and are rejected in production. See
 | `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_ID` | Production-only independently pinned id beginning `postgresql-infrastructure-attestation-profile:` |
 | `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_VERSION` | Production-only canonical positive base-10 independently pinned attestation-profile version, at most 9,007,199,254,740,991 |
 | `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the independently approved attestation profile |
+| `RYUKI_FIRST_OWNER_AUTHORITY_ID` | Production-only independently pinned id beginning `first-owner-authority:`; configure with the complete five-value group |
+| `RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID` | Production-only independently pinned Ed25519 key id beginning `first-owner-authority-key:` |
+| `RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64` | Production-only canonical Base64 of exactly 32 raw, non-weak Ed25519 authority public-key bytes |
+| `RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT` | Production-only nonzero `sha256:<64 lowercase hex>` fingerprint of the decoded public-key bytes; cryptographically distinct from the checkpoint, workload, ingress, and PostgreSQL authority keys |
+| `RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH` | Production-only canonical positive base-10 independently accepted authority fencing epoch, at most 9,007,199,254,740,991 |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
@@ -297,6 +311,7 @@ for explicit local dry-run compatibility and are rejected in production. See
 | `RYUKI_API_URL` | Portal server's validated platform API origin |
 | `RYUKI_PORTAL_PUBLIC_ORIGIN` | Exact browser origin admitted by the portal (required) |
 | `RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK` | Explicitly permit HTTP only for a loopback portal/API origin |
+| `RYUKI_PORTAL_EXECUTION_MODE` | Mandatory closed mode: `live-provider`, or `static-dry-run` only with an explicit loopback public origin; missing/unknown/`external-static` fails startup |
 | `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Runtime-only verifier key required for local, Entra, and OIDC sessions |
 | `RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` | Distinct runtime-only certificate-pagination cursor key required outside explicit credential-free dry-run modes and for OIDC |
 
@@ -359,14 +374,24 @@ production requires configured pool maximum and minimum counts to both equal
 one, with no reconnect or fallback path. The independently governed authority
 must derive the same purpose-bound exporter and sign facts that match the
 deployment pins and receipt-bound profile, route, identities, roles, and
-session exactly. This completes live witnesses for `HttpsPublicUrls`,
-`SecureCookies`, `ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, and
-`DurablePostgresql`. The measured pool remains unpublished and production still
-exits before database publication, workers, routing, or listeners until the
-complete eight-guard admission succeeds. Exactly three serving guards remain:
-`external-signing-key-material`, `mock-dependencies-disabled`, and
-`first-owner-path-closed`; the overall proposed normative production boundary
-is not complete.
+session exactly. Startup also authenticates `FirstOwnerPathClosed` through that
+same exact retained PostgreSQL runtime. Its independently pinned first-owner
+Ed25519 key must strictly verify the length-framed domain and exact canonical
+unsigned certificate after removing only top-level `signature_base64`, and the
+certificate authority epoch must meet the pin;
+the stored columns, all five privileged-domain assignments, linked atomic
+audit/domain-event evidence, and receipt-bound namespace/closure digests must
+agree. The same live snapshot is remeasured at every applicable serving fence.
+This makes six live witnesses: `HttpsPublicUrls`, `SecureCookies`,
+`ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, `DurablePostgresql`,
+and `FirstOwnerPathClosed`. The measured pool remains unpublished and
+production still exits before database publication, workers, routing, or
+listeners until the complete eight-guard admission succeeds. Exactly two
+serving guards remain: `external-signing-key-material` and
+`mock-dependencies-disabled`. The overall proposed normative production
+boundary is not complete, and the closed-state witness does not complete the
+broader SB-BOOT/AC-023 bootstrap, ownership-transfer, recovery, or break-glass
+acceptance program.
 
 ### Production Vault Kubernetes workload authentication
 

@@ -42,7 +42,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 aws-lc-rs = "1"
 pkcs8 = "0.10"
 ryuki-core = { workspace = true, features = ["security-test-support"] }
-ryuki-agent = { workspace = true }
+ryuki-agent = { workspace = true, features = ["test-fixtures"] }
 # `test-util` enables the paused-clock test runtime (`start_paused = true`) used
 # by the background-loop timeout unit tests; kept dev-only so it never ships.
 tokio = { version = "1", features = ["full", "test-util"] }

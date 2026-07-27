@@ -16,14 +16,13 @@ use crate::api_client::{
 use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, catalog_contract_fallbacks,
     catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session, normalize_api_stage,
-    operation_run_fallbacks, platform_settings_summary_fallback, rbac_role_summary_fallbacks,
-    request_intake_form_fallback, AdminSessionSummary, AdminTokenSummary, AgentSummary,
-    ApiRbacRole, AuditEventRow, AuthSession, CatalogOffering, CmdbActionResult, CmdbCiDrift,
-    CmdbReconciliationSnapshot, CreateTokenPayload, EvidenceComplianceSnapshot,
-    EvidencePackDirectorySnapshot, EvidencePackRef, EvidenceRetentionSnapshot,
-    HardwareAssetSummary, HardwareInventorySnapshot, OfferingCatalogSnapshot,
-    PlatformSettingsSummary, RbacRoleCatalogSnapshot, ServiceNowQueueItem, ServiceNowQueueSnapshot,
-    ShiftQueueItem, ShiftQueueSnapshot, ALL_APP_ROLES,
+    operation_run_fallbacks, rbac_role_summary_fallbacks, request_intake_form_fallback,
+    AdminSessionSummary, AdminTokenSummary, AgentSummary, ApiRbacRole, AuditEventRow, AuthSession,
+    CatalogOffering, CmdbActionResult, CmdbCiDrift, CmdbReconciliationSnapshot, CreateTokenPayload,
+    EvidenceComplianceSnapshot, EvidencePackDirectorySnapshot, EvidencePackRef,
+    EvidenceRetentionSnapshot, HardwareAssetSummary, HardwareInventorySnapshot,
+    OfferingCatalogSnapshot, PlatformSettingsSummary, RbacRoleCatalogSnapshot, ServiceNowQueueItem,
+    ServiceNowQueueSnapshot, ShiftQueueItem, ShiftQueueSnapshot, ALL_APP_ROLES,
 };
 use crate::server_boundary::{
     cmdb_export, cmdb_import, cmdb_reconcile, create_admin_token, get_activity_audit_feed,
@@ -3713,9 +3712,28 @@ fn AdminSettingsDetail() -> impl IntoView {
         }>
             {move || {
                 Suspend::new(async move {
-                    let settings = match settings_resource.await {
-                        Ok(s) => s,
-                        Err(_) => platform_settings_summary_fallback(),
+                    let Ok(settings) = settings_resource.await else {
+                        return view! {
+                            <article
+                                class="workspace-detail-panel"
+                                aria-labelledby="admin-settings-detail-title"
+                            >
+                                <div class="workspace-detail-head">
+                                    <div>
+                                        <span class="eyebrow">"Admin"</span>
+                                        <h2 id="admin-settings-detail-title">"Platform settings"</h2>
+                                    </div>
+                                    <span class="badge bad">"Settings unavailable"</span>
+                                </div>
+                                <div class="empty-state" role="status">
+                                    <p class="empty-state-title">"Platform settings unavailable"</p>
+                                    <p class="table-note">
+                                        "The platform API could not supply the active settings. Editing is disabled, and no preview defaults or fabricated provider mode are displayed."
+                                    </p>
+                                </div>
+                            </article>
+                        }
+                            .into_any();
                     };
 
                     set_tenant_id.set(settings.entra_tenant_id.clone());

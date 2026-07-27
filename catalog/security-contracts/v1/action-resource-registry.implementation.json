@@ -23,19 +23,19 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:0899f19b4321c6743cecf1084dfb97d3e83b72146da1ca2cd41e37f7d84a0610",
+        "content_digest": "sha256:f350796d1ef48f06be028f7afafc80b6afb698630681fa88b7ceb734372be009",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
         "document_id": "source:ryuki-api-build-identity",
         "document_version": 1,
-        "content_digest": "sha256:24acf2334d6864930d51fe8a089488b46a4d18298487ec8005d0b3f7d284b005",
+        "content_digest": "sha256:789a73c8ad9130879208fd8a8df241504a4be1151b2b635dfe6bec58bd42a974",
         "artifact_locator": "sources/ryuki-api/src/build_identity.rs"
       },
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:60050c941e85461271bd7ae8c958f21b6cd9b006a3b593507d5242e97f49f199",
+        "content_digest": "sha256:b0a6b560eaa2539d33f636cd247b20c9be8c07a06032c96e1d6ecf41ebe0c04a",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
@@ -47,7 +47,7 @@
       {
         "document_id": "source:ryuki-api-agents",
         "document_version": 1,
-        "content_digest": "sha256:6135bb4bfc18ef6e67700932b64ae081b1a8bed6f06a19af8f2af2b5a0218eda",
+        "content_digest": "sha256:b9a0c0154803722d5030ff8ef530e1520fd4c8895511c8b1f46a9ac1266ffc86",
         "artifact_locator": "sources/ryuki-api/src/agents.rs"
       },
       {
@@ -77,7 +77,7 @@
       {
         "document_id": "source:ryuki-api-database-boundary",
         "document_version": 1,
-        "content_digest": "sha256:bef9246e05078e671b43062bca6a139796d7c59d6637cf7be9f9055029598ef4",
+        "content_digest": "sha256:3acbc7b2df34c21417201d3095da1ac36bce56800c406b5943a820fea6459b18",
         "artifact_locator": "sources/ryuki-api/src/database.rs"
       },
       {
@@ -85,6 +85,18 @@
         "document_version": 1,
         "content_digest": "sha256:22285303f9be7c977f154cceb7c1a7d87af23ceaf5562f51a88aa580edb96f01",
         "artifact_locator": "sources/ryuki-api/src/postgresql_tls_channel.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-first-owner-runtime",
+        "document_version": 1,
+        "content_digest": "sha256:7327ff130707aadf4e46a6a6bf1801e3df990ed71e811ec949d427efe172d445",
+        "artifact_locator": "sources/ryuki-api/src/first_owner_runtime.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-production-dependencies",
+        "document_version": 1,
+        "content_digest": "sha256:5c75d9d305927402cd25d8f13da9d7e65b786cd9d601d0fbee3092059178fa53",
+        "artifact_locator": "sources/ryuki-api/src/production_dependencies.rs"
       },
       {
         "document_id": "source:ryuki-api-audit-repository",
@@ -107,7 +119,7 @@
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:12a0f94b993261fc59620fedbc3c3e24e6430e6af99bc092c9b9df160029b59d",
+        "content_digest": "sha256:113673897e0932e8d3efdd8fa96359168f15666f6c73711f6da277220dffb745",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {

@@ -39,10 +39,11 @@ pub fn openapi_document() -> Value {
                 submission, heartbeat): poll, ack, result, and heartbeat require an agent \
                 bearer token (`Authorization: Bearer rya_...`); registration has no \
                 agent bearer yet and instead requires a preprovisioned one-time challenge \
-                plus Ed25519 proof of possession; `cp-public-key` is unauthenticated. \
-                Every agent-protocol request MUST \
-                carry the supported `x-ryuki-protocol-version` header. This build is \
-                protocol-v7-only; an absent header resolves to legacy v1 and is rejected. \
+                plus Ed25519 proof of possession; `cp-public-key` is an unauthenticated \
+                bootstrap read that atomically returns the protocol version and keyset \
+                without requiring a request version header. Every other agent-protocol \
+                request MUST carry the supported `x-ryuki-protocol-version` header. This build is \
+                protocol-v8-only; an absent header resolves to legacy v1 and is rejected. \
                 (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal \
                 bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts \
                 feed, scheduler introspection) that requires an operator session and a \
@@ -83,7 +84,7 @@ pub fn openapi_document() -> Value {
                     "in": "header",
                     "required": true,
                     "description": "Required sender CP↔agent wire-schema version. This \
-                        control plane accepts protocol v7 only. An absent header resolves \
+                        control plane accepts protocol v8 only. An absent header resolves \
                         to legacy v1 and is rejected (400), as are duplicate, malformed, \
                         or unsupported values.",
                     "schema": {
@@ -180,9 +181,10 @@ pub fn openapi_document() -> Value {
                     "type": "object",
                     "description": "References IaC artefacts by stable identifier + digest, never \
                         by inline content. Credentials are never included.",
-                    "required": ["request_id", "offering_id", "iac_ref", "iac_digest", "mode"],
+                    "required": ["request_id", "request_resource_version", "offering_id", "iac_ref", "iac_digest", "mode"],
                     "properties": {
                         "request_id": { "type": "string", "format": "uuid" },
+                        "request_resource_version": { "type": "integer", "format": "int64", "minimum": 1 },
                         "offering_id": { "type": "string", "format": "uuid" },
                         "iac_ref": { "type": "string" },
                         "iac_digest": { "type": "string", "description": "SHA-256 hex digest of the IaC template." },
@@ -292,14 +294,15 @@ pub fn openapi_document() -> Value {
                 },
                 "VerifiedLiveContext": {
                     "type": "object",
-                    "description": "Protocol-v6 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact successful plan row and attempt; live_destroy grants are also step-bound.",
+                    "description": "Protocol-v8 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact request version, successful plan row and attempt, execution authority, and control-plane signing key id; live_destroy grants are also step-bound.",
                     "required": [
-                        "request_id", "platform", "job_spec_digest", "approved_plan_digest",
+                        "request_id", "request_resource_version", "platform", "job_spec_digest", "approved_plan_digest",
                         "approved_plan_job_id", "approved_plan_attempt_id", "approver",
-                        "expiry", "execution_authority", "signature"
+                        "expiry", "execution_authority", "signing_key_id", "signature"
                     ],
                     "properties": {
                         "request_id": { "type": "string", "format": "uuid" },
+                        "request_resource_version": { "type": "integer", "format": "int64", "minimum": 1 },
                         "platform": {
                             "type": "string",
                             "description": "Signed destination platform/site; must equal Job.platform before live mutation."
@@ -332,6 +335,11 @@ pub fn openapi_document() -> Value {
                             "description": "Present only for a step-scoped grant: binds this grant to one dispatched step job id, preventing replay across steps or re-dispatches. Absent for a whole-request LiveApply grant."
                         },
                         "execution_authority": { "$ref": "#/components/schemas/LiveExecutionAuthority" },
+                        "signing_key_id": {
+                            "type": "string",
+                            "pattern": "^signing-key:sha256-[0-9a-f]{64}$",
+                            "description": "Deterministic id of the exact CP key selected from the versioned verification keyset; included in the signature."
+                        },
                         "signature": { "type": "string", "description": "Base64-encoded Ed25519 signature." }
                     }
                 },
@@ -371,7 +379,7 @@ pub fn openapi_document() -> Value {
                         tamper-evident via an Ed25519 signature over the fixed-order signable fields.",
                     "required": [
                         "agent_id", "agent_enrollment_id", "platform", "job_id", "attempt_id", "lease_generation",
-                        "request_id", "result_id", "mode", "status", "job_spec_digest",
+                        "request_id", "request_resource_version", "result_id", "mode", "status", "job_spec_digest",
                         "approved_plan_digest", "raw_plan_digest", "execution_trust_profile", "evidence_digest",
                         "redaction_policy_version", "timestamp", "key_id",
                         "cp_nonce", "signature"
@@ -388,6 +396,7 @@ pub fn openapi_document() -> Value {
                         "attempt_id": { "type": "string", "format": "uuid" },
                         "lease_generation": { "type": "integer", "format": "int64", "minimum": 0 },
                         "request_id": { "type": "string", "format": "uuid" },
+                        "request_resource_version": { "type": "integer", "format": "int64", "minimum": 1 },
                         "result_id": { "type": "string", "format": "uuid", "description": "Must equal JobResult.result_id." },
                         "mode": { "$ref": "#/components/schemas/JobMode" },
                         "status": { "$ref": "#/components/schemas/JobResultStatus" },
@@ -533,13 +542,39 @@ pub fn openapi_document() -> Value {
                         }
                     }
                 },
-                "CpPublicKeyResponse": {
+                "ControlPlaneGrantVerifyingKey": {
                     "type": "object",
-                    "required": ["public_key", "protocol_version"],
+                    "required": ["key_id", "public_key", "disposition"],
                     "properties": {
-                        "public_key": { "type": "string", "description": "Base64-encoded Ed25519 CP public key." },
+                        "key_id": { "type": "string", "pattern": "^signing-key:sha256-[0-9a-f]{64}$" },
+                        "public_key": { "type": "string", "description": "Canonical base64-encoded 32-byte Ed25519 public key." },
+                        "disposition": { "type": "string", "enum": ["active", "verify-only"] }
+                    },
+                    "additionalProperties": false
+                },
+                "ControlPlaneGrantKeyset": {
+                    "type": "object",
+                    "required": ["keyset_version", "active_key_id", "keys"],
+                    "properties": {
+                        "keyset_version": { "type": "integer", "format": "int64", "minimum": 1 },
+                        "active_key_id": { "type": "string", "pattern": "^signing-key:sha256-[0-9a-f]{64}$" },
+                        "keys": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": ryuki_protocol::MAX_CONTROL_PLANE_GRANT_KEYS,
+                            "items": { "$ref": "#/components/schemas/ControlPlaneGrantVerifyingKey" }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "ControlPlaneGrantKeysetResponse": {
+                    "type": "object",
+                    "required": ["keyset", "protocol_version"],
+                    "properties": {
+                        "keyset": { "$ref": "#/components/schemas/ControlPlaneGrantKeyset" },
                         "protocol_version": { "type": "integer", "format": "int64", "minimum": 1 }
-                    }
+                    },
+                    "additionalProperties": false
                 },
                 "ErrorBody": {
                     "type": "object",
@@ -904,27 +939,30 @@ pub fn openapi_document() -> Value {
             },
             "/api/agents/cp-public-key": {
                 "get": {
-                    "summary": "Fetch the control plane's Ed25519 public key",
-                    "description": "Unauthenticated — a public key is not a secret. Agents use \
-                        this to pin the CP public key for verifying VerifiedLiveContext grants, and \
-                        to read the CP's advertised protocol_version.",
+                    "summary": "Fetch the control plane's Ed25519 verification keyset",
+                    "description": "Unauthenticated — public keys are not secrets. Agents use \
+                        this to pin the versioned CP keyset for verifying VerifiedLiveContext grants, and \
+                        to read the CP's advertised protocol_version from the same atomic response. \
+                        The endpoint deliberately does not require a request protocol header because \
+                        its purpose is to bootstrap compatibility.",
                     "operationId": "cpPublicKey",
                     "tags": ["agents"],
                     "security": [],
-                    "parameters": [{ "$ref": "#/components/parameters/ProtocolVersionHeader" }],
                     "responses": {
                         "200": {
-                            "description": "CP public key + advertised protocol version.",
+                            "description": "Versioned CP verification keyset + advertised protocol version.",
+                            "headers": {
+                                "Cache-Control": {
+                                    "description": "Always `no-store` so a bootstrap publication is not retained by an intermediary.",
+                                    "schema": { "type": "string", "const": "no-store" }
+                                }
+                            },
                             "content": {
-                                "application/json": { "schema": { "$ref": "#/components/schemas/CpPublicKeyResponse" } }
+                                "application/json": { "schema": { "$ref": "#/components/schemas/ControlPlaneGrantKeysetResponse" } }
                             }
                         },
-                        "400": {
-                            "description": "Missing, malformed, duplicate, or unsupported x-ryuki-protocol-version header.",
-                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
-                        },
                         "503": {
-                            "description": "CP signing key not initialised (degraded startup).",
+                            "description": "CP signing keyring not initialised (degraded startup).",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
                         }
                     }
@@ -1464,6 +1502,17 @@ mod tests {
             schemas["JobSpec"]["properties"]["state_key"]["pattern"],
             "^[A-Za-z0-9_-]{1,128}$"
         );
+        for schema_name in ["JobSpec", "VerifiedLiveContext", "SignedEnvelope"] {
+            assert!(schemas[schema_name]["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "request_resource_version"));
+            assert_eq!(
+                schemas[schema_name]["properties"]["request_resource_version"]["minimum"],
+                1
+            );
+        }
         assert_eq!(
             schemas["VerifiedLiveContext"]["properties"]["job_spec_digest"]["pattern"],
             "^[0-9a-f]{64}$"
@@ -1489,9 +1538,14 @@ mod tests {
                     .expect("required fields")
                     .iter()
                     .any(|required| required == field),
-                "VerifiedLiveContext must require protocol-v7 field {field}"
+                "VerifiedLiveContext must require protocol-v8 field {field}"
             );
         }
+        assert!(schemas["VerifiedLiveContext"]["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "signing_key_id"));
         assert_eq!(
             schemas["VerifiedLiveContext"]["properties"]["execution_authority"]["$ref"],
             "#/components/schemas/LiveExecutionAuthority"
@@ -1520,6 +1574,34 @@ mod tests {
             .expect("JobResult required fields")
             .iter()
             .any(|field| field == "raw_plan_digest"));
+        assert_eq!(
+            schemas["ControlPlaneGrantKeysetResponse"]["properties"]["keyset"]["$ref"],
+            "#/components/schemas/ControlPlaneGrantKeyset"
+        );
+        assert!(schemas["ControlPlaneGrantKeysetResponse"]["properties"]
+            .get("public_key")
+            .is_none());
+        let bootstrap = &doc["paths"]["/api/agents/cp-public-key"]["get"];
+        assert!(
+            bootstrap.get("parameters").is_none(),
+            "the compatibility bootstrap must not require a version header"
+        );
+        assert!(
+            bootstrap["responses"].get("400").is_none(),
+            "bootstrap has no request-version header error"
+        );
+        assert_eq!(
+            bootstrap["responses"]["200"]["headers"]["Cache-Control"]["schema"]["const"],
+            "no-store"
+        );
+        assert_eq!(
+            schemas["ControlPlaneGrantKeyset"]["properties"]["keys"]["maxItems"],
+            ryuki_protocol::MAX_CONTROL_PLANE_GRANT_KEYS
+        );
+        assert_eq!(
+            schemas["ControlPlaneGrantVerifyingKey"]["properties"]["disposition"]["enum"],
+            serde_json::json!(["active", "verify-only"])
+        );
         let reviewed = &schemas["ApproveReviewedLivePlanBody"];
         assert_eq!(reviewed["additionalProperties"], false);
         assert_eq!(

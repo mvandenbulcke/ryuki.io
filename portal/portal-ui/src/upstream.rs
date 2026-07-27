@@ -22,8 +22,12 @@ pub const COOKIE_SECURE_ENV: &str = "RYUKI_PORTAL_COOKIE_SECURE";
 
 /// Default upstream base URL for plain-HTTP local development.
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8081";
-/// Opt-in live mode value; anything else stays static-dry-run.
+/// Live provider execution against the configured upstream API.
 pub const LIVE_PROVIDER_MODE: &str = "live-provider";
+/// Explicit preview-only mode. It is accepted only for a loopback public
+/// origin so a missing or mistyped production mode can never manufacture the
+/// synthetic static authority surface.
+pub const STATIC_DRY_RUN_MODE: &str = "static-dry-run";
 /// Host-only session cookie used by every HTTPS portal origin. The `__Host-`
 /// prefix is enforced by browsers: it requires `Secure`, `Path=/`, and no
 /// `Domain` attribute, preventing a sibling host from planting a competitor.
@@ -94,17 +98,17 @@ pub struct UpstreamClient {
 
 impl UpstreamClient {
     /// Builds the client once from the environment. `RYUKI_API_URL` defaults
-    /// to the local API; live mode is strictly opt-in via
-    /// `RYUKI_PORTAL_EXECUTION_MODE=live-provider`.
+    /// to the local API. The execution mode is closed and mandatory: external
+    /// origins require `live-provider`, while `static-dry-run` is available
+    /// only for an explicitly configured loopback preview.
     pub fn from_env(public_origin: &PortalPublicOrigin) -> Result<Self, PortalConfigError> {
         let base_url = std::env::var(API_URL_ENV)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-        let live = std::env::var(EXECUTION_MODE_ENV)
-            .map(|mode| mode.trim() == LIVE_PROVIDER_MODE)
-            .unwrap_or(false);
+        let configured_mode = std::env::var(EXECUTION_MODE_ENV).ok();
+        let live = execution_mode_for_origin(configured_mode.as_deref(), public_origin)?;
         let cookie_secure = cookie_secure_for_origin(public_origin)?;
         Self::new(
             &base_url,
@@ -289,6 +293,28 @@ impl UpstreamClient {
         let url = self.url(path)?;
         let request = self.http.put(url).json(body);
         self.dispatch(request, session_id).await
+    }
+}
+
+fn execution_mode_for_origin(
+    configured: Option<&str>,
+    public_origin: &PortalPublicOrigin,
+) -> Result<bool, PortalConfigError> {
+    match configured.map(str::trim) {
+        Some(LIVE_PROVIDER_MODE) => Ok(true),
+        Some(STATIC_DRY_RUN_MODE) if public_origin.is_loopback() => Ok(false),
+        Some(STATIC_DRY_RUN_MODE) => Err(PortalConfigError::new(
+            EXECUTION_MODE_ENV,
+            "static-dry-run is permitted only for an explicit loopback public origin",
+        )),
+        Some("") | None => Err(PortalConfigError::new(
+            EXECUTION_MODE_ENV,
+            "execution mode is required and must be live-provider or static-dry-run",
+        )),
+        Some(_) => Err(PortalConfigError::new(
+            EXECUTION_MODE_ENV,
+            "execution mode must be exactly live-provider or static-dry-run",
+        )),
     }
 }
 
@@ -708,6 +734,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn portal_execution_mode_is_explicit_and_external_origins_require_live_provider() {
+        let external = PortalPublicOrigin::parse("https://portal.example.test", false).unwrap();
+        let loopback = PortalPublicOrigin::parse("http://127.0.0.1:8080", true).unwrap();
+
+        assert_eq!(
+            execution_mode_for_origin(Some(LIVE_PROVIDER_MODE), &external),
+            Ok(true)
+        );
+        assert_eq!(
+            execution_mode_for_origin(Some(LIVE_PROVIDER_MODE), &loopback),
+            Ok(true)
+        );
+        assert_eq!(
+            execution_mode_for_origin(Some(STATIC_DRY_RUN_MODE), &loopback),
+            Ok(false)
+        );
+
+        for configured in [None, Some(""), Some("static"), Some("LIVE-PROVIDER")] {
+            assert!(
+                execution_mode_for_origin(configured, &external).is_err(),
+                "missing or unknown mode {configured:?} must fail closed"
+            );
+        }
+        assert!(execution_mode_for_origin(Some(STATIC_DRY_RUN_MODE), &external).is_err());
+    }
+
+    #[test]
     fn upstream_requires_https_except_explicit_loopback() {
         assert!(UpstreamClient::new("https://api.example.test", true, false, true).is_ok());
         assert!(UpstreamClient::new("http://api.example.test", true, true, false).is_err());
@@ -776,6 +829,14 @@ mod tests {
         format!("rys_{payload}")
     }
 
+    fn request_has_session_header(request: &str, session: &str) -> bool {
+        request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case(SESSION_ID_HEADER) && value.trim() == session
+            })
+        })
+    }
+
     #[tokio::test]
     async fn loopback_upstream_bypasses_all_proxy_configuration() {
         let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -814,9 +875,7 @@ mod tests {
         assert_eq!(response.status, 200);
         let target_request = target.await.expect("target server completes");
         assert!(
-            target_request
-                .to_ascii_lowercase()
-                .contains(&format!("x-ryuki-session-id: {session}")),
+            request_has_session_header(&target_request, &session),
             "the configured loopback upstream receives the session directly"
         );
         assert!(
@@ -857,9 +916,7 @@ mod tests {
         assert_eq!(response.status, 302);
         let first_request = first_hop.await.expect("first-hop server completes");
         assert!(
-            first_request
-                .to_ascii_lowercase()
-                .contains(&format!("x-ryuki-session-id: {session}")),
+            request_has_session_header(&first_request, &session),
             "configured upstream receives the intended session header"
         );
         assert!(

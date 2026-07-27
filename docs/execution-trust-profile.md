@@ -1,7 +1,8 @@
-# Execution trust profile (protocol v7)
+# Execution trust profile (protocol v8)
 
-Protocol v7 makes a successful live plan an execution-authority snapshot, not
-only a plan digest. The planning agent signs the complete non-secret
+Protocol v8 carries forward the successful live plan as an execution-authority
+snapshot, not only a plan digest, and binds every control-plane grant to an
+exact signing-key id (`kid`). The planning agent signs the complete non-secret
 `ExecutionTrustProfile`; the control plane validates its closed schema and
 reviewed-live allowlist, then copies its canonical digest and the exact planning
 agent enrollment into the CP-signed live grant.
@@ -75,8 +76,23 @@ plan step-grant comparison remains internal protocol groundwork, while system-
 owned step-scoped `LiveDestroy` authority is reserved for compensation.
 
 The signed domains are `ryuki-v5/signed-envelope` and
-`ryuki-v7/verified-live-context`; protocol v1 through v6 grants/results are
-rejected rather than interpreted without the exact request-version authority.
+`ryuki-v8/verified-live-context`. Protocol v8 adds the required
+`signing_key_id` to the latter signed layout. `GET /api/agents/cp-public-key`
+returns a positive-versioned, bounded keyset with
+exactly one active Ed25519 key and zero or more verify-only overlap keys; each
+key id is deterministically cross-bound to its canonical public key. The agent
+validates and pins that keyset once at startup, selects the exact key named by
+the signed grant, and rejects an unknown or removed `kid`. Protocol v1 through
+v7 peers and grants are rejected rather than interpreted without the complete
+current authority.
+
+This is keyset and rotation protocol groundwork, not production key-custody
+closure. The currently wired control-plane startup still loads or creates one
+local key, publishes it as the sole active member of keyset version 1, and has
+no admitted external signing-key-material resolver. The default local
+`cp-signing.key` and its create-on-first-boot path are development-only.
+`ExternalSigningKeyMaterial` remains unverified, so neither the v8 keyset nor a
+locally persisted seed is production-admission evidence.
 
 Production external execution currently remains fail-closed: the runner has no
 production constructor for the required sealed per-command descendant-

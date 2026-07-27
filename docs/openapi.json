@@ -2,13 +2,13 @@
   "components": {
     "parameters": {
       "ProtocolVersionHeader": {
-        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v7 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
+        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v8 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
         "in": "header",
         "name": "x-ryuki-protocol-version",
         "required": true,
         "schema": {
           "enum": [
-            7
+            8
           ],
           "format": "int64",
           "type": "integer"
@@ -260,21 +260,75 @@
         },
         "type": "object"
       },
-      "CpPublicKeyResponse": {
+      "ControlPlaneGrantKeyset": {
+        "additionalProperties": false,
         "properties": {
+          "active_key_id": {
+            "pattern": "^signing-key:sha256-[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/ControlPlaneGrantVerifyingKey"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "keyset_version": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "keyset_version",
+          "active_key_id",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ControlPlaneGrantKeysetResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "keyset": {
+            "$ref": "#/components/schemas/ControlPlaneGrantKeyset"
+          },
           "protocol_version": {
             "format": "int64",
             "minimum": 1,
             "type": "integer"
+          }
+        },
+        "required": [
+          "keyset",
+          "protocol_version"
+        ],
+        "type": "object"
+      },
+      "ControlPlaneGrantVerifyingKey": {
+        "additionalProperties": false,
+        "properties": {
+          "disposition": {
+            "enum": [
+              "active",
+              "verify-only"
+            ],
+            "type": "string"
+          },
+          "key_id": {
+            "pattern": "^signing-key:sha256-[0-9a-f]{64}$",
+            "type": "string"
           },
           "public_key": {
-            "description": "Base64-encoded Ed25519 CP public key.",
+            "description": "Canonical base64-encoded 32-byte Ed25519 public key.",
             "type": "string"
           }
         },
         "required": [
+          "key_id",
           "public_key",
-          "protocol_version"
+          "disposition"
         ],
         "type": "object"
       },
@@ -810,6 +864,11 @@
             "format": "uuid",
             "type": "string"
           },
+          "request_resource_version": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
           "state_key": {
             "description": "Opaque control-plane-owned Terraform state key. New specs always carry it; absent legacy specs remain decodable but are refused for live Terraform execution.",
             "pattern": "^[A-Za-z0-9_-]{1,128}$",
@@ -825,6 +884,7 @@
         },
         "required": [
           "request_id",
+          "request_resource_version",
           "offering_id",
           "iac_ref",
           "iac_digest",
@@ -1261,6 +1321,11 @@
             "format": "uuid",
             "type": "string"
           },
+          "request_resource_version": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
           "result_id": {
             "description": "Must equal JobResult.result_id.",
             "format": "uuid",
@@ -1286,6 +1351,7 @@
           "attempt_id",
           "lease_generation",
           "request_id",
+          "request_resource_version",
           "result_id",
           "mode",
           "status",
@@ -1323,7 +1389,7 @@
         "type": "object"
       },
       "VerifiedLiveContext": {
-        "description": "Protocol-v6 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact successful plan row and attempt; live_destroy grants are also step-bound.",
+        "description": "Protocol-v8 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact request version, successful plan row and attempt, execution authority, and control-plane signing key id; live_destroy grants are also step-bound.",
         "properties": {
           "approved_plan_attempt_id": {
             "description": "Exact leased attempt that produced the reviewed plan result.",
@@ -1363,8 +1429,18 @@
             "format": "uuid",
             "type": "string"
           },
+          "request_resource_version": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
           "signature": {
             "description": "Base64-encoded Ed25519 signature.",
+            "type": "string"
+          },
+          "signing_key_id": {
+            "description": "Deterministic id of the exact CP key selected from the versioned verification keyset; included in the signature.",
+            "pattern": "^signing-key:sha256-[0-9a-f]{64}$",
             "type": "string"
           },
           "step_job_id": {
@@ -1375,6 +1451,7 @@
         },
         "required": [
           "request_id",
+          "request_resource_version",
           "platform",
           "job_spec_digest",
           "approved_plan_digest",
@@ -1383,6 +1460,7 @@
           "approver",
           "expiry",
           "execution_authority",
+          "signing_key_id",
           "signature"
         ],
         "type": "object"
@@ -1404,7 +1482,7 @@
     }
   },
   "info": {
-    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is unauthenticated. Every agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v7-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
+    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is an unauthenticated bootstrap read that atomically returns the protocol version and keyset without requiring a request version header. Every other agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v8-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
     "title": "Ryuki Agent Protocol API",
     "version": "0.1.0"
   },
@@ -1412,33 +1490,27 @@
   "paths": {
     "/api/agents/cp-public-key": {
       "get": {
-        "description": "Unauthenticated — a public key is not a secret. Agents use this to pin the CP public key for verifying VerifiedLiveContext grants, and to read the CP's advertised protocol_version.",
+        "description": "Unauthenticated — public keys are not secrets. Agents use this to pin the versioned CP keyset for verifying VerifiedLiveContext grants, and to read the CP's advertised protocol_version from the same atomic response. The endpoint deliberately does not require a request protocol header because its purpose is to bootstrap compatibility.",
         "operationId": "cpPublicKey",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/ProtocolVersionHeader"
-          }
-        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CpPublicKeyResponse"
+                  "$ref": "#/components/schemas/ControlPlaneGrantKeysetResponse"
                 }
               }
             },
-            "description": "CP public key + advertised protocol version."
-          },
-          "400": {
-            "content": {
-              "application/json": {
+            "description": "Versioned CP verification keyset + advertised protocol version.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always `no-store` so a bootstrap publication is not retained by an intermediary.",
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "const": "no-store",
+                  "type": "string"
                 }
               }
-            },
-            "description": "Missing, malformed, duplicate, or unsupported x-ryuki-protocol-version header."
+            }
           },
           "503": {
             "content": {
@@ -1448,11 +1520,11 @@
                 }
               }
             },
-            "description": "CP signing key not initialised (degraded startup)."
+            "description": "CP signing keyring not initialised (degraded startup)."
           }
         },
         "security": [],
-        "summary": "Fetch the control plane's Ed25519 public key",
+        "summary": "Fetch the control plane's Ed25519 verification keyset",
         "tags": [
           "agents"
         ]

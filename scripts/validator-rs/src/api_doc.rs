@@ -9,8 +9,11 @@
 //!   to keep the handler ident per method. The route count is asserted equal
 //!   to `generate_endpoints_doc`'s count so the two documents cannot drift.
 //! * Permission tiers and auth exemption are NOT re-derived here: the real
-//!   `ryuki-api` binary is invoked as `target/debug/ryuki-api
-//!   --dump-route-meta` (build it first with `cargo build -p ryuki-api`).
+//!   `ryuki-api` binary is invoked from Cargo's effective target directory as
+//!   `debug/ryuki-api --dump-route-meta` (build it first with
+//!   `cargo build -p ryuki-api`). This honours `CARGO_TARGET_DIR`, allowing the
+//!   repository's bounded disposable verification target to be used without
+//!   creating a persistent checkout-local `target/debug` tree.
 //!   That hidden flag reads `[{"path","method"}]` from stdin and answers with
 //!   `{"meta":[{"path","method","tier","auth_exempt"}],"openapi":{...}}` by
 //!   calling the same functions the auth middleware uses. The `openapi` half
@@ -36,9 +39,10 @@
 //!   "Routes for <Title>." placeholder.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
@@ -48,6 +52,7 @@ use syn::visit::Visit as _;
 pub(crate) const API_DOC_JSON_PATH: &str = "docs/api/api-doc.json";
 pub(crate) const OPENAPI_JSON_PATH: &str = "docs/api/openapi.json";
 const RYUKI_API_DUMP_BIN: &str = "target/debug/ryuki-api";
+const RYUKI_API_DUMP_NAME: &str = "ryuki-api";
 
 // ───────────────────────── route extraction ─────────────────────────
 
@@ -1227,11 +1232,26 @@ struct DumpMetaEntry {
     auth_exempt: bool,
 }
 
-/// Invokes `target/debug/ryuki-api --dump-route-meta` with the extracted
-/// route keys on stdin. The binary must be built beforehand — permission
-/// tiers come from the REAL runtime functions, never a re-implementation.
+fn api_dump_binary(root: &Path, configured_target: Option<&OsStr>) -> PathBuf {
+    let Some(configured_target) = configured_target.filter(|value| !value.is_empty()) else {
+        return root.join(RYUKI_API_DUMP_BIN);
+    };
+    let target = PathBuf::from(configured_target);
+    let target = if target.is_absolute() {
+        target
+    } else {
+        root.join(target)
+    };
+    target.join("debug").join(RYUKI_API_DUMP_NAME)
+}
+
+/// Invokes the effective Cargo target's `debug/ryuki-api --dump-route-meta`
+/// with the extracted route keys on stdin. The binary must be built
+/// beforehand — permission tiers come from the REAL runtime functions, never
+/// a re-implementation.
 fn run_route_meta_dump(root: &Path, routes_json: &str) -> Result<DumpEnvelope, String> {
-    let binary = root.join(RYUKI_API_DUMP_BIN);
+    let configured_target = std::env::var_os("CARGO_TARGET_DIR");
+    let binary = api_dump_binary(root, configured_target.as_deref());
     if !binary.is_file() {
         return Err(format!(
             "{} not found — run `cargo build -p ryuki-api` first; generate-api-doc \
@@ -2956,10 +2976,29 @@ fn response_notes_for(info: &HandlerInfo) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::path::PathBuf;
 
     fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    #[test]
+    fn api_dump_binary_honours_the_effective_cargo_target() {
+        let root = Path::new("/workspace/ryuki");
+
+        assert_eq!(
+            api_dump_binary(root, None),
+            root.join("target/debug/ryuki-api")
+        );
+        assert_eq!(
+            api_dump_binary(root, Some(OsStr::new(".build/target"))),
+            root.join(".build/target/debug/ryuki-api")
+        );
+        assert_eq!(
+            api_dump_binary(root, Some(OsStr::new("/private/tmp/ryuki-target"))),
+            Path::new("/private/tmp/ryuki-target/debug/ryuki-api")
+        );
     }
 
     #[test]

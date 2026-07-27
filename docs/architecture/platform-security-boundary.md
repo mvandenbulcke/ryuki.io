@@ -1192,21 +1192,26 @@ receipt closure, and seals all static proof ownership into one non-cloneable
 production-boundary capability. The checked-in provider remains development-
 only, every compiled adapter remains production-ineligible, and the checked-in
 documents are implementation fixtures rather than active signed production
-authority. The runtime admission boundary now measures and retains five typed
+authority. The runtime admission boundary now measures and retains six typed
 live witnesses: `HttpsPublicUrls` through one nonce-bound, no-retry exchange
 with an independently pinned Ed25519 ingress authority;
 `SecureCookies` over the exact API cookie runtime and every declared consumer;
 `ApprovedSecretProvider` over the exact retained D/P/R/I composition;
 `NonDevelopmentAuthenticator` over the exact immutable authenticator runtime;
-and `DurablePostgresql` over the purpose-bound v2 infrastructure proof, exact
-single-channel serving pool, and local durable observation. The witnesses are
-rechecked at the applicable pre-database, pre-worker, and final-listener
-freshness and exact-remeasurement fences. Exactly three typed witnesses remain
-unimplemented: `ExternalSigningKeyMaterial`, `MockDependenciesDisabled`, and
-`FirstOwnerPathClosed`. The retained PostgreSQL pool is not published while
-any guard is absent, so production serving remains fail-closed before database
-publication, workers, routing, or listeners. The boundary remains proposed,
-not production-complete.
+`DurablePostgresql` over the purpose-bound v2 infrastructure proof, exact
+single-channel serving pool, and local durable observation; and
+`FirstOwnerPathClosed` over the independently authenticated permanent closure
+record measured through that same retained PostgreSQL allocation. The witnesses
+are rechecked at the applicable pre-database, pre-worker, and final-listener
+freshness and exact-remeasurement fences. Exactly two typed witnesses remain
+unimplemented: `ExternalSigningKeyMaterial` and `MockDependenciesDisabled`.
+The retained PostgreSQL pool is not published while any guard is absent, so
+production serving remains fail-closed before database publication, workers,
+routing, or listeners. The boundary remains proposed, not
+production-complete. `FirstOwnerPathClosed` proves the retained closed state;
+it does not by itself complete the full SB-BOOT/AC-023 first-claim,
+concurrency/replay, ownership-transfer, last-owner, recovery, and break-glass
+acceptance program.
 
 Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
@@ -1335,6 +1340,46 @@ application role, migration inventory, and single-connection SQLx pool. A
 `migration` proof, caller-recomputed metadata, another pool allocation, or an
 unattested reconnect cannot satisfy the witness. Publication consumes that
 same retained allocation only after all eight live guard witnesses have passed.
+The `FirstOwnerPathClosed` witness retains that same complete PostgreSQL
+runtime, including the exact pool, application-session binding, and durable
+observation allocations. It opens one bounded read-only repeatable-read
+snapshot and reads the deployment's permanent closure row, exactly five
+bytewise-sorted privileged-domain assignment rows, and the closure-linked audit
+and domain-event rows. The certificate must be exact
+`ryuki-canonical-json-v1` bytes with the closed schema and no unknown fields;
+its duplicated database columns, exact timestamps, certificate/signature
+digests, authority namespace, closure record, assignment set, and atomic
+evidence must all agree.
+
+The first-owner trust anchor is a production-only, complete-or-none deployment
+binding of authority id, key id, canonical Base64 32-byte non-weak Ed25519
+public key, matching SHA-256 key fingerprint, and positive minimum authority
+epoch. It has no authority socket and cannot be inferred from the certificate,
+database, rollbackable contract root, or build manifest. The authority and key
+ids begin `first-owner-authority:` and `first-owner-authority-key:`; its key is
+cryptographically distinct from the checkpoint, workload, ingress, and
+PostgreSQL authority keys. The certificate authority fields must equal those
+pins and its epoch must meet the floor.
+
+Certificate signature input is exact and domain separated. Remove only the
+top-level `signature_base64` member, canonicalize the remaining JSON, then
+concatenate four byte strings in this order: the little-endian unsigned 64-bit
+length of `ryuki-v1/first-owner-closure-certificate`, those domain bytes, the
+little-endian unsigned 64-bit length of the canonical unsigned certificate,
+and those canonical bytes. The canonical Base64 signature must decode to
+exactly 64 bytes, equal the separately stored signature bytes and digest, and
+pass strict Ed25519 verification under the pinned key. The resulting authority-
+namespace and closure-record digests must exactly equal the receipt-bound
+`FirstOwnerPathClosed` expected value.
+
+The initial proof seals one live snapshot. Each applicable serving fence
+synchronously revalidates the retained allocations and projections, repeats
+the live closure snapshot through the same retained single-channel runtime, and
+requires exact equality with the sealed typed observation, including identical
+canonical certificate bytes. A changed certificate, assignment,
+linked evidence row, receipt value, channel, pool, session, or observation
+fails closed. This closed-state witness is not evidence that the bootstrap
+writer or operator ceremonies required by SB-BOOT and AC-023 are complete.
 Digest-valued expectations use the named canonical contracts
 `ryuki-postgresql-database-identity-v1`,
 `ryuki-postgresql-storage-binding-v1`,
@@ -2086,9 +2131,14 @@ The current protocol closes the first-writer enrollment gap with migration 158:
 an unrestricted administrator issues a short-lived, single-use challenge bound
 to the exact agent id, platform, and canonical Ed25519 public key; the agent
 signs the domain-separated claim with that key; registration atomically consumes
-the challenge; and approval requires the consumed linkage. Protocol v7 rejects
-older peers, while the database mutation fence remains enrollment contract v3.
-Pre-cutover Pending rows are removed because their provenance is unknowable.
+the challenge; and approval requires the consumed linkage. The current protocol
+is v8-only and rejects v1 through v7 peers, while the database mutation fence
+remains enrollment contract v3. Historically, v7 made the positive request
+resource version part of jobs, grants, and results. Protocol v8 additionally
+binds an exact control-plane signing-key id (`kid`) into each live grant and
+publishes a positive-versioned, bounded active/verify-only verification keyset.
+Migration 158 removes pre-enrollment-cutover Pending rows because their
+provenance is unknowable.
 Approved and Revoked legacy rows remain operable for a controlled migration but
 are marked `cryptographically_admitted: false`; operators must inventory them
 and revoke and re-enroll every Approved row before claiming the rollout has
@@ -2103,6 +2153,27 @@ remain deployment/operator conformance evidence. The design is provider-neutral:
 the current environment seam may be materialized by any approved secret manager
 or workload bootstrap channel and does not make Vault a mandatory identity
 backend.
+
+The v7-to-v8 durable-grant deployment is an explicit non-overlap cutover. Stop
+new live approvals, drain and stop every v7 API, agent, scheduler, and execution
+worker, and independently require zero nonterminal (`Pending`, `Leased`, or
+`Running`) `LiveApply` or `LiveDestroy` rows before any v8 component starts.
+Terminal v7 rows remain immutable historical evidence and must never be
+rewritten, re-signed, or requeued. A mutation with uncertain effects enters
+operator reconciliation rather than retry. Any later `LiveApply` requires a new
+v8 plan, approval decision, and `ryuki-v8/verified-live-context` grant; any
+permitted compensation requires its own freshly minted step-scoped v8 grant
+after the fleet is uniformly v8. A stored v7 signature cannot be upgraded in
+place by adding a `kid`.
+
+That wire foundation does not satisfy SB-MID-03 or SB-MID-05. The currently
+wired control plane still loads or creates one local development seed, exposes
+it as the sole active key in keyset version 1, and agents pin once for their
+process lifetime. `ExternalSigningKeyMaterial` remains unverified; externally
+governed version-pinned private material, live overlap rotation, revocation,
+rollback protection, agent refresh, and recovery still require implementation
+and production evidence. The default local `cp-signing.key` is development-only
+and cannot close those requirements.
 
 ### Provider credentials and execution
 

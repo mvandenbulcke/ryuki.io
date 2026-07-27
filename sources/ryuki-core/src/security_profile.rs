@@ -8,6 +8,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::conformance_closure::{
+    RUNTIME_GUARD_REQUIREMENT_BINDING_DIGEST_CONTRACT,
+    RUNTIME_GUARD_SEMANTIC_CHALLENGE_BINDING_DIGEST_CONTRACT,
+};
 use crate::conformance_trust::canonical_json_bytes;
 
 pub const DEPLOYMENT_SECURITY_PROFILE_SCHEMA_URI: &str =
@@ -57,6 +61,8 @@ pub const POSTGRESQL_MIGRATION_INVENTORY_DIGEST_CONTRACT: &str =
 pub const EXTERNAL_SIGNING_KEY_IDENTITY_DIGEST_CONTRACT: &str =
     "ryuki-external-signing-key-identity-v1";
 pub const EXTERNAL_SIGNING_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-external-signing-inventory-v1";
+pub const PRODUCTION_DEPENDENCY_COMPONENT_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-production-dependency-component-binding-v1";
 pub const PRODUCTION_DEPENDENCY_INVENTORY_DIGEST_CONTRACT: &str =
     "ryuki-production-dependency-inventory-v1";
 pub const FIRST_OWNER_AUTHORITY_NAMESPACE_DIGEST_CONTRACT: &str =
@@ -1546,6 +1552,155 @@ pub struct ExpectedProductionDependencyBinding {
     pub component_binding_digest: String,
 }
 
+/// Cycle-free, value-free observation of one exact retained production
+/// dependency allocation.
+///
+/// `authority_bindings` are produced by component-specific live verifiers
+/// (PostgreSQL route/identity/storage/migrations, secret-provider runtime,
+/// authenticator runtime, and so on). They must never contain this component
+/// digest, the enclosing inventory digest, or the MockDependenciesDisabled
+/// requirement/challenge: those values are computed only after every component
+/// observation exists. The live API witness must additionally retain the
+/// allocation measured by those verifiers; this serializable projection cannot
+/// prove handle identity by itself.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDependencyRuntimeBinding {
+    pub component_id: String,
+    pub implementation_id: String,
+    pub implementation_version: String,
+    pub production_posture: ProductionDependencyPosture,
+    pub authority_mode: ProductionDependencyAuthorityMode,
+    pub fallback_allowed: bool,
+    pub authority_bindings: Vec<ProductionDependencyAuthorityBinding>,
+    pub retained_consumer_ids: Vec<String>,
+    pub ownership: ProductionDependencyRuntimeOwnership,
+}
+
+/// One independently domain-separated non-secret fact used to admit a
+/// component. Multiple facts remain separately named instead of being
+/// flattened into an operator-supplied opaque digest.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDependencyAuthorityBinding {
+    pub binding_id: String,
+    pub binding_contract: String,
+    pub binding_digest: String,
+}
+
+/// Ownership posture of the allocation measured by one dependency binding.
+/// A production dependency cannot be independently reconstructed or switched
+/// by an ambient consumer after the inventory is sealed.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDependencyRuntimeOwnership {
+    pub runtime_owner_id: String,
+    pub single_runtime_owner: bool,
+    pub ambient_reconfiguration_allowed: bool,
+}
+
+#[derive(Serialize)]
+struct ProductionDependencyComponentBindingProjection<'a> {
+    digest_contract: &'static str,
+    component_binding: &'a ProductionDependencyRuntimeBinding,
+}
+
+/// One internally consistent measurement derived from the exact runtime
+/// bindings. The required component ids and inventory digest cannot be
+/// supplied independently or copied from a deployment receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredProductionDependencyInventory {
+    pub component_bindings: Vec<ProductionDependencyRuntimeBinding>,
+    pub dependencies: Vec<ExpectedProductionDependencyBinding>,
+    pub required_component_ids: Vec<String>,
+    pub dependency_inventory_digest: String,
+}
+
+pub fn production_dependency_component_binding_canonical_bytes(
+    dependency: &ProductionDependencyRuntimeBinding,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_production_dependency_runtime_binding(dependency)?;
+    canonical_projection_bytes(ProductionDependencyComponentBindingProjection {
+        digest_contract: PRODUCTION_DEPENDENCY_COMPONENT_BINDING_DIGEST_CONTRACT,
+        component_binding: dependency,
+    })
+}
+
+pub fn production_dependency_component_binding_digest(
+    dependency: &ProductionDependencyRuntimeBinding,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(production_dependency_component_binding_canonical_bytes(
+        dependency,
+    )?)
+}
+
+pub fn expected_production_dependency_binding(
+    dependency: &ProductionDependencyRuntimeBinding,
+) -> Result<ExpectedProductionDependencyBinding, RuntimeGuardDigestError> {
+    Ok(ExpectedProductionDependencyBinding {
+        component_id: dependency.component_id.clone(),
+        implementation_id: dependency.implementation_id.clone(),
+        implementation_version: dependency.implementation_version.clone(),
+        production_posture: dependency.production_posture,
+        authority_mode: dependency.authority_mode,
+        fallback_allowed: dependency.fallback_allowed,
+        component_binding_digest: production_dependency_component_binding_digest(dependency)?,
+    })
+}
+
+/// Reject a copied or stale row even when its component digest is syntactically
+/// valid. The expected row must be exactly the one derived from this live
+/// component preimage.
+pub fn validate_production_dependency_component_preimage(
+    expected: &ExpectedProductionDependencyBinding,
+    dependency: &ProductionDependencyRuntimeBinding,
+) -> Result<(), RuntimeGuardDigestError> {
+    if expected != &expected_production_dependency_binding(dependency)? {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "production dependency component/preimage reconciliation",
+        ));
+    }
+    Ok(())
+}
+
+/// Derive the complete receipt-comparison projection from one independently
+/// discovered, component-id-sorted retained-runtime inventory.
+pub fn measure_production_dependency_inventory(
+    dependencies: &[ProductionDependencyRuntimeBinding],
+) -> Result<MeasuredProductionDependencyInventory, RuntimeGuardDigestError> {
+    let unique_runtime_owner_ids = dependencies
+        .iter()
+        .map(|dependency| dependency.ownership.runtime_owner_id.as_str())
+        .collect::<HashSet<_>>();
+    if dependencies.is_empty()
+        || !dependencies
+            .windows(2)
+            .all(|pair| pair[0].component_id < pair[1].component_id)
+        || unique_runtime_owner_ids.len() != dependencies.len()
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "production dependency runtime inventory",
+        ));
+    }
+
+    let measured = dependencies
+        .iter()
+        .map(expected_production_dependency_binding)
+        .collect::<Result<Vec<_>, RuntimeGuardDigestError>>()?;
+    let required_component_ids = measured
+        .iter()
+        .map(|dependency| dependency.component_id.clone())
+        .collect::<Vec<_>>();
+    let dependency_inventory_digest = production_dependency_inventory_digest(&measured)?;
+
+    Ok(MeasuredProductionDependencyInventory {
+        component_bindings: dependencies.to_vec(),
+        dependencies: measured,
+        required_component_ids,
+        dependency_inventory_digest,
+    })
+}
+
 #[derive(Serialize)]
 struct ProductionDependencyInventoryProjection<'a> {
     digest_contract: &'static str,
@@ -2518,6 +2673,54 @@ fn validate_production_dependency_inventory_projection(
     {
         return Err(RuntimeGuardDigestError::InvalidProjection(
             "production dependency inventory",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_production_dependency_runtime_binding(
+    dependency: &ProductionDependencyRuntimeBinding,
+) -> Result<(), RuntimeGuardDigestError> {
+    let unique_authority_binding_digests = dependency
+        .authority_bindings
+        .iter()
+        .map(|binding| binding.binding_digest.as_str())
+        .collect::<HashSet<_>>();
+    if !valid_canonical_scoped_id(&dependency.component_id, "runtime-component:")
+        || !valid_canonical_scoped_id(&dependency.implementation_id, "runtime-implementation:")
+        || !valid_canonical_runtime_identifier(&dependency.implementation_version)
+        || dependency.fallback_allowed
+        || dependency.authority_bindings.is_empty()
+        || dependency.authority_bindings.len() > 64
+        || !dependency
+            .authority_bindings
+            .windows(2)
+            .all(|pair| pair[0].binding_id < pair[1].binding_id)
+        || unique_authority_binding_digests.len() != dependency.authority_bindings.len()
+        || dependency.authority_bindings.iter().any(|binding| {
+            !valid_canonical_scoped_id(&binding.binding_id, "runtime-binding:")
+                || !valid_canonical_runtime_identifier(&binding.binding_contract)
+                || binding.binding_contract
+                    == PRODUCTION_DEPENDENCY_COMPONENT_BINDING_DIGEST_CONTRACT
+                || binding.binding_contract == PRODUCTION_DEPENDENCY_INVENTORY_DIGEST_CONTRACT
+                || binding.binding_contract == RUNTIME_GUARD_REQUIREMENT_BINDING_DIGEST_CONTRACT
+                || binding.binding_contract
+                    == RUNTIME_GUARD_SEMANTIC_CHALLENGE_BINDING_DIGEST_CONTRACT
+                || !valid_sha256_digest(&binding.binding_digest)
+        })
+        || dependency.retained_consumer_ids.is_empty()
+        || dependency.retained_consumer_ids.len() > 128
+        || !strictly_sorted_unique_strings(&dependency.retained_consumer_ids)
+        || !dependency
+            .retained_consumer_ids
+            .iter()
+            .all(|consumer| valid_canonical_scoped_id(consumer, "runtime-consumer:"))
+        || !valid_canonical_scoped_id(&dependency.ownership.runtime_owner_id, "runtime-owner:")
+        || !dependency.ownership.single_runtime_owner
+        || dependency.ownership.ambient_reconfiguration_allowed
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "production dependency runtime binding",
         ));
     }
     Ok(())
@@ -4280,25 +4483,55 @@ mod tests {
         }
     }
 
-    fn production_dependencies() -> Vec<ExpectedProductionDependencyBinding> {
+    fn production_dependency_runtime_bindings() -> Vec<ProductionDependencyRuntimeBinding> {
         vec![
-            ExpectedProductionDependencyBinding {
+            ProductionDependencyRuntimeBinding {
                 component_id: "runtime-component:database".into(),
                 implementation_id: "runtime-implementation:postgresql".into(),
                 implementation_version: "18.0.0".into(),
                 production_posture: ProductionDependencyPosture::Production,
                 authority_mode: ProductionDependencyAuthorityMode::Live,
                 fallback_allowed: false,
-                component_binding_digest: fixture_digest('c'),
+                authority_bindings: vec![
+                    ProductionDependencyAuthorityBinding {
+                        binding_id: "runtime-binding:database-identity".into(),
+                        binding_contract: POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT.into(),
+                        binding_digest: fixture_digest('c'),
+                    },
+                    ProductionDependencyAuthorityBinding {
+                        binding_id: "runtime-binding:provider-route".into(),
+                        binding_contract: POSTGRESQL_PROVIDER_ROUTE_BINDING_DIGEST_CONTRACT.into(),
+                        binding_digest: fixture_digest('d'),
+                    },
+                ],
+                retained_consumer_ids: vec![
+                    "runtime-consumer:api-audit".into(),
+                    "runtime-consumer:api-requests".into(),
+                ],
+                ownership: ProductionDependencyRuntimeOwnership {
+                    runtime_owner_id: "runtime-owner:api-database".into(),
+                    single_runtime_owner: true,
+                    ambient_reconfiguration_allowed: false,
+                },
             },
-            ExpectedProductionDependencyBinding {
+            ProductionDependencyRuntimeBinding {
                 component_id: "runtime-component:secret-provider".into(),
                 implementation_id: "runtime-implementation:openbao".into(),
                 implementation_version: "2.3.0".into(),
                 production_posture: ProductionDependencyPosture::Production,
                 authority_mode: ProductionDependencyAuthorityMode::Live,
                 fallback_allowed: false,
-                component_binding_digest: fixture_digest('d'),
+                authority_bindings: vec![ProductionDependencyAuthorityBinding {
+                    binding_id: "runtime-binding:secret-provider-runtime".into(),
+                    binding_contract: SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT.into(),
+                    binding_digest: fixture_digest('e'),
+                }],
+                retained_consumer_ids: vec!["runtime-consumer:api-integrations".into()],
+                ownership: ProductionDependencyRuntimeOwnership {
+                    runtime_owner_id: "runtime-owner:api-secret-provider".into(),
+                    single_runtime_owner: true,
+                    ambient_reconfiguration_allowed: false,
+                },
             },
         ]
     }
@@ -6175,7 +6408,7 @@ mod tests {
             ),
             (
                 "/derived_session_authority/credential_key_identity_digest",
-                json!(fixture_digest('7')),
+                json!(fixture_digest('6')),
             ),
             (
                 "/derived_session_authority/verifier_column_name",
@@ -6744,10 +6977,51 @@ mod tests {
     }
 
     #[test]
-    fn dependency_inventory_has_an_independent_golden_and_rejects_fallback_or_order_drift() {
-        let dependencies = production_dependencies();
+    fn dependency_component_and_inventory_have_independent_canonical_goldens() {
+        let runtime_bindings = production_dependency_runtime_bindings();
         assert_independent_canonical_golden(
-            production_dependency_inventory_canonical_bytes(&dependencies).unwrap(),
+            production_dependency_component_binding_canonical_bytes(&runtime_bindings[0]).unwrap(),
+            json!({
+                "digest_contract": "ryuki-production-dependency-component-binding-v1",
+                "component_binding": {
+                    "component_id": "runtime-component:database",
+                    "implementation_id": "runtime-implementation:postgresql",
+                    "implementation_version": "18.0.0",
+                    "production_posture": "production",
+                    "authority_mode": "live",
+                    "fallback_allowed": false,
+                    "authority_bindings": [
+                        {
+                            "binding_id": "runtime-binding:database-identity",
+                            "binding_contract": "ryuki-postgresql-database-identity-v1",
+                            "binding_digest": fixture_digest('c')
+                        },
+                        {
+                            "binding_id": "runtime-binding:provider-route",
+                            "binding_contract": "ryuki-postgresql-provider-route-binding-v1",
+                            "binding_digest": fixture_digest('d')
+                        }
+                    ],
+                    "retained_consumer_ids": [
+                        "runtime-consumer:api-audit",
+                        "runtime-consumer:api-requests"
+                    ],
+                    "ownership": {
+                        "runtime_owner_id": "runtime-owner:api-database",
+                        "single_runtime_owner": true,
+                        "ambient_reconfiguration_allowed": false
+                    }
+                }
+            }),
+        );
+
+        let measured = measure_production_dependency_inventory(&runtime_bindings).unwrap();
+        let database_binding_digest =
+            production_dependency_component_binding_digest(&runtime_bindings[0]).unwrap();
+        let secret_provider_binding_digest =
+            production_dependency_component_binding_digest(&runtime_bindings[1]).unwrap();
+        assert_independent_canonical_golden(
+            production_dependency_inventory_canonical_bytes(&measured.dependencies).unwrap(),
             json!({
                 "digest_contract": "ryuki-production-dependency-inventory-v1",
                 "dependencies": [
@@ -6758,7 +7032,7 @@ mod tests {
                         "production_posture": "production",
                         "authority_mode": "live",
                         "fallback_allowed": false,
-                        "component_binding_digest": fixture_digest('c')
+                        "component_binding_digest": database_binding_digest
                     },
                     {
                         "component_id": "runtime-component:secret-provider",
@@ -6767,24 +7041,175 @@ mod tests {
                         "production_posture": "production",
                         "authority_mode": "live",
                         "fallback_allowed": false,
-                        "component_binding_digest": fixture_digest('d')
+                        "component_binding_digest": secret_provider_binding_digest
                     }
                 ]
             }),
         );
-        let digest = production_dependency_inventory_digest(&dependencies).unwrap();
-        let mut drifted = dependencies.clone();
-        drifted[0].component_binding_digest = fixture_digest('e');
-        assert_ne!(
-            production_dependency_inventory_digest(&drifted).unwrap(),
-            digest
+        assert_eq!(
+            measured.required_component_ids,
+            vec![
+                "runtime-component:database".to_string(),
+                "runtime-component:secret-provider".to_string(),
+            ]
         );
-        drifted[0].fallback_allowed = true;
-        assert!(production_dependency_inventory_digest(&drifted).is_err());
+        assert_eq!(
+            measured.dependency_inventory_digest,
+            production_dependency_inventory_digest(&measured.dependencies).unwrap()
+        );
+    }
+
+    #[test]
+    fn dependency_measurement_binds_every_runtime_leaf_and_fails_closed() {
+        let dependencies = production_dependency_runtime_bindings();
+        let original = measure_production_dependency_inventory(&dependencies).unwrap();
+
+        for changed_identity in [
+            {
+                let mut candidate = dependencies.clone();
+                candidate[0].component_id = "runtime-component:database-primary".into();
+                candidate
+            },
+            {
+                let mut candidate = dependencies.clone();
+                candidate[0].implementation_id = "runtime-implementation:postgresql-proxy".into();
+                candidate
+            },
+            {
+                let mut candidate = dependencies.clone();
+                candidate[0].implementation_version = "18.1.0".into();
+                candidate
+            },
+            {
+                let mut candidate = dependencies.clone();
+                candidate[0].authority_bindings[0].binding_id =
+                    "runtime-binding:database-identity-v2".into();
+                candidate
+            },
+            {
+                let mut candidate = dependencies.clone();
+                candidate[0].ownership.runtime_owner_id = "runtime-owner:api-database-v2".into();
+                candidate
+            },
+        ] {
+            let changed = measure_production_dependency_inventory(&changed_identity)
+                .expect("valid identity drift must remain measurable");
+            assert_ne!(
+                changed.dependency_inventory_digest,
+                original.dependency_inventory_digest
+            );
+        }
+
+        let mut drifted = dependencies.clone();
+        drifted[0].authority_bindings[0].binding_digest = fixture_digest('f');
+        let drifted_measurement = measure_production_dependency_inventory(&drifted).unwrap();
+        assert_ne!(
+            drifted_measurement.dependencies[0].component_binding_digest,
+            original.dependencies[0].component_binding_digest
+        );
+        assert_ne!(
+            drifted_measurement.dependency_inventory_digest,
+            original.dependency_inventory_digest
+        );
+
+        let mut changed_consumer = dependencies.clone();
+        changed_consumer[0].retained_consumer_ids[1] = "runtime-consumer:api-scheduler".into();
+        assert_ne!(
+            measure_production_dependency_inventory(&changed_consumer)
+                .unwrap()
+                .dependency_inventory_digest,
+            original.dependency_inventory_digest
+        );
+
+        let mut reordered_consumers = dependencies.clone();
+        reordered_consumers[0].retained_consumer_ids.swap(0, 1);
+        assert!(measure_production_dependency_inventory(&reordered_consumers).is_err());
+
+        let mut ambient_owner = dependencies.clone();
+        ambient_owner[0].ownership.ambient_reconfiguration_allowed = true;
+        assert!(measure_production_dependency_inventory(&ambient_owner).is_err());
+
+        let mut shared_owner = dependencies.clone();
+        shared_owner[0].ownership.single_runtime_owner = false;
+        assert!(measure_production_dependency_inventory(&shared_owner).is_err());
+
+        let mut recursive_contract = dependencies.clone();
+        recursive_contract[0].authority_bindings[0].binding_contract =
+            PRODUCTION_DEPENDENCY_INVENTORY_DIGEST_CONTRACT.into();
+        assert!(measure_production_dependency_inventory(&recursive_contract).is_err());
+
+        let mut reordered_authority = dependencies.clone();
+        reordered_authority[0].authority_bindings.swap(0, 1);
+        assert!(measure_production_dependency_inventory(&reordered_authority).is_err());
+
+        let mut duplicate_authority_digest = dependencies.clone();
+        duplicate_authority_digest[0].authority_bindings[1].binding_digest =
+            duplicate_authority_digest[0].authority_bindings[0]
+                .binding_digest
+                .clone();
+        assert!(measure_production_dependency_inventory(&duplicate_authority_digest).is_err());
+
+        let mut duplicated_owner = dependencies.clone();
+        duplicated_owner[1].ownership.runtime_owner_id =
+            duplicated_owner[0].ownership.runtime_owner_id.clone();
+        assert!(measure_production_dependency_inventory(&duplicated_owner).is_err());
+
+        let mut invalid_consumer = dependencies.clone();
+        invalid_consumer[0].retained_consumer_ids = vec!["api-audit".into()];
+        assert!(measure_production_dependency_inventory(&invalid_consumer).is_err());
+
+        let mut copied_outer_row = original.dependencies.clone();
+        copied_outer_row[0].fallback_allowed = true;
+        assert!(production_dependency_inventory_digest(&copied_outer_row).is_err());
+
+        let mut stale_row = original.dependencies[0].clone();
+        stale_row.component_binding_digest = fixture_digest('9');
+        assert!(
+            validate_production_dependency_component_preimage(&stale_row, &dependencies[0])
+                .is_err()
+        );
+        let crosswired_row = original.dependencies[1].clone();
+        assert!(
+            validate_production_dependency_component_preimage(&crosswired_row, &dependencies[0])
+                .is_err()
+        );
 
         let mut reordered = dependencies;
         reordered.swap(0, 1);
-        assert!(production_dependency_inventory_digest(&reordered).is_err());
+        assert!(measure_production_dependency_inventory(&reordered).is_err());
+        assert!(measure_production_dependency_inventory(&[]).is_err());
+    }
+
+    #[test]
+    fn dependency_runtime_binding_rejects_derived_guard_contracts() {
+        for forbidden_contract in [
+            RUNTIME_GUARD_REQUIREMENT_BINDING_DIGEST_CONTRACT,
+            RUNTIME_GUARD_SEMANTIC_CHALLENGE_BINDING_DIGEST_CONTRACT,
+        ] {
+            let mut dependency = production_dependency_runtime_bindings().remove(0);
+            dependency.authority_bindings[0].binding_contract = forbidden_contract.into();
+
+            assert_eq!(
+                production_dependency_component_binding_canonical_bytes(&dependency),
+                Err(RuntimeGuardDigestError::InvalidProjection(
+                    "production dependency runtime binding"
+                )),
+                "derived guard contract {forbidden_contract} must not be admitted as an authority binding"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_runtime_binding_requires_a_retained_consumer() {
+        let mut dependency = production_dependency_runtime_bindings().remove(0);
+        dependency.retained_consumer_ids.clear();
+
+        assert_eq!(
+            production_dependency_component_binding_canonical_bytes(&dependency),
+            Err(RuntimeGuardDigestError::InvalidProjection(
+                "production dependency runtime binding"
+            ))
+        );
     }
 
     #[test]

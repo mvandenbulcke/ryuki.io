@@ -56,7 +56,7 @@
 <h2 class="ep-h" id="get-api-me-preferences"><span class="method-chip m-get">GET</span><code>/api/me/preferences</code></h2>
 <p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">The CURRENT user's scope preferences (#59).</p>
-<p>Keyed on the verified <code>session.user_id</code>; returns nulls when none are set. Self-service (any authenticated user); empty + <code>durable:false</code> with no DB.</p>
+<p>Keyed on the verified opaque session principal; returns nulls when none are set. Self-service (any authenticated user); empty + <code>durable:false</code> with no DB.</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
@@ -95,7 +95,7 @@
 <h2 class="ep-h" id="put-api-me-preferences"><span class="method-chip m-put">PUT</span><code>/api/me/preferences</code></h2>
 <p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Set the CURRENT user's scope preferences (#59).</p>
-<p>Full replace (absent/null/empty clears a field). Keyed on the verified <code>session.user_id</code> — a client cannot write another user's preferences. Self-service; 503 with no DB.</p>
+<p>Full replace (absent/null/empty clears a field). Keyed on the verified opaque session principal — a client cannot write another user's preferences. Self-service; 503 with no DB.</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>

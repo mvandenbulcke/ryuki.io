@@ -8,6 +8,13 @@ version = "0.1.0"
 # that stalled S1.
 edition = "2021"
 
+[features]
+default = []
+# Deterministic executors are available only to this crate's unit tests and to
+# explicitly opted-in downstream test targets. Production builds never enable
+# this feature.
+test-fixtures = []
+
 [lib]
 name = "ryuki_agent"
 path = "src/lib.rs"

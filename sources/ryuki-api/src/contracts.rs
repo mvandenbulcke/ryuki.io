@@ -17988,6 +17988,56 @@ fn platform_config_entries(config: &PlatformConfig) -> Vec<(&'static str, String
 
 const PLATFORM_SETTINGS_PERSISTENCE_FAILED: &str = "PLATFORM_SETTINGS_PERSISTENCE_FAILED";
 const PLATFORM_SETTINGS_READ_FAILED: &str = "PLATFORM_SETTINGS_READ_FAILED";
+const PRODUCTION_SETTINGS_IMMUTABLE: &str = "PRODUCTION_SETTINGS_IMMUTABLE";
+
+/// Production admission authenticates one immutable startup configuration and
+/// retains concrete runtime owners derived from it. Persisting a different
+/// configuration while those owners remain live would create an unauthenticated
+/// next-startup posture and can re-enable mock/static dependencies. Production
+/// configuration changes therefore require a new sealed deployment rather than
+/// this mutable administration endpoint.
+fn require_mutable_platform_settings_profile(
+    production: bool,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if production {
+        Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::new(
+                PRODUCTION_SETTINGS_IMMUTABLE,
+                "Production platform settings are immutable; publish a newly admitted deployment",
+            )),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_runtime_mutable_platform_settings() -> Result<(), (StatusCode, Json<ApiError>)> {
+    let production = crate::config_store::security_contract_context_if_initialized()
+        .is_some_and(crate::security_contracts::SecurityContractContext::is_production);
+    require_mutable_platform_settings_profile(production)
+}
+
+#[cfg(test)]
+mod production_platform_settings_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn production_rejects_update_and_reset_at_the_shared_mutation_gate() {
+        for _operation in ["update", "reset"] {
+            let (status, Json(error)) = require_mutable_platform_settings_profile(true)
+                .expect_err("production mutation must fail closed");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(error.error, PRODUCTION_SETTINGS_IMMUTABLE);
+            assert!(!format!("{error:?}").contains("mock-dry-run"));
+        }
+    }
+
+    #[test]
+    fn non_production_keeps_the_existing_administration_path() {
+        assert!(require_mutable_platform_settings_profile(false).is_ok());
+    }
+}
 
 fn platform_settings_persistence_problem() -> ProblemDetails {
     problem_details(
@@ -18159,6 +18209,7 @@ async fn admin_platform_settings_update(
         &session,
         &crate::config_store::get_app_config().auth_mode,
     )?;
+    require_runtime_mutable_platform_settings()?;
 
     let validation_errors = ryuki_core::types::validate_platform_config(&body);
     if !validation_errors.is_empty() {
@@ -18221,6 +18272,7 @@ async fn admin_platform_settings_reset(
         &session,
         &crate::config_store::get_app_config().auth_mode,
     )?;
+    require_runtime_mutable_platform_settings()?;
 
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {

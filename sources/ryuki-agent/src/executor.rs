@@ -230,12 +230,14 @@ impl JobExecutor for RunnerExecutor {
 /// A canned executor that returns deterministic `Evidence` without running any
 /// binary.  Used in unit tests for `result.rs` and `outbox.rs`, and will be
 /// the seam for S4c e2e tests that run without terraform installed.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub struct StubExecutor {
     status: RunStatus,
     evidence_bytes: Vec<u8>,
     evidence_json: Option<Value>,
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 impl StubExecutor {
     /// Create a stub that always returns `CheckOk` with the given payload.
     pub fn new(status: RunStatus, evidence_bytes: Vec<u8>, evidence_json: Option<Value>) -> Self {
@@ -256,6 +258,7 @@ impl StubExecutor {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 impl JobExecutor for StubExecutor {
     fn execute(&self, _spec: &JobSpec) -> Result<Evidence, ExecError> {
         Ok(Evidence {

@@ -36,35 +36,33 @@
 //! grant to pass validation; every non-refusal mutation result still requires
 //! the complete grant checks.
 //!
-//! ## TOFU note for `pin_cp_key`
+//! ## Bootstrap note for `pin_cp_keyset`
 //!
-//! [`pin_cp_key`] wraps [`ryuki_protocol::decode_verifying_key`].  The fetched
-//! key is only as trustworthy as the transport used to retrieve it.  In
-//! production the CP URL MUST use HTTPS (TLS chain verified against a trusted
-//! CA, or certificate-pinned).  Fetching over plain `http://` exposes the key
-//! to a MITM who can substitute their own key and forge grants; the agent logs
-//! a warning when the CP URL is `http://`.  Operators who need stronger
-//! bootstrapping guarantees should pin the CP public key via the agent's config
-//! file rather than relying solely on the TOFU fetch.
+//! [`pin_cp_keyset`] validates the closed keyset structure. The fetched keyset
+//! is only as trustworthy as the transport used to retrieve it. Production CP
+//! URLs therefore require HTTPS; plain HTTP is restricted to an explicit
+//! loopback development policy. This build pins the keyset once at startup and
+//! does not refresh it while running. A published rotation or revocation takes
+//! effect for an agent only after its next successful restart/bootstrap; runtime
+//! keyset refresh and monotonic update enforcement remain future work.
 
 use chrono::Utc;
-use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
 use ryuki_protocol::{
     crypto::{
-        decode_verifying_key, execution_trust_profile_digest, job_spec_digest,
-        public_key_fingerprint, verify_vlc, VerifyError,
+        control_plane_grant_verifying_key, decode_verifying_key, execution_trust_profile_digest,
+        job_spec_digest, public_key_fingerprint, validate_control_plane_grant_keyset,
+        verify_vlc_with_keyset, VerifyError,
     },
-    ExecutionTrustProfile, Job, JobMode,
+    ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ExecutionTrustProfile, Job, JobMode,
 };
 
 // ---------------------------------------------------------------------------
 // Error type for key pinning
 // ---------------------------------------------------------------------------
 
-/// Error returned by [`pin_cp_key`] when the supplied base64 cannot be
-/// decoded into a valid Ed25519 verifying key.
+/// Error returned when a CP verification key or keyset cannot be pinned.
 #[derive(Debug, Error)]
 #[error("failed to pin CP public key: {0}")]
 pub struct PinKeyError(#[from] VerifyError);
@@ -133,8 +131,9 @@ pub fn evaluate_execution_trust_binding(
 /// # Arguments
 ///
 /// - `job` — the leased job received from the control plane.
-/// - `cp_verifying_key` — the **pinned** CP Ed25519 verifying key; obtained
-///   once at startup via [`pin_cp_key`] (wrapping `fetch_cp_public_key`).
+/// - `cp_verifying_key` — the **pinned** CP Ed25519 verification keyset;
+///   obtained once at startup via [`pin_cp_keyset`] (wrapping
+///   `fetch_cp_keyset_response`).
 ///   The gate verifies the [`VerifiedLiveContext`] grant's signature against
 ///   this key so it cannot trust a tampered or forged grant.
 /// - `allow_live` — the value of [`crate::config::AgentConfig::allow_live`];
@@ -155,7 +154,7 @@ pub fn evaluate_execution_trust_binding(
 /// `LiveApply` → `Proceed` iff ALL of (checked in order):
 ///   1. `allow_live` is `true`
 ///   2. `job.live_context` is `Some(grant)`
-///   3. `verify_vlc(grant, cp_verifying_key)` succeeds
+///   3. `verify_vlc_with_keyset(grant, cp_verifying_key)` succeeds
 ///   4. `grant.platform == job.platform`
 ///   5. `grant.job_spec_digest == job_spec_digest(job.spec)`
 ///   6. `grant.request_id == job.spec.request_id`
@@ -172,7 +171,7 @@ pub fn evaluate_execution_trust_binding(
 /// Any failure → `Refused` with a specific reason string.
 pub fn evaluate_live_execution(
     job: &Job,
-    cp_verifying_key: &VerifyingKey,
+    cp_verifying_key: &ControlPlaneGrantKeyset,
     allow_live: bool,
     replanned_plan_digest: Option<&str>,
 ) -> LiveDecision {
@@ -215,7 +214,7 @@ pub fn evaluate_live_execution(
 /// checks directly at its mutation boundary.
 pub fn evaluate_live_authority(
     job: &Job,
-    cp_verifying_key: &VerifyingKey,
+    cp_verifying_key: &ControlPlaneGrantKeyset,
     allow_live: bool,
 ) -> LiveDecision {
     let (mode, require_step_bound) = match job.spec.mode {
@@ -241,7 +240,7 @@ pub fn evaluate_live_authority(
 /// signature, platform/request binding, step binding, and expiry.
 fn verify_live_grant<'g>(
     job: &'g Job,
-    cp_verifying_key: &VerifyingKey,
+    cp_verifying_key: &ControlPlaneGrantKeyset,
     allow_live: bool,
     mode: &str,
     require_step_bound: bool,
@@ -266,7 +265,7 @@ fn verify_live_grant<'g>(
     // Check 3: the grant's signature must verify against the PINNED CP key.
     // This is the agent's independent trust check — it does NOT trust the bare
     // `mode` field or the grant fields without cryptographic proof.
-    if verify_vlc(grant, cp_verifying_key).is_err() {
+    if verify_vlc_with_keyset(grant, cp_verifying_key).is_err() {
         return Err(LiveDecision::Refused(
             "grant signature is not from the control plane".to_owned(),
         ));
@@ -349,7 +348,7 @@ fn verify_live_grant<'g>(
 /// readable.  Checks in strict order; the first failure returns `Refused`.
 fn evaluate_live_apply(
     job: &Job,
-    cp_verifying_key: &VerifyingKey,
+    cp_verifying_key: &ControlPlaneGrantKeyset,
     allow_live: bool,
     replanned_plan_digest: Option<&str>,
 ) -> LiveDecision {
@@ -386,7 +385,7 @@ fn evaluate_live_apply(
 /// applied), signature-verified, request/version-bound, and expiry-checked.
 fn evaluate_live_destroy(
     job: &Job,
-    cp_verifying_key: &VerifyingKey,
+    cp_verifying_key: &ControlPlaneGrantKeyset,
     allow_live: bool,
 ) -> LiveDecision {
     // require_step_bound = true: a destroy's safety bound IS the step binding,
@@ -398,24 +397,41 @@ fn evaluate_live_destroy(
 }
 
 // ---------------------------------------------------------------------------
-// pin_cp_key — decode and pin the CP verifying key at startup
+// pin_cp_keyset — validate and pin the CP verification keyset at startup
 // ---------------------------------------------------------------------------
 
-/// Decode a base64-encoded CP Ed25519 verifying key returned by
-/// `fetch_cp_public_key` into a [`VerifyingKey`] suitable for passing to
-/// [`evaluate_live_execution`].
+/// Validate the versioned CP Ed25519 keyset returned by
+/// `fetch_cp_keyset_response` for use by [`evaluate_live_execution`].
 ///
 /// Call this **once at startup** and hold the result for the lifetime of the
 /// process.  A successful return means the key is structurally valid; it does
-/// not guarantee it is the legitimate CP key (see the TOFU note in the module
-/// doc comment).
+/// not guarantee it is the legitimate CP keyset (see the bootstrap note in the
+/// module doc comment). This function does not refresh the pinned publication
+/// at runtime; restart/bootstrap is currently required for rotation or
+/// revocation to take effect.
 ///
 /// # Errors
 ///
-/// Returns [`PinKeyError`] if the string is not valid base64, if the decoded
-/// bytes are not 32 bytes, or if the bytes do not form a valid Ed25519 point.
-pub fn pin_cp_key(b64: &str) -> Result<VerifyingKey, PinKeyError> {
-    Ok(decode_verifying_key(b64)?)
+/// Returns [`PinKeyError`] if the keyset is malformed, non-canonical, empty,
+/// oversized, or contains an invalid Ed25519 public key/id binding.
+pub fn pin_cp_keyset(
+    keyset: ControlPlaneGrantKeyset,
+) -> Result<ControlPlaneGrantKeyset, PinKeyError> {
+    validate_control_plane_grant_keyset(&keyset)?;
+    Ok(keyset)
+}
+
+/// Development compatibility helper for tests and explicitly pinned legacy
+/// configuration. Production fetches the complete versioned keyset.
+pub fn pin_cp_key(b64: &str) -> Result<ControlPlaneGrantKeyset, PinKeyError> {
+    let verifying_key = decode_verifying_key(b64)?;
+    let entry =
+        control_plane_grant_verifying_key(&verifying_key, ControlPlaneGrantKeyDisposition::Active);
+    pin_cp_keyset(ControlPlaneGrantKeyset {
+        keyset_version: 1,
+        active_key_id: entry.key_id.clone(),
+        keys: vec![entry],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -440,10 +456,18 @@ mod tests {
 
     /// Generate a fresh CP keypair for a single test (parallel-safe: no global
     /// state).
-    fn cp_keypair() -> (ed25519_dalek::SigningKey, VerifyingKey) {
+    fn cp_keypair() -> (ed25519_dalek::SigningKey, ControlPlaneGrantKeyset) {
         let sk = generate_keypair(&mut OsRng);
-        let vk = sk.verifying_key();
-        (sk, vk)
+        let entry = control_plane_grant_verifying_key(
+            &sk.verifying_key(),
+            ControlPlaneGrantKeyDisposition::Active,
+        );
+        let keyset = ControlPlaneGrantKeyset {
+            keyset_version: 1,
+            active_key_id: entry.key_id.clone(),
+            keys: vec![entry],
+        };
+        (sk, keyset)
     }
 
     fn test_execution_authority() -> LiveExecutionAuthority {
@@ -477,6 +501,7 @@ mod tests {
             expiry: Utc::now() + Duration::hours(1),
             step_job_id: None,
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -504,6 +529,7 @@ mod tests {
             expiry: Utc::now() + Duration::hours(1),
             step_job_id: Some(step_job_id),
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -805,6 +831,7 @@ mod tests {
             expiry: Utc::now() + Duration::hours(1),
             step_job_id: None,
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         let forged_grant = sign_vlc(unsigned, &attacker_sk);
@@ -877,6 +904,7 @@ mod tests {
             expiry: Utc::now() - Duration::seconds(1), // in the past
             step_job_id: None,
             execution_authority: test_execution_authority(),
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         let expired_grant = sign_vlc(unsigned, &cp_sk);
@@ -1109,13 +1137,13 @@ mod tests {
 
     #[test]
     fn pin_cp_key_roundtrip() {
-        let (_, vk) = cp_keypair();
+        let key = generate_keypair(&mut OsRng);
+        let vk = key.verifying_key();
         let b64 = encode_verifying_key(&vk);
         let pinned = pin_cp_key(&b64).expect("pin must succeed for a valid key");
         assert_eq!(
-            pinned.as_bytes(),
-            vk.as_bytes(),
-            "pinned key bytes must match the original"
+            pinned.keys[0].public_key, b64,
+            "pinned keyset must contain the original public key"
         );
     }
 

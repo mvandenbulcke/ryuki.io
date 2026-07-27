@@ -628,7 +628,7 @@ pub struct LiveExecutionAuthority {
 /// Signable fields (fixed order, see `signing_bytes_vlc`):
 /// `request_id, request_resource_version, platform, job_spec_digest, approved_plan_digest,
 /// approved_plan_job_id, approved_plan_attempt_id, approver, expiry
-/// (RFC 3339), step_job_id, execution_authority`
+/// (RFC 3339), step_job_id, execution_authority, signing_key_id`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedLiveContext {
     /// The upstream change-request id.
@@ -674,9 +674,66 @@ pub struct VerifiedLiveContext {
     /// Exact successful-plan owner and canonical execution-profile digest.
     /// This required field is immutable under the CP signature.
     pub execution_authority: LiveExecutionAuthority,
+    /// Stable `kid` of the exact control-plane grant key that produced the
+    /// signature. [`crate::crypto::sign_vlc`] always overwrites this field with
+    /// the deterministic id of the supplied Ed25519 key before signing. Agents
+    /// use it to select one member of the versioned CP verification keyset and
+    /// reject unknown or revoked keys without trial-verifying every key.
+    pub signing_key_id: String,
     /// Base64-encoded Ed25519 signature over the canonical bytes of the fields
     /// above.  Produced by `sign_vlc`; verified by `verify_vlc`.
     pub signature: String,
+}
+
+/// Maximum number of simultaneously published control-plane grant verifying
+/// keys. Rotation needs only one active key and a short, bounded overlap set.
+pub const MAX_CONTROL_PLANE_GRANT_KEYS: usize = 8;
+
+/// Public disposition of a control-plane grant key. Only the active member may
+/// mint new grants; both active and verify-only members may verify grants during
+/// a bounded rotation overlap. Revoked keys are removed from the keyset and
+/// therefore fail as unknown `kid`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControlPlaneGrantKeyDisposition {
+    Active,
+    VerifyOnly,
+}
+
+/// One non-secret member of the control-plane grant verification keyset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneGrantVerifyingKey {
+    /// Deterministic id bound to `public_key` by the protocol verifier.
+    pub key_id: String,
+    /// Canonical base64 encoding of the 32-byte Ed25519 public key.
+    pub public_key: String,
+    pub disposition: ControlPlaneGrantKeyDisposition,
+}
+
+/// Versioned public keyset fetched and pinned by execution agents.
+///
+/// `keys` is a nonempty, strictly `key_id`-sorted set with exactly one active
+/// member matching `active_key_id`. A higher `keyset_version` represents an
+/// operator-authorized rotation, revocation, or rollback publication. Reusing a
+/// version for different bytes and decreasing the version both fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneGrantKeyset {
+    pub keyset_version: u64,
+    pub active_key_id: String,
+    pub keys: Vec<ControlPlaneGrantVerifyingKey>,
+}
+
+/// Atomic bootstrap document returned by the control plane to an execution
+/// agent. The protocol version and the exact keyset are intentionally carried
+/// in one response so compatibility cannot be checked against a different
+/// publication than the keys that are pinned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneGrantKeysetResponse {
+    pub keyset: ControlPlaneGrantKeyset,
+    pub protocol_version: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +827,13 @@ pub const TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION: &str =
 /// reinterpreted as version-bound authority. Mixed v6/v7 operation is
 /// intentionally unsupported because accepting an omitted version would
 /// silently downgrade approval and result freshness.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// Version 8 adds the required control-plane grant `kid`, binds it into the
+/// `ryuki-v8/verified-live-context` signature domain, and replaces the single
+/// CP public-key response with a versioned active/verify-only keyset. A v7
+/// agent cannot select the correct overlap key or refuse an unknown/revoked
+/// `kid`, so mixed v7/v8 operation is intentionally unsupported.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The closed set of wire-protocol versions a peer will accept, gated
 /// fail-closed exactly like [`SUPPORTED_REDACTION_POLICY_VERSIONS`]. During a
@@ -778,7 +841,7 @@ pub const PROTOCOL_VERSION: u32 = 7;
 /// interoperates, then narrow to `&[N]` once every peer is upgraded. Both the CP
 /// (accepting agent requests) and the agent (accepting the CP's advertised
 /// version) reference this ONE constant, so emission and acceptance cannot drift.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[7];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[8];
 
 /// The version an absent [`PROTOCOL_VERSION_HEADER`] is resolved to. A peer that
 /// predates protocol versioning sends no header; it is, by definition, speaking

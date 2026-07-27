@@ -142,6 +142,19 @@ migration, exact ledger postflight, and the durable operation marker run in one
 transaction. A pre-COMMIT failure rolls back; a lost COMMIT acknowledgement is
 `CommitOutcomeUnknown` and needs a fresh independently attested reconciliation
 run.
+Every production process also requires the complete five-value first-owner
+authority group: `RYUKI_FIRST_OWNER_AUTHORITY_ID`,
+`RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID`,
+`RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64`,
+`RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT`, and
+`RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH`. The values are complete-or-none,
+production-only, and independently provisioned; the ids begin
+`first-owner-authority:` and `first-owner-authority-key:`, the key is canonical
+Base64 for exactly 32 raw, non-weak Ed25519 bytes, its fingerprint is the
+matching nonzero SHA-256 digest and is distinct from all four other authority
+keys, and the epoch is a canonical positive integer. There is no first-owner
+socket: startup uses the pinned key to authenticate the permanent closure
+certificate read through the exact retained PostgreSQL serving runtime.
 Production execution remains disabled before credential loading until live
 Kubernetes render admission, one-use attempt consumption, materialized-pin
 binding, and runtime receipt freshness are implemented.
@@ -154,15 +167,22 @@ child-manifest resolution must also be internally consistent. Startup now
 derives the complete implementation-plus-deployment applicability inventory,
 verifies exact semantic closure, and consumes the checkpoint, current SB-9
 root, authenticated documents, pinned profile/build, and workload proof into
-one non-cloneable production-boundary proof. Serving startup now retains
-verified `HttpsPublicUrls`, `SecureCookies`, `ApprovedSecretProvider`,
-`NonDevelopmentAuthenticator`, and `DurablePostgresql` witnesses. The exact
-measured PostgreSQL pool remains unpublished, and startup still exits before
+one non-cloneable production-boundary proof. Serving startup now retains six
+verified witnesses: `HttpsPublicUrls`, `SecureCookies`,
+`ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, `DurablePostgresql`,
+and `FirstOwnerPathClosed`. The last witness requires the pinned authority to
+strictly verify the length-framed domain and exact canonical unsigned
+certificate after removing only top-level `signature_base64`, plus exact
+database columns and five privileged-domain assignments, linked atomic
+audit/domain-event evidence, receipt-bound namespace/closure digests, and exact
+remeasurement through the same PostgreSQL allocation at the applicable serving
+fences. The measured pool remains unpublished, and startup still exits before
 database publication, workers, routing, or listeners until the complete
-eight-guard admission. Exactly three receipt-bound live runtime guards remain:
-`external-signing-key-material`, `mock-dependencies-disabled`, and
-`first-owner-path-closed`. The overall proposed normative production boundary
-is not complete.
+eight-guard admission. Exactly two receipt-bound live runtime guards remain:
+`external-signing-key-material` and `mock-dependencies-disabled`. The overall
+proposed normative production boundary is not complete. The closed-state
+witness also does not complete the broader SB-BOOT/AC-023 bootstrap,
+ownership-transfer, recovery, or break-glass acceptance program.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 
@@ -191,8 +211,12 @@ RYUKI_PORTAL_EXECUTION_MODE=live-provider \
 cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 ```
 
-Open `http://127.0.0.1:8080`. Without `live-provider`, the portal deliberately
-uses its labeled static dry-run data instead of forwarding to the API.
+Open `http://127.0.0.1:8080`. Portal execution mode is mandatory and closed.
+The command above explicitly selects `live-provider`. To preview labeled static
+data instead, set exactly `RYUKI_PORTAL_EXECUTION_MODE=static-dry-run` and keep
+`RYUKI_PORTAL_PUBLIC_ORIGIN` explicitly loopback. Missing, blank, unknown, and
+legacy `external-static` values fail startup; an external public origin cannot
+select `static-dry-run`.
 
 The Compose stack reserves host ports API `18080` and portal `18000`, but the
 API's bridged listener is not loopback. The current admission slice refuses
@@ -200,7 +224,7 @@ credential-free authority there and also refuses legacy `local`/`entra-id`
 authority until every runtime value is projected by the selected provider
 contract. The full Compose API is therefore intentionally blocked; when run
 independently, the portal can still use its labeled static dry-run data at
-`http://127.0.0.1:18000`.
+`http://127.0.0.1:18000` with the explicit loopback-only mode described above.
 
 ### 6. Run tests
 

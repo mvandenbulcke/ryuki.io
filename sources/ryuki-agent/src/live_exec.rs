@@ -935,6 +935,7 @@ impl LiveExecutor for RunnerLiveExecutor {
 ///   the bytes thread through unchanged from `plan_outcome.tfplan`.
 /// - Optionally fails `plan()` for tests that verify the agent handles plan
 ///   failures correctly (see `with_failing_plan`).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub struct StubLiveExecutor {
     /// The plan outcome to return from `plan()`.
     plan_outcome: LivePlanOutcome,
@@ -955,6 +956,7 @@ pub struct StubLiveExecutor {
     last_apply_tfplan: std::sync::Mutex<Vec<u8>>,
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 impl StubLiveExecutor {
     /// Construct with explicit plan outcome and apply evidence.
     ///
@@ -1075,6 +1077,7 @@ impl StubLiveExecutor {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 impl LiveExecutor for StubLiveExecutor {
     fn execution_trust_profile(
         &self,

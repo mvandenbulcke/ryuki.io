@@ -37,7 +37,7 @@ use ryuki_agent::{
     config::AgentConfig,
     executor::RunnerExecutor,
     identity::AgentIdentity,
-    live::pin_cp_key,
+    live::pin_cp_keyset,
     live_exec::RunnerLiveExecutor,
     outbox::Outbox,
     run::run_loop,
@@ -217,39 +217,43 @@ async fn main() {
         }
     };
 
-    // Wire protocol compatibility handshake — runs for EVERY agent, live or not
-    // (the CP→agent half of the version check; the CP-side extractor is the
-    // agent→CP half). A CONFIRMED version mismatch is fatal: the agent refuses to
-    // start rather than fail opaquely mid-job on a drifted wire schema. A
-    // network/HTTP failure fetching the version is NON-fatal (matches the lenient
-    // CP-key fetch below): we cannot confirm, so we warn and let the pull-loop —
-    // and the CP-side gate — remain the backstop.
-    match cp.ensure_cp_protocol_compatible().await {
-        Ok(cp_version) => info!(
-            cp_protocol_version = cp_version,
-            agent_protocol_version = ryuki_protocol::PROTOCOL_VERSION,
-            "CP wire protocol is compatible"
-        ),
-        Err(ClientError::IncompatibleProtocol {
-            cp_version,
-            supported,
-        }) => {
-            tracing::error!(
-                cp_protocol_version = cp_version,
-                supported = ?supported,
-                "control plane speaks an incompatible wire protocol version — \
-                 upgrade this agent; refusing to start"
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
+    // Fetch the bootstrap document ONCE for every agent. Compatibility and the
+    // exact keyset publication are intentionally taken from the same typed
+    // response. A confirmed mismatch is fatal. Transport or schema failure is
+    // non-fatal for non-live agents; live jobs remain fail-closed below because
+    // no verification keyset can be pinned.
+    let cp_bootstrap = match cp.fetch_cp_keyset_response().await {
+        Ok(response) => match CpClient::require_compatible_protocol(response.protocol_version) {
+            Ok(()) => {
+                info!(
+                    cp_protocol_version = response.protocol_version,
+                    agent_protocol_version = ryuki_protocol::PROTOCOL_VERSION,
+                    "CP wire protocol is compatible"
+                );
+                Some(response)
+            }
+            Err(ClientError::IncompatibleProtocol {
+                cp_version,
+                supported,
+            }) => {
+                tracing::error!(
+                    cp_protocol_version = cp_version,
+                    supported = ?supported,
+                    "control plane speaks an incompatible wire protocol version — \
+                     upgrade this agent; refusing to start"
+                );
+                std::process::exit(1);
+            }
+            Err(_) => unreachable!("protocol compatibility has one failure variant"),
+        },
+        Err(_) => {
             tracing::warn!(
-                error = %e,
-                "could not confirm CP wire protocol compatibility (CP unreachable?) — \
-                 continuing; the CP will still reject an unsupported version per request"
+                "could not fetch a valid CP bootstrap document — continuing without a \
+                 pinned grant keyset; the CP still gates subsequent request versions"
             );
+            None
         }
-    }
+    };
 
     let executor = RunnerExecutor::new(Arc::clone(&identity));
     let live_exec = RunnerLiveExecutor::from_env();
@@ -269,31 +273,34 @@ async fn main() {
         }
     };
 
-    // S5b: fetch and pin the CP public key when live execution is enabled.
+    // S5b: pin the keyset from that same bootstrap response when live execution
+    // is enabled.
     //
     // The pinned key is required to verify VerifiedLiveContext grants before
     // any LiveApply job is executed.  If the fetch fails, we continue with
     // `None` — LivePlan jobs will still run; LiveApply jobs will be refused.
     let cp_verifying_key = if cfg.allow_live {
-        match cp.fetch_cp_public_key().await {
-            Ok(b64) => match pin_cp_key(&b64) {
-                Ok(vk) => {
-                    info!("CP public key pinned — LiveApply grant verification is active");
-                    Some(vk)
+        match cp_bootstrap.map(|response| response.keyset) {
+            Some(keyset) => match pin_cp_keyset(keyset) {
+                Ok(keyset) => {
+                    info!(
+                        keyset_version = keyset.keyset_version,
+                        key_count = keyset.keys.len(),
+                        "CP public keyset pinned — live grant verification is active"
+                    );
+                    Some(keyset)
                 }
-                Err(e) => {
+                Err(_) => {
                     tracing::warn!(
-                        error = %e,
-                        "failed to decode CP public key — LiveApply jobs will be refused \
+                        "CP bootstrap keyset failed structural validation — LiveApply jobs will be refused \
                          (no grant verification possible)"
                     );
                     None
                 }
             },
-            Err(e) => {
+            None => {
                 tracing::warn!(
-                    error = %e,
-                    "failed to fetch CP public key — LiveApply jobs will be refused \
+                    "CP bootstrap keyset is unavailable — LiveApply jobs will be refused \
                      (no grant verification possible)"
                 );
                 None

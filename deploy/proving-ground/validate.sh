@@ -552,9 +552,9 @@ grep -Fq 'agent_sha256=$AGENT_ARTIFACT_SHA256' "$HERE/run-agent.sh" || \
 [[ "$(grep -Fc 'verify_agent_trust_binding' "$HERE/run-agent.sh")" -ge 6 ]] || \
   fail "agent runner must recheck trust at every credential-bearing execution boundary"
 PROTOCOL_TYPES="$HERE/../../sources/ryuki-protocol/src/types.rs"
-grep -Fqx 'pub const PROTOCOL_VERSION: u32 = 7;' "$PROTOCOL_TYPES" || \
-  fail "the proving ground requires the shared protocol-v7 wire contract"
-grep -Fqx 'pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[7];' "$PROTOCOL_TYPES" || \
+grep -Fqx 'pub const PROTOCOL_VERSION: u32 = 8;' "$PROTOCOL_TYPES" || \
+  fail "the proving ground requires the shared protocol-v8 wire contract"
+grep -Fqx 'pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[8];' "$PROTOCOL_TYPES" || \
   fail "legacy protocol peers must remain outside the shared acceptance set"
 grep -Fq 'export RYUKI_LIVE_PROVIDER_AUTHORITY_ID="$PG_PROVIDER_AUTHORITY_ID"' \
   "$HERE/run-agent.sh" || \

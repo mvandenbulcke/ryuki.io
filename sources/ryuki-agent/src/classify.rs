@@ -54,6 +54,10 @@ pub fn classify_client_error(err: &ClientError) -> RetryClass {
         // A rejected endpoint is a local configuration/security-policy error;
         // retries cannot make an unsafe URL admissible.
         ClientError::InvalidEndpoint { .. } => RetryClass::Permanent,
+
+        // A malformed bootstrap keyset is a structural control-plane contract
+        // failure. Retrying the same response cannot make it trustworthy.
+        ClientError::InvalidControlPlaneKeysetResponse => RetryClass::Permanent,
     }
 }
 
@@ -234,5 +238,13 @@ mod tests {
             supported: &[1],
         };
         assert_eq!(classify_client_error(&err), RetryClass::Permanent);
+    }
+
+    #[test]
+    fn invalid_control_plane_keyset_is_permanent() {
+        assert_eq!(
+            classify_client_error(&ClientError::InvalidControlPlaneKeysetResponse),
+            RetryClass::Permanent
+        );
     }
 }

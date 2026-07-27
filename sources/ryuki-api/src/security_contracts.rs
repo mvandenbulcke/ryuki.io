@@ -5,6 +5,9 @@
 //! remains unavailable until trusted closure receipts and live runtime facts
 //! can be verified; structural JSON can never promote itself to authority.
 
+#[path = "production_dependencies.rs"]
+mod production_dependencies;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::OsString;
@@ -7815,14 +7818,21 @@ impl SecurityContractContext {
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
+            // This is a code-owned topology check, not receipt discovery. The
+            // current plan deliberately remains incomplete while mock-backed
+            // routes, workers, and fallback stores are reachable; therefore it
+            // cannot manufacture a nominal MockDependenciesDisabled witness.
+            let dependency_plan_blocker =
+                production_dependencies::current_production_dependency_admission_blocker();
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and DurablePostgresql, the independently signed FirstOwnerPathClosed permanent closure, HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: external-signing-key-material, mock-dependencies-disabled",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and DurablePostgresql, the independently signed FirstOwnerPathClosed permanent closure, HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: external-signing-key-material, mock-dependencies-disabled; {}",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
                 boundary.deployed_workload.workload_id(),
                 provider_applicability,
                 REMAINING_PRODUCTION_RUNTIME_GUARDS.len(),
+                dependency_plan_blocker,
             ));
         }
 
@@ -11255,6 +11265,14 @@ impl<'a> ReferenceVerifier<'a> {
                 | (
                     "source:ryuki-api-postgresql-tls-channel",
                     "sources/ryuki-api/src/postgresql_tls_channel.rs"
+                )
+                | (
+                    "source:ryuki-api-first-owner-runtime",
+                    "sources/ryuki-api/src/first_owner_runtime.rs"
+                )
+                | (
+                    "source:ryuki-api-production-dependencies",
+                    "sources/ryuki-api/src/production_dependencies.rs"
                 )
                 | (
                     "source:ryuki-api-audit-repository",
@@ -14827,7 +14845,7 @@ mod tests {
                 challenge_binding_digest,
                 production_composition_time(7, 7).not_before,
                 production_composition_time(8, 8).not_before,
-                production_composition_time(8, 8).not_before,
+                production_composition_time(10, 10).not_before,
                 stale_handle,
                 production_composition_time(9, 10),
             )
@@ -15551,6 +15569,8 @@ mod tests {
                 "sources/ryuki-api/src/repos/degradation.rs",
                 "sources/ryuki-api/src/database.rs",
                 "sources/ryuki-api/src/postgresql_tls_channel.rs",
+                "sources/ryuki-api/src/first_owner_runtime.rs",
+                "sources/ryuki-api/src/production_dependencies.rs",
                 "sources/ryuki-api/src/audit.rs",
                 "sources/ryuki-api/src/entra_auth.rs",
                 "sources/ryuki-api/src/identity_authority.rs",
@@ -17510,7 +17530,7 @@ mod tests {
         assert_eq!(claim.document_version, reference.document_version);
         assert_eq!(claim.content_digest, reference.content_digest);
         assert_eq!(claim.artifact_locator, reference.artifact_locator);
-        assert_eq!(claim.profile_version, 2);
+        assert_eq!(claim.profile_version, 3);
 
         prepared
             .raw_document_bytes
@@ -17529,7 +17549,7 @@ mod tests {
         prepared
             .documents
             .get_mut(&reference.artifact_locator)
-            .unwrap()["profile_version"] = json!(3);
+            .unwrap()["profile_version"] = json!(4);
         assert!(security_limit_applicability_claim(&prepared)
             .unwrap_err()
             .contains("exact profile-selected artifact"));

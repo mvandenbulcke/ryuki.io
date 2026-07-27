@@ -54,7 +54,7 @@ use crate::sha256_hex;
 use ryuki_protocol::{
     crypto::{
         decode_verifying_key, encode_verifying_key, execution_trust_profile_digest, sign_vlc,
-        verify_agent_enrollment_proof, verify_vlc,
+        verify_agent_enrollment_proof,
     },
     AgentHeartbeat, AgentHeartbeatResponse, Capabilities, ExecutionTrustProfile, Job, JobLease,
     JobMode, JobResult, JobResultStatus, JobSpec, JobStatus, LiveExecutionAuthority,
@@ -561,6 +561,21 @@ fn service_unavailable(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({"error": msg.into()})),
     )
+}
+
+fn cp_grant_verification_error(
+    error: cp_identity::CpGrantVerificationError,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        cp_identity::CpGrantVerificationError::Unavailable => {
+            tracing::error!("CP signing keyring is unavailable during grant verification");
+            service_unavailable("control plane signing keyring is unavailable")
+        }
+        cp_identity::CpGrantVerificationError::Invalid(_) => {
+            tracing::warn!("approval grant key selection or signature verification failed");
+            bad_request("approval grant signature or signing key id is invalid")
+        }
+    }
 }
 
 fn too_many_requests(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -3366,7 +3381,7 @@ fn protocol_version_is_supported(v: u32) -> bool {
 /// - absent                     → `PROTOCOL_VERSION_LEGACY` (1)
 ///
 /// The resolved value is then ALWAYS checked against
-/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v7-only allowlist therefore
+/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v8-only allowlist therefore
 /// rejects an absent header as legacy v1; omission is never a compatibility
 /// bypass. Used by the [`ProtocolVersion`] extractor.
 fn resolve_protocol_version(headers: &HeaderMap) -> Result<u32, (StatusCode, Json<Value>)> {
@@ -4562,21 +4577,7 @@ async fn post_job_result_with_pool(
                 // tampered stored grant (e.g. a DB-write attacker who alters
                 // approved_plan_digest but cannot forge the CP signature). The agent
                 // also independently verifies this signature before applying (S5b).
-                let cp_vk = cp_identity::cp_signing_key()
-                    .ok_or_else(|| {
-                        tracing::error!(
-                            "CP signing key is not initialised — cannot verify LiveApply grant"
-                        );
-                        (
-                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(json!({
-                                "error": "control plane is not configured to verify live grants"
-                            })),
-                        )
-                    })?
-                    .verifying_key();
-                verify_vlc(&grant, &cp_vk)
-                    .map_err(|_| bad_request("approval grant signature is invalid"))?;
+                cp_identity::verify_cp_grant(&grant).map_err(cp_grant_verification_error)?;
 
                 // Destination authority is signed independently from the
                 // agent's result envelope. It must equal the same canonical
@@ -6540,6 +6541,7 @@ pub async fn create_live_apply_job(
         expiry,
         step_job_id: None,
         execution_authority: execution_authority.clone(),
+        signing_key_id: String::new(),
         signature: String::new(),
     };
     let signed_grant = sign_vlc(unsigned_grant, cp_key);
@@ -6823,6 +6825,7 @@ pub async fn create_step_live_job(
         expiry,
         step_job_id: Some(job_id),
         execution_authority: execution_authority.clone(),
+        signing_key_id: String::new(),
         signature: String::new(),
     };
     let signed_grant = sign_vlc(unsigned_grant, cp_key);
@@ -6881,38 +6884,42 @@ pub async fn create_step_live_job(
 // GET /api/agents/cp-public-key — unauthenticated CP public-key endpoint
 // ---------------------------------------------------------------------------
 
-/// Return the CP's Ed25519 public key as base64.
+/// Return the CP's versioned active/verify-only Ed25519 public keyset.
 ///
 /// ## Auth posture
 ///
 /// **Unauthenticated** — intentionally.  A public key is not a secret; any
-/// agent (or observer) may fetch it.  Agents use this to pin the CP public key
-/// for verifying [`VerifiedLiveContext`] grants.  This endpoint is mounted via
+/// agent (or observer) may fetch it. Agents use this to pin the CP public
+/// keyset for verifying [`VerifiedLiveContext`] grants. This endpoint is mounted via
 /// `agent_routes()`, which sits OUTSIDE the human `auth_middleware` layer in
 /// `main.rs`, so no session or agent-token is required.
 ///
 /// Returns 503 if the CP signing key was not initialised at startup (e.g. the
 /// key file was unreadable and the server continued in degraded mode).
-pub async fn cp_public_key() -> impl IntoResponse {
-    match cp_identity::cp_public_key_b64() {
-        Some(pubkey) => (
+pub async fn cp_public_key() -> Response {
+    let mut response = match cp_identity::cp_public_keyset() {
+        Some(keyset) => (
             axum::http::StatusCode::OK,
             // Advertise the CP's wire protocol version alongside the key. The agent
             // fetches this at startup and refuses to run against a CP whose version
             // is outside its own SUPPORTED_PROTOCOL_VERSIONS — the CP→agent half of
             // the compatibility handshake.
-            Json(serde_json::json!({
-                "public_key": pubkey,
-                "protocol_version": ryuki_protocol::PROTOCOL_VERSION,
-            })),
+            Json(ryuki_protocol::ControlPlaneGrantKeysetResponse {
+                keyset,
+                protocol_version: ryuki_protocol::PROTOCOL_VERSION,
+            }),
         )
             .into_response(),
         None => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "CP signing key not initialised"})),
+            Json(serde_json::json!({"error": "CP signing keyring not initialised"})),
         )
             .into_response(),
-    }
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -8983,6 +8990,26 @@ mod tests {
         live_approver_session("test-operator-admin")
     }
 
+    #[test]
+    fn cp_grant_verification_maps_unavailable_to_503_and_invalid_to_fixed_400() {
+        let unavailable =
+            cp_grant_verification_error(cp_identity::CpGrantVerificationError::Unavailable);
+        assert_eq!(unavailable.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.1 .0,
+            json!({"error": "control plane signing keyring is unavailable"})
+        );
+
+        let invalid = cp_grant_verification_error(cp_identity::CpGrantVerificationError::Invalid(
+            ryuki_protocol::VerifyError::UnknownControlPlaneGrantKey,
+        ));
+        assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid.1 .0,
+            json!({"error": "approval grant signature or signing key id is invalid"})
+        );
+    }
+
     async fn install_live_approval_audit_failure_trigger(pool: &PgPool) {
         sqlx::query("DROP TRIGGER IF EXISTS zz_ryuki_test_reject_live_approval_audit ON audit_log")
             .execute(pool)
@@ -9406,7 +9433,7 @@ mod tests {
     #[test]
     fn protocol_version_absent_header_is_rejected_as_legacy_v1() {
         // No header at all resolves to legacy v1, which is intentionally outside
-        // the v7-only allowlist because older agents lack current state,
+        // the v8-only allowlist because older agents lack current state,
         // enrollment isolation, and exact signed execution-authority controls.
         let err = resolve_protocol_version(&HeaderMap::new())
             .expect_err("an absent header must be rejected as legacy protocol v1");
@@ -9431,8 +9458,15 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_v4_peer_is_rejected_after_execution_authority_cutover() {
-        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 7);
+    fn protocol_version_v7_peer_is_rejected_after_keyset_cutover() {
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 8);
+        let err = resolve_protocol_version(&hdrs_with_version("7"))
+            .expect_err("a v7 peer cannot parse or verify the required signing key id");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1 .0["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("unsupported protocol_version: 7")));
+
         let err = resolve_protocol_version(&hdrs_with_version("4"))
             .expect_err("a v4 peer cannot parse the required signed execution authority");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -17960,6 +17994,7 @@ mod tests {
                     &canonical_execution_trust_profile(&spec, platform),
                 ),
             },
+            signing_key_id: String::new(),
             signature: String::new(),
         };
         let grant = sign_vlc(unsigned, signing_key);
@@ -19070,6 +19105,7 @@ mod tests {
         // no cross-test race on the write-once global).
         let key = ensure_test_cp_key();
         let expected_pubkey = ryuki_protocol::encode_verifying_key(&key.verifying_key());
+        let expected_key_id = ryuki_protocol::control_plane_grant_key_id(&key.verifying_key());
 
         // Call the handler directly.
         let response = cp_public_key().await.into_response();
@@ -19082,34 +19118,39 @@ mod tests {
             axum::http::StatusCode::OK,
             "cp-public-key must return 200 when the key is initialised"
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "bootstrap key material and compatibility metadata must not be cached"
+        );
 
         // Parse the body.
         use axum::body::to_bytes;
         let body_bytes = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body bytes");
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("JSON body");
-
-        // The public_key field must be a non-empty base64 string.
-        let pubkey_field = body
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .expect("public_key field must be present and a string");
-
-        // If the key was freshly set by THIS test, it must match exactly.
-        // If it was already set by a prior test, we just verify it is a
-        // well-formed base64-encoded 32-byte Ed25519 verifying key.
-        let actual_b64 = cp_identity::cp_public_key_b64().expect("key must be set");
+        let body: ryuki_protocol::ControlPlaneGrantKeysetResponse =
+            serde_json::from_slice(&body_bytes).expect("typed bootstrap response");
+        assert_eq!(body.protocol_version, ryuki_protocol::PROTOCOL_VERSION);
+        let endpoint_keyset = body.keyset;
+        let retained_keyset = cp_identity::cp_public_keyset().expect("keyring must be set");
+        assert_eq!(endpoint_keyset, retained_keyset);
+        ryuki_protocol::validate_control_plane_grant_keyset(&endpoint_keyset)
+            .expect("endpoint keyset must be canonical and internally bound");
+        assert_eq!(endpoint_keyset.active_key_id, expected_key_id);
+        let active = endpoint_keyset
+            .keys
+            .iter()
+            .find(|entry| entry.key_id == endpoint_keyset.active_key_id)
+            .expect("active keyset entry");
+        assert_eq!(active.public_key, expected_pubkey);
         assert_eq!(
-            pubkey_field, actual_b64,
-            "endpoint must return the key stored in the global"
+            active.disposition,
+            ryuki_protocol::ControlPlaneGrantKeyDisposition::Active
         );
-        // Verify it decodes to a valid 32-byte key.
-        ryuki_protocol::crypto::decode_verifying_key(pubkey_field)
-            .expect("public_key must be a valid base64-encoded verifying key");
-
-        // Confirm the expected key is at least BASE64-valid.
-        let _ = expected_pubkey; // used above, consumed by init
     }
 
     /// An exact replay of an already-recorded LiveApply result must return
@@ -22386,6 +22427,15 @@ mod tests {
         // backlink → dispatch_teardown_steps) and the result verifier.
         let cp_key = ensure_test_cp_key();
         let cp_vk = cp_key.verifying_key();
+        let cp_active = ryuki_protocol::control_plane_grant_verifying_key(
+            &cp_vk,
+            ryuki_protocol::ControlPlaneGrantKeyDisposition::Active,
+        );
+        let cp_keyset = ryuki_protocol::ControlPlaneGrantKeyset {
+            keyset_version: 1,
+            active_key_id: cp_active.key_id.clone(),
+            keys: vec![cp_active],
+        };
 
         // Enroll a REAL agent identity on the seeded request's site platform.
         let identity = ryuki_agent::identity::AgentIdentity::generate();
@@ -22481,7 +22531,7 @@ mod tests {
         job.live_context = Some(grant);
 
         // RUN AGENT CODE (1): the REAL trust gate — no plan digest for destroy.
-        let decision = ryuki_agent::live::evaluate_live_execution(&job, &cp_vk, true, None);
+        let decision = ryuki_agent::live::evaluate_live_execution(&job, &cp_keyset, true, None);
         assert_eq!(
             decision,
             ryuki_agent::live::LiveDecision::Proceed,
