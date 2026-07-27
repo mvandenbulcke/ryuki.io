@@ -1,0 +1,6 @@
+[build]
+# Every Cargo entry point (direct commands, Make, cargo-leptos, rust-analyzer,
+# and the disposable verification wrapper) passes rustc through the same hard
+# disk ceiling. The wrapper delegates transparently while the effective target
+# is healthy and refuses new compiler processes once it is too large.
+rustc-wrapper = "scripts/cargo-rustc-disk-guard.sh"

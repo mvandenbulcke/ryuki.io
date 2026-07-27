@@ -504,6 +504,7 @@ if (( $# > 0 )); then
 fi
 
 run_gate "verification cleanup regression" ./scripts/regressions/verify-workspace-clean.sh
+run_gate "repository Cargo disk guard regression" ./scripts/regressions/cargo-rustc-disk-guard.sh
 run_gate "format" cargo fmt --check --all
 run_gate "workspace build" cargo build --workspace
 run_gate "workspace tests" cargo test --workspace

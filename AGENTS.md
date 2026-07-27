@@ -26,6 +26,20 @@ free space and target size between gates, and removes the target on success,
 failure, or interruption. Do not run parallel Cargo build/test/clippy commands
 in the same checkout. Never leave ad-hoc `CARGO_TARGET_DIR` trees behind.
 
+Coding agents must never invoke `cargo build`, `cargo check`, `cargo test`,
+`cargo clippy`, `cargo run`, or `cargo leptos` directly. Use the focused bounded
+form for an individual build gate:
+
+```bash
+./scripts/verify-workspace-clean.sh -- cargo check -p ryuki-api
+./scripts/verify-workspace-clean.sh -- cargo test -p ryuki-api <test-filter>
+./scripts/verify-workspace-clean.sh -- cargo clippy -p ryuki-api -- -D warnings
+```
+
+The checked-in Cargo rustc wrapper is a final hard stop for accidental direct,
+Make, IDE, and cargo-leptos compilation paths: it refuses new compiler work
+once the effective target exceeds 48 GiB or free space falls below 30 GiB.
+
 For iterative human development, the individual commands remain available:
 
 ```bash

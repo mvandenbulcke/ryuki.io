@@ -1,12 +1,12 @@
 .PHONY: build test test-unit test-db lint validate verify-clean cache-status clean run-api run-portal compose-up compose-down docker-build release-check db-backup db-restore
 
-# The ordinary Cargo targets below intentionally keep ./target for iterative
-# human development. Use `make verify-clean` for every complete verification
-# wave; it caps and removes a disposable target. Run `make clean` after any
-# deliberate debugging session that opts back into full debug information.
+# Build/test/lint targets use the bounded disposable verifier so routine agent
+# and CI-style work never leaves a persistent ./target behind. Long-running
+# development servers remain persistent workflows, but the checked-in rustc
+# wrapper enforces the repository-wide hard target ceiling for every Cargo path.
 
 build:
-	cargo build --workspace
+	./scripts/verify-workspace-clean.sh -- cargo build --workspace
 
 # Run in-memory unit tests only (no database).
 # RYUKI_DATABASE_URL is explicitly unset so every DB test in ryuki-api skips
@@ -17,8 +17,7 @@ build:
 # and fail.  Running unit tests without the URL keeps the pool unset and the
 # two test categories fully isolated.
 test-unit:
-	RYUKI_DATABASE_URL= cargo test -p ryuki-api
-	cargo test -p ryuki-engine
+	RYUKI_DATABASE_URL= ./scripts/verify-workspace-clean.sh -- cargo test -p ryuki-api -p ryuki-engine
 
 # Run DB integration tests only (requires a live Postgres instance).
 # Filtered by name so only DB tests run in this process — no in-memory
@@ -38,17 +37,18 @@ test-unit:
 # against the shared, already-seeded dev database — it belongs to `make test`
 # run against a throwaway Postgres.
 test-db:
-	RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
-	  cargo test -p ryuki-api -- --test-threads=1 \
+	RYUKI_VERIFY_ALLOW_DATABASE=1 \
+	  RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
+	  ./scripts/verify-workspace-clean.sh -- cargo test -p ryuki-api -- --test-threads=1 \
 	    --skip test_migrations_run_against_pg18 \
 	    db_tests db_lifecycle_tests agents::tests::db_
 
 test:
-	cargo test --workspace
+	./scripts/verify-workspace-clean.sh -- cargo test --workspace
 
 lint:
 	cargo fmt --check --all
-	cargo clippy --workspace --all-targets -- -D warnings
+	./scripts/verify-workspace-clean.sh -- cargo clippy --workspace --all-targets -- -D warnings
 
 validate:
 	cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
