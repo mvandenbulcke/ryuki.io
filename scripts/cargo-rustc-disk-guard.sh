@@ -16,7 +16,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-48}"
 MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
-CHECK_INTERVAL_SECONDS="${RYUKI_CARGO_GUARD_INTERVAL_SECONDS:-15}"
+CHECK_INTERVAL_SECONDS="${RYUKI_CARGO_GUARD_INTERVAL_SECONDS:-2}"
 TEST_MODE="${RYUKI_CARGO_GUARD_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_CARGO_GUARD_TEST_MAX_KIB:-}"
 
@@ -93,63 +93,169 @@ fi
 state_dir="$target_root/.ryuki-cargo-disk-guard"
 lock_dir="$state_dir/check.lock"
 stamp_file="$state_dir/last-check"
+trip_file="$state_dir/target-limit-tripped"
 mkdir -p "$state_dir"
 
-now="$(date +%s)"
-last_check=0
-if [[ -f "$stamp_file" ]]; then
-  read -r last_check < "$stamp_file" || last_check=0
-fi
-if [[ ! "$last_check" =~ ^[0-9]+$ ]]; then
-  last_check=0
-fi
-
-if (( now - last_check < CHECK_INTERVAL_SECONDS )); then
-  exec "$@"
-fi
-
-# Only one concurrent rustc wrapper pays for `du`. A dead checker's lock is
-# reclaimed after twice the check interval so it cannot disable the ceiling.
-if ! mkdir "$lock_dir" 2>/dev/null; then
-  lock_timestamp=0
-  if [[ -f "$lock_dir/timestamp" ]]; then
-    read -r lock_timestamp < "$lock_dir/timestamp" || lock_timestamp=0
-  fi
-  if [[ "$lock_timestamp" =~ ^[0-9]+$ ]] \
-    && (( now - lock_timestamp > CHECK_INTERVAL_SECONDS * 2 )); then
-    rm -rf -- "$lock_dir"
-    mkdir "$lock_dir" 2>/dev/null || exec "$@"
-  else
-    exec "$@"
-  fi
-fi
-printf '%s\n' "$now" > "$lock_dir/timestamp"
-
-release_lock() {
-  rm -rf -- "$lock_dir"
-}
-trap release_lock EXIT INT TERM
-
-target_kib="$(du -sk "$target_root" | awk '{print $1}')"
-free_kib="$(df -Pk "$target_root" | awk 'END {print $4}')"
 max_target_kib=$((MAX_TARGET_GIB * 1024 * 1024))
 min_free_kib=$((MIN_FREE_GIB * 1024 * 1024))
 if [[ -n "$TEST_MAX_KIB" ]]; then
   max_target_kib="$TEST_MAX_KIB"
 fi
 
-if (( target_kib > max_target_kib )); then
-  echo "error: Cargo compilation refused: target exceeds the ${MAX_TARGET_GIB} GiB repository ceiling" >&2
+trip_guard() {
+  local temporary="${trip_file}.$$.$RANDOM"
+  printf 'tripped\n' > "$temporary"
+  mv -f -- "$temporary" "$trip_file"
+}
+
+# One concurrent wrapper pays for `du`; every wrapper remains alive to watch
+# the shared trip marker for the full lifetime of its compiler. A fresh forced
+# check can clear a prior trip only after the target has actually returned
+# below both limits (normally after `make clean`).
+guard_check() (
+  local force="${1:-0}"
+  local now last_check lock_timestamp target_kib free_kib
+
+  now="$(date +%s)"
+  last_check=0
+  if [[ -f "$stamp_file" ]]; then
+    read -r last_check < "$stamp_file" || last_check=0
+  fi
+  [[ "$last_check" =~ ^[0-9]+$ ]] || last_check=0
+
+  if [[ "$force" != "1" && -f "$trip_file" ]]; then
+    return 75
+  fi
+  if [[ "$force" != "1" ]] && (( now - last_check < CHECK_INTERVAL_SECONDS )); then
+    return 0
+  fi
+
+  # A dead checker's lock is reclaimable; lock contention never disables
+  # supervision because the other wrappers still observe `trip_file`.
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    lock_timestamp=0
+    if [[ -f "$lock_dir/timestamp" ]]; then
+      read -r lock_timestamp < "$lock_dir/timestamp" || lock_timestamp=0
+    fi
+    if [[ "$lock_timestamp" =~ ^[0-9]+$ ]] \
+      && (( now - lock_timestamp > CHECK_INTERVAL_SECONDS * 2 )); then
+      rm -rf -- "$lock_dir"
+      mkdir "$lock_dir" 2>/dev/null || {
+        [[ ! -f "$trip_file" ]]
+        return
+      }
+    else
+      [[ ! -f "$trip_file" ]]
+      return
+    fi
+  fi
+  printf '%s\n' "$now" > "$lock_dir/timestamp"
+  trap 'rm -rf -- "$lock_dir"' EXIT INT TERM
+
+  target_kib="$(du -sk "$target_root" | awk '{print $1}')"
+  free_kib="$(df -Pk "$target_root" | awk 'END {print $4}')"
+
+  if (( target_kib > max_target_kib )); then
+    trip_guard
+    echo "error: Cargo target exceeded the ${MAX_TARGET_GIB} GiB repository ceiling" >&2
+    return 75
+  fi
+  if (( free_kib < min_free_kib )); then
+    trip_guard
+    echo "error: Cargo target stopped because less than ${MIN_FREE_GIB} GiB remains free" >&2
+    return 75
+  fi
+
+  rm -f -- "$trip_file"
+  printf '%s\n' "$now" > "$stamp_file"
+)
+
+collect_process_tree() {
+  local pid="$1"
+  local child
+  if command -v pgrep >/dev/null 2>&1; then
+    while IFS= read -r child; do
+      [[ -n "$child" ]] && collect_process_tree "$child"
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+  fi
+  printf '%s\n' "$pid"
+}
+
+compiler_pid=""
+
+stop_compiler_tree() {
+  local pid="${compiler_pid:-}"
+  local child attempt alive
+  local tree_pids=()
+  [[ -n "$pid" ]] || return 0
+
+  while IFS= read -r child; do
+    [[ -n "$child" ]] && tree_pids+=("$child")
+  done < <(collect_process_tree "$pid")
+  for child in "${tree_pids[@]}"; do
+    kill -TERM "$child" 2>/dev/null || true
+  done
+  for attempt in {1..20}; do
+    alive=0
+    for child in "${tree_pids[@]}"; do
+      if kill -0 "$child" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    (( alive == 0 )) && break
+    sleep 0.1
+  done
+  if (( alive != 0 )); then
+    for child in "${tree_pids[@]}"; do
+      kill -KILL "$child" 2>/dev/null || true
+    done
+  fi
+  wait "$pid" 2>/dev/null || true
+  compiler_pid=""
+}
+
+handle_signal() {
+  local status="$1"
+  trap - INT TERM
+  stop_compiler_tree
+  exit "$status"
+}
+
+if ! guard_check 1; then
+  echo "error: Cargo compilation refused by the repository disk guard" >&2
   echo "error: run 'make clean' or use the disposable verification wrapper" >&2
   exit 75
 fi
-if (( free_kib < min_free_kib )); then
-  echo "error: Cargo compilation refused: less than ${MIN_FREE_GIB} GiB remains free" >&2
-  echo "error: run 'make clean' or free disk capacity" >&2
-  exit 75
-fi
 
-printf '%s\n' "$now" > "$stamp_file"
-release_lock
-trap - EXIT INT TERM
-exec "$@"
+"$@" &
+compiler_pid=$!
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
+while kill -0 "$compiler_pid" 2>/dev/null; do
+  # Poll child completion separately from the relatively expensive aggregate
+  # size check so short compiler probes do not inherit a multi-second delay.
+  sleep 0.2
+  kill -0 "$compiler_pid" 2>/dev/null || break
+  if (( SECONDS < next_guard_check )); then
+    continue
+  fi
+  next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
+  if guard_check 0; then
+    continue
+  fi
+  echo "error: stopping Cargo compiler processes before they can exhaust the disk" >&2
+  stop_compiler_tree
+  exit 75
+done
+
+if wait "$compiler_pid"; then
+  compiler_status=0
+else
+  compiler_status=$?
+fi
+compiler_pid=""
+trap - INT TERM
+exit "$compiler_status"
