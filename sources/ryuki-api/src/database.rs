@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use ryuki_core::postgresql_infrastructure::{
-    postgresql_session_binding_digest, PostgresqlSessionBinding, PostgresqlTlsChannelBinding,
+    postgresql_attestation_request_tag, postgresql_session_binding_digest,
+    postgresql_tls_channel_binding_digest, postgresql_tls_exporter_context,
+    PostgresqlSessionBinding, PostgresqlSessionPurpose, PostgresqlTlsChannelBinding,
     VerifiedPostgresqlInfrastructureAttestation,
 };
 use ryuki_core::security_profile::{
@@ -23,7 +25,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use url::{Host, Url};
 
-use crate::postgresql_tls_channel::ProductionPostgresqlTarget;
+use crate::postgresql_tls_channel::{
+    ChannelBoundProductionPgPool, ProductionPostgresqlTarget, SingleChannelPgPoolSettings,
+};
 
 #[cfg(not(test))]
 static POOL: OnceLock<Option<Arc<PgPool>>> = OnceLock::new();
@@ -434,6 +438,17 @@ impl ApplicationPoolSettings {
             max_lifetime_secs,
         })
     }
+
+    fn exact_channel_settings(self) -> Result<SingleChannelPgPoolSettings, String> {
+        SingleChannelPgPoolSettings::new(
+            self.max_connections,
+            self.min_connections,
+            self.idle_timeout_secs,
+            self.acquire_timeout_secs,
+            self.max_lifetime_secs,
+        )
+        .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,7 +731,7 @@ fn canonical_absolute_certificate_path(raw: &str) -> bool {
         && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn production_migration_target(raw_url: &str) -> Result<ProductionPostgresqlTarget, String> {
+fn production_postgresql_target(raw_url: &str) -> Result<ProductionPostgresqlTarget, String> {
     if raw_url.is_empty()
         || raw_url.len() > 8192
         || raw_url != raw_url.trim()
@@ -1146,8 +1161,34 @@ pub enum PostgresqlRuntimePublicationError {
     AlreadyPublished,
     #[error("database publication did not receive the exact admission-retained runtime handle")]
     AdmissionHandleMismatch,
-    #[error("the globally published database is not the measured retained pool")]
-    PublishedPoolMismatch,
+    #[error("the exact retained PostgreSQL TLS channel is no longer active")]
+    ExactChannelInactive,
+    #[error("the retained PostgreSQL channel owner does not own the measured pool and session")]
+    ExactChannelIdentityMismatch,
+}
+
+/// Private ownership contract for the only transport that may back a
+/// production serving pool. Production installs the concrete one-use relay;
+/// tests may supply a non-network owner solely for value/pointer-identity unit
+/// tests in this module.
+trait RetainedPostgresqlChannelOwner: Send + Sync {
+    fn pool(&self) -> &Arc<PgPool>;
+    fn binding(&self) -> &PostgresqlTlsChannelBinding;
+    fn exact_channel_is_active(&self) -> bool;
+}
+
+impl RetainedPostgresqlChannelOwner for ChannelBoundProductionPgPool {
+    fn pool(&self) -> &Arc<PgPool> {
+        ChannelBoundProductionPgPool::pool(self)
+    }
+
+    fn binding(&self) -> &PostgresqlTlsChannelBinding {
+        ChannelBoundProductionPgPool::binding(self)
+    }
+
+    fn exact_channel_is_active(&self) -> bool {
+        ChannelBoundProductionPgPool::exact_channel_is_active(self)
+    }
 }
 
 /// Independently authenticated infrastructure evidence needed by the local
@@ -1232,6 +1273,10 @@ pub(crate) enum DurablePostgresqlRuntimeVerificationError {
     InvalidMigrationVersion,
     #[error("the measured DurablePostgresql value does not equal the receipt-bound expectation")]
     ExpectedValueMismatch,
+    #[error(
+        "the exact retained PostgreSQL channel/pool/session identity is inactive or substituted"
+    )]
+    ExactChannelInvalid,
     #[error(transparent)]
     DigestProjection(#[from] RuntimeGuardDigestError),
     #[error(transparent)]
@@ -1242,6 +1287,8 @@ pub(crate) enum DurablePostgresqlRuntimeVerificationError {
 /// supplied by the separate non-cloneable nominal runtime witness.
 #[derive(Clone)]
 pub struct RetainedPostgresqlRuntime {
+    channel_owner: Arc<dyn RetainedPostgresqlChannelOwner>,
+    session_binding: Arc<PostgresqlSessionBinding>,
     pool: Arc<PgPool>,
     observation: Arc<PostgresqlRuntimeObservation>,
     roles: Arc<ProductionDatabaseRoles>,
@@ -1252,7 +1299,7 @@ impl fmt::Debug for RetainedPostgresqlRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RetainedPostgresqlRuntime")
-            .field("contract", &"retained-postgresql-runtime-v1")
+            .field("contract", &"retained-postgresql-runtime-v2")
             .field(
                 "server_major_version",
                 &self.observation.server_major_version,
@@ -1277,6 +1324,10 @@ impl RetainedPostgresqlRuntime {
         &self.observation
     }
 
+    pub(crate) fn session_binding(&self) -> &Arc<PostgresqlSessionBinding> {
+        &self.session_binding
+    }
+
     pub fn pool_ptr_eq(&self, candidate: &Arc<PgPool>) -> bool {
         Arc::ptr_eq(&self.pool, candidate)
     }
@@ -1286,7 +1337,9 @@ impl RetainedPostgresqlRuntime {
     }
 
     pub fn same_runtime(&self, candidate: &Self) -> bool {
-        Arc::ptr_eq(&self.pool, &candidate.pool)
+        Arc::ptr_eq(&self.channel_owner, &candidate.channel_owner)
+            && Arc::ptr_eq(&self.session_binding, &candidate.session_binding)
+            && Arc::ptr_eq(&self.pool, &candidate.pool)
             && Arc::ptr_eq(&self.observation, &candidate.observation)
             && Arc::ptr_eq(&self.roles, &candidate.roles)
             && Arc::ptr_eq(&self.connection_binding, &candidate.connection_binding)
@@ -1296,14 +1349,37 @@ impl RetainedPostgresqlRuntime {
         published_pool_ptr_eq(&self.pool)
     }
 
+    fn retained_channel_is_exact_and_active(&self) -> bool {
+        self.channel_owner.exact_channel_is_active()
+            && Arc::ptr_eq(self.channel_owner.pool(), &self.pool)
+            && self.channel_owner.binding() == &self.session_binding.tls_channel_binding
+    }
+
     /// Repeat every local SQL observation through the exact retained pool and
     /// require value equality with the initially sealed observation.
     pub async fn remeasure_exact(&self) -> Result<(), PostgresqlRuntimeObservationError> {
-        let current = observe_postgresql_runtime(&self.pool, &self.roles).await?;
-        self.connection_binding.require_match(&current)?;
-        if current != *self.observation {
+        if !self.retained_channel_is_exact_and_active() {
+            return Err(observation_contract_error(
+                "the retained one-use PostgreSQL TLS channel is inactive or substituted",
+            ));
+        }
+        let (current_observation, current_session) = observe_postgresql_runtime(
+            &self.pool,
+            &self.roles,
+            &self.session_binding.application_name,
+            self.channel_owner.binding(),
+        )
+        .await?;
+        self.connection_binding
+            .require_match(&current_observation)?;
+        if current_observation != *self.observation || current_session != *self.session_binding {
             return Err(PostgresqlRuntimeObservationError::Contract(
-                "live PostgreSQL facts changed after the retained observation was sealed".into(),
+                "live PostgreSQL session or runtime facts changed after sealing".into(),
+            ));
+        }
+        if !self.retained_channel_is_exact_and_active() {
+            return Err(observation_contract_error(
+                "the retained one-use PostgreSQL TLS channel ended during remeasurement",
             ));
         }
         Ok(())
@@ -1344,6 +1420,18 @@ impl VerifiedLocalDurablePostgresqlRuntime {
         &self.observed_value
     }
 
+    pub(crate) fn retains_runtime(&self, candidate: &RetainedPostgresqlRuntime) -> bool {
+        self.runtime.same_runtime(candidate)
+    }
+
+    pub(crate) fn retains_infrastructure_attestation(
+        &self,
+        candidate: &Arc<VerifiedPostgresqlInfrastructureAttestation>,
+    ) -> bool {
+        let candidate: Arc<dyn VerifiedPostgresqlInfrastructureEvidence> = candidate.clone();
+        Arc::ptr_eq(&self.infrastructure_evidence, &candidate)
+    }
+
     fn recheck_retained_projection(&self) -> Result<(), DurablePostgresqlRuntimeVerificationError> {
         if self.infrastructure_evidence.verify_integrity().is_err() {
             return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
@@ -1362,6 +1450,18 @@ impl VerifiedLocalDurablePostgresqlRuntime {
             return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
         }
         Ok(())
+    }
+
+    /// Synchronous integrity fence used by startup checkpoints that cannot do
+    /// SQL I/O. The async fence below additionally remeasures the exact backend
+    /// session and local runtime observation.
+    pub(crate) fn recheck_integrity(
+        &self,
+    ) -> Result<(), DurablePostgresqlRuntimeVerificationError> {
+        if !self.runtime.retained_channel_is_exact_and_active() {
+            return Err(DurablePostgresqlRuntimeVerificationError::ExactChannelInvalid);
+        }
+        self.recheck_retained_projection()
     }
 
     /// Remeasure every SQL-visible fact through the exact retained pool, then
@@ -1468,6 +1568,9 @@ pub(crate) fn verify_local_durable_postgresql_runtime(
     ) {
         return Err(DurablePostgresqlRuntimeVerificationError::ExpectedGuardKind);
     }
+    if !unpublished.retained.retained_channel_is_exact_and_active() {
+        return Err(DurablePostgresqlRuntimeVerificationError::ExactChannelInvalid);
+    }
     if infrastructure_evidence.verify_integrity().is_err() {
         return Err(DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid);
     }
@@ -1515,17 +1618,36 @@ impl UnpublishedPostgresqlRuntime {
         !database_publication_decided()
     }
 
-    pub fn publish_after_admission(
+    pub(crate) fn session_binding(&self) -> &Arc<PostgresqlSessionBinding> {
+        self.retained.session_binding()
+    }
+
+    // Publication is intentionally unreachable until the remaining three
+    // guard verifiers can construct the complete aggregate capability.
+    #[allow(dead_code)]
+    pub(crate) fn publish_after_admission(
         self,
-        admitted_runtime: &RetainedPostgresqlRuntime,
+        admission: &crate::security_contracts::CompleteProductionRuntimeAdmissionToken,
     ) -> Result<RetainedPostgresqlRuntime, PostgresqlRuntimePublicationError> {
-        if !self.retained.same_runtime(admitted_runtime) {
+        if !admission.retains_durable_postgresql_runtime(&self.retained) {
             return Err(PostgresqlRuntimePublicationError::AdmissionHandleMismatch);
         }
-        publish_production_pool(self.retained.pool.clone())?;
-        if !self.retained.is_exact_published_pool() {
-            return Err(PostgresqlRuntimePublicationError::PublishedPoolMismatch);
+        if !self.retained.channel_owner.exact_channel_is_active() {
+            return Err(PostgresqlRuntimePublicationError::ExactChannelInactive);
         }
+        if !Arc::ptr_eq(self.retained.channel_owner.pool(), &self.retained.pool)
+            || self.retained.channel_owner.binding()
+                != &self.retained.session_binding.tls_channel_binding
+        {
+            return Err(PostgresqlRuntimePublicationError::ExactChannelIdentityMismatch);
+        }
+        publish_production_pool(self.retained.pool.clone())?;
+        // `publish_production_pool` installs this exact Arc or returns before
+        // mutating the one-shot global. A channel failure after this point is a
+        // terminal poisoned-startup condition detected by the mandatory exact
+        // remeasurement fences; it must not be presented as a recoverable
+        // publication error after the global has become irreversible.
+        debug_assert!(self.retained.is_exact_published_pool());
         Ok(self.retained)
     }
 }
@@ -1692,12 +1814,16 @@ fn database_publication_decided() -> bool {
 }
 
 #[cfg(not(test))]
+// Kept private behind `publish_after_admission`; it becomes reachable only
+// when the complete eight-guard aggregate can mint publication authority.
+#[allow(dead_code)]
 fn publish_production_pool(pool: Arc<PgPool>) -> Result<(), PostgresqlRuntimePublicationError> {
     POOL.set(Some(pool))
         .map_err(|_| PostgresqlRuntimePublicationError::AlreadyPublished)
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn publish_production_pool(pool: Arc<PgPool>) -> Result<(), PostgresqlRuntimePublicationError> {
     TEST_POOL.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -2138,7 +2264,7 @@ struct RawPostgresqlRuntimeFacts {
 /// the closed core preimage that the independent infrastructure authority must
 /// sign. The raw form keeps fallible PostgreSQL integer/NULL values out of the
 /// trusted type until local validation succeeds.
-struct RawPostgresqlMigrationSessionBinding {
+struct RawPostgresqlSessionBinding {
     server_version_num: i32,
     database_name: String,
     database_oid: i64,
@@ -2168,7 +2294,7 @@ struct RawPostgresqlMigrationSessionBinding {
 
 fn migration_session_contract_error(message: impl Into<String>) -> String {
     format!(
-        "production migration session contract was not proven: {}",
+        "production PostgreSQL session contract was not proven: {}",
         message.into()
     )
 }
@@ -2189,10 +2315,11 @@ fn validate_migration_optional_distinguished_name(
     }
 }
 
-fn validate_postgresql_migration_session_binding(
-    raw: RawPostgresqlMigrationSessionBinding,
+fn validate_postgresql_session_binding(
+    raw: RawPostgresqlSessionBinding,
     application_name: &str,
-    contract: &MigrationRoleContract,
+    expected_role: &str,
+    counterpart_role: &str,
     tls_channel_binding: &PostgresqlTlsChannelBinding,
 ) -> Result<PostgresqlSessionBinding, String> {
     let server_version_num = u32::try_from(raw.server_version_num).map_err(|_| {
@@ -2262,15 +2389,15 @@ fn validate_postgresql_migration_session_binding(
             "live application_name does not equal the nonce-derived request tag",
         ));
     }
-    if raw.current_role != contract.expected || raw.selected_role != contract.expected {
+    if raw.current_role != expected_role || raw.selected_role != expected_role {
         return Err(migration_session_contract_error(
-            "current and selected roles do not equal the receipt-bound migration role",
+            "current and selected roles do not equal the receipt-bound purpose-selected role",
         ));
     }
     canonical_database_role_name("session_login_role", raw.session_login_role.clone())
         .map_err(migration_session_contract_error)?;
-    if raw.session_login_role == contract.expected
-        || raw.session_login_role == contract.application
+    if raw.session_login_role == expected_role
+        || raw.session_login_role == counterpart_role
         || raw.session_login_role == "postgres"
     {
         return Err(migration_session_contract_error(
@@ -2358,6 +2485,22 @@ fn validate_postgresql_migration_session_binding(
         )?,
         tls_channel_binding: tls_channel_binding.clone(),
     })
+}
+
+#[cfg(test)]
+fn validate_postgresql_migration_session_binding(
+    raw: RawPostgresqlSessionBinding,
+    application_name: &str,
+    contract: &MigrationRoleContract,
+    tls_channel_binding: &PostgresqlTlsChannelBinding,
+) -> Result<PostgresqlSessionBinding, String> {
+    validate_postgresql_session_binding(
+        raw,
+        application_name,
+        &contract.expected,
+        &contract.application,
+        tls_channel_binding,
+    )
 }
 
 fn observation_contract_error(message: impl Into<String>) -> PostgresqlRuntimeObservationError {
@@ -2576,10 +2719,11 @@ async fn read_postgresql_runtime_facts(
     })
 }
 
-async fn read_postgresql_migration_session_binding(
+async fn read_postgresql_session_binding(
     connection: &mut PgConnection,
     application_name: &str,
-    contract: &MigrationRoleContract,
+    expected_role: &str,
+    counterpart_role: &str,
     tls_channel_binding: &PostgresqlTlsChannelBinding,
 ) -> Result<PostgresqlSessionBinding, String> {
     let row = sqlx::query(
@@ -2634,7 +2778,7 @@ async fn read_postgresql_migration_session_binding(
             "exact pg_stat_activity/pg_stat_ssl backend row could not be read",
         )
     })?;
-    let raw = RawPostgresqlMigrationSessionBinding {
+    let raw = RawPostgresqlSessionBinding {
         server_version_num: row
             .try_get("server_version_num")
             .map_err(|_| migration_session_contract_error("server_version_num is invalid"))?,
@@ -2711,18 +2855,68 @@ async fn read_postgresql_migration_session_binding(
             .try_get("issuer_distinguished_name")
             .map_err(|_| migration_session_contract_error("TLS issuer DN is invalid"))?,
     };
-    validate_postgresql_migration_session_binding(
+    validate_postgresql_session_binding(
         raw,
         application_name,
-        contract,
+        expected_role,
+        counterpart_role,
         tls_channel_binding,
     )
+}
+
+async fn read_postgresql_migration_session_binding(
+    connection: &mut PgConnection,
+    application_name: &str,
+    contract: &MigrationRoleContract,
+    tls_channel_binding: &PostgresqlTlsChannelBinding,
+) -> Result<PostgresqlSessionBinding, String> {
+    read_postgresql_session_binding(
+        connection,
+        application_name,
+        &contract.expected,
+        &contract.application,
+        tls_channel_binding,
+    )
+    .await
+}
+
+fn require_session_observation_match(
+    session: &PostgresqlSessionBinding,
+    observation: &PostgresqlRuntimeObservation,
+) -> Result<(), PostgresqlRuntimeObservationError> {
+    if session.database_name != observation.database_name
+        || session.database_oid != observation.database_oid
+        || session.server_address != observation.server_address.to_string()
+        || session.server_port != observation.server_port
+        || session.server_major_version != observation.server_major_version
+        || session.primary != observation.primary
+        || session.transaction_writable != observation.transaction_writable
+        || session.default_transaction_writable != observation.default_transaction_writable
+        || session.current_role != observation.application_role
+        || session.selected_role != observation.application_role
+        || session.session_login_role != observation.session_login_role
+        || session.tls_protocol != observation.tls.protocol.to_ascii_lowercase()
+        || session.tls_cipher_suite != observation.tls.cipher.to_ascii_lowercase()
+        || session.tls_cipher_bits != observation.tls.bits
+        || session.client_distinguished_name != observation.tls.client_distinguished_name
+        || session.issuer_distinguished_name != observation.tls.issuer_distinguished_name
+    {
+        return Err(observation_contract_error(
+            "exact PostgreSQL session differs from the co-transactional runtime observation",
+        ));
+    }
+    Ok(())
 }
 
 async fn observe_postgresql_runtime(
     pool: &PgPool,
     roles: &ProductionDatabaseRoles,
-) -> Result<PostgresqlRuntimeObservation, PostgresqlRuntimeObservationError> {
+    application_name: &str,
+    tls_channel_binding: &PostgresqlTlsChannelBinding,
+) -> Result<
+    (PostgresqlRuntimeObservation, PostgresqlSessionBinding),
+    PostgresqlRuntimeObservationError,
+> {
     let mut connection = pool
         .acquire()
         .await
@@ -2750,6 +2944,15 @@ async fn observe_postgresql_runtime(
         attest_application_connection(&mut transaction, &roles.application_contract())
             .await
             .map_err(PostgresqlRuntimeObservationError::Database)?;
+        let session = read_postgresql_session_binding(
+            &mut transaction,
+            application_name,
+            roles.application_role(),
+            roles.migration_role(),
+            tls_channel_binding,
+        )
+        .await
+        .map_err(observation_contract_error)?;
         let raw = read_postgresql_runtime_facts(&mut transaction)
             .await
             .map_err(PostgresqlRuntimeObservationError::Database)?;
@@ -2764,17 +2967,19 @@ async fn observe_postgresql_runtime(
             ))
         })?;
         let migration_ledger = validate_observed_migration_ledger(ledger_rows)?;
-        validate_postgresql_runtime_facts(raw, roles, migration_ledger)
+        let observation = validate_postgresql_runtime_facts(raw, roles, migration_ledger)?;
+        require_session_observation_match(&session, &observation)?;
+        Ok((observation, session))
     }
     .await;
 
     match result {
-        Ok(observation) => {
+        Ok(measurement) => {
             transaction
                 .commit()
                 .await
                 .map_err(PostgresqlRuntimeObservationError::Database)?;
-            Ok(observation)
+            Ok(measurement)
         }
         Err(error) => {
             let _ = transaction.rollback().await;
@@ -6939,20 +7144,34 @@ async fn build_application_pool_inner(
         .await
 }
 
-/// Connect, attest, and measure a production PostgreSQL pool without making it
-/// visible to request handlers, repositories, workers, or `get_db()`. The
-/// returned wrapper must remain unpublished until the complete production
-/// runtime admission has consumed a retained handle for this exact allocation.
-pub async fn construct_unpublished_production_database(
+/// Establish one independently measured direct TLS channel, bind SQLx's only
+/// serving connection to that exact stream, and measure the application-role
+/// backend without publishing it to request handlers, workers, or `get_db()`.
+/// The fresh request context is purpose-bound before it reaches the TLS
+/// exporter; the request tag is then derived from the observed channel rather
+/// than from caller-supplied connection metadata.
+pub(crate) async fn construct_unpublished_channel_bound_production_database(
     url: &str,
     settings: ApplicationPoolSettings,
     roles: ProductionDatabaseRoles,
+    database_provider: ProductionDatabaseProvider,
+    expected_route_digest: &str,
+    request_context: &[u8; 32],
 ) -> Result<UnpublishedPostgresqlRuntime, PostgresqlRuntimeObservationError> {
     if database_publication_decided() {
         return Err(observation_contract_error(
             "a database publication decision already exists before production observation",
         ));
     }
+    if request_context.iter().all(|byte| *byte == 0) {
+        return Err(observation_contract_error(
+            "the application-serving PostgreSQL request context is not fresh",
+        ));
+    }
+    let target = production_postgresql_target(url).map_err(observation_contract_error)?;
+    let exact_pool_settings = settings
+        .exact_channel_settings()
+        .map_err(observation_contract_error)?;
     if PRODUCTION_DATABASE_CONSTRUCTION_CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -6961,28 +7180,76 @@ pub async fn construct_unpublished_production_database(
             "production database construction was already claimed for this process",
         ));
     }
+    let exporter_context = postgresql_tls_exporter_context(
+        request_context,
+        PostgresqlSessionPurpose::ApplicationServing,
+    );
+    let established = target
+        .establish(database_provider, expected_route_digest, &exporter_context)
+        .await
+        .map_err(|error| observation_contract_error(error.to_string()))?;
+    let channel_digest = postgresql_tls_channel_binding_digest(established.binding())
+        .map_err(|error| observation_contract_error(error.to_string()))?;
+    let application_name = postgresql_attestation_request_tag(request_context, &channel_digest);
+    let tls_channel_binding = established.binding().clone();
     let roles = Arc::new(roles);
     let connection_binding = Arc::new(ProductionDatabaseConnectionBinding::new(roles.clone()));
-    let pool = Arc::new(
-        build_application_pool_inner(url, settings, None, Some(connection_binding.clone()))
+    let initialization_binding = connection_binding.clone();
+    let channel = established
+        .connect_sqlx_pool(&application_name, exact_pool_settings, move |connection| {
+            let binding = initialization_binding.clone();
+            Box::pin(async move {
+                use sqlx::Executor;
+                connection
+                    .execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'")
+                    .await?;
+                attest_and_bind_production_connection(connection, binding.as_ref()).await
+            })
+        })
+        .await
+        .map_err(|error| observation_contract_error(error.to_string()))?;
+    if !channel.exact_channel_is_active()
+        || !channel.matches_binding(&tls_channel_binding)
+        || channel.settings() != exact_pool_settings
+    {
+        channel.close_hard().await;
+        set_migration_status(MigrationStatus::Failed);
+        return Err(observation_contract_error(
+            "the exact PostgreSQL serving relay changed before runtime observation",
+        ));
+    }
+    let pool = channel.pool().clone();
+    let (observation, session_binding) =
+        match observe_postgresql_runtime(&pool, &roles, &application_name, &tls_channel_binding)
             .await
-            .map_err(PostgresqlRuntimeObservationError::Database)?,
-    );
-    let observation = match observe_postgresql_runtime(&pool, &roles).await {
-        Ok(observation) => observation,
-        Err(error) => {
-            pool.close().await;
-            set_migration_status(MigrationStatus::Failed);
-            return Err(error);
-        }
-    };
+        {
+            Ok(measurement) => measurement,
+            Err(error) => {
+                channel.close_hard().await;
+                set_migration_status(MigrationStatus::Failed);
+                return Err(error);
+            }
+        };
     if let Err(error) = connection_binding.require_match(&observation) {
-        pool.close().await;
+        channel.close_hard().await;
         set_migration_status(MigrationStatus::Failed);
         return Err(error);
     }
+    if !channel.exact_channel_is_active()
+        || !channel.pool_ptr_eq(&pool)
+        || !channel.matches_binding(&session_binding.tls_channel_binding)
+    {
+        channel.close_hard().await;
+        set_migration_status(MigrationStatus::Failed);
+        return Err(observation_contract_error(
+            "the exact PostgreSQL serving relay changed while sealing the runtime",
+        ));
+    }
     set_migration_status(MigrationStatus::Applied);
+    let channel_owner: Arc<dyn RetainedPostgresqlChannelOwner> = Arc::new(channel);
     let retained = RetainedPostgresqlRuntime {
+        channel_owner,
+        session_binding: Arc::new(session_binding),
         pool,
         observation: Arc::new(observation),
         roles,
@@ -9122,16 +9389,16 @@ async fn apply_embedded_production_migrations(
     // Reject an unreviewed production timeout profile before DNS, TLS, or
     // database authentication touches the selected target.
     production_migration_preflight_timeouts(timeouts).map_err(MigrationRunError::Admission)?;
-    let target = production_migration_target(url).map_err(MigrationRunError::Target)?;
+    let target = production_postgresql_target(url).map_err(MigrationRunError::Target)?;
     let (database_provider, expected_route_digest) = pending
         .database_provider_and_route_digest()
         .map_err(MigrationRunError::Admission)?;
+    let exporter_context = postgresql_tls_exporter_context(
+        pending.tls_exporter_context(),
+        PostgresqlSessionPurpose::Migration,
+    );
     let established = target
-        .establish(
-            database_provider,
-            expected_route_digest,
-            pending.tls_exporter_context(),
-        )
+        .establish(database_provider, expected_route_digest, &exporter_context)
         .await
         .map_err(|error| MigrationRunError::Target(error.to_string()))?;
     let application_name = pending
@@ -9519,6 +9786,100 @@ mod tests {
         }
     }
 
+    struct TestRetainedPostgresqlChannelOwner {
+        pool: std::sync::Arc<sqlx::PgPool>,
+        binding: ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding,
+        active: std::sync::atomic::AtomicBool,
+    }
+
+    impl super::RetainedPostgresqlChannelOwner for TestRetainedPostgresqlChannelOwner {
+        fn pool(&self) -> &std::sync::Arc<sqlx::PgPool> {
+            &self.pool
+        }
+
+        fn binding(&self) -> &ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding {
+            &self.binding
+        }
+
+        fn exact_channel_is_active(&self) -> bool {
+            self.active.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    fn test_tls_channel_binding(
+    ) -> ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding {
+        fn digest(character: char) -> String {
+            format!("sha256:{}", character.to_string().repeat(64))
+        }
+
+        ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding {
+            provider_route_binding_digest: digest('1'),
+            server_name: "postgres.example.test".into(),
+            peer_address: "192.0.2.10".into(),
+            peer_port: 5432,
+            trust_anchor_bundle_digest: digest('2'),
+            peer_leaf_certificate_digest: digest('3'),
+            peer_certificate_chain_digest: digest('4'),
+            exporter_digest: digest('5'),
+            tls_protocol: "tlsv1.3".into(),
+            tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
+            tls_cipher_bits: 256,
+        }
+    }
+
+    fn test_session_binding(
+        observation: &super::PostgresqlRuntimeObservation,
+        tls_channel_binding: ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding,
+    ) -> ryuki_core::postgresql_infrastructure::PostgresqlSessionBinding {
+        ryuki_core::postgresql_infrastructure::PostgresqlSessionBinding {
+            application_name: format!("ryuki-pg-attest-v2-{}", "a".repeat(40)),
+            database_name: observation.database_name.clone(),
+            database_oid: observation.database_oid,
+            datid: observation.database_oid,
+            server_address: observation.server_address.to_string(),
+            server_port: observation.server_port,
+            server_major_version: observation.server_major_version,
+            primary: observation.primary,
+            transaction_writable: observation.transaction_writable,
+            default_transaction_writable: observation.default_transaction_writable,
+            client_address: "192.0.2.20".into(),
+            client_port: 43_210,
+            backend_process_id: 42,
+            backend_start: chrono::Utc::now(),
+            backend_type: "client backend".into(),
+            session_login_role: observation.session_login_role.clone(),
+            session_user_oid: 16_385,
+            current_role: observation.application_role.clone(),
+            selected_role: observation.application_role.clone(),
+            tls_enabled: true,
+            tls_protocol: observation.tls.protocol.to_ascii_lowercase(),
+            tls_cipher_suite: observation.tls.cipher.to_ascii_lowercase(),
+            tls_cipher_bits: observation.tls.bits,
+            client_distinguished_name: observation.tls.client_distinguished_name.clone(),
+            issuer_distinguished_name: observation.tls.issuer_distinguished_name.clone(),
+            tls_channel_binding,
+        }
+    }
+
+    fn test_channel_owner(
+        pool: std::sync::Arc<sqlx::PgPool>,
+        binding: ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding,
+    ) -> std::sync::Arc<dyn super::RetainedPostgresqlChannelOwner> {
+        test_channel_owner_with_active(pool, binding, true)
+    }
+
+    fn test_channel_owner_with_active(
+        pool: std::sync::Arc<sqlx::PgPool>,
+        binding: ryuki_core::postgresql_infrastructure::PostgresqlTlsChannelBinding,
+        active: bool,
+    ) -> std::sync::Arc<dyn super::RetainedPostgresqlChannelOwner> {
+        std::sync::Arc::new(TestRetainedPostgresqlChannelOwner {
+            pool,
+            binding,
+            active: std::sync::atomic::AtomicBool::new(active),
+        })
+    }
+
     fn durable_postgresql_verification_fixture() -> (
         super::UnpublishedPostgresqlRuntime,
         std::sync::Arc<TestVerifiedPostgresqlInfrastructureEvidence>,
@@ -9569,12 +9930,21 @@ mod tests {
             .into_boxed_slice(),
         });
         let roles = std::sync::Arc::new(roles);
+        let pool = std::sync::Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgresql://placeholder@example.invalid/ryuki")
+                .unwrap(),
+        );
+        let tls_channel_binding = test_tls_channel_binding();
+        let session_binding = std::sync::Arc::new(test_session_binding(
+            observation.as_ref(),
+            tls_channel_binding.clone(),
+        ));
+        let channel_owner = test_channel_owner(pool.clone(), tls_channel_binding);
         let retained = super::RetainedPostgresqlRuntime {
-            pool: std::sync::Arc::new(
-                sqlx::postgres::PgPoolOptions::new()
-                    .connect_lazy("postgresql://placeholder@example.invalid/ryuki")
-                    .unwrap(),
-            ),
+            channel_owner,
+            session_binding,
+            pool,
             observation,
             roles: roles.clone(),
             connection_binding: std::sync::Arc::new(
@@ -9725,7 +10095,7 @@ mod tests {
 
     #[test]
     fn production_migration_url_requires_one_dns_tls_target() {
-        let target = super::production_migration_target(
+        let target = super::production_postgresql_target(
             "postgresql://ephemeral_login:fixture%2Dvalue@postgresql.database.svc:6432/ryuki?sslmode=verify-full&sslrootcert=/var/run/ryuki/postgresql-ca.pem",
         )
         .expect("canonical DNS target with explicit credential, port, database, and CA");
@@ -9761,7 +10131,7 @@ mod tests {
             "postgresql://login:fixture@postgresql.database.svc:5432/ryuki?sslmode=verify-full&sslmode=disable&sslrootcert=/ca.pem",
         ] {
             assert!(
-                super::production_migration_target(invalid).is_err(),
+                super::production_postgresql_target(invalid).is_err(),
                 "unsafe migration target was accepted: {invalid}"
             );
         }
@@ -10138,8 +10508,8 @@ mod tests {
             }
         }
 
-        fn valid_raw() -> super::RawPostgresqlMigrationSessionBinding {
-            super::RawPostgresqlMigrationSessionBinding {
+        fn valid_raw() -> super::RawPostgresqlSessionBinding {
+            super::RawPostgresqlSessionBinding {
                 server_version_num: 180_002,
                 database_name: "ryuki".into(),
                 database_oid: 16_384,
@@ -10156,7 +10526,8 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
                 backend_type: "client backend".into(),
-                application_name: "ryuki-pg-attest-0123456789abcdef0123456789abcdef01234567".into(),
+                application_name: "ryuki-pg-attest-v2-0123456789abcdef0123456789abcdef01234567"
+                    .into(),
                 session_login_role: "ryuki_login_20260720".into(),
                 session_user_oid: Some(32_768),
                 current_role: "ryuki_schema_migrator".into(),
@@ -10170,7 +10541,7 @@ mod tests {
             }
         }
 
-        let tag = "ryuki-pg-attest-0123456789abcdef0123456789abcdef01234567";
+        let tag = "ryuki-pg-attest-v2-0123456789abcdef0123456789abcdef01234567";
         let contract = super::MigrationRoleContract::from_values(
             "ryuki_schema_migrator".into(),
             "ryuki_app_runtime".into(),
@@ -10191,6 +10562,36 @@ mod tests {
                 .is_ok()
         );
 
+        let mut application_raw = valid_raw();
+        application_raw.current_role = "ryuki_app_runtime".into();
+        application_raw.selected_role = "ryuki_app_runtime".into();
+        let application_binding = super::validate_postgresql_session_binding(
+            application_raw,
+            tag,
+            "ryuki_app_runtime",
+            "ryuki_schema_migrator",
+            &channel,
+        )
+        .expect("exact application-serving backend session");
+        assert_eq!(application_binding.current_role, "ryuki_app_runtime");
+        assert_eq!(application_binding.selected_role, "ryuki_app_runtime");
+        assert_ne!(
+            application_binding.session_login_role,
+            application_binding.current_role
+        );
+
+        assert!(
+            super::validate_postgresql_session_binding(
+                valid_raw(),
+                tag,
+                "ryuki_app_runtime",
+                "ryuki_schema_migrator",
+                &channel,
+            )
+            .is_err(),
+            "a migration-role session cannot satisfy the application-serving purpose"
+        );
+
         let mut dnat_channel = valid_channel();
         dnat_channel.peer_address = "192.0.2.11".into();
         assert!(
@@ -10206,7 +10607,7 @@ mod tests {
 
         let mut wrong_tag = valid_raw();
         wrong_tag.application_name =
-            "ryuki-pg-attest-ffffffffffffffffffffffffffffffffffffffff".into();
+            "ryuki-pg-attest-v2-ffffffffffffffffffffffffffffffffffffffff".into();
         assert!(super::validate_postgresql_migration_session_binding(
             wrong_tag, tag, &contract, &channel,
         )
@@ -10597,7 +10998,15 @@ mod tests {
                 .connect_lazy("postgresql://placeholder@example.invalid/debug-db")
                 .unwrap(),
         );
+        let tls_channel_binding = test_tls_channel_binding();
+        let session_binding = std::sync::Arc::new(test_session_binding(
+            observation.as_ref(),
+            tls_channel_binding.clone(),
+        ));
+        let channel_owner = test_channel_owner(pool.clone(), tls_channel_binding);
         let retained = super::RetainedPostgresqlRuntime {
+            channel_owner,
+            session_binding,
             pool,
             observation: observation.clone(),
             roles: std::sync::Arc::new(roles.clone()),
@@ -10612,12 +11021,52 @@ mod tests {
                 .unwrap(),
         );
         let foreign = super::RetainedPostgresqlRuntime {
+            channel_owner: retained.channel_owner.clone(),
+            session_binding: retained.session_binding.clone(),
             pool: foreign_pool,
             observation: observation.clone(),
             roles: retained.roles.clone(),
             connection_binding: retained.connection_binding.clone(),
         };
         assert!(!retained.same_runtime(&foreign));
+
+        let substituted_session = super::RetainedPostgresqlRuntime {
+            channel_owner: retained.channel_owner.clone(),
+            session_binding: std::sync::Arc::new((*retained.session_binding).clone()),
+            pool: retained.pool.clone(),
+            observation: retained.observation.clone(),
+            roles: retained.roles.clone(),
+            connection_binding: retained.connection_binding.clone(),
+        };
+        assert!(!retained.same_runtime(&substituted_session));
+
+        let substituted_owner = super::RetainedPostgresqlRuntime {
+            channel_owner: test_channel_owner(
+                retained.pool.clone(),
+                retained.session_binding.tls_channel_binding.clone(),
+            ),
+            session_binding: retained.session_binding.clone(),
+            pool: retained.pool.clone(),
+            observation: retained.observation.clone(),
+            roles: retained.roles.clone(),
+            connection_binding: retained.connection_binding.clone(),
+        };
+        assert!(!retained.same_runtime(&substituted_owner));
+        assert!(substituted_owner.retained_channel_is_exact_and_active());
+
+        let inactive_owner = super::RetainedPostgresqlRuntime {
+            channel_owner: test_channel_owner_with_active(
+                retained.pool.clone(),
+                retained.session_binding.tls_channel_binding.clone(),
+                false,
+            ),
+            session_binding: retained.session_binding.clone(),
+            pool: retained.pool.clone(),
+            observation: retained.observation.clone(),
+            roles: retained.roles.clone(),
+            connection_binding: retained.connection_binding.clone(),
+        };
+        assert!(!inactive_owner.retained_channel_is_exact_and_active());
         let debug = format!("{roles:?} {observation:?} {retained:?}");
         for forbidden in [
             "ryuki_app_runtime",
@@ -10651,10 +11100,11 @@ mod tests {
         assert!(verified
             .runtime()
             .same_runtime(&unpublished.retained_handle()));
+        assert!(verified.retains_runtime(&unpublished.retained_handle()));
         assert_eq!(verified.observed_value(), &expected);
         let _freshness_api = super::VerifiedLocalDurablePostgresqlRuntime::remeasure_exact;
         verified
-            .recheck_retained_projection()
+            .recheck_integrity()
             .expect("retained evidence and digest projections must remain exact");
 
         let debug = format!("{verified:?}");
@@ -10676,7 +11126,7 @@ mod tests {
             .valid
             .store(false, std::sync::atomic::Ordering::Release);
         assert!(matches!(
-            verified.recheck_retained_projection(),
+            verified.recheck_integrity(),
             Err(super::DurablePostgresqlRuntimeVerificationError::InfrastructureEvidenceInvalid)
         ));
     }
@@ -10714,6 +11164,21 @@ mod tests {
         assert!(matches!(
             super::verify_local_durable_postgresql_runtime(&unpublished, evidence, &wrong_kind),
             Err(super::DurablePostgresqlRuntimeVerificationError::ExpectedGuardKind)
+        ));
+
+        let (mut unpublished, evidence, expected) = durable_postgresql_verification_fixture();
+        unpublished.retained.channel_owner = test_channel_owner_with_active(
+            unpublished.retained.pool.clone(),
+            unpublished
+                .retained
+                .session_binding
+                .tls_channel_binding
+                .clone(),
+            false,
+        );
+        assert!(matches!(
+            super::verify_local_durable_postgresql_runtime(&unpublished, evidence, &expected),
+            Err(super::DurablePostgresqlRuntimeVerificationError::ExactChannelInvalid)
         ));
     }
 

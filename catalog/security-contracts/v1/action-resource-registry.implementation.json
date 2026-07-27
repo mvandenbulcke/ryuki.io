@@ -23,25 +23,25 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:d478d31b70ae48727395a17344694a7c3c4341c64353cb67dc85d47185e59e15",
+        "content_digest": "sha256:0899f19b4321c6743cecf1084dfb97d3e83b72146da1ca2cd41e37f7d84a0610",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
         "document_id": "source:ryuki-api-build-identity",
         "document_version": 1,
-        "content_digest": "sha256:ced065254830453ff999fd824018dbc997caf6e6594c917f72acdc7e85cef995",
+        "content_digest": "sha256:24acf2334d6864930d51fe8a089488b46a4d18298487ec8005d0b3f7d284b005",
         "artifact_locator": "sources/ryuki-api/src/build_identity.rs"
       },
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:ae1eb9c5fec8161f76b2eba0dec2466a0db28bc1a8570c631574858c78f707f8",
+        "content_digest": "sha256:60050c941e85461271bd7ae8c958f21b6cd9b006a3b593507d5242e97f49f199",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
         "document_id": "source:ryuki-api-scheduler",
         "document_version": 1,
-        "content_digest": "sha256:3adf2a11c56e5b662f30d907be54db663a3b8db2f35da74fad26f8ea9ec33845",
+        "content_digest": "sha256:65c068a5d122e19c9f1285e952173d8a7691fbb88a9fff749cae9f375ece54db",
         "artifact_locator": "sources/ryuki-api/src/scheduler.rs"
       },
       {
@@ -53,7 +53,7 @@
       {
         "document_id": "source:ryuki-api-request-authority",
         "document_version": 1,
-        "content_digest": "sha256:b895b27682ead1802329589c6723f38cc48026ca40b9fdddaba3781ed69b789f",
+        "content_digest": "sha256:0fb16491ed4752467cb0c7c3dfa623f5c46c2695291de2cd3b2bd9388e338288",
         "artifact_locator": "sources/ryuki-api/src/request_authority.rs"
       },
       {
@@ -77,8 +77,14 @@
       {
         "document_id": "source:ryuki-api-database-boundary",
         "document_version": 1,
-        "content_digest": "sha256:77eece414d06252d3b648cce95ddc24f38be16f594cd944bc12ea95dae6d753f",
+        "content_digest": "sha256:bef9246e05078e671b43062bca6a139796d7c59d6637cf7be9f9055029598ef4",
         "artifact_locator": "sources/ryuki-api/src/database.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-postgresql-tls-channel",
+        "document_version": 1,
+        "content_digest": "sha256:22285303f9be7c977f154cceb7c1a7d87af23ceaf5562f51a88aa580edb96f01",
+        "artifact_locator": "sources/ryuki-api/src/postgresql_tls_channel.rs"
       },
       {
         "document_id": "source:ryuki-api-audit-repository",
@@ -89,20 +95,26 @@
       {
         "document_id": "source:ryuki-api-entra-auth",
         "document_version": 1,
-        "content_digest": "sha256:9c166a70acf32a599d7d6f8735a1fe4f93e9c65384d9f499bad110064c2b6f52",
+        "content_digest": "sha256:87aa08b37277ef2176c6e3709dba0251d296c61c5c0a7f7de8a2c2033a624782",
         "artifact_locator": "sources/ryuki-api/src/entra_auth.rs"
       },
       {
         "document_id": "source:ryuki-api-identity-authority",
         "document_version": 1,
-        "content_digest": "sha256:09fa645d2c3d85ef9320252e1b8989a5509eeefd77428dbb32226a42e33cc5bc",
+        "content_digest": "sha256:db42b112cfbf298170c52249db857e419c4946e0c4ad5641f1fc2e795d3d14ad",
         "artifact_locator": "sources/ryuki-api/src/identity_authority.rs"
       },
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:b0665db3747a0f701658af2da117ec5c89cb8aab5aff10910a27de743369699d",
+        "content_digest": "sha256:12a0f94b993261fc59620fedbc3c3e24e6430e6af99bc092c9b9df160029b59d",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
+      },
+      {
+        "document_id": "source:ryuki-core-postgresql-infrastructure",
+        "document_version": 1,
+        "content_digest": "sha256:3b3738a149a9176be6e77e29db5c60c08303f08c3ff5eb696d83a8e6a10f7b43",
+        "artifact_locator": "sources/ryuki-core/src/postgresql_infrastructure.rs"
       },
       {
         "document_id": "source:ryuki-engine-authorization-kernel",

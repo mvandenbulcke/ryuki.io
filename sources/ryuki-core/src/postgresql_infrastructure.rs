@@ -7,11 +7,12 @@
 //! and accepts only a short-lived, domain-separated Ed25519 response from an
 //! independently pinned PostgreSQL infrastructure authority.
 //!
-//! The request commits to the exact receipt-bound `durable-postgresql` value
-//! and to a caller-measured PostgreSQL backend session. The response must carry
-//! that complete session preimage, the complete database-identity preimage,
-//! and the strictly ordered durable-storage preimages. The verifier recomputes
-//! every digest before minting a non-cloneable proof.
+//! The request commits to the exact receipt-bound `durable-postgresql` value,
+//! an explicit migration or application-serving purpose, and a caller-measured
+//! PostgreSQL backend session. The response must carry that complete session
+//! preimage, the complete database-identity preimage, and the strictly ordered
+//! durable-storage preimages. The verifier recomputes every digest and enforces
+//! the purpose-selected role before minting a non-cloneable proof.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -33,18 +34,19 @@ use crate::security_profile::{
     postgresql_storage_binding_digest, valid_canonical_scoped_id,
 };
 
-pub const POSTGRESQL_INFRASTRUCTURE_PROTOCOL_VERSION: &str = "1.0.0";
+pub const POSTGRESQL_INFRASTRUCTURE_PROTOCOL_VERSION: &str = "2.0.0";
 pub const POSTGRESQL_INFRASTRUCTURE_REQUEST_DOMAIN: &str =
-    "ryuki-v1/postgresql-infrastructure-attestation-request";
+    "ryuki-v2/postgresql-infrastructure-attestation-request";
 pub const POSTGRESQL_INFRASTRUCTURE_RESPONSE_DOMAIN: &str =
-    "ryuki-v1/postgresql-infrastructure-attestation-response";
-pub const POSTGRESQL_SESSION_BINDING_DIGEST_CONTRACT: &str = "ryuki-postgresql-session-binding-v1";
+    "ryuki-v2/postgresql-infrastructure-attestation-response";
+pub const POSTGRESQL_SESSION_BINDING_DIGEST_CONTRACT: &str = "ryuki-postgresql-session-binding-v2";
 pub const POSTGRESQL_TLS_CHANNEL_BINDING_DIGEST_CONTRACT: &str =
-    "ryuki-postgresql-tls-channel-binding-v1";
+    "ryuki-postgresql-tls-channel-binding-v2";
+pub const POSTGRESQL_TLS_EXPORTER_CONTEXT_DOMAIN: &str = "ryuki-v2/postgresql-tls-exporter-context";
 pub const POSTGRESQL_TLS_EXPORTER_LABEL: &[u8] =
-    b"EXPORTER-ryuki-postgresql-migration-direct-session-v1";
+    b"EXPORTER-ryuki-postgresql-purpose-bound-direct-session-v2";
 pub const POSTGRESQL_TLS_CHANNEL_VERIFICATION_METHOD: &str =
-    "provider-tls-endpoint-exporter-direct-session-v1";
+    "provider-tls-endpoint-exporter-direct-session-v2";
 pub const MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES: usize = 32 * 1024;
 pub const MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -54,7 +56,7 @@ const REQUEST_OPERATION: &str = "attest_postgresql_infrastructure";
 const CANONICALIZATION: &str = "ryuki-canonical-json-v1";
 const SIGNATURE_ALGORITHM: &str = "ed25519";
 const GUARD_ID: &str = "durable-postgresql";
-const MEASUREMENT_METHOD: &str = "provider-control-plane-postgresql-direct-session-v1";
+const MEASUREMENT_METHOD: &str = "provider-control-plane-postgresql-direct-session-v2";
 const MAX_ATTESTATION_LIFETIME_SECONDS: i64 = 300;
 const MAX_SESSION_AGE_SECONDS: i64 = 300;
 const MAX_JSON_DEPTH: usize = 16;
@@ -62,7 +64,7 @@ const MAX_JSON_NODES: usize = 1024;
 const MAX_JSON_COLLECTION_ITEMS: usize = 128;
 const MAX_JSON_STRING_BYTES: usize = 4096;
 const MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_991;
-const REQUEST_TAG_PREFIX: &str = "ryuki-pg-attest-";
+const REQUEST_TAG_PREFIX: &str = "ryuki-pg-attest-v2-";
 const AUTHORITY_ID_PREFIX: &str = "postgresql-infrastructure-attestation-authority:";
 const AUTHORITY_KEY_ID_PREFIX: &str = "postgresql-infrastructure-attestation-key:";
 
@@ -88,12 +90,7 @@ pub struct PostgresqlInfrastructureAuthorityAnchor<'a> {
     pub attestation_profile_digest: &'a str,
 }
 
-/// Exact SQL-visible and independently observable identity of the migration
-/// backend session selected for one attestation request.
-///
-/// `application_name` is the nonce-derived request tag returned by
-/// [`postgresql_attestation_request_tag`]. Raw connection strings and secrets
-/// are deliberately absent.
+/// Exact caller-observed TLS channel selected for one attestation request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresqlTlsChannelBinding {
@@ -127,6 +124,12 @@ pub fn postgresql_tls_channel_binding_digest(
     Ok(sha256_digest(&canonical))
 }
 
+/// Exact SQL-visible and independently observable identity of the purpose-bound
+/// backend session selected for one attestation request.
+///
+/// `application_name` is the nonce-derived request tag returned by
+/// [`postgresql_attestation_request_tag`]. Raw connection strings and secrets
+/// are deliberately absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresqlSessionBinding {
@@ -158,6 +161,41 @@ pub struct PostgresqlSessionBinding {
     pub tls_channel_binding: PostgresqlTlsChannelBinding,
 }
 
+/// Stable semantic purpose of the PostgreSQL session being independently
+/// attested. This selects which receipt-bound role the session must have
+/// activated without weakening login-role separation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PostgresqlSessionPurpose {
+    Migration,
+    ApplicationServing,
+}
+
+/// Derives the exact purpose-bound context supplied to the TLS 1.3 exporter.
+///
+/// The nonce is length-framed alongside the v2 domain and the stable serialized
+/// purpose token before hashing. Nonce freshness and nonzero validation remain
+/// the responsibility of the one-shot attestation-request builder.
+pub fn postgresql_tls_exporter_context(
+    request_nonce: &[u8; 32],
+    session_purpose: PostgresqlSessionPurpose,
+) -> [u8; 32] {
+    let purpose = match session_purpose {
+        PostgresqlSessionPurpose::Migration => b"migration".as_slice(),
+        PostgresqlSessionPurpose::ApplicationServing => b"application-serving".as_slice(),
+    };
+    let mut preimage = Vec::with_capacity(
+        POSTGRESQL_TLS_EXPORTER_CONTEXT_DOMAIN.len() + request_nonce.len() + purpose.len() + 24,
+    );
+    write_frame(
+        &mut preimage,
+        POSTGRESQL_TLS_EXPORTER_CONTEXT_DOMAIN.as_bytes(),
+    );
+    write_frame(&mut preimage, request_nonce);
+    write_frame(&mut preimage, purpose);
+    Sha256::digest(preimage).into()
+}
+
 /// Exact semantic, workload, guard, and receipt-bound facts selected by the
 /// caller. The session preimage is retained only by the one-shot request; the
 /// canonical request sent to the authority carries its digest and request tag.
@@ -179,6 +217,7 @@ pub struct ExpectedPostgresqlInfrastructure<'a> {
     pub migration_inventory_digest: &'a str,
     pub application_role: &'a str,
     pub migration_role: &'a str,
+    pub session_purpose: PostgresqlSessionPurpose,
     pub session_binding: &'a PostgresqlSessionBinding,
 }
 
@@ -225,6 +264,7 @@ struct ExpectedInfrastructureBinding {
     migration_inventory_digest: String,
     application_role: String,
     migration_role: String,
+    session_purpose: PostgresqlSessionPurpose,
     session_request_tag: String,
     session_binding_digest: String,
     tls_channel_binding_digest: String,
@@ -252,6 +292,7 @@ impl fmt::Debug for PostgresqlInfrastructureAttestationRequest {
             .debug_struct("PostgresqlInfrastructureAttestationRequest")
             .field("digest", &self.digest)
             .field("requested_at", &self.requested_at)
+            .field("session_purpose", &self.expected.session_purpose)
             .field("request_tag", &self.expected.session_request_tag)
             .field("byte_len", &self.canonical_bytes.len())
             .finish_non_exhaustive()
@@ -365,6 +406,7 @@ pub fn build_postgresql_infrastructure_attestation_request(
         migration_inventory_digest: expected.migration_inventory_digest.to_owned(),
         application_role: expected.application_role.to_owned(),
         migration_role: expected.migration_role.to_owned(),
+        session_purpose: expected.session_purpose,
         session_request_tag: request_tag,
         session_binding_digest: postgresql_session_binding_digest(expected.session_binding)?,
         tls_channel_binding_digest,
@@ -500,6 +542,7 @@ impl fmt::Debug for VerifiedPostgresqlInfrastructureAttestation {
                 &self.response.authority.authority_revision,
             )
             .field("measurement_sequence", &self.response.measurement.sequence)
+            .field("session_purpose", &self.response.expected.session_purpose)
             .field("valid_until", &self.response.measurement.valid_until)
             .field(
                 "storage_binding_count",
@@ -662,6 +705,10 @@ impl VerifiedPostgresqlInfrastructureAttestation {
 
     pub fn migration_role(&self) -> &str {
         &self.response.expected.migration_role
+    }
+
+    pub fn session_purpose(&self) -> PostgresqlSessionPurpose {
+        self.response.expected.session_purpose
     }
 
     pub fn request_tag(&self) -> &str {
@@ -866,20 +913,25 @@ fn validate_expected(
         ));
     }
     validate_session_binding(expected.session_binding)?;
+    let selected_role = selected_role_for_purpose(
+        expected.session_purpose,
+        expected.application_role,
+        expected.migration_role,
+    );
     if expected.session_binding.server_major_version != expected.server_major_version
         || expected
             .session_binding
             .tls_channel_binding
             .provider_route_binding_digest
             != expected.provider_route_binding_digest
-        || expected.session_binding.current_role != expected.migration_role
-        || expected.session_binding.selected_role != expected.migration_role
+        || expected.session_binding.current_role != selected_role
+        || expected.session_binding.selected_role != selected_role
         || expected.session_binding.session_login_role == expected.application_role
         || expected.session_binding.session_login_role == expected.migration_role
         || expected.session_binding.session_login_role == "postgres"
     {
         return Err(invalid(
-            "PostgreSQL session does not satisfy the receipt-bound route and migration-role contract",
+            "PostgreSQL session does not satisfy the receipt-bound route and purpose-selected role contract",
         ));
     }
     Ok(())
@@ -1098,16 +1150,22 @@ fn validate_self_consistent_response(
     }
     validate_expected_binding(&response.expected)?;
     validate_session_binding(&response.measurement.session_binding)?;
+    let selected_role = selected_role_for_purpose(
+        response.expected.session_purpose,
+        &response.expected.application_role,
+        &response.expected.migration_role,
+    );
     if response.measurement.session_binding.application_name
         != response.expected.session_request_tag
         || response.measurement.session_binding.server_major_version
             != response.expected.server_major_version
-        || response.measurement.session_binding.current_role != response.expected.migration_role
-        || response.measurement.session_binding.selected_role != response.expected.migration_role
+        || response.measurement.session_binding.current_role != selected_role
+        || response.measurement.session_binding.selected_role != selected_role
         || response.measurement.session_binding.session_login_role
             == response.expected.application_role
         || response.measurement.session_binding.session_login_role
             == response.expected.migration_role
+        || response.measurement.session_binding.session_login_role == "postgres"
     {
         return Err(invalid(
             "measured PostgreSQL session differs from the response expected-value binding",
@@ -1379,6 +1437,17 @@ fn valid_counter(value: u64) -> bool {
     value > 0 && value <= MAX_EXACT_JSON_INTEGER
 }
 
+fn selected_role_for_purpose<'a>(
+    purpose: PostgresqlSessionPurpose,
+    application_role: &'a str,
+    migration_role: &'a str,
+) -> &'a str {
+    match purpose {
+        PostgresqlSessionPurpose::Migration => migration_role,
+        PostgresqlSessionPurpose::ApplicationServing => application_role,
+    }
+}
+
 fn valid_source_revision(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
@@ -1474,6 +1543,7 @@ mod tests {
         migration_inventory_digest: String,
         provider_route_binding_digest: String,
         nonce: [u8; 32],
+        session_purpose: PostgresqlSessionPurpose,
         session: PostgresqlSessionBinding,
         identity: PostgresqlDatabaseIdentity,
         identity_digest: String,
@@ -1484,6 +1554,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::for_purpose(PostgresqlSessionPurpose::Migration)
+        }
+
+        fn for_purpose(session_purpose: PostgresqlSessionPurpose) -> Self {
             let signing_key = SigningKey::from_bytes(&test_entropy(b"signing key"));
             let public_key = signing_key.verifying_key().to_bytes();
             let public_key_fingerprint = sha256_digest(&public_key);
@@ -1506,6 +1580,10 @@ mod tests {
             let tls_channel_binding_digest =
                 postgresql_tls_channel_binding_digest(&tls_channel_binding)
                     .expect("fixture TLS channel binding must hash");
+            let selected_role = match session_purpose {
+                PostgresqlSessionPurpose::Migration => "ryuki_schema_migrator",
+                PostgresqlSessionPurpose::ApplicationServing => "ryuki_app",
+            };
             let session = PostgresqlSessionBinding {
                 application_name: postgresql_attestation_request_tag(
                     &nonce,
@@ -1527,8 +1605,8 @@ mod tests {
                 backend_type: "client backend".into(),
                 session_login_role: "ryuki_login".into(),
                 session_user_oid: 16_385,
-                current_role: "ryuki_schema_migrator".into(),
-                selected_role: "ryuki_schema_migrator".into(),
+                current_role: selected_role.into(),
+                selected_role: selected_role.into(),
                 tls_enabled: true,
                 tls_protocol: "tlsv1.3".into(),
                 tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
@@ -1590,6 +1668,7 @@ mod tests {
                 migration_inventory_digest: digest_for(b"migration inventory"),
                 provider_route_binding_digest,
                 nonce,
+                session_purpose,
                 session,
                 identity,
                 identity_digest,
@@ -1630,6 +1709,7 @@ mod tests {
                 migration_inventory_digest: &self.migration_inventory_digest,
                 application_role: "ryuki_app",
                 migration_role: "ryuki_schema_migrator",
+                session_purpose: self.session_purpose,
                 session_binding: &self.session,
             }
         }
@@ -1785,11 +1865,40 @@ mod tests {
         );
         assert_eq!(proof.application_role(), "ryuki_app");
         assert_eq!(proof.migration_role(), "ryuki_schema_migrator");
+        assert_eq!(proof.session_purpose(), PostgresqlSessionPurpose::Migration);
         proof.verify_integrity().expect("retained proof is intact");
         proof
             .ensure_fresh(trusted_now(5, 6))
             .expect("proof remains fresh before the exclusive fence");
         assert!(!format!("{proof:?}").contains("10.20.30.40"));
+    }
+
+    #[test]
+    fn application_serving_attestation_selects_only_the_application_role() {
+        let fixture = Fixture::for_purpose(PostgresqlSessionPurpose::ApplicationServing);
+        let request = fixture.request();
+        let request_value: Value = serde_json::from_slice(request.as_bytes()).unwrap();
+        assert_eq!(
+            request_value["expected"]["session_purpose"],
+            "application-serving"
+        );
+        assert_eq!(fixture.session.current_role, "ryuki_app");
+        assert_eq!(fixture.session.selected_role, "ryuki_app");
+
+        let response = fixture.signed_response(&request);
+        let proof = verify_postgresql_infrastructure_attestation(
+            request,
+            &response,
+            fixture.authority(),
+            trusted_now(3, 4),
+        )
+        .expect("application-serving infrastructure measurement must verify");
+        assert_eq!(
+            proof.session_purpose(),
+            PostgresqlSessionPurpose::ApplicationServing
+        );
+        assert_eq!(proof.session_binding().selected_role, "ryuki_app");
+        proof.verify_integrity().expect("retained proof is intact");
     }
 
     #[test]
@@ -1805,6 +1914,12 @@ mod tests {
         let response: Value = serde_json::from_slice(&fixture.signed_response(&fixture.request()))
             .expect("signed fixture response must be JSON");
         assert!(validator.is_valid(&response));
+
+        let serving_fixture = Fixture::for_purpose(PostgresqlSessionPurpose::ApplicationServing);
+        let serving_response: Value =
+            serde_json::from_slice(&serving_fixture.signed_response(&serving_fixture.request()))
+                .expect("signed application-serving fixture response must be JSON");
+        assert!(validator.is_valid(&serving_response));
 
         let mut reversed = response.clone();
         reversed["measurement"]["storage_bindings"]
@@ -1868,6 +1983,35 @@ mod tests {
         );
 
         let mut fixture = Fixture::new();
+        fixture.session_purpose = PostgresqlSessionPurpose::ApplicationServing;
+        assert!(
+            build_postgresql_infrastructure_attestation_request(
+                fixture.expected(),
+                fixture.authority(),
+                fixture.nonce,
+                instant(0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("purpose-selected role")
+        );
+
+        for stable_or_superuser in ["ryuki_app", "ryuki_schema_migrator", "postgres"] {
+            let mut fixture = Fixture::new();
+            fixture.session.session_login_role = stable_or_superuser.into();
+            assert!(
+                build_postgresql_infrastructure_attestation_request(
+                    fixture.expected(),
+                    fixture.authority(),
+                    fixture.nonce,
+                    instant(0),
+                )
+                .is_err(),
+                "login role {stable_or_superuser} must not be accepted"
+            );
+        }
+
+        let mut fixture = Fixture::new();
         fixture.provider_route_binding_digest = digest_for(b"substituted expected route");
         assert!(
             build_postgresql_infrastructure_attestation_request(
@@ -1894,6 +2038,23 @@ mod tests {
             verify_postgresql_infrastructure_attestation(
                 request,
                 &replay,
+                fixture.authority(),
+                trusted_now(3, 4),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("request echo")
+        );
+
+        let request = fixture.request();
+        let mut purpose_substitution = fixture.unsigned_response(&request);
+        purpose_substitution["expected"]["session_purpose"] =
+            Value::String("application-serving".into());
+        let purpose_substitution = sign_response(purpose_substitution, &fixture.signing_key);
+        assert!(
+            verify_postgresql_infrastructure_attestation(
+                request,
+                &purpose_substitution,
                 fixture.authority(),
                 trusted_now(3, 4),
             )
@@ -2084,6 +2245,29 @@ mod tests {
             postgresql_attestation_request_tag(&fixture.nonce, &changed_digest),
             request_tag
         );
+    }
+
+    #[test]
+    fn tls_exporter_context_is_deterministic_and_binds_nonce_and_purpose() {
+        let nonce = test_entropy(b"TLS exporter context nonce");
+        let migration =
+            postgresql_tls_exporter_context(&nonce, PostgresqlSessionPurpose::Migration);
+        assert_eq!(
+            migration,
+            postgresql_tls_exporter_context(&nonce, PostgresqlSessionPurpose::Migration)
+        );
+
+        let application_serving =
+            postgresql_tls_exporter_context(&nonce, PostgresqlSessionPurpose::ApplicationServing);
+        assert_ne!(migration, application_serving);
+
+        let mut changed_nonce = nonce;
+        changed_nonce[31] ^= 1;
+        assert_ne!(
+            migration,
+            postgresql_tls_exporter_context(&changed_nonce, PostgresqlSessionPurpose::Migration,)
+        );
+        assert_ne!(migration, nonce);
     }
 
     #[test]

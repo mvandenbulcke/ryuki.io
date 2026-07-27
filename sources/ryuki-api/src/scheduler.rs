@@ -6,9 +6,10 @@
 //! records a `job_executions` row, and advances `next_run_at` off the DB clock.
 //!
 //! Design choices that matter:
-//! - **Leader election:** each tick takes a session advisory lock on a dedicated
-//!   close-on-drop connection. Only one replica wins; cancellation or crash
-//!   closes that connection and releases the lock.
+//! - **Leader election:** each schedule transaction takes the same transaction-
+//!   scoped advisory lock before its row claim. Only one replica runs scheduler
+//!   work at a time, and cancellation or rollback releases authority without
+//!   retiring the production pool's exact measured connection.
 //! - **Short claims:** the leader revalidates and locks each due schedule in its
 //!   own top-level transaction. Population scans commit one bounded page at a
 //!   time instead of retaining one transaction across the whole tick.
@@ -30,6 +31,7 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 /// advisory key in the codebase (e.g. the audit chain lock) so the two never
 /// contend. Bytes spell "SCHED\0".
 const SCHEDULER_TICK_LOCK_KEY: i64 = 0x5343_4845_4400;
+const SCHEDULER_TRY_LEADER_SQL: &str = "SELECT pg_try_advisory_xact_lock($1)";
 
 /// Most due schedules a single tick will claim and run. A safety bound so one
 /// tick cannot do unbounded work; remaining due rows are picked up next tick.
@@ -2151,6 +2153,14 @@ async fn run_due_schedule(
     hinted: &DueSchedule,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = connection.begin().await?;
+    let is_leader: bool = sqlx::query_scalar(SCHEDULER_TRY_LEADER_SQL)
+        .bind(SCHEDULER_TICK_LOCK_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !is_leader {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let sched: Option<DueSchedule> = sqlx::query_as(
         "SELECT id, job_kind, interval_secs FROM schedules \
          WHERE id = $1 AND enabled AND next_run_at <= clock_timestamp() \
@@ -2220,38 +2230,14 @@ async fn tick_as_leader(connection: &mut PgConnection) -> Result<usize, sqlx::Er
     Ok(ran)
 }
 
-/// Run one scheduler tick. Leadership is session-scoped so each schedule — and
-/// therefore each population page — can use an independent top-level
-/// transaction without allowing another replica to enter between pages. The
-/// checked-out connection is marked close-on-drop before lock acquisition: a
-/// timeout, cancellation, panic, or lost connection therefore releases the
-/// session lock instead of returning a lock-bearing session to the pool.
+/// Run one scheduler tick. Leadership is reacquired transactionally for every
+/// due schedule, preserving independent page commits without placing session-
+/// scoped authority on a pooled connection. A timeout, cancellation, panic, or
+/// rollback releases the transaction lock without closing the exact measured
+/// production connection.
 pub async fn tick_once(pool: &PgPool) -> Result<usize, sqlx::Error> {
-    let mut leader = pool.acquire().await?;
-    leader.close_on_drop();
-    let is_leader: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(SCHEDULER_TICK_LOCK_KEY)
-        .fetch_one(&mut *leader)
-        .await?;
-    if !is_leader {
-        return Ok(0);
-    }
-
-    let tick_result = tick_as_leader(&mut leader).await;
-    let unlock_result: Result<bool, sqlx::Error> =
-        sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-            .bind(SCHEDULER_TICK_LOCK_KEY)
-            .fetch_one(&mut *leader)
-            .await;
-
-    match (tick_result, unlock_result) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(ran), Ok(true)) => Ok(ran),
-        (Ok(_), Ok(false)) => Err(sqlx::Error::Protocol(
-            "scheduler leader connection did not own its advisory lock".to_string(),
-        )),
-    }
+    let mut connection = pool.acquire().await?;
+    tick_as_leader(&mut connection).await
 }
 
 /// List all schedules, newest-created first.
@@ -2330,9 +2316,10 @@ pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
     //   genuinely hung tick — one that escapes the DB-level statement/lock
     //   timeouts (#12) via an application-level stall — is aborted and retried on
     //   the next tick rather than starving the loop forever. Dropping the tick
-    //   future rolls back only the active schedule/page transaction and closes
-    //   the leader connection, releasing its session lock. Earlier bounded pages
-    //   remain committed; the durable cursor makes the next leader resume.
+    //   future rolls back only the active schedule/page transaction, releasing
+    //   its transaction-scoped leader lock without retiring the measured pool
+    //   connection. Earlier bounded pages remain committed; the durable cursor
+    //   makes the next leader resume.
     let tick_timeout = Duration::from_secs(tick_secs.saturating_mul(4).max(300));
     tokio::spawn(async move {
         crate::background::register_loop(DURABLE_SCHEDULER_NAME, tick_secs);
@@ -2373,6 +2360,15 @@ pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
 mod db_tests {
     use super::*;
     use crate::database::DB_TEST_SERIAL;
+
+    #[test]
+    fn scheduler_leadership_is_transaction_scoped() {
+        assert_eq!(
+            SCHEDULER_TRY_LEADER_SQL,
+            "SELECT pg_try_advisory_xact_lock($1)"
+        );
+        assert!(!SCHEDULER_TRY_LEADER_SQL.contains("pg_try_advisory_lock("));
+    }
 
     #[test]
     fn population_scheduler_authority_shape_matches_queue_contract() {
@@ -2506,9 +2502,9 @@ mod db_tests {
     }
 
     /// Two replicas racing the same due row still produce one execution. The
-    /// session leader lock serializes the ticks, and the second leader (if it
-    /// acquires after the first releases) revalidates that the row is no longer
-    /// due before opening a job transaction.
+    /// transaction-scoped leader lock serializes the claims, and the second
+    /// leader (if it acquires after the first releases) revalidates that the row
+    /// is no longer due.
     #[tokio::test]
     async fn concurrent_ticks_execute_a_due_schedule_once() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -4365,7 +4361,7 @@ mod db_tests {
 
     /// Two scheduler replicas racing a population page still commit one page,
     /// one execution, and one deduped queue item. The losing replica either
-    /// misses the session leader lock or revalidates the now-future schedule.
+    /// misses the transaction leader lock or revalidates the now-future schedule.
     #[tokio::test]
     async fn concurrent_ticks_commit_one_secret_population_page() {
         let _serial = DB_TEST_SERIAL.lock().await;

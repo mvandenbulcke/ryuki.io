@@ -42,14 +42,14 @@
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:d059964b3d50be2a42edaf8e3a8a2612b990a0b2391a0b973b31eb530776ffe5",
+    "content_digest": "sha256:b029b080c0b073ee6683059d7b7723cd063ef355ac39ff14f5d9c2ac4f6ec604",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json"
   },
   "provider_lifecycle_snapshot_ref": {
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:d059964b3d50be2a42edaf8e3a8a2612b990a0b2391a0b973b31eb530776ffe5",
+    "content_digest": "sha256:b029b080c0b073ee6683059d7b7723cd063ef355ac39ff14f5d9c2ac4f6ec604",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json",
     "projection": "provider_lifecycle",
     "required_states": ["active"]
@@ -58,35 +58,35 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 2,
-    "content_digest": "sha256:23d5a36ff5e1103beaef677c1a0c2c1bf3a8d0988f51206730f9c83983e26ec6",
+    "content_digest": "sha256:6b35d2f834b673aa8f7fdd83b3171fcf3dbe89727c261c6b94628e702202e3c4",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {
     "artifact_kind": "security-limit-profile",
     "document_id": "security-limit-profile:repository-implementation-v1",
     "document_version": 3,
-    "content_digest": "sha256:8226bd5424ddf2864ad1586e63f368959318dcefb3fd94967188a4735ffe7833",
+    "content_digest": "sha256:2872d1c445782d7298d50c38298f989823e392ab691b05cf457e94ddad796c09",
     "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
   },
   "control_plane_topology_ref": {
     "artifact_kind": "control-plane-topology",
     "document_id": "control-plane-topology:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:6b844288d9b2a233c2c56e7f6df989cdc5f84a4bbbc7ac723fcc4c199210670f",
+    "content_digest": "sha256:e86cfa85562654ac8ac70fc141037dd3c9d7c2b2df01c3ed6de5d7050159bff4",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "egress_policy_ref": {
     "artifact_kind": "egress-policy",
     "document_id": "egress-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:6b844288d9b2a233c2c56e7f6df989cdc5f84a4bbbc7ac723fcc4c199210670f",
+    "content_digest": "sha256:e86cfa85562654ac8ac70fc141037dd3c9d7c2b2df01c3ed6de5d7050159bff4",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "retention_policy_ref": {
     "artifact_kind": "retention-policy",
     "document_id": "retention-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:6b844288d9b2a233c2c56e7f6df989cdc5f84a4bbbc7ac723fcc4c199210670f",
+    "content_digest": "sha256:e86cfa85562654ac8ac70fc141037dd3c9d7c2b2df01c3ed6de5d7050159bff4",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "production_acceptance_receipt_ref": null,

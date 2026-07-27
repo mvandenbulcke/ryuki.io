@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ryuki.io/schemas/security-contracts/v1/postgresql-infrastructure-attestation-envelope.schema.json",
-  "title": "Ryuki PostgreSQL infrastructure attestation response",
-  "description": "Closed response returned by an independently pinned PostgreSQL provider-control-plane authority. Schema validity never grants trust. The runtime verifier consumes one nonce-bound request, verifies the domain-separated Ed25519 signature and exact request/workload/guard/profile/expected-value echoes, compares the full independently observed backend-session and caller-observed TLS-channel preimages, recomputes TLS-channel, database, session, and storage digests, requires the receipt-bound provider-route digest to match the caller-validated route and every response projection, rejects channel/route/cluster/storage cross-wiring, and enforces an exclusive 300-second freshness ceiling.",
+  "title": "Ryuki PostgreSQL infrastructure attestation v2 response",
+  "description": "Closed v2 response returned by an independently pinned PostgreSQL provider-control-plane authority. Schema validity never grants trust. The runtime verifier consumes one nonce-bound request, verifies the domain-separated Ed25519 signature and exact request/workload/guard/profile/expected-value echoes, binds an explicit migration or application-serving session purpose to its corresponding receipt-bound role, compares the full independently observed backend-session and caller-observed TLS-channel preimages, recomputes TLS-channel, database, session, and storage digests, requires the receipt-bound provider-route digest to match the caller-validated route and every response projection, rejects purpose/role/channel/route/cluster/storage cross-wiring, and enforces an exclusive 300-second freshness ceiling.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -23,7 +23,7 @@
     "signature_base64"
   ],
   "properties": {
-    "schema_version": { "const": "1.0.0" },
+    "schema_version": { "const": "2.0.0" },
     "contract_kind": { "const": "postgresql-infrastructure-attestation-response" },
     "canonicalization": { "const": "ryuki-canonical-json-v1" },
     "signature_algorithm": { "const": "ed25519" },
@@ -38,7 +38,7 @@
     "outcome": { "const": "matched" },
     "measurement": { "$ref": "#/$defs/measurement" },
     "signature_base64": {
-      "description": "Canonical Base64 of a 64-byte Ed25519 signature. Signing bytes are a little-endian u64 length frame for ryuki-v1/postgresql-infrastructure-attestation-response followed by a frame for canonical response bytes with signature_base64 removed.",
+      "description": "Canonical Base64 of a 64-byte Ed25519 signature. Signing bytes are a little-endian u64 length frame for ryuki-v2/postgresql-infrastructure-attestation-response followed by a frame for canonical response bytes with signature_base64 removed.",
       "type": "string",
       "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
     }
@@ -212,6 +212,7 @@
         "migration_inventory_digest",
         "application_role",
         "migration_role",
+        "session_purpose",
         "session_request_tag",
         "session_binding_digest",
         "tls_channel_binding_digest"
@@ -226,15 +227,28 @@
         "database_identity_digest": { "$ref": "#/$defs/digest" },
         "storage_binding_digest": { "$ref": "#/$defs/digest" },
         "migration_inventory_digest": { "$ref": "#/$defs/digest" },
-        "application_role": { "$ref": "#/$defs/postgresqlIdentifier" },
-        "migration_role": { "$ref": "#/$defs/postgresqlIdentifier" },
+        "application_role": {
+          "description": "Receipt-bound stable role that current_role and selected_role must equal for application-serving sessions.",
+          "$ref": "#/$defs/postgresqlIdentifier"
+        },
+        "migration_role": {
+          "description": "Receipt-bound stable role that current_role and selected_role must equal for migration sessions.",
+          "$ref": "#/$defs/postgresqlIdentifier"
+        },
+        "session_purpose": {
+          "description": "Typed semantic purpose bound into the canonical request and signed response. The runtime verifier requires migration to select migration_role and application-serving to select application_role; the login role must remain distinct from both roles and postgres.",
+          "enum": ["migration", "application-serving"]
+        },
         "session_request_tag": {
           "type": "string",
-          "pattern": "^ryuki-pg-attest-[a-f0-9]{40}$"
+          "pattern": "^ryuki-pg-attest-v2-[a-f0-9]{40}$"
         },
-        "session_binding_digest": { "$ref": "#/$defs/digest" },
+        "session_binding_digest": {
+          "description": "ryuki-postgresql-session-binding-v2 digest of the exact independently observable backend-session preimage; session_purpose is separately bound in this same canonical expected object.",
+          "$ref": "#/$defs/digest"
+        },
         "tls_channel_binding_digest": {
-          "description": "ryuki-postgresql-tls-channel-binding-v1 digest of the exact caller-observed direct TLS channel preimage.",
+          "description": "ryuki-postgresql-tls-channel-binding-v2 digest of the exact caller-observed direct TLS channel preimage.",
           "$ref": "#/$defs/digest"
         }
       }
@@ -296,7 +310,7 @@
       "properties": {
         "application_name": {
           "type": "string",
-          "pattern": "^ryuki-pg-attest-[a-f0-9]{40}$"
+          "pattern": "^ryuki-pg-attest-v2-[a-f0-9]{40}$"
         },
         "database_name": { "$ref": "#/$defs/postgresqlIdentifier" },
         "database_oid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
@@ -368,7 +382,7 @@
           "$ref": "#/$defs/digest"
         },
         "exporter_digest": {
-          "description": "SHA-256 digest of the 32-byte TLS 1.3 exporter produced with label EXPORTER-ryuki-postgresql-migration-direct-session-v1 and the request-specific context.",
+          "description": "SHA-256 digest of the 32-byte TLS 1.3 exporter produced with label EXPORTER-ryuki-postgresql-purpose-bound-direct-session-v2. Its 32-byte context is SHA-256 over little-endian u64 length frames for ryuki-v2/postgresql-tls-exporter-context, the request nonce, and the canonical session-purpose token.",
           "$ref": "#/$defs/digest"
         },
         "tls_protocol": { "const": "tlsv1.3" },
@@ -499,8 +513,8 @@
       ],
       "properties": {
         "sequence": { "$ref": "#/$defs/positiveCounter" },
-        "method": { "const": "provider-control-plane-postgresql-direct-session-v1" },
-        "tls_channel_verification_method": { "const": "provider-tls-endpoint-exporter-direct-session-v1" },
+        "method": { "const": "provider-control-plane-postgresql-direct-session-v2" },
+        "tls_channel_verification_method": { "const": "provider-tls-endpoint-exporter-direct-session-v2" },
         "observed_at": { "$ref": "#/$defs/trustedTimeInterval" },
         "valid_until": { "$ref": "#/$defs/timestampSeconds" },
         "restored_state_reconciled": { "const": true },

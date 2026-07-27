@@ -49,13 +49,13 @@ Startup now derives the complete implementation-plus-deployment applicability
 inventory, verifies the exact semantic receipt closure, and consumes the
 checkpoint, current SB-9 root, authenticated documents, pinned profile/build,
 and workload proof into one non-cloneable production-boundary proof. Production
-serving now retains verified `HttpsPublicUrls`, `SecureCookies`, and
-`ApprovedSecretProvider` witnesses, but still exits before database publication,
-workers, routing, or listeners until the remaining five receipt-bound live
-runtime guards are implemented and verified: `durable-postgresql`,
-`non-development-authenticator`, `external-signing-key-material`,
+serving now retains verified `HttpsPublicUrls`, `SecureCookies`,
+`ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, and
+`DurablePostgresql` witnesses. It still exits before database publication,
+workers, routing, or listeners until exactly three receipt-bound live runtime
+guards are implemented and verified: `external-signing-key-material`,
 `mock-dependencies-disabled`, and `first-owner-path-closed`. The overall
-normative production boundary is not complete.
+proposed normative production boundary is not complete.
 
 Production additionally requires these external checkpoint bindings:
 
@@ -158,21 +158,30 @@ URL, PostgreSQL server, or attestation response. The PostgreSQL authority's
 socket path and decoded-public-key fingerprint must each differ from the
 checkpoint, deployed-workload, and public-ingress authorities.
 
-The lower-level production `apply-only` protocol performs one bounded exchange
-without retry. A fresh
-nonce and exact request digest bind the domain-separated Ed25519 response to the
-receipt's `durable-postgresql` requirement, deployment/trust/workload namespace,
-expected provider and PostgreSQL major version, exact receipt-bound provider
-route, database-identity digest, and durable-storage digest. The proof
-authorization is at most 300 seconds. The runner establishes one exclusive-CA
-TLS 1.3 channel, requires its exact peer leaf-certificate digest to match the
-receipt-bound route before releasing credentials, permits only SCRAM-SHA-256,
-binds the exporter into the request tag, and relays only that channel into one
-direct PgConnection. The authority must independently derive
-the same exporter at the database endpoint. Provider identity, cluster system
-identity, and durable-storage bindings come only from signed authority
-evidence; the runner recomputes their typed digests and requires exact receipt
-equality.
+PostgreSQL infrastructure attestation protocol v2 performs one bounded exchange
+without retry for either an explicit `migration` or `application-serving`
+session purpose. The purpose is bound with the fresh nonce into the TLS 1.3
+exporter context, request tag, canonical request, and domain-separated Ed25519
+response. The request also binds the receipt's `durable-postgresql`
+requirement, deployment/trust/workload namespace, expected provider and
+PostgreSQL major version, exact receipt-bound provider route, database-identity
+digest, durable-storage digest, roles, and backend session. The proof
+authorization is at most 300 seconds. The authority must independently derive
+the same purpose-bound exporter at the database endpoint; an echoed client tag
+or local SQL observation is insufficient. Its signed profile and session facts
+must remain in exact lockstep with the independently supplied deployment pins
+and receipt-bound expectations.
+
+For `migration`, the runner relays the one exclusive-CA, SCRAM-SHA-256 TLS
+channel into one direct PgConnection. For `application-serving`, startup
+retains that exact channel, its bound loopback relay listener, the exact
+application-role backend session, its local durable observation, and the same
+SQLx pool.
+Production requires `RYUKI_SERVER__POOL_MAX_CONNECTIONS=1` and
+`RYUKI_SERVER__POOL_MIN_CONNECTIONS=1`; a wider pool, implicit reconnect,
+fallback route, substituted role, or changed observation fails closed. The
+pool allocation remains unpublished until the complete eight-guard runtime
+admission succeeds, and it is remeasured at the serving startup fences.
 
 Production execution is currently contained: `apply-only` exits before reading
 the migration credential until live Kubernetes render admission, one-use
@@ -238,8 +247,9 @@ Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
 authority, and cannot start the API or migration runner. Even a valid sealed
 semantic closure, build manifest, and deployed-workload proof cannot start
-production until the remaining five receipt-bound live runtime guards are
-implemented and verified. The proving ground
+production until the remaining three receipt-bound live runtime guards are
+implemented and verified: `external-signing-key-material`,
+`mock-dependencies-disabled`, and `first-owner-path-closed`. The proving ground
 likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
 runnable profile digest.
@@ -524,7 +534,7 @@ Most operational settings are grouped under typed nested structs. Use double und
 
 | Group | Example variable | Purpose |
 |---|---|---|
-| `server` | `RYUKI_SERVER__POOL_MAX_CONNECTIONS` | Bind address, timeouts, body size, TLS paths, DB pool, compression, keep-alive, concurrency. |
+| `server` | `RYUKI_SERVER__POOL_MAX_CONNECTIONS` | Bind address, timeouts, body size, TLS paths, DB pool, compression, keep-alive, concurrency. Production's purpose-bound PostgreSQL serving runtime requires both pool maximum and minimum to equal 1. |
 | `cors` | `RYUKI_CORS__ALLOWED_ORIGINS` | Allowed origins and cache age. |
 | `rate_limit` | `RYUKI_RATE_LIMIT__ENABLED` | Global and per-path request limits. |
 | `logging` | `RYUKI_LOGGING__LEVEL` | Console log level and format. |
@@ -653,7 +663,11 @@ The platform expects PostgreSQL 18. The local compose skeleton in `deploy/compos
 - PostgreSQL 18 with user `ryuki` and database `ryuki_platform`
 - Port `5432` exposed locally
 
-For production, use CloudNativePG or a managed PostgreSQL service and set `RYUKI_DATABASE_URL` accordingly.
+For production, use CloudNativePG or a managed PostgreSQL service and set
+`RYUKI_DATABASE_URL` accordingly. The currently implemented purpose-bound
+serving channel is intentionally single-channel: set
+`RYUKI_SERVER__POOL_MAX_CONNECTIONS=1` and
+`RYUKI_SERVER__POOL_MIN_CONNECTIONS=1` or `DurablePostgresql` admission fails.
 
 ### Why PostgreSQL only
 

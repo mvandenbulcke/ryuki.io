@@ -1,16 +1,18 @@
 //! Exact production PostgreSQL TLS channel establishment.
 //!
 //! SQLx 0.8 does not expose the Rustls connection it owns. Production
-//! migrations therefore establish and measure one TLS stream here, then hand
-//! that exact stream to one SQLx `PgConnection` through an owner-only,
-//! single-use Unix-domain relay. There is no reconnect or fallback path.
+//! migrations and serving therefore establish and measure one TLS stream here,
+//! then hand that exact stream to one SQLx `PgConnection` or one-connection
+//! `PgPool` through a retained, single-use loopback relay. There is no
+//! reconnect or fallback path.
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::net::IpAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ryuki_core::postgresql_infrastructure::{
@@ -21,11 +23,10 @@ use ryuki_core::security_profile::{
     ProductionDatabaseProvider, POSTGRESQL_PROVIDER_ROUTE_MODE_DIRECT_SESSION_V1,
 };
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgConnectOptions, PgSslMode};
-use sqlx::{Connection, PgConnection};
-use tempfile::TempDir;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::{Connection, PgConnection, PgPool};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixListener};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::rustls::client::Resumption;
@@ -37,7 +38,6 @@ use zeroize::Zeroize;
 
 const POSTGRESQL_SSL_REQUEST_CODE: u32 = 80_877_103;
 const POSTGRESQL_PROTOCOL_VERSION_3: u32 = 196_608;
-const POSTGRESQL_RELAY_WORKSPACE: &str = "/run/ryuki-postgresql-relay";
 const MAX_CA_BUNDLE_BYTES: u64 = 256 * 1024;
 const MAX_CA_CERTIFICATES: usize = 32;
 const MAX_POSTGRESQL_STARTUP_MESSAGE_BYTES: usize = 64 * 1024;
@@ -229,55 +229,12 @@ impl EstablishedPostgresqlTlsChannel {
         self,
         application_name: &str,
     ) -> Result<ChannelBoundProductionPgConnection, PostgresqlTlsChannelError> {
-        let socket_directory = tempfile::Builder::new()
-            .prefix("ryuki-pg-")
-            .tempdir_in(POSTGRESQL_RELAY_WORKSPACE)
-            .map_err(|error| PostgresqlTlsChannelError::Relay(error.to_string()))?;
-        std::fs::set_permissions(
-            socket_directory.path(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|error| PostgresqlTlsChannelError::Relay(error.to_string()))?;
-        let socket_path = socket_directory
-            .path()
-            .join(format!(".s.PGSQL.{}", self.target.port));
-        let listener = UnixListener::bind(&socket_path)
-            .map_err(|error| PostgresqlTlsChannelError::Relay(error.to_string()))?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| PostgresqlTlsChannelError::Relay(error.to_string()))?;
-        let expected_pid = i32::try_from(std::process::id())
-            .map_err(|_| PostgresqlTlsChannelError::Relay("process id is out of range".into()))?;
-        let mut tls = self.tls;
-        let relay: JoinHandle<Result<(), String>> = tokio::spawn(async move {
-            let (mut local, _) = timeout(RELAY_ACCEPT_TIMEOUT, listener.accept())
-                .await
-                .map_err(|_| "relay accept timed out".to_owned())?
-                .map_err(|error| error.to_string())?;
-            drop(listener);
-            let _ = std::fs::remove_file(&socket_path);
-            let credentials = local.peer_cred().map_err(|error| error.to_string())?;
-            if credentials.pid() != Some(expected_pid) {
-                return Err("relay peer process does not own the SQLx connection".into());
-            }
-            timeout(
-                RELAY_AUTH_TIMEOUT,
-                relay_postgresql_scram_authentication(&mut local, &mut tls),
-            )
-            .await
-            .map_err(|_| "PostgreSQL SCRAM authentication relay timed out".to_owned())??;
-            tokio::io::copy_bidirectional(&mut local, &mut tls)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        });
-        let options = PgConnectOptions::new_without_pgpass()
-            .socket(socket_directory.path())
-            .port(self.target.port)
-            .username(&self.target.username)
-            .password(&self.target.password)
-            .database(&self.target.database)
-            .ssl_mode(PgSslMode::Disable)
-            .application_name(application_name);
+        let PendingSqlxRelay {
+            options,
+            binding,
+            relay,
+            listener,
+        } = self.into_sqlx_relay(application_name).await?;
         let connection =
             match timeout(TLS_CONNECT_TIMEOUT, PgConnection::connect_with(&options)).await {
                 Ok(Ok(connection)) => connection,
@@ -294,10 +251,385 @@ impl EstablishedPostgresqlTlsChannel {
             };
         Ok(ChannelBoundProductionPgConnection {
             connection,
+            binding,
+            relay: relay.into_handle(),
+            _listener: listener,
+        })
+    }
+
+    /// Constructs the serving pool over the exact stream measured by
+    /// [`ProductionPostgresqlTarget::establish`]. The relay accepts exactly
+    /// one loopback connection. Immediately after that connection succeeds,
+    /// the pool's password-bearing connect options are irreversibly replaced by
+    /// a passwordless, non-connectable sentinel before any further await.
+    /// SQLx therefore has no credential-bearing reconnect or network fallback
+    /// path. `initialize_connection` must perform the complete application-role
+    /// and runtime-observation binding before this pool is returned.
+    pub(crate) async fn connect_sqlx_pool<F>(
+        self,
+        application_name: &str,
+        settings: SingleChannelPgPoolSettings,
+        initialize_connection: F,
+    ) -> Result<ChannelBoundProductionPgPool, PostgresqlTlsChannelError>
+    where
+        for<'connection> F: Fn(
+                &'connection mut PgConnection,
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), sqlx::Error>> + Send + 'connection>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let PendingSqlxRelay {
+            options,
+            binding,
+            relay,
+            listener,
+        } = self.into_sqlx_relay(application_name).await?;
+        let connection_initialization = Arc::new(ConnectionInitializationSeal::new());
+        let callback_seal = connection_initialization.clone();
+        let initialize_connection = Arc::new(initialize_connection);
+        let pool_options = PgPoolOptions::new()
+            .max_connections(settings.max_connections)
+            .min_connections(settings.min_connections)
+            // Retiring the only connection would make SQLx reconnect. The
+            // configured idle/lifetime bounds remain retained below, but do
+            // not retire this non-reconnectable measured channel.
+            .idle_timeout(None)
+            .max_lifetime(None)
+            // `connect_with` acquires the newly initialized idle connection
+            // once before returning. SQLx's default pre-acquire ping could
+            // reject a connection made unusable by an initializer failure and
+            // open another one with the original credential-bearing options.
+            // The sealed initializer result is the authoritative construction
+            // check; later exact-runtime SQL probes provide liveness checks.
+            .test_before_acquire(false)
+            .acquire_timeout(settings.acquire_timeout)
+            .after_connect(move |connection, _metadata| {
+                let callback_seal = callback_seal.clone();
+                let initialize_connection = initialize_connection.clone();
+                Box::pin(async move {
+                    // Returning an initializer error from `after_connect`
+                    // causes SQLx to discard the connection and retry with the
+                    // original password-bearing options. Seal the result for
+                    // the owner to inspect after `connect_with` returns, while
+                    // always completing this callback successfully. A second
+                    // invocation irreversibly invalidates the seal but also
+                    // returns `Ok` so it cannot induce another credentialed
+                    // retry.
+                    if callback_seal.begin() {
+                        let result = initialize_connection(connection).await;
+                        callback_seal.finish(result);
+                    }
+                    Ok(())
+                })
+            });
+        let pool = match timeout(settings.acquire_timeout, pool_options.connect_with(options)).await
+        {
+            Ok(Ok(pool)) => {
+                // `after_connect` runs only after PostgreSQL authentication, so
+                // it cannot protect a future reconnect from disclosing the
+                // password to a substituted local peer. Replace the options
+                // synchronously, before any further await or publication. The
+                // existing measured connection is left untouched by SQLx.
+                pool.set_connect_options(disabled_postgresql_reconnect_options());
+                if let Err(error) = connection_initialization.result_after_connect() {
+                    pool.close().await;
+                    relay.abort();
+                    return Err(PostgresqlTlsChannelError::Sqlx(error));
+                }
+                Arc::new(pool)
+            }
+            Ok(Err(error)) => {
+                relay.abort();
+                return Err(PostgresqlTlsChannelError::Sqlx(error));
+            }
+            Err(_) => {
+                relay.abort();
+                return Err(PostgresqlTlsChannelError::Relay(
+                    "SQLx single-channel pool connect timed out".into(),
+                ));
+            }
+        };
+        if relay.is_finished()
+            || pool.is_closed()
+            || pool.size() != 1
+            || !connection_initialization.succeeded()
+        {
+            pool.close().await;
+            relay.abort();
+            return Err(PostgresqlTlsChannelError::Relay(
+                "exact PostgreSQL TLS relay terminated before pool construction completed".into(),
+            ));
+        }
+        Ok(ChannelBoundProductionPgPool {
+            pool,
+            binding,
+            relay: Some(relay.into_handle()),
+            _listener: listener,
+            connection_initialization,
+            settings,
+        })
+    }
+
+    async fn into_sqlx_relay(
+        self,
+        application_name: &str,
+    ) -> Result<PendingSqlxRelay, PostgresqlTlsChannelError> {
+        let listener = Arc::new(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| PostgresqlTlsChannelError::Relay(error.to_string()))?,
+        );
+        let relay_port = listener
+            .local_addr()
+            .map_err(|error| PostgresqlTlsChannelError::Relay(error.to_string()))?
+            .port();
+        let mut tls = self.tls;
+        let relay_listener = listener.clone();
+        let relay = AbortRelayOnDrop::new(tokio::spawn(async move {
+            // The owner retains another `Arc` for the complete direct-channel
+            // lifetime. Even after this one accept, the original listener and
+            // its ephemeral port therefore remain bound and cannot be replaced
+            // by a same-UID process.
+            let (mut local, peer) = timeout(RELAY_ACCEPT_TIMEOUT, relay_listener.accept())
+                .await
+                .map_err(|_| "relay accept timed out".to_owned())?
+                .map_err(|error| error.to_string())?;
+            if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                return Err("PostgreSQL relay accepted a non-loopback peer".into());
+            }
+            local.set_nodelay(true).map_err(|error| error.to_string())?;
+            timeout(
+                RELAY_AUTH_TIMEOUT,
+                relay_postgresql_scram_authentication(&mut local, &mut tls),
+            )
+            .await
+            .map_err(|_| "PostgreSQL SCRAM authentication relay timed out".to_owned())??;
+            tokio::io::copy_bidirectional(&mut local, &mut tls)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }));
+        let options = PgConnectOptions::new_without_pgpass()
+            .host("127.0.0.1")
+            .port(relay_port)
+            .username(&self.target.username)
+            .password(&self.target.password)
+            .database(&self.target.database)
+            .ssl_mode(PgSslMode::Disable)
+            .application_name(application_name);
+        Ok(PendingSqlxRelay {
+            options,
             binding: self.binding,
             relay,
-            _socket_directory: socket_directory,
+            listener,
         })
+    }
+}
+
+struct PendingSqlxRelay {
+    options: PgConnectOptions,
+    binding: PostgresqlTlsChannelBinding,
+    relay: AbortRelayOnDrop,
+    listener: Arc<TcpListener>,
+}
+
+enum ConnectionInitializationState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed(sqlx::Error),
+    Invalid,
+}
+
+/// One-shot handoff between SQLx's initializer callback and the pool owner.
+///
+/// The callback never returns an error because SQLx treats that as permission
+/// to retry using the still-credentialed connection options. Instead it seals
+/// exactly one result here. The owner replaces those options with the disabled
+/// sentinel synchronously before reading the result and failing closed.
+struct ConnectionInitializationSeal {
+    state: Mutex<ConnectionInitializationState>,
+}
+
+impl ConnectionInitializationSeal {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ConnectionInitializationState::Pending),
+        }
+    }
+
+    fn begin(&self) -> bool {
+        match self.state.lock() {
+            Ok(mut state) if matches!(*state, ConnectionInitializationState::Pending) => {
+                *state = ConnectionInitializationState::Running;
+                true
+            }
+            Ok(mut state) => {
+                *state = ConnectionInitializationState::Invalid;
+                false
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = ConnectionInitializationState::Invalid;
+                false
+            }
+        }
+    }
+
+    fn finish(&self, result: Result<(), sqlx::Error>) {
+        let completed = match result {
+            Ok(()) => ConnectionInitializationState::Succeeded,
+            Err(error) => ConnectionInitializationState::Failed(error),
+        };
+        match self.state.lock() {
+            Ok(mut state) if matches!(*state, ConnectionInitializationState::Running) => {
+                *state = completed;
+            }
+            Ok(mut state) => {
+                *state = ConnectionInitializationState::Invalid;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = ConnectionInitializationState::Invalid;
+            }
+        }
+    }
+
+    fn result_after_connect(&self) -> Result<(), sqlx::Error> {
+        let mut state = self.state.lock().map_err(|_| {
+            sqlx::Error::Protocol("PostgreSQL connection initialization seal was poisoned".into())
+        })?;
+        match std::mem::replace(&mut *state, ConnectionInitializationState::Invalid) {
+            ConnectionInitializationState::Succeeded => {
+                *state = ConnectionInitializationState::Succeeded;
+                Ok(())
+            }
+            ConnectionInitializationState::Failed(error) => Err(error),
+            ConnectionInitializationState::Pending => Err(sqlx::Error::Protocol(
+                "PostgreSQL connection initialization did not run".into(),
+            )),
+            ConnectionInitializationState::Running => Err(sqlx::Error::Protocol(
+                "PostgreSQL connection initialization did not complete".into(),
+            )),
+            ConnectionInitializationState::Invalid => Err(sqlx::Error::Protocol(
+                "PostgreSQL connection initialization ran more than once".into(),
+            )),
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| matches!(*state, ConnectionInitializationState::Succeeded))
+    }
+}
+
+/// Join-handle owner used while the SQLx connection or pool is being created.
+/// Dropping an in-flight construction future must abort the relay rather than
+/// detach a task that still owns the measured TLS stream.
+struct AbortRelayOnDrop {
+    handle: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl AbortRelayOnDrop {
+    fn new(handle: JoinHandle<Result<(), String>>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn into_handle(mut self) -> JoinHandle<Result<(), String>> {
+        self.handle
+            .take()
+            .expect("pending PostgreSQL relay handle is present")
+    }
+}
+
+impl Drop for AbortRelayOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+/// SQLx pool options retained after the only authenticated connection exists.
+/// The explicit empty password defeats `PGPASSWORD` fallback, while `/dev/null`
+/// makes every attempted Unix-socket connection fail locally with `ENOTDIR`.
+fn disabled_postgresql_reconnect_options() -> PgConnectOptions {
+    PgConnectOptions::new_without_pgpass()
+        .socket(Path::new("/dev/null"))
+        .port(1)
+        .username("ryuki_reconnect_disabled")
+        .password("")
+        .database("ryuki_reconnect_disabled")
+        .ssl_mode(PgSslMode::Disable)
+        .application_name("ryuki-reconnect-disabled")
+}
+
+/// Pool configuration accepted by the non-reconnectable serving channel.
+///
+/// The ordinary application pool's idle and maximum-lifetime values remain
+/// explicit, validated configuration bounds, but they cannot retire the only
+/// measured connection. Doing so would require a fresh independently measured
+/// TLS channel rather than an implicit SQLx reconnect through this relay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SingleChannelPgPoolSettings {
+    max_connections: u32,
+    min_connections: u32,
+    configured_idle_timeout: Duration,
+    acquire_timeout: Duration,
+    configured_max_lifetime: Duration,
+}
+
+impl SingleChannelPgPoolSettings {
+    pub(crate) fn new(
+        max_connections: u32,
+        min_connections: u32,
+        idle_timeout_secs: u64,
+        acquire_timeout_secs: u64,
+        max_lifetime_secs: u64,
+    ) -> Result<Self, PostgresqlTlsChannelError> {
+        if max_connections != 1 || min_connections != 1 {
+            return Err(PostgresqlTlsChannelError::Target(
+                "exact PostgreSQL TLS serving requires max_connections=min_connections=1".into(),
+            ));
+        }
+        if idle_timeout_secs == 0 || acquire_timeout_secs == 0 || max_lifetime_secs == 0 {
+            return Err(PostgresqlTlsChannelError::Target(
+                "single-channel PostgreSQL pool timeouts must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            max_connections,
+            min_connections,
+            configured_idle_timeout: Duration::from_secs(idle_timeout_secs),
+            acquire_timeout: Duration::from_secs(acquire_timeout_secs),
+            configured_max_lifetime: Duration::from_secs(max_lifetime_secs),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configured_idle_timeout(&self) -> Duration {
+        self.configured_idle_timeout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_timeout(&self) -> Duration {
+        self.acquire_timeout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configured_max_lifetime(&self) -> Duration {
+        self.configured_max_lifetime
     }
 }
 
@@ -665,7 +997,7 @@ pub(crate) struct ChannelBoundProductionPgConnection {
     connection: PgConnection,
     binding: PostgresqlTlsChannelBinding,
     relay: JoinHandle<Result<(), String>>,
-    _socket_directory: TempDir,
+    _listener: Arc<TcpListener>,
 }
 
 impl ChannelBoundProductionPgConnection {
@@ -692,6 +1024,75 @@ impl ChannelBoundProductionPgConnection {
     pub(crate) async fn close_hard(self) {
         let _ = self.connection.close_hard().await;
         self.relay.abort();
+    }
+}
+
+/// Owner of the serving pool and the only relay capable of reaching its exact
+/// independently measured PostgreSQL TLS stream.
+///
+/// Request-facing code may clone [`Self::pool`], but this owner must remain
+/// retained for as long as that pool is published. Dropping the owner aborts
+/// the TLS relay. The retained listener keeps the exact loopback port bound,
+/// and SQLx's reconnect options point at a passwordless local-failure sentinel,
+/// so it cannot replace the connection or fall back to a direct network route.
+pub(crate) struct ChannelBoundProductionPgPool {
+    pool: Arc<PgPool>,
+    binding: PostgresqlTlsChannelBinding,
+    relay: Option<JoinHandle<Result<(), String>>>,
+    _listener: Arc<TcpListener>,
+    connection_initialization: Arc<ConnectionInitializationSeal>,
+    settings: SingleChannelPgPoolSettings,
+}
+
+impl ChannelBoundProductionPgPool {
+    pub(crate) fn pool(&self) -> &Arc<PgPool> {
+        &self.pool
+    }
+
+    pub(crate) fn binding(&self) -> &PostgresqlTlsChannelBinding {
+        &self.binding
+    }
+
+    pub(crate) fn matches_binding(&self, expected: &PostgresqlTlsChannelBinding) -> bool {
+        &self.binding == expected
+    }
+
+    pub(crate) fn pool_ptr_eq(&self, expected: &Arc<PgPool>) -> bool {
+        Arc::ptr_eq(&self.pool, expected)
+    }
+
+    pub(crate) fn relay_is_active(&self) -> bool {
+        self.relay
+            .as_ref()
+            .is_some_and(|relay| !relay.is_finished())
+    }
+
+    pub(crate) fn exact_channel_is_active(&self) -> bool {
+        self.relay_is_active()
+            && !self.pool.is_closed()
+            && self.pool.size() == 1
+            && self.connection_initialization.succeeded()
+            && self.settings.max_connections == 1
+            && self.settings.min_connections == 1
+    }
+
+    pub(crate) fn settings(&self) -> SingleChannelPgPoolSettings {
+        self.settings
+    }
+
+    pub(crate) async fn close_hard(mut self) {
+        if let Some(relay) = self.relay.take() {
+            relay.abort();
+        }
+        self.pool.close().await;
+    }
+}
+
+impl Drop for ChannelBoundProductionPgPool {
+    fn drop(&mut self) {
+        if let Some(relay) = self.relay.as_ref() {
+            relay.abort();
+        }
     }
 }
 
@@ -836,6 +1237,111 @@ fn sha256_digest(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[test]
+    fn single_channel_pool_settings_require_exactly_one_connection() {
+        for (max_connections, min_connections) in [(2, 1), (1, 0), (2, 2)] {
+            let error =
+                SingleChannelPgPoolSettings::new(max_connections, min_connections, 300, 30, 1_800)
+                    .expect_err("a pool wider than the measured channel must be rejected");
+            assert!(error
+                .to_string()
+                .contains("max_connections=min_connections=1"));
+        }
+    }
+
+    #[test]
+    fn single_channel_pool_settings_reject_zero_timeouts() {
+        for (idle_timeout, acquire_timeout, max_lifetime) in
+            [(0, 30, 1_800), (300, 0, 1_800), (300, 30, 0)]
+        {
+            let error =
+                SingleChannelPgPoolSettings::new(1, 1, idle_timeout, acquire_timeout, max_lifetime)
+                    .expect_err("zero pool timeouts must be rejected");
+            assert!(error.to_string().contains("must be greater than zero"));
+        }
+    }
+
+    #[test]
+    fn single_channel_pool_settings_retain_positive_configuration_bounds() {
+        let settings = SingleChannelPgPoolSettings::new(1, 1, 300, 30, 1_800)
+            .expect("exactly one connection and positive timeouts are valid");
+
+        assert_eq!(settings.max_connections, 1);
+        assert_eq!(settings.min_connections, 1);
+        assert_eq!(settings.configured_idle_timeout(), Duration::from_secs(300));
+        assert_eq!(settings.acquire_timeout(), Duration::from_secs(30));
+        assert_eq!(
+            settings.configured_max_lifetime(),
+            Duration::from_secs(1_800)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_reconnect_options_fail_before_postgresql_authentication() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy_with(disabled_postgresql_reconnect_options());
+
+        pool.acquire()
+            .await
+            .expect_err("the passwordless /dev/null sentinel must never reach a PostgreSQL peer");
+    }
+
+    #[tokio::test]
+    async fn accepted_loopback_listener_remains_bound_while_owner_retains_arc() {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await {
+            Ok(listener) => Arc::new(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // The Codex workspace sandbox denies all listener creation.
+                // Normal CI and deployment hosts execute the rebind assertion.
+                return;
+            }
+            Err(error) => panic!("bind loopback relay listener: {error}"),
+        };
+        let address = listener.local_addr().expect("read relay address");
+        let client = TcpStream::connect(address)
+            .await
+            .expect("connect first loopback client");
+        let (accepted, peer) = listener.accept().await.expect("accept first client");
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        drop(accepted);
+        drop(client);
+
+        let error = std::net::TcpListener::bind(address)
+            .expect_err("the retained listener must prevent same-address substitution");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn connection_initializer_failure_is_sealed_for_post_connect_rejection() {
+        let seal = ConnectionInitializationSeal::new();
+        assert!(seal.begin());
+        seal.finish(Err(sqlx::Error::Protocol(
+            "deliberate initializer failure".into(),
+        )));
+
+        let error = seal
+            .result_after_connect()
+            .expect_err("the captured initializer failure must fail pool construction");
+        assert!(error.to_string().contains("deliberate initializer failure"));
+        assert!(!seal.succeeded());
+    }
+
+    #[test]
+    fn second_connection_initialization_invalidates_the_seal_without_retry_error() {
+        let seal = ConnectionInitializationSeal::new();
+        assert!(seal.begin());
+        seal.finish(Ok(()));
+        assert!(!seal.begin());
+
+        let error = seal
+            .result_after_connect()
+            .expect_err("a second initialization must fail the owner-side check");
+        assert!(error.to_string().contains("ran more than once"));
+        assert!(!seal.succeeded());
+    }
 
     fn startup_message() -> Vec<u8> {
         let mut body = POSTGRESQL_PROTOCOL_VERSION_3.to_be_bytes().to_vec();

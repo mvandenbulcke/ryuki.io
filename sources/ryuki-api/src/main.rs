@@ -3871,16 +3871,50 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    security_contract
-        .validate_runtime_bindings(
-            &app_config,
-            std::env::var_os("RYUKI_AUTH_MODE").is_some(),
-            chrono::Utc::now(),
+    // Production constructs and independently attests the exact application-
+    // serving PostgreSQL channel before the remaining runtime guards are
+    // evaluated. Keep this allocation unpublished: only the future complete
+    // eight-guard admission may consume it through `publish_after_admission`.
+    // Naming the owner (instead of discarding the result) keeps the measured
+    // relay and pool alive across the terminal remaining-guard check below.
+    let unpublished_production_database = if security_contract.is_production() {
+        Some(
+            security_contract
+                .verify_durable_postgresql_runtime_guard(&security_pins, &app_config)
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("durable-postgresql runtime guard failed: {error}");
+                    std::process::exit(1);
+                }),
         )
-        .unwrap_or_else(|error| {
-            eprintln!("security contract runtime binding failed: {error}");
-            std::process::exit(1);
-        });
+    } else {
+        None
+    };
+    if let Err(error) = security_contract.validate_runtime_bindings(
+        &app_config,
+        std::env::var_os("RYUKI_AUTH_MODE").is_some(),
+        chrono::Utc::now(),
+    ) {
+        // `process::exit` does not run destructors. Explicitly release both
+        // owners of the unpublished relay/pool so failed production admission
+        // cannot leave a live task or relay directory behind.
+        drop(unpublished_production_database);
+        drop(security_contract);
+        eprintln!("security contract runtime binding failed: {error}");
+        std::process::exit(1);
+    }
+    // The only production success path will obtain a database-publication
+    // capability from the complete eight-witness aggregate. Until the final
+    // three guards exist, the check above is terminal and this owner remains
+    // deliberately unpublished.
+    if unpublished_production_database.is_some() {
+        eprintln!(
+            "complete production runtime admission returned without database publication authority"
+        );
+        drop(unpublished_production_database);
+        drop(security_contract);
+        std::process::exit(1);
+    }
     START_TIME.set(Instant::now()).ok();
     let api_cookie_runtime_identity = Arc::clone(&api_cookie_runtime);
     let api_authenticator_runtime_identity = Arc::clone(&api_authenticator_runtime);
@@ -4078,7 +4112,20 @@ async fn main() {
             tracing::error!(error = %error, "security checkpoint freshness fence failed before database startup");
             std::process::exit(1);
         });
+    config_store::get_security_contract_context()
+        .remeasure_durable_postgresql_runtime_guard(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "durable-postgresql exact remeasurement failed before database startup");
+            std::process::exit(1);
+        });
     match migration_mode {
+        database::MigrationStartupMode::VerifyOnly if production => {
+            tracing::error!(
+                "production reached database startup without complete eight-guard publication authority"
+            );
+            std::process::exit(1);
+        }
         database::MigrationStartupMode::VerifyOnly => {
             let role_contract =
                 database::ApplicationRoleContract::from_env().unwrap_or_else(|error| {
@@ -4374,6 +4421,13 @@ async fn main() {
             tracing::error!(error = %error, "security checkpoint freshness fence failed");
             std::process::exit(1);
         });
+    config_store::get_security_contract_context()
+        .remeasure_durable_postgresql_runtime_guard(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "durable-postgresql exact remeasurement failed before worker startup");
+            std::process::exit(1);
+        });
 
     // Spawn background sweeps (lease-expiry + idempotency retention). Only when
     // a DB pool is available. Both are idempotent and cancelled automatically
@@ -4604,6 +4658,13 @@ async fn main() {
         .validate_serving_checkpoint_freshness(chrono::Utc::now())
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "security checkpoint freshness fence failed");
+            std::process::exit(1);
+        });
+    config_store::get_security_contract_context()
+        .remeasure_durable_postgresql_runtime_guard(chrono::Utc::now())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "durable-postgresql exact remeasurement failed before listener bind");
             std::process::exit(1);
         });
     // The approved-secret-provider witness retains the exact initial lease Arc.

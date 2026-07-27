@@ -44,7 +44,7 @@ use ryuki_core::postgresql_infrastructure::{
     build_postgresql_infrastructure_attestation_request, postgresql_attestation_request_tag,
     postgresql_tls_channel_binding_digest, verify_postgresql_infrastructure_attestation,
     ExpectedPostgresqlInfrastructure, PostgresqlInfrastructureAuthorityAnchor,
-    PostgresqlSessionBinding, PostgresqlTlsChannelBinding,
+    PostgresqlSessionBinding, PostgresqlSessionPurpose, PostgresqlTlsChannelBinding,
     VerifiedPostgresqlInfrastructureAttestation, MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES,
     MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES,
 };
@@ -3466,16 +3466,42 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
-const REMAINING_PRODUCTION_RUNTIME_GUARDS: [GuardId; 4] = [
-    GuardId::DurablePostgresql,
+const REMAINING_PRODUCTION_RUNTIME_GUARDS: [GuardId; 3] = [
     GuardId::ExternalSigningKeyMaterial,
     GuardId::MockDependenciesDisabled,
     GuardId::FirstOwnerPathClosed,
 ];
 
-// HttpsPublicUrls, SecureCookies, ApprovedSecretProvider, and
-// NonDevelopmentAuthenticator have live production verifiers. The remaining
-// four nominal witness types and the final
+/// Non-cloneable publication capability emitted only by the complete
+/// eight-witness runtime aggregate. Owning a DurablePostgresql witness alone is
+/// deliberately insufficient to publish the retained pool.
+#[allow(dead_code)]
+pub(crate) struct CompleteProductionRuntimeAdmissionToken {
+    durable_postgresql_runtime: crate::database::RetainedPostgresqlRuntime,
+}
+
+impl fmt::Debug for CompleteProductionRuntimeAdmissionToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompleteProductionRuntimeAdmissionToken")
+            .field("durable_postgresql_runtime", &"[RETAINED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)]
+impl CompleteProductionRuntimeAdmissionToken {
+    pub(crate) fn retains_durable_postgresql_runtime(
+        &self,
+        candidate: &crate::database::RetainedPostgresqlRuntime,
+    ) -> bool {
+        self.durable_postgresql_runtime.same_runtime(candidate)
+    }
+}
+
+// HttpsPublicUrls, SecureCookies, ApprovedSecretProvider,
+// NonDevelopmentAuthenticator, and DurablePostgresql have live production
+// verifiers. The remaining three nominal witness types and the final
 // eight-witness aggregate stay under this temporary dead-code allowance until
 // their guard-specific verifiers are implemented.
 #[allow(dead_code)]
@@ -3794,6 +3820,199 @@ mod runtime_admission {
         VerifiedFirstOwnerPathClosedGuardWitness,
         GuardId::FirstOwnerPathClosed
     );
+
+    /// Exact process-lifetime PostgreSQL authority retained after the
+    /// DurablePostgresql guard seals. The local proof owns the measured,
+    /// unpublished application pool; `infrastructure` retains the same Arc
+    /// whose signed provider facts were used by that local proof.
+    pub(super) struct VerifiedDurablePostgresqlRuntimeHandle {
+        local: crate::database::VerifiedLocalDurablePostgresqlRuntime,
+        infrastructure: Arc<VerifiedPostgresqlInfrastructureAttestation>,
+    }
+
+    impl fmt::Debug for VerifiedDurablePostgresqlRuntimeHandle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedDurablePostgresqlRuntimeHandle")
+                .field("local", &self.local)
+                .field("infrastructure", &"[RETAINED-SIGNED-PROOF]")
+                .finish()
+        }
+    }
+
+    impl VerifiedDurablePostgresqlRuntimeHandle {
+        pub(super) fn runtime(&self) -> &crate::database::RetainedPostgresqlRuntime {
+            self.local.runtime()
+        }
+    }
+
+    pub(super) type VerifiedDurablePostgresqlRuntimeWitness =
+        VerifiedDurablePostgresqlGuardWitness<VerifiedDurablePostgresqlRuntimeHandle>;
+
+    fn durable_postgresql_measurement_failed() -> ProductionRuntimeAdmissionError {
+        ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+            guard_id: GuardId::DurablePostgresql,
+        }
+    }
+
+    fn verified_postgresql_proof_matches_durable_challenge(
+        boundary: &VerifiedProductionBoundary,
+        infrastructure: &VerifiedPostgresqlInfrastructureAttestation,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        let measurement_failed = durable_postgresql_measurement_failed;
+        infrastructure
+            .verify_integrity()
+            .map_err(|_| measurement_failed())?;
+        if infrastructure.session_purpose() != PostgresqlSessionPurpose::ApplicationServing {
+            return Err(measurement_failed());
+        }
+        let challenge = exact_challenge(boundary, GuardId::DurablePostgresql)?;
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            database_provider,
+            server_major_version,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            provider_route_binding_digest,
+            database_identity_digest,
+            storage_binding_digest,
+            migration_inventory_digest,
+            application_role,
+            migration_role,
+        } = challenge.expected_value()
+        else {
+            return Err(ProductionRuntimeAdmissionError::GuardKindMismatch {
+                expected: GuardId::DurablePostgresql,
+                observed: challenge.expected_value().guard_id(),
+            });
+        };
+        if infrastructure.deployment_id() != boundary.deployed_workload.deployment_id()
+            || infrastructure.trust_domain_id() != boundary.deployed_workload.trust_domain_id()
+            || infrastructure.workload_id() != boundary.deployed_workload.workload_id()
+            || infrastructure.source_revision() != boundary.conformance.source_revision()
+            || infrastructure.artifact_digest() != boundary.deployed_workload.oci_subject_digest()
+            || infrastructure.workload_instance_binding_digest()
+                != boundary
+                    .deployed_workload
+                    .workload_instance_binding_digest()
+            || infrastructure.requirement_digest() != challenge.requirement_digest()
+            || infrastructure.challenge_binding_digest() != challenge.challenge_binding_digest()
+            || infrastructure.database_provider() != *database_provider
+            || infrastructure.server_major_version() != *server_major_version
+            || infrastructure.attestation_profile_id() != attestation_profile_id.as_str()
+            || infrastructure.attestation_profile_version() != *attestation_profile_version
+            || infrastructure.attestation_profile_digest() != attestation_profile_digest.as_str()
+            || infrastructure.provider_route_binding_digest()
+                != provider_route_binding_digest.as_str()
+            || infrastructure.database_identity_digest() != database_identity_digest.as_str()
+            || infrastructure.storage_binding_digest() != storage_binding_digest.as_str()
+            || infrastructure.migration_inventory_digest() != migration_inventory_digest.as_str()
+            || infrastructure.application_role() != application_role.as_str()
+            || infrastructure.migration_role() != migration_role.as_str()
+        {
+            return Err(measurement_failed());
+        }
+        Ok(())
+    }
+
+    fn validate_durable_postgresql_runtime_handle(
+        boundary: &VerifiedProductionBoundary,
+        handle: &VerifiedDurablePostgresqlRuntimeHandle,
+    ) -> Result<RuntimeGuardExpectedValue, ProductionRuntimeAdmissionError> {
+        let measurement_failed = durable_postgresql_measurement_failed;
+        verified_postgresql_proof_matches_durable_challenge(boundary, &handle.infrastructure)?;
+        handle
+            .local
+            .recheck_integrity()
+            .map_err(|_| measurement_failed())?;
+        if !handle
+            .local
+            .retains_infrastructure_attestation(&handle.infrastructure)
+        {
+            return Err(measurement_failed());
+        }
+        let challenge = exact_challenge(boundary, GuardId::DurablePostgresql)?;
+        if handle.local.observed_value() != challenge.expected_value() {
+            return Err(ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::DurablePostgresql,
+            });
+        }
+        Ok(handle.local.observed_value().clone())
+    }
+
+    pub(super) fn seal_durable_postgresql_guard(
+        boundary: &VerifiedProductionBoundary,
+        local: crate::database::VerifiedLocalDurablePostgresqlRuntime,
+        infrastructure: Arc<VerifiedPostgresqlInfrastructureAttestation>,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<VerifiedDurablePostgresqlRuntimeWitness, ProductionRuntimeAdmissionError> {
+        let observed_at_not_before = infrastructure.observed_at_not_before();
+        let observed_at_not_after = infrastructure.observed_at_not_after();
+        let valid_until = infrastructure.valid_until();
+        let requirement_digest = infrastructure.requirement_digest().to_owned();
+        let challenge_binding_digest = infrastructure.challenge_binding_digest().to_owned();
+        let handle = VerifiedDurablePostgresqlRuntimeHandle {
+            local,
+            infrastructure,
+        };
+        let observed_value = validate_durable_postgresql_runtime_handle(boundary, &handle)?;
+        VerifiedDurablePostgresqlGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::DurablePostgresql,
+                observed_value,
+                requirement_digest,
+                challenge_binding_digest,
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle,
+            },
+            trusted_now,
+        )
+    }
+
+    pub(super) fn recheck_durable_postgresql_guard(
+        boundary: &VerifiedProductionBoundary,
+        witness: &VerifiedDurablePostgresqlRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        witness
+            .handle()
+            .infrastructure
+            .ensure_fresh(trusted_now)
+            .map_err(|_| ProductionRuntimeAdmissionError::WitnessStale {
+                guard_id: GuardId::DurablePostgresql,
+            })?;
+        let remeasured = validate_durable_postgresql_runtime_handle(boundary, witness.handle())?;
+        if witness.0.observed_value != remeasured {
+            return Err(durable_postgresql_measurement_failed());
+        }
+        witness.recheck(boundary, trusted_now)
+    }
+
+    /// Repeat every SQL and exact-session observation through the retained,
+    /// still-identical application pool. The synchronous recheck runs on both
+    /// sides so a stale proof or changed projection cannot be spliced around
+    /// the asynchronous database measurement.
+    pub(super) async fn remeasure_durable_postgresql_guard_exact(
+        boundary: &VerifiedProductionBoundary,
+        witness: &VerifiedDurablePostgresqlRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        recheck_durable_postgresql_guard(boundary, witness, trusted_now)?;
+        witness
+            .handle()
+            .local
+            .remeasure_exact()
+            .await
+            .map_err(|_| durable_postgresql_measurement_failed())?;
+        let verified_at = trusted_time_point(Utc::now());
+        if verified_at.not_before < trusted_now.not_after {
+            return Err(ProductionRuntimeAdmissionError::TrustedTimeRollback);
+        }
+        recheck_durable_postgresql_guard(boundary, witness, verified_at)
+    }
 
     pub(super) type VerifiedHttpsPublicUrlsRuntimeWitness =
         VerifiedHttpsPublicUrlsGuardWitness<VerifiedPublicIngressAttestation>;
@@ -5201,6 +5420,35 @@ mod runtime_admission {
             self.witnesses.first_owner_path_closed.handle()
         }
     }
+
+    impl<
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+        VerifiedProductionRuntimeAdmission<
+            VerifiedDurablePostgresqlRuntimeHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+    {
+        /// Derive database publication authority from the complete aggregate,
+        /// never from the DurablePostgresql witness in isolation.
+        pub(super) fn database_publication_token(&self) -> CompleteProductionRuntimeAdmissionToken {
+            CompleteProductionRuntimeAdmissionToken {
+                durable_postgresql_runtime: self.durable_postgresql_handle().runtime().clone(),
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -5421,6 +5669,7 @@ impl VerifiedProductionMigrationExecution {
                 != migration_inventory_digest.as_str()
             || self.verified_infrastructure.application_role() != application_role.as_str()
             || self.verified_infrastructure.migration_role() != migration_role.as_str()
+            || self.verified_infrastructure.session_purpose() != PostgresqlSessionPurpose::Migration
         {
             return Err(
                 "verified PostgreSQL-infrastructure proof differs from the retained production boundary"
@@ -5737,6 +5986,7 @@ impl PendingProductionMigrationTarget {
                 migration_inventory_digest,
                 application_role,
                 migration_role,
+                session_purpose: PostgresqlSessionPurpose::Migration,
                 session_binding: &session_binding,
             },
             authority,
@@ -5958,6 +6208,11 @@ pub(crate) struct SecurityContractContext {
     /// allocation that satisfied NonDevelopmentAuthenticator.
     verified_non_development_authenticator_guard:
         Option<runtime_admission::VerifiedNonDevelopmentAuthenticatorRuntimeWitness>,
+    /// Live DurablePostgresql witness retaining the exact unpublished,
+    /// channel-bound application pool and the same independently signed
+    /// infrastructure proof used by its local receipt comparison.
+    verified_durable_postgresql_guard:
+        Option<runtime_admission::VerifiedDurablePostgresqlRuntimeWitness>,
     /// Exact active security-limit document selected by the deployment root.
     /// Runtime owners receive only opaque policies resolved from this retained
     /// authority and the verified provider D document.
@@ -6341,6 +6596,12 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if !self.profile.security_profile.is_production() {
+            if self.verified_durable_postgresql_guard.is_some() {
+                return Err(
+                    "non-production serving startup retained DurablePostgresql production authority"
+                        .into(),
+                );
+            }
             return Ok(());
         }
         let ConformanceState::Production(boundary) = &self.conformance_state else {
@@ -6350,6 +6611,21 @@ impl SecurityContractContext {
         };
         let trusted_now = trusted_time_point(now);
         boundary.ensure_fresh(trusted_now)?;
+        let durable_postgresql_guard =
+            self.verified_durable_postgresql_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production serving startup has no verified DurablePostgresql runtime guard"
+                        .to_string()
+                })?;
+        runtime_admission::recheck_durable_postgresql_guard(
+            boundary,
+            durable_postgresql_guard,
+            trusted_now,
+        )
+        .map_err(|error| {
+            format!("DurablePostgresql runtime guard freshness recheck failed: {error}")
+        })?;
         if let Some(witness) = &self.verified_https_public_urls_guard {
             runtime_admission::recheck_https_public_urls_guard(boundary, witness, trusted_now)
                 .map_err(|error| {
@@ -6626,12 +6902,298 @@ impl SecurityContractContext {
             .is_some_and(|witness| witness.handle().retains_runtime(runtime))
     }
 
+    /// Construct, independently attest, locally measure, and seal the exact
+    /// production application database without publishing it. Every role,
+    /// provider, route, profile, workload, and challenge value comes from the
+    /// sealed boundary. The caller supplies only the already-admitted runtime
+    /// configuration and the independently pinned authority set.
+    pub(crate) async fn verify_durable_postgresql_runtime_guard(
+        &mut self,
+        pins: &StartupSecurityPins,
+        config: &RyukiConfig,
+    ) -> Result<crate::database::UnpublishedPostgresqlRuntime, String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_durable_postgresql_guard.is_some()
+                || pins.postgresql_infrastructure_attestation.is_some()
+            {
+                return Err(
+                    "non-production startup retained DurablePostgresql production authority".into(),
+                );
+            }
+            return Err("DurablePostgresql runtime verification is production-only".into());
+        }
+        if self.verified_durable_postgresql_guard.is_some() {
+            return Err(
+                "production DurablePostgresql runtime guard was verified more than once".into(),
+            );
+        }
+        if self.profile.security_profile != pins.security_profile
+            || self.profile.deployment_id != pins.deployment_id
+        {
+            return Err(
+                "DurablePostgresql startup pins differ from the loaded deployment identity".into(),
+            );
+        }
+        let authority_pins = pins
+            .postgresql_infrastructure_attestation
+            .as_ref()
+            .ok_or_else(|| {
+                "production startup has no independently pinned PostgreSQL-infrastructure authority"
+                    .to_string()
+            })?;
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        let challenge = runtime_admission::exact_challenge(boundary, GuardId::DurablePostgresql)
+            .map_err(|error| format!("production startup lost its database guard: {error}"))?;
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            database_provider,
+            server_major_version,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            provider_route_binding_digest,
+            database_identity_digest,
+            storage_binding_digest,
+            migration_inventory_digest,
+            application_role,
+            migration_role,
+        } = challenge.expected_value()
+        else {
+            return Err("production startup database challenge is not DurablePostgresql".into());
+        };
+        if authority_pins.attestation_profile_id.as_str() != attestation_profile_id.as_str()
+            || authority_pins.attestation_profile_version != *attestation_profile_version
+            || authority_pins.attestation_profile_digest.as_str()
+                != attestation_profile_digest.as_str()
+        {
+            return Err(
+                "PostgreSQL-infrastructure startup profile pins differ from the receipt-bound runtime guard"
+                    .into(),
+            );
+        }
+        let roles = crate::database::ProductionDatabaseRoles::new(
+            application_role.clone(),
+            migration_role.clone(),
+        )?;
+        let settings = crate::database::ApplicationPoolSettings::new(
+            config.server.pool_max_connections,
+            config.server.pool_min_connections,
+            config.server.pool_idle_timeout_secs,
+            config.server.pool_acquire_timeout_secs,
+            config.server.pool_max_lifetime_secs,
+        )?;
+        let mut request_nonce = [0u8; 32];
+        OsRng.try_fill_bytes(&mut request_nonce).map_err(|_| {
+            "cannot generate the one-shot PostgreSQL-infrastructure serving nonce".to_string()
+        })?;
+        if request_nonce.iter().all(|byte| *byte == 0) {
+            return Err(
+                "operating-system randomness produced an invalid PostgreSQL-infrastructure serving nonce"
+                    .into(),
+            );
+        }
+        boundary.ensure_fresh(trusted_time_point(Utc::now()))?;
+        let unpublished = crate::database::construct_unpublished_channel_bound_production_database(
+            &config.database_url,
+            settings,
+            roles,
+            *database_provider,
+            provider_route_binding_digest,
+            &request_nonce,
+        )
+        .await
+        .map_err(|error| {
+            format!("cannot construct the unpublished production database runtime: {error}")
+        })?;
+        let session_binding = Arc::clone(unpublished.session_binding());
+        let requested_at = Utc::now();
+        boundary.ensure_fresh(trusted_time_point(requested_at))?;
+        let public_key = decode_postgresql_infrastructure_authority_public_key(authority_pins)?;
+        let authority = PostgresqlInfrastructureAuthorityAnchor {
+            authority_id: &authority_pins.authority_id,
+            key_id: &authority_pins.key_id,
+            public_key: &public_key,
+            public_key_fingerprint: &authority_pins.public_key_fingerprint,
+            minimum_authority_epoch: authority_pins.minimum_authority_epoch,
+            attestation_profile_id: &authority_pins.attestation_profile_id,
+            attestation_profile_version: authority_pins.attestation_profile_version,
+            attestation_profile_digest: &authority_pins.attestation_profile_digest,
+        };
+        let request = build_postgresql_infrastructure_attestation_request(
+            ExpectedPostgresqlInfrastructure {
+                deployment_id: boundary.deployed_workload.deployment_id(),
+                trust_domain_id: boundary.deployed_workload.trust_domain_id(),
+                workload_id: boundary.deployed_workload.workload_id(),
+                source_revision: boundary.conformance.source_revision(),
+                artifact_digest: boundary.deployed_workload.oci_subject_digest(),
+                workload_instance_binding_digest: boundary
+                    .deployed_workload
+                    .workload_instance_binding_digest(),
+                requirement_digest: challenge.requirement_digest(),
+                challenge_binding_digest: challenge.challenge_binding_digest(),
+                database_provider: *database_provider,
+                server_major_version: *server_major_version,
+                provider_route_binding_digest,
+                database_identity_digest,
+                storage_binding_digest,
+                migration_inventory_digest,
+                application_role,
+                migration_role,
+                session_purpose: PostgresqlSessionPurpose::ApplicationServing,
+                session_binding: session_binding.as_ref(),
+            },
+            authority,
+            request_nonce,
+            requested_at,
+        )
+        .map_err(|error| {
+            format!("cannot build exact PostgreSQL-infrastructure serving request: {error}")
+        })?;
+        if request.request_tag() != session_binding.application_name.as_str() {
+            return Err(
+                "PostgreSQL serving session application_name differs from the one-shot attestation request tag"
+                    .into(),
+            );
+        }
+        let transport = UnixAuthorityTransport::new(
+            authority_pins.socket_path.clone(),
+            AuthorityTransportDeadlines {
+                connect: POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+                write: POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+                read: POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+            },
+            AuthorityTransportBounds {
+                max_request_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES,
+                max_response_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES,
+            },
+            AuthorityTransportHardLimits {
+                max_socket_path_bytes: MAX_AUTHORITY_SOCKET_PATH_BYTES,
+                max_phase_deadline: MAX_POSTGRESQL_INFRASTRUCTURE_TRANSPORT_PHASE_DEADLINE,
+                max_request_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_REQUEST_BYTES,
+                max_response_bytes: MAX_POSTGRESQL_INFRASTRUCTURE_RESPONSE_BYTES,
+            },
+        )
+        .map_err(|error| {
+            format!("cannot configure bounded PostgreSQL-infrastructure transport: {error}")
+        })?;
+        let raw_response = transport
+            .exchange(request.as_bytes())
+            .await
+            .map_err(|error| {
+                format!("PostgreSQL-infrastructure serving attestation exchange failed: {error}")
+            })?;
+        let proof_verified_at = Utc::now();
+        boundary.ensure_fresh(trusted_time_point(proof_verified_at))?;
+        let infrastructure = Arc::new(
+            verify_postgresql_infrastructure_attestation(
+                request,
+                &raw_response,
+                authority,
+                trusted_time_point(proof_verified_at),
+            )
+            .map_err(|error| {
+                format!("PostgreSQL-infrastructure serving proof verification failed: {error}")
+            })?,
+        );
+        if infrastructure.session_purpose() != PostgresqlSessionPurpose::ApplicationServing
+            || infrastructure.session_binding() != session_binding.as_ref()
+        {
+            return Err(
+                "verified PostgreSQL-infrastructure proof substituted the application-serving session"
+                    .into(),
+            );
+        }
+        let infrastructure_evidence: Arc<
+            dyn crate::database::VerifiedPostgresqlInfrastructureEvidence,
+        > = infrastructure.clone();
+        let local = crate::database::verify_local_durable_postgresql_runtime(
+            &unpublished,
+            infrastructure_evidence,
+            challenge.expected_value(),
+        )
+        .map_err(|error| format!("local DurablePostgresql runtime verification failed: {error}"))?;
+        let retained = unpublished.retained_handle();
+        if !local.retains_runtime(&retained)
+            || !local.retains_infrastructure_attestation(&infrastructure)
+        {
+            return Err(
+                "DurablePostgresql verification did not retain the exact unpublished authority"
+                    .into(),
+            );
+        }
+        // Signature verification and the local digest/identity comparisons can
+        // consume the proof's final validity instant. Resample immediately
+        // before sealing so a proof that expired during synchronous work is
+        // never installed as a live witness.
+        let sealed_at = Utc::now();
+        if sealed_at < proof_verified_at {
+            return Err(
+                "trusted time moved backwards while sealing DurablePostgresql authority".into(),
+            );
+        }
+        let sealed_time = trusted_time_point(sealed_at);
+        boundary.ensure_fresh(sealed_time)?;
+        infrastructure.ensure_fresh(sealed_time).map_err(|error| {
+            format!("PostgreSQL-infrastructure proof expired before sealing: {error}")
+        })?;
+        let witness = runtime_admission::seal_durable_postgresql_guard(
+            boundary,
+            local,
+            infrastructure,
+            sealed_time,
+        )
+        .map_err(|error| format!("DurablePostgresql runtime guard verification failed: {error}"))?;
+        self.verified_durable_postgresql_guard = Some(witness);
+        Ok(unpublished)
+    }
+
+    /// Repeat the exact channel-bound SQL/session observation at an
+    /// asynchronous serving fence. This is intentionally separate from the
+    /// value-free synchronous checkpoint recheck.
+    pub(crate) async fn remeasure_durable_postgresql_runtime_guard(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_durable_postgresql_guard.is_some() {
+                return Err(
+                    "non-production startup retained DurablePostgresql production authority".into(),
+                );
+            }
+            return Ok(());
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        let witness = self
+            .verified_durable_postgresql_guard
+            .as_ref()
+            .ok_or_else(|| {
+                "production startup has no verified DurablePostgresql runtime guard".to_string()
+            })?;
+        runtime_admission::remeasure_durable_postgresql_guard_exact(
+            boundary,
+            witness,
+            trusted_time_point(now),
+        )
+        .await
+        .map_err(|error| format!("DurablePostgresql exact runtime remeasurement failed: {error}"))
+    }
+
     pub(crate) fn validate_runtime_bindings(
         &self,
         config: &RyukiConfig,
         legacy_auth_selector_present: bool,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production()
+            && self.verified_durable_postgresql_guard.is_some()
+        {
+            return Err(
+                "non-production startup retained DurablePostgresql production authority".into(),
+            );
+        }
         // Production authority always comes from the authenticated provider
         // registry. Reject the legacy selector before any guard-specific
         // branch can return early and accidentally leave two authority
@@ -6670,6 +7232,12 @@ impl SecurityContractContext {
                     "production startup has no verified non-development-authenticator runtime guard"
                         .to_string()
                 })?;
+            let durable_postgresql_guard = self
+                .verified_durable_postgresql_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production startup has no verified DurablePostgresql runtime guard".to_string()
+                })?;
             let (secret_provider, _) = self.exact_production_secret_provider()?;
             let trusted_now = trusted_time_point(now);
             runtime_admission::recheck_https_public_urls_guard(
@@ -6707,6 +7275,14 @@ impl SecurityContractContext {
                     "non-development-authenticator runtime guard freshness recheck failed: {error}"
                 )
             })?;
+            runtime_admission::recheck_durable_postgresql_guard(
+                boundary,
+                durable_postgresql_guard,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!("DurablePostgresql runtime guard freshness recheck failed: {error}")
+            })?;
             let selected = self.select_authentication_provider(&config.auth_mode)?;
             self.validate_selected_provider(selected, config)?;
             let provider_applicability = format!(
@@ -6715,7 +7291,7 @@ impl SecurityContractContext {
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: durable-postgresql, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and DurablePostgresql, HttpsPublicUrls, the exact retained SecureCookies policy, the singleton ApprovedSecretProvider D/P/R/I composition, plus the NonDevelopmentAuthenticator D/P/Q/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining {} runtime guards are verified: external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
@@ -7917,6 +8493,7 @@ fn finalize_startup_security_contract(
         verified_https_public_urls_guard: None,
         verified_approved_secret_provider_guard: None,
         verified_non_development_authenticator_guard: None,
+        verified_durable_postgresql_guard: None,
         verified_security_limit_profile: prepared.verified_security_limit_profile,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
@@ -10025,6 +10602,10 @@ impl<'a> ReferenceVerifier<'a> {
                     "sources/ryuki-api/src/database.rs"
                 )
                 | (
+                    "source:ryuki-api-postgresql-tls-channel",
+                    "sources/ryuki-api/src/postgresql_tls_channel.rs"
+                )
+                | (
                     "source:ryuki-api-audit-repository",
                     "sources/ryuki-api/src/audit.rs"
                 )
@@ -10039,6 +10620,10 @@ impl<'a> ReferenceVerifier<'a> {
                 | (
                     "source:ryuki-api-security-contract-loader",
                     "sources/ryuki-api/src/security_contracts.rs"
+                )
+                | (
+                    "source:ryuki-core-postgresql-infrastructure",
+                    "sources/ryuki-core/src/postgresql_infrastructure.rs"
                 )
                 | (
                     "source:ryuki-engine-authorization-kernel",
@@ -13677,7 +14262,6 @@ mod tests {
         assert_eq!(
             REMAINING_PRODUCTION_RUNTIME_GUARDS,
             [
-                GuardId::DurablePostgresql,
                 GuardId::ExternalSigningKeyMaterial,
                 GuardId::MockDependenciesDisabled,
                 GuardId::FirstOwnerPathClosed,
@@ -14316,10 +14900,12 @@ mod tests {
                 "sources/ryuki-api/src/repos/job_steps.rs",
                 "sources/ryuki-api/src/repos/degradation.rs",
                 "sources/ryuki-api/src/database.rs",
+                "sources/ryuki-api/src/postgresql_tls_channel.rs",
                 "sources/ryuki-api/src/audit.rs",
                 "sources/ryuki-api/src/entra_auth.rs",
                 "sources/ryuki-api/src/identity_authority.rs",
                 "sources/ryuki-api/src/security_contracts.rs",
+                "sources/ryuki-core/src/postgresql_infrastructure.rs",
                 "sources/ryuki-engine/src/authorization.rs",
             ] {
                 copy_relative(&repository, &root, relative);
@@ -16060,6 +16646,59 @@ mod tests {
             .validate_runtime_bindings(&config, false, fixed_now())
             .unwrap_err()
             .contains("does not exactly match"));
+    }
+
+    #[tokio::test]
+    async fn nonproduction_refuses_durable_postgresql_authority_before_database_construction() {
+        let fixture = ActiveFixture::build();
+        let mut context = fixture.load().expect("active test contract must load");
+        let config = RyukiConfig::default();
+
+        let error = context
+            .verify_durable_postgresql_runtime_guard(&fixture.pins, &config)
+            .await
+            .unwrap_err();
+        assert!(error.contains("production-only"));
+        context
+            .validate_serving_checkpoint_freshness(fixed_now())
+            .expect("non-production without retained authority remains valid");
+
+        let signing_key = SigningKey::from_bytes(&rand::random());
+        let public_key = signing_key.verifying_key().to_bytes();
+        let mut authority_pins = fixture.pins.clone();
+        authority_pins.postgresql_infrastructure_attestation =
+            Some(StartupPostgresqlInfrastructureAttestationPins {
+                socket_path: PathBuf::from("/run/ryuki/postgresql-infrastructure/authority.sock"),
+                authority_id: "postgresql-infrastructure-attestation-authority:nonproduction-test"
+                    .into(),
+                key_id: "postgresql-infrastructure-attestation-key:nonproduction-test".into(),
+                public_key_base64: BASE64_STANDARD.encode(public_key),
+                public_key_fingerprint: raw_digest(&public_key),
+                minimum_authority_epoch: 1,
+                attestation_profile_id:
+                    "postgresql-infrastructure-attestation-profile:nonproduction-test".into(),
+                attestation_profile_version: 1,
+                attestation_profile_digest: raw_digest(b"nonproduction PostgreSQL profile"),
+            });
+        let error = context
+            .verify_durable_postgresql_runtime_guard(&authority_pins, &config)
+            .await
+            .unwrap_err();
+        assert!(error.contains("retained DurablePostgresql production authority"));
+    }
+
+    #[test]
+    fn durable_postgresql_has_a_concrete_guard_and_three_guards_remain() {
+        assert_eq!(
+            REMAINING_PRODUCTION_RUNTIME_GUARDS,
+            [
+                GuardId::ExternalSigningKeyMaterial,
+                GuardId::MockDependenciesDisabled,
+                GuardId::FirstOwnerPathClosed,
+            ]
+        );
+        let _verify_api = SecurityContractContext::verify_durable_postgresql_runtime_guard;
+        let _remeasure_api = SecurityContractContext::remeasure_durable_postgresql_runtime_guard;
     }
 
     #[test]

@@ -3,7 +3,7 @@
 - Status: **proposed normative production boundary**
 - Owner: platform and security engineering
 - Evidence revision: `8212748308372e92d9cf794907d85fe103afd1da`
-- Last updated: 2026-07-19
+- Last updated: 2026-07-27
 - Production gate: **blocking until the required invariants are implemented and verified**
 
 This specification defines one security boundary for every Ryuki caller and
@@ -741,24 +741,40 @@ controls are part of the boundary rather than optional operational guidance.
   recovery path. Wall-clock rollback must
   not revive expired credentials, grants, leases, replay windows, or step-up.
 
-### Production PostgreSQL migration boundary
+### Production PostgreSQL migration and serving boundary
 
 - Production schema changes use an isolated `apply-only` process and one
   explicit migration credential. The normal serving pool cannot perform DDL,
   and the migration process never starts listeners, workers, or application
   routing.
+- PostgreSQL infrastructure attestation protocol v2 carries an explicit
+  `migration` or `application-serving` session purpose. It binds that purpose
+  with the one-shot nonce into the TLS 1.3 exporter context, request tag,
+  canonical request, and signed response, so a valid migration proof cannot be
+  substituted for a serving session or vice versa.
 - The deployment receipt binds a direct PostgreSQL provider route consisting of
   provider, canonical DNS name and port, exclusive CA-bundle digest, and exact
   peer leaf-certificate digest. The runner establishes TLS 1.3 itself, checks
   that route before releasing credentials, permits only SCRAM-SHA-256 startup
   authentication, disables TLS resumption, derives an exporter-bound request
-  tag, and exposes the measured stream to exactly one process-owned SQLx
-  connection through a bounded owner-only Unix relay.
+  tag, and exposes the measured stream to exactly one SQLx connection through
+  a bounded loopback relay whose listener remains bound to that runtime.
 - An independently governed PostgreSQL infrastructure authority must derive the
-  same TLS exporter at the database endpoint and sign the exact provider,
-  cluster, durable-storage, database, role, migration-inventory, and backend-
-  session projection. A client-echoed tag or local SQL observation is not
-  independent evidence.
+  same purpose-bound TLS exporter at the database endpoint and sign the exact
+  provider, cluster, durable-storage, database, role, migration-inventory, and
+  backend-session projection. The authority/profile pins supplied by the
+  deployment and the receipt-bound profile, route, identities, roles, and
+  session must remain in exact lockstep. A client-echoed tag or local SQL
+  observation is not independent evidence.
+- For `application-serving`, startup retains the exact measured TLS channel,
+  bound loopback relay listener, application-role backend session, durable local
+  observation, and SQLx pool as one non-cloneable runtime. Production requires
+  configured `max_connections=min_connections=1`; immediately after the first
+  connection, SQLx's stored options are replaced with a passwordless,
+  locally non-connectable sentinel while the original listener stays bound, so
+  SQLx has no credential-bearing reconnect, wider-pool, or fallback path.
+  The retained allocation is remeasured at startup fences and remains
+  unpublished until the complete eight-guard admission authorizes publication.
 - Serialization is acquired on the backend before `BEGIN`, promoted to the
   same transaction-scoped advisory lock as the first transactional statement,
   and then removed from session scope. Migration SQL cannot release the
@@ -1176,15 +1192,21 @@ receipt closure, and seals all static proof ownership into one non-cloneable
 production-boundary capability. The checked-in provider remains development-
 only, every compiled adapter remains production-ineligible, and the checked-in
 documents are implementation fixtures rather than active signed production
-authority. The runtime admission boundary now measures `HttpsPublicUrls`
-through one nonce-bound, no-retry exchange with an independently pinned
-Ed25519 ingress authority and retains its exact signed DNS/TLS/route/backend
-observation. It also measures `SecureCookies` through a typed live witness that
-retains the exact API cookie-runtime and policy allocations used by every
-declared API cookie consumer. Both witnesses are rechecked at the pre-database,
-pre-worker, and final-listener freshness fences. The other six typed live guard
-witnesses are not yet implemented. Production therefore remains fail-closed
-before migrations, workers, routing, or listeners.
+authority. The runtime admission boundary now measures and retains five typed
+live witnesses: `HttpsPublicUrls` through one nonce-bound, no-retry exchange
+with an independently pinned Ed25519 ingress authority;
+`SecureCookies` over the exact API cookie runtime and every declared consumer;
+`ApprovedSecretProvider` over the exact retained D/P/R/I composition;
+`NonDevelopmentAuthenticator` over the exact immutable authenticator runtime;
+and `DurablePostgresql` over the purpose-bound v2 infrastructure proof, exact
+single-channel serving pool, and local durable observation. The witnesses are
+rechecked at the applicable pre-database, pre-worker, and final-listener
+freshness and exact-remeasurement fences. Exactly three typed witnesses remain
+unimplemented: `ExternalSigningKeyMaterial`, `MockDependenciesDisabled`, and
+`FirstOwnerPathClosed`. The retained PostgreSQL pool is not published while
+any guard is absent, so production serving remains fail-closed before database
+publication, workers, routing, or listeners. The boundary remains proposed,
+not production-complete.
 
 Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
@@ -1307,6 +1329,12 @@ the public-ingress expectation is signed before startup, that instance binding
 is a stable provisioned deployment identity known when the receipt is issued;
 a newly randomized per-start identity cannot satisfy the precommitted ingress
 digest.
+The `DurablePostgresql` witness accepts only an `application-serving` v2
+attestation for the exact retained TLS exporter, route, backend session,
+application role, migration inventory, and single-connection SQLx pool. A
+`migration` proof, caller-recomputed metadata, another pool allocation, or an
+unattested reconnect cannot satisfy the witness. Publication consumes that
+same retained allocation only after all eight live guard witnesses have passed.
 Digest-valued expectations use the named canonical contracts
 `ryuki-postgresql-database-identity-v1`,
 `ryuki-postgresql-storage-binding-v1`,

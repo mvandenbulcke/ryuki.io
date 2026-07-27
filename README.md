@@ -349,15 +349,24 @@ attested marker-and-inventory reconciliation, never by assuming rollback or
 blindly replaying DDL. This repository does not yet contain the live Kubernetes
 admission/attempt-consumption and runtime receipt verifier needed to make the
 offline signed render authoritative, so production `apply-only` exits before
-reading the migration credential. Serving startup now retains independently verified
-`HttpsPublicUrls`, exact-runtime `SecureCookies`, and exact retained
-`ApprovedSecretProvider` witnesses, but still exits before workers, routing, or
-listeners until the remaining five receipt-bound live runtime guards and
-normative boundary work packages are implemented and verified. The five
-outstanding serving guards are `durable-postgresql`,
-`non-development-authenticator`, `external-signing-key-material`,
-`mock-dependencies-disabled`, and `first-owner-path-closed`; the overall
-normative production boundary is not complete.
+reading the migration credential. PostgreSQL infrastructure attestation v2
+binds an explicit `migration` or `application-serving` purpose alongside the
+fresh nonce in the TLS exporter context, request tag, canonical request, and
+signed response. For application serving, startup retains the exact measured
+TLS 1.3 channel, bound loopback relay listener, application-role backend
+session, and SQLx pool;
+production requires configured pool maximum and minimum counts to both equal
+one, with no reconnect or fallback path. The independently governed authority
+must derive the same purpose-bound exporter and sign facts that match the
+deployment pins and receipt-bound profile, route, identities, roles, and
+session exactly. This completes live witnesses for `HttpsPublicUrls`,
+`SecureCookies`, `ApprovedSecretProvider`, `NonDevelopmentAuthenticator`, and
+`DurablePostgresql`. The measured pool remains unpublished and production still
+exits before database publication, workers, routing, or listeners until the
+complete eight-guard admission succeeds. Exactly three serving guards remain:
+`external-signing-key-material`, `mock-dependencies-disabled`, and
+`first-owner-path-closed`; the overall proposed normative production boundary
+is not complete.
 
 ### Production Vault Kubernetes workload authentication
 

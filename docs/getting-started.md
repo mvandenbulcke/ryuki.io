@@ -122,19 +122,26 @@ PostgreSQL infrastructure attestation group:
 `RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST`. The nine values
 are complete-or-none and must be independently provisioned; development and
 test must leave them unset. The PostgreSQL socket and decoded-key fingerprint
-must differ from the checkpoint, workload, and ingress authorities. A
-lower-level production `apply-only` protocol performs one fresh nonce-bound, no-retry
-Ed25519 exchange with an authorization ceiling of 300 seconds. It establishes
-one exclusive-CA TLS 1.3 channel, requires its peer leaf-certificate digest to
-match the receipt-bound route before releasing credentials, permits only
-SCRAM-SHA-256, binds its exporter and provider route into the request tag, and
-relays only that channel into one direct
-PgConnection. The independent authority must derive the same exporter at the
-database endpoint; an echoed client tag is insufficient. After exact receipt
-matching, pre-DDL recheck, every pending migration, exact ledger postflight,
-and the durable operation marker run in one transaction. A pre-COMMIT failure
-rolls back; a lost COMMIT acknowledgement is `CommitOutcomeUnknown` and needs
-a fresh independently attested reconciliation run.
+must differ from the checkpoint, workload, and ingress authorities. PostgreSQL
+infrastructure attestation v2 performs one fresh nonce-bound, no-retry Ed25519
+exchange with an authorization ceiling of 300 seconds. It binds an explicit
+`migration` or `application-serving` purpose alongside the fresh nonce in the
+TLS 1.3 exporter context,
+request tag, canonical request, and signed response. The independent authority
+must derive the same purpose-bound exporter at the database endpoint and keep
+its signed profile, route, identities, roles, and backend session in exact
+lockstep with the deployment pins and receipt-bound expectation; an echoed
+client tag is insufficient. Apply-only relays its measured channel into one
+direct PgConnection. Serving retains the exact channel, its bound loopback
+relay listener,
+application-role session, and SQLx pool and therefore requires
+`RYUKI_SERVER__POOL_MAX_CONNECTIONS=1` and
+`RYUKI_SERVER__POOL_MIN_CONNECTIONS=1`; reconnect, fallback, or a wider pool
+fails closed. After exact receipt matching, pre-DDL recheck, every pending
+migration, exact ledger postflight, and the durable operation marker run in one
+transaction. A pre-COMMIT failure rolls back; a lost COMMIT acknowledgement is
+`CommitOutcomeUnknown` and needs a fresh independently attested reconciliation
+run.
 Production execution remains disabled before credential loading until live
 Kubernetes render admission, one-use attempt consumption, materialized-pin
 binding, and runtime receipt freshness are implemented.
@@ -148,10 +155,14 @@ derives the complete implementation-plus-deployment applicability inventory,
 verifies exact semantic closure, and consumes the checkpoint, current SB-9
 root, authenticated documents, pinned profile/build, and workload proof into
 one non-cloneable production-boundary proof. Serving startup now retains
-verified `HttpsPublicUrls`, `SecureCookies`, and `ApprovedSecretProvider`
-witnesses, but still exits before database publication, workers, routing, or
-listeners until the remaining five receipt-bound live runtime guards are
-implemented and verified.
+verified `HttpsPublicUrls`, `SecureCookies`, `ApprovedSecretProvider`,
+`NonDevelopmentAuthenticator`, and `DurablePostgresql` witnesses. The exact
+measured PostgreSQL pool remains unpublished, and startup still exits before
+database publication, workers, routing, or listeners until the complete
+eight-guard admission. Exactly three receipt-bound live runtime guards remain:
+`external-signing-key-material`, `mock-dependencies-disabled`, and
+`first-owner-path-closed`. The overall proposed normative production boundary
+is not complete.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 
