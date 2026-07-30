@@ -14,6 +14,9 @@ set -Eeuo pipefail
 # target triples, and the disposable verification target are all covered.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+HARD_MAX_TARGET_GIB=48
+HARD_MIN_FREE_GIB=30
+HARD_MAX_CHECK_INTERVAL_SECONDS=2
 MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-48}"
 MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
 CHECK_INTERVAL_SECONDS="${RYUKI_CARGO_GUARD_INTERVAL_SECONDS:-2}"
@@ -24,16 +27,46 @@ require_positive_integer() {
   local name="$1"
   local value="$2"
   case "$value" in
-    ''|*[!0-9]*|0)
+    ''|0|0*|*[!0-9]*)
       echo "error: ${name} must be a positive integer" >&2
       exit 64
       ;;
   esac
+  if (( ${#value} > 9 )); then
+    echo "error: ${name} is outside the supported integer range" >&2
+    exit 64
+  fi
 }
 
 require_positive_integer RYUKI_CARGO_MAX_TARGET_GIB "$MAX_TARGET_GIB"
 require_positive_integer RYUKI_CARGO_MIN_FREE_GIB "$MIN_FREE_GIB"
 require_positive_integer RYUKI_CARGO_GUARD_INTERVAL_SECONDS "$CHECK_INTERVAL_SECONDS"
+
+case "$TEST_MODE" in
+  0|1) ;;
+  *)
+    echo "error: RYUKI_CARGO_GUARD_TEST_MODE must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+
+# These environment variables are tunable only toward a stricter production
+# posture. Regression tests use their separately gated KiB ceiling and may use
+# a lower free-space floor on constrained test hosts.
+if [[ "$TEST_MODE" != "1" ]]; then
+  if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
+    echo "error: RYUKI_CARGO_MAX_TARGET_GIB must not exceed ${HARD_MAX_TARGET_GIB}" >&2
+    exit 64
+  fi
+  if (( MIN_FREE_GIB < HARD_MIN_FREE_GIB )); then
+    echo "error: RYUKI_CARGO_MIN_FREE_GIB must not be less than ${HARD_MIN_FREE_GIB}" >&2
+    exit 64
+  fi
+  if (( CHECK_INTERVAL_SECONDS > HARD_MAX_CHECK_INTERVAL_SECONDS )); then
+    echo "error: RYUKI_CARGO_GUARD_INTERVAL_SECONDS must not exceed ${HARD_MAX_CHECK_INTERVAL_SECONDS}" >&2
+    exit 64
+  fi
+fi
 
 if [[ -n "$TEST_MAX_KIB" && "$TEST_MODE" != "1" ]]; then
   echo "error: RYUKI_CARGO_GUARD_TEST_MAX_KIB is reserved for regression tests" >&2

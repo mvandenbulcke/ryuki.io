@@ -12,6 +12,14 @@ set -Eeuo pipefail
 # interruption, or the next run after an untrappable process death.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUSTC_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
+HARD_MAX_TARGET_GIB=64
+HARD_MIN_FREE_GIB=30
+HARD_MAX_WATCH_INTERVAL_SECONDS=5
+if [[ ! -f "$RUSTC_GUARD" || -L "$RUSTC_GUARD" || ! -x "$RUSTC_GUARD" ]]; then
+  echo "error: repository Cargo rustc guard is missing or unsafe: ${RUSTC_GUARD}" >&2
+  exit 75
+fi
 if [[ -n "${RYUKI_VERIFY_STATE_BASE:-}" && "${RYUKI_VERIFY_TEST_MODE:-0}" != "1" ]]; then
   echo "error: RYUKI_VERIFY_STATE_BASE is reserved for verify-clean regression tests" >&2
   exit 64
@@ -37,22 +45,53 @@ VERIFY_DIR_CREATED=0
 SENTINEL_TMP="${VERIFY_TARGET_ROOT}/.run.${RUN_ID}.owner.tmp"
 SENTINEL_TMP_CREATED=0
 SENTINEL_PUBLISHED=0
+
+# Dedicated Cargo environment variables override checked-in configuration.
+# Do not let an inherited IDE, sccache, or caller configuration redirect the
+# target or replace the repository guard inside this bounded verification.
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+unset CARGO_BUILD_INCREMENTAL
+unset CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL
 export CARGO_TARGET_DIR="${VERIFY_DIR}/target"
+export RUSTC_WRAPPER="$RUSTC_GUARD"
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
 
 require_positive_integer() {
   local name="$1"
   local value="$2"
   case "$value" in
-    ''|*[!0-9]*|0)
+    ''|0|0*|*[!0-9]*)
       echo "error: ${name} must be a positive integer (got '${value}')" >&2
       exit 64
       ;;
   esac
+  if (( ${#value} > 9 )); then
+    echo "error: ${name} is outside the supported integer range" >&2
+    exit 64
+  fi
 }
 
 require_positive_integer RYUKI_VERIFY_MIN_FREE_GIB "$MIN_FREE_GIB"
 require_positive_integer RYUKI_VERIFY_MAX_TARGET_GIB "$MAX_TARGET_GIB"
 require_positive_integer RYUKI_VERIFY_WATCH_INTERVAL_SECONDS "$WATCH_INTERVAL_SECONDS"
+
+if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
+  echo "error: RYUKI_VERIFY_MAX_TARGET_GIB must not exceed ${HARD_MAX_TARGET_GIB}" >&2
+  exit 64
+fi
+if (( MIN_FREE_GIB < HARD_MIN_FREE_GIB )); then
+  echo "error: RYUKI_VERIFY_MIN_FREE_GIB must not be less than ${HARD_MIN_FREE_GIB}" >&2
+  exit 64
+fi
+if (( WATCH_INTERVAL_SECONDS > HARD_MAX_WATCH_INTERVAL_SECONDS )); then
+  echo "error: RYUKI_VERIFY_WATCH_INTERVAL_SECONDS must not exceed ${HARD_MAX_WATCH_INTERVAL_SECONDS}" >&2
+  exit 64
+fi
 
 case "$KEEP_TARGET" in
   0|1) ;;
@@ -211,10 +250,6 @@ reclaim_stale_verify_dirs() {
     rm -rf -- "$candidate"
   done
 }
-
-export CARGO_INCREMENTAL=0
-export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
-export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
 
 if [[ "${RYUKI_VERIFY_ALLOW_DATABASE:-0}" != "1" ]]; then
   unset RYUKI_DATABASE_URL

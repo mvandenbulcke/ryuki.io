@@ -34,6 +34,32 @@ printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ndd if=/dev/zero of=%q bs=1024 c
   "$TARGET/fast-oversized.bin" "$FAST_GROWER_FINISHED" > "$FAKE_FAST_GROWER"
 chmod +x "$FAKE_GROWER" "$FAKE_PEER" "$FAKE_FAST_GROWER"
 
+if RYUKI_CARGO_MAX_TARGET_GIB=49 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/max-target.log"; then
+  echo "error: production guard accepted a target ceiling above 48 GiB" >&2
+  exit 1
+fi
+grep -q "RYUKI_CARGO_MAX_TARGET_GIB must not exceed 48" "$TEST_ROOT/max-target.log"
+
+if RYUKI_CARGO_MIN_FREE_GIB=29 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/min-free.log"; then
+  echo "error: production guard accepted a free-space floor below 30 GiB" >&2
+  exit 1
+fi
+grep -q "RYUKI_CARGO_MIN_FREE_GIB must not be less than 30" "$TEST_ROOT/min-free.log"
+
+if RYUKI_CARGO_GUARD_INTERVAL_SECONDS=3 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/interval.log"; then
+  echo "error: production guard accepted a sampling interval above 2 seconds" >&2
+  exit 1
+fi
+grep -q "RYUKI_CARGO_GUARD_INTERVAL_SECONDS must not exceed 2" "$TEST_ROOT/interval.log"
+
+[[ ! -e "$MARKER" ]] || {
+  echo "error: rustc ran while a weakened production guard was rejected" >&2
+  exit 1
+}
+
 # Use real allocated blocks so the same `du -sk` semantics are exercised.
 dd if=/dev/zero of="$TARGET/oversized.bin" bs=1024 count=32 status=none
 if RYUKI_CARGO_GUARD_TEST_MODE=1 \
