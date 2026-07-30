@@ -2132,11 +2132,13 @@ an unrestricted administrator issues a short-lived, single-use challenge bound
 to the exact agent id, platform, and canonical Ed25519 public key; the agent
 signs the domain-separated claim with that key; registration atomically consumes
 the challenge; and approval requires the consumed linkage. The current protocol
-is v8-only and rejects v1 through v7 peers, while the database mutation fence
+is v9-only and rejects v1 through v8 peers, while the database mutation fence
 remains enrollment contract v3. Historically, v7 made the positive request
 resource version part of jobs, grants, and results. Protocol v8 additionally
 binds an exact control-plane signing-key id (`kid`) into each live grant and
 publishes a positive-versioned, bounded active/verify-only verification keyset.
+Protocol v9 additionally signs the canonical deployment and trust-domain ids;
+agents compare them with independently provisioned expected scope.
 Migration 158 removes pre-enrollment-cutover Pending rows because their
 provenance is unknowable.
 Approved and Revoked legacy rows remain operable for a controlled migration but
@@ -2154,17 +2156,17 @@ the current environment seam may be materialized by any approved secret manager
 or workload bootstrap channel and does not make Vault a mandatory identity
 backend.
 
-The v7-to-v8 durable-grant deployment is an explicit non-overlap cutover. Stop
-new live approvals, drain and stop every v7 API, agent, scheduler, and execution
+The v8-to-v9 durable-grant deployment is an explicit non-overlap cutover. Stop
+new live approvals, drain and stop every v8 API, agent, scheduler, and execution
 worker, and independently require zero nonterminal (`Pending`, `Leased`, or
-`Running`) `LiveApply` or `LiveDestroy` rows before any v8 component starts.
-Terminal v7 rows remain immutable historical evidence and must never be
+`Running`) `LiveApply` or `LiveDestroy` rows before any v9 component starts.
+Terminal v8 rows remain immutable historical evidence and must never be
 rewritten, re-signed, or requeued. A mutation with uncertain effects enters
 operator reconciliation rather than retry. Any later `LiveApply` requires a new
-v8 plan, approval decision, and `ryuki-v8/verified-live-context` grant; any
-permitted compensation requires its own freshly minted step-scoped v8 grant
-after the fleet is uniformly v8. A stored v7 signature cannot be upgraded in
-place by adding a `kid`.
+v9 plan, approval decision, and `ryuki-v9/verified-live-context` grant; any
+permitted compensation requires its own freshly minted step-scoped v9 grant
+after the fleet is uniformly v9. A stored v8 signature cannot be upgraded in
+place by adding deployment and trust-domain fields.
 
 That wire foundation does not satisfy SB-MID-03 or SB-MID-05. The currently
 wired control plane still loads or creates one local development seed, exposes

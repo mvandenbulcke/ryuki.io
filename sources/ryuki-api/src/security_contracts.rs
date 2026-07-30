@@ -6591,6 +6591,17 @@ impl SecurityContractContext {
         self.profile.security_profile.is_production()
     }
 
+    /// Derive the one immutable namespace that every control-plane live grant
+    /// must carry. Grant scope is deployment authority, not request input: it
+    /// comes only from the startup-admitted security profile and refuses a
+    /// federated/ambiguous topology until an explicit domain-selection
+    /// authority exists.
+    pub(crate) fn control_plane_grant_scope(
+        &self,
+    ) -> Result<ryuki_protocol::ControlPlaneGrantScope, String> {
+        control_plane_grant_scope_from_profile(&self.profile)
+    }
+
     fn select_entra_authenticator_provider(
         &self,
         ambiguity_context: &str,
@@ -8017,6 +8028,16 @@ impl SecurityContractContext {
             )),
         }
     }
+}
+
+fn control_plane_grant_scope_from_profile(
+    profile: &DeploymentSecurityProfile,
+) -> Result<ryuki_protocol::ControlPlaneGrantScope, String> {
+    let [trust_domain_id] = profile.trust_topology.trust_domain_ids.as_slice() else {
+        return Err("control-plane grant scope requires exactly one admitted trust domain".into());
+    };
+    ryuki_protocol::ControlPlaneGrantScope::new(&profile.deployment_id, trust_domain_id)
+        .map_err(|_| "control-plane grant scope in the admitted profile is invalid".into())
 }
 
 impl ActiveProviderConfiguration {
@@ -15967,6 +15988,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_plane_grant_scope_is_profile_authoritative_and_unambiguous() {
+        let fixture = ActiveFixture::build();
+        let context = fixture.load().expect("active fixture loads");
+        let scope = context
+            .control_plane_grant_scope()
+            .expect("single-domain profile has a canonical grant scope");
+        assert_eq!(scope.deployment_id(), DEPLOYMENT_ID);
+        assert_eq!(scope.trust_domain_id(), "trust-domain:repository-fixture");
+
+        let mut ambiguous = context.profile;
+        ambiguous.trust_topology.trust_domain_ids =
+            vec!["trust-domain:first".into(), "trust-domain:second".into()];
+        assert!(control_plane_grant_scope_from_profile(&ambiguous).is_err());
+        ambiguous.trust_topology.trust_domain_ids.clear();
+        assert!(control_plane_grant_scope_from_profile(&ambiguous).is_err());
+        ambiguous.trust_topology.trust_domain_ids = vec!["foreign-domain".into()];
+        assert!(control_plane_grant_scope_from_profile(&ambiguous).is_err());
+    }
+
     fn copy_relative(source_root: &Path, destination_root: &Path, relative: &str) {
         let destination = destination_root.join(relative);
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -17824,8 +17865,7 @@ mod tests {
             .profile
             .trust_topology
             .trust_domain_ids
-            .iter()
-            .next()
+            .first()
             .expect("fixture trust domain")
             .clone();
         let canonical_provider_id = provider.provider_id.clone();

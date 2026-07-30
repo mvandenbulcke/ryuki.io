@@ -56,12 +56,12 @@ use ryuki_protocol::{
         decode_verifying_key, encode_verifying_key, execution_trust_profile_digest, sign_vlc,
         verify_agent_enrollment_proof,
     },
-    AgentHeartbeat, AgentHeartbeatResponse, Capabilities, ExecutionTrustProfile, Job, JobLease,
-    JobMode, JobResult, JobResultStatus, JobSpec, JobStatus, LiveExecutionAuthority,
-    VerifiedLiveContext, AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES, AGENT_ENROLLMENT_CHALLENGE_PREFIX,
-    EXECUTABLE_PROVENANCE_POLICY_VERSION, EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION,
-    EXECUTION_TRUST_PROFILE_SCHEMA_VERSION, PROVIDER_CREDENTIAL_AUTHORITY_MODE,
-    TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
+    AgentHeartbeat, AgentHeartbeatResponse, Capabilities, ControlPlaneGrantScope,
+    ExecutionTrustProfile, Job, JobLease, JobMode, JobResult, JobResultStatus, JobSpec, JobStatus,
+    LiveExecutionAuthority, VerifiedLiveContext, AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES,
+    AGENT_ENROLLMENT_CHALLENGE_PREFIX, EXECUTABLE_PROVENANCE_POLICY_VERSION,
+    EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION, EXECUTION_TRUST_PROFILE_SCHEMA_VERSION,
+    PROVIDER_CREDENTIAL_AUTHORITY_MODE, TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,31 @@ const _: () = {
     assert!(LIVE_LEASE_TTL_SECS > LEASE_TTL_SECS);
     assert!(MAX_ACTIVE_LEASES_PER_AGENT > 0);
 };
+
+#[cfg(not(test))]
+fn admitted_control_plane_grant_scope() -> Result<ControlPlaneGrantScope, String> {
+    crate::config_store::security_contract_context_if_initialized()
+        .ok_or_else(|| "startup security contract is not initialized".to_string())?
+        .control_plane_grant_scope()
+}
+
+#[cfg(test)]
+fn admitted_control_plane_grant_scope() -> Result<ControlPlaneGrantScope, String> {
+    ControlPlaneGrantScope::new("deployment:api-test", "trust-domain:api-test")
+        .map_err(|_| "test control-plane grant scope is invalid".into())
+}
+
+/// Compare a signed grant's public replay namespace with the exact scope
+/// admitted by this control plane. Signature validity is a separate mandatory
+/// check at each caller: a genuinely signed grant for a sibling deployment is
+/// still unauthorized here.
+pub(crate) fn verified_live_context_matches_control_plane_grant_scope(
+    grant: &VerifiedLiveContext,
+    expected_scope: &ControlPlaneGrantScope,
+) -> bool {
+    grant.deployment_id == expected_scope.deployment_id()
+        && grant.trust_domain_id == expected_scope.trust_domain_id()
+}
 
 // ---------------------------------------------------------------------------
 // Public enrollment admission bounds
@@ -3381,7 +3406,7 @@ fn protocol_version_is_supported(v: u32) -> bool {
 /// - absent                     → `PROTOCOL_VERSION_LEGACY` (1)
 ///
 /// The resolved value is then ALWAYS checked against
-/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v8-only allowlist therefore
+/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v9-only allowlist therefore
 /// rejects an absent header as legacy v1; omission is never a compatibility
 /// bypass. Used by the [`ProtocolVersion`] extractor.
 fn resolve_protocol_version(headers: &HeaderMap) -> Result<u32, (StatusCode, Json<Value>)> {
@@ -4578,6 +4603,19 @@ async fn post_job_result_with_pool(
                 // approved_plan_digest but cannot forge the CP signature). The agent
                 // also independently verifies this signature before applying (S5b).
                 cp_identity::verify_cp_grant(&grant).map_err(cp_grant_verification_error)?;
+
+                // A signature proves who minted the grant, while this
+                // independent comparison proves where it is valid. Sharing a
+                // retained verification key across deployments or trust
+                // domains must not make an otherwise genuine grant replayable.
+                let expected_scope = admitted_control_plane_grant_scope()
+                    .map_err(|_| db_err("control plane has no unambiguous admitted grant scope"))?;
+                if !verified_live_context_matches_control_plane_grant_scope(&grant, &expected_scope)
+                {
+                    return Err(bad_request(
+                        "approval grant scope does not match the admitted control plane",
+                    ));
+                }
 
                 // Destination authority is signed independently from the
                 // agent's result envelope. It must equal the same canonical
@@ -6339,6 +6377,7 @@ async fn successful_plan_execution_authority(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_live_apply_job(
     pool: &PgPool,
+    grant_scope: &ControlPlaneGrantScope,
     approved_plan: ApprovedPlanReference,
     request_id: Uuid,
     platform: &str,
@@ -6530,6 +6569,8 @@ pub async fn create_live_apply_job(
     let unsigned_grant = VerifiedLiveContext {
         request_id,
         request_resource_version: spec.request_resource_version,
+        deployment_id: grant_scope.deployment_id().to_owned(),
+        trust_domain_id: grant_scope.trust_domain_id().to_owned(),
         platform: platform.to_string(),
         job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
@@ -6651,6 +6692,7 @@ pub async fn create_live_apply_job(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_step_live_job(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    grant_scope: &ControlPlaneGrantScope,
     approved_plan: ApprovedPlanReference,
     request_id: Uuid,
     step_id: Uuid,
@@ -6816,6 +6858,8 @@ pub async fn create_step_live_job(
     let unsigned_grant = VerifiedLiveContext {
         request_id,
         request_resource_version: spec.request_resource_version,
+        deployment_id: grant_scope.deployment_id().to_owned(),
+        trust_domain_id: grant_scope.trust_domain_id().to_owned(),
         platform: platform.to_string(),
         job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
@@ -7015,6 +7059,7 @@ pub struct ApproveLiveApplyBody {
 pub async fn approve_live_apply_with(
     pool: &PgPool,
     cp_key: &ed25519_dalek::SigningKey,
+    grant_scope: &ControlPlaneGrantScope,
     session: &AuthSession,
     body: &ApproveLiveApplyBody,
 ) -> ApiResult<Json<Value>> {
@@ -7045,6 +7090,7 @@ pub async fn approve_live_apply_with(
 
     let job_id = create_live_apply_job(
         pool,
+        grant_scope,
         ApprovedPlanReference {
             job_id: body.approved_plan_job_id,
             attempt_id: body.approved_plan_attempt_id,
@@ -8934,6 +8980,15 @@ pub fn admin_routes() -> Router {
 mod tests {
     use super::*;
 
+    fn test_control_plane_grant_scope() -> &'static ControlPlaneGrantScope {
+        static SCOPE: std::sync::LazyLock<ControlPlaneGrantScope> =
+            std::sync::LazyLock::new(|| {
+                ControlPlaneGrantScope::new("deployment:api-test", "trust-domain:api-test")
+                    .expect("test grant scope is canonical")
+            });
+        &SCOPE
+    }
+
     type PendingJobLeaseState = (
         String,
         Option<String>,
@@ -9433,7 +9488,7 @@ mod tests {
     #[test]
     fn protocol_version_absent_header_is_rejected_as_legacy_v1() {
         // No header at all resolves to legacy v1, which is intentionally outside
-        // the v8-only allowlist because older agents lack current state,
+        // the v9-only allowlist because older agents lack current state,
         // enrollment isolation, and exact signed execution-authority controls.
         let err = resolve_protocol_version(&HeaderMap::new())
             .expect_err("an absent header must be rejected as legacy protocol v1");
@@ -9458,14 +9513,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_v7_peer_is_rejected_after_keyset_cutover() {
-        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 8);
-        let err = resolve_protocol_version(&hdrs_with_version("7"))
-            .expect_err("a v7 peer cannot parse or verify the required signing key id");
+    fn protocol_version_v8_peer_is_rejected_after_grant_scope_cutover() {
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 9);
+        let err = resolve_protocol_version(&hdrs_with_version("8"))
+            .expect_err("a v8 peer cannot parse or verify the required signed grant scope");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1 .0["error"]
             .as_str()
-            .is_some_and(|message| message.contains("unsupported protocol_version: 7")));
+            .is_some_and(|message| message.contains("unsupported protocol_version: 8")));
 
         let err = resolve_protocol_version(&hdrs_with_version("4"))
             .expect_err("a v4 peer cannot parse the required signed execution authority");
@@ -17926,6 +17981,82 @@ mod tests {
         TEST_CP_KEY.clone()
     }
 
+    fn signed_test_grant_for_scope(
+        scope: &ControlPlaneGrantScope,
+        key: &ed25519_dalek::SigningKey,
+    ) -> VerifiedLiveContext {
+        let unsigned = VerifiedLiveContext {
+            request_id: Uuid::new_v4(),
+            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
+                .expect("test resource version is positive"),
+            deployment_id: scope.deployment_id().to_owned(),
+            trust_domain_id: scope.trust_domain_id().to_owned(),
+            platform: "DEFRA".into(),
+            job_spec_digest: "a".repeat(64),
+            approved_plan_digest: "b".repeat(64),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
+            approver: Uuid::new_v4().to_string(),
+            expiry: Utc::now() + Duration::hours(1),
+            step_job_id: Some(Uuid::new_v4()),
+            execution_authority: LiveExecutionAuthority {
+                assigned_agent_id: "agent-scope-test".into(),
+                assigned_agent_enrollment_id: Uuid::new_v4(),
+                assigned_agent_key_fingerprint: format!("sha256:{}", "c".repeat(64)),
+                execution_trust_profile_digest: "d".repeat(64),
+            },
+            signing_key_id: String::new(),
+            signature: String::new(),
+        };
+        ryuki_protocol::sign_vlc(unsigned, key)
+    }
+
+    #[test]
+    fn validly_resigned_foreign_scope_grant_is_rejected_by_cp_result_ingest_scope_validation() {
+        let key = generate_keypair(&mut OsRng);
+        let foreign_scope = ControlPlaneGrantScope::new(
+            "deployment:foreign-api-test",
+            "trust-domain:foreign-api-test",
+        )
+        .expect("foreign test scope is canonical");
+        let grant = signed_test_grant_for_scope(&foreign_scope, &key);
+
+        assert!(
+            ryuki_protocol::verify_vlc(&grant, &key.verifying_key()).is_ok(),
+            "the foreign grant must carry a valid CP signature"
+        );
+        assert!(
+            !verified_live_context_matches_control_plane_grant_scope(
+                &grant,
+                test_control_plane_grant_scope(),
+            ),
+            "result ingest must reject a genuine sibling-scope grant"
+        );
+    }
+
+    #[test]
+    fn foreign_scope_prior_grant_is_rejected_by_teardown_lineage_scope_validation() {
+        let key = generate_keypair(&mut OsRng);
+        let foreign_scope = ControlPlaneGrantScope::new(
+            "deployment:foreign-teardown-test",
+            "trust-domain:foreign-teardown-test",
+        )
+        .expect("foreign teardown scope is canonical");
+        let prior_grant = signed_test_grant_for_scope(&foreign_scope, &key);
+
+        assert!(
+            ryuki_protocol::verify_vlc(&prior_grant, &key.verifying_key()).is_ok(),
+            "the foreign prior grant must carry a valid CP signature"
+        );
+        assert!(
+            !crate::contracts::teardown_grant_matches_control_plane_scope(
+                &prior_grant,
+                test_control_plane_grant_scope(),
+            ),
+            "teardown lineage must reject a genuine sibling-scope prior grant"
+        );
+    }
+
     /// Seed a minimal ACTIVE (`locked`) request row for `request_id`. A LiveApply
     /// grant may only be minted for a real, non-concluded request — the gate in
     /// `create_live_apply_job` loads `requests.status` — so any test that mints a
@@ -17978,6 +18109,10 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id: grant_request_id.unwrap_or(request_id),
             request_resource_version: spec.request_resource_version,
+            deployment_id: test_control_plane_grant_scope().deployment_id().to_owned(),
+            trust_domain_id: test_control_plane_grant_scope()
+                .trust_domain_id()
+                .to_owned(),
             platform: platform.to_string(),
             job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
             approved_plan_digest: approved_plan_digest.to_string(),
@@ -18375,6 +18510,7 @@ mod tests {
         let wrong_site = format!("{platform}-other-site");
         let site_mismatch = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             approved_plan.clone(),
             request_id,
             &wrong_site,
@@ -18418,6 +18554,7 @@ mod tests {
             nonhuman.actor_class = actor_class;
             let denied = create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 approved_plan.clone(),
                 request_id,
                 &platform,
@@ -18457,6 +18594,7 @@ mod tests {
         assert_ne!(offering_drift_spec.offering_id, spec.offering_id);
         let offering_drift = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             approved_plan.clone(),
             request_id,
             &platform,
@@ -18499,6 +18637,7 @@ mod tests {
 
         let job_id = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             approved_plan.clone(),
             request_id,
             &platform,
@@ -18535,6 +18674,14 @@ mod tests {
         );
         assert_eq!(grant.approved_plan_digest, plan_digest);
         assert_eq!(grant.request_id, request_id);
+        assert_eq!(
+            grant.deployment_id,
+            test_control_plane_grant_scope().deployment_id()
+        );
+        assert_eq!(
+            grant.trust_domain_id,
+            test_control_plane_grant_scope().trust_domain_id()
+        );
         assert_eq!(grant.platform, platform);
         assert_eq!(grant.approved_plan_job_id, approved_plan.job_id);
         assert_eq!(grant.approved_plan_attempt_id, approved_plan.attempt_id);
@@ -18593,6 +18740,7 @@ mod tests {
         install_live_approval_audit_failure_trigger(&pool).await;
         let result = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             approved_plan,
             request_id,
             &platform,
@@ -18671,6 +18819,7 @@ mod tests {
 
         let result = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             dummy_approved_plan_reference(),
             request_id,
             "s5a2-concluded-plt",
@@ -18754,6 +18903,7 @@ mod tests {
         // CP enqueues the job with a production-signed grant.
         let _job_id = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             approved_plan,
             request_id,
             &platform,
@@ -18871,6 +19021,7 @@ mod tests {
         // CP signs the grant for `approved_digest`.
         let _job_id = create_live_apply_job(
             &pool,
+            test_control_plane_grant_scope(),
             approved_plan,
             request_id,
             &platform,
@@ -19560,6 +19711,7 @@ mod tests {
         assert!(matches!(
             create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 dummy_approved_plan_reference(),
                 request_id,
                 &platform,
@@ -19576,6 +19728,7 @@ mod tests {
         assert!(matches!(
             create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 dummy_approved_plan_reference(),
                 request_id,
                 &platform,
@@ -19592,6 +19745,7 @@ mod tests {
         assert!(matches!(
             create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 dummy_approved_plan_reference(),
                 request_id,
                 &platform,
@@ -19610,6 +19764,7 @@ mod tests {
         assert!(matches!(
             create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 dummy_approved_plan_reference(),
                 request_id,
                 &platform,
@@ -20000,6 +20155,7 @@ mod tests {
         let wrong_site = format!("{platform}-other-site");
         let site_mismatch = create_step_live_job(
             &mut tx,
+            test_control_plane_grant_scope(),
             approved_plan_one.clone(),
             request_id,
             step_one.id,
@@ -20034,6 +20190,7 @@ mod tests {
         destroy_without_prior_apply.mode = JobMode::LiveDestroy;
         let unbound_destroy = create_step_live_job(
             &mut tx,
+            test_control_plane_grant_scope(),
             dummy_approved_plan_reference(),
             request_id,
             step_one.id,
@@ -20055,6 +20212,7 @@ mod tests {
         let nonexistent_step_spec = make_spec(nonexistent_step_id);
         let foreign_owner = create_step_live_job(
             &mut tx,
+            test_control_plane_grant_scope(),
             dummy_approved_plan_reference(),
             request_id,
             nonexistent_step_id,
@@ -20080,6 +20238,7 @@ mod tests {
             nonhuman.actor_class = actor_class;
             let denied = create_step_live_job(
                 &mut tx,
+                test_control_plane_grant_scope(),
                 approved_plan_one.clone(),
                 request_id,
                 step_one.id,
@@ -20095,6 +20254,7 @@ mod tests {
         }
         let wrong_system_authority = create_step_live_job(
             &mut tx,
+            test_control_plane_grant_scope(),
             approved_plan_one.clone(),
             request_id,
             step_one.id,
@@ -20122,6 +20282,7 @@ mod tests {
 
         let job1 = create_step_live_job(
             &mut tx,
+            test_control_plane_grant_scope(),
             approved_plan_one.clone(),
             request_id,
             step_one.id,
@@ -20136,6 +20297,7 @@ mod tests {
         .expect("first step grant mints");
         let job2 = create_step_live_job(
             &mut tx,
+            test_control_plane_grant_scope(),
             approved_plan_two.clone(),
             request_id,
             step_two.id,
@@ -20386,7 +20548,14 @@ mod tests {
             .principal_id
             .expect("verified approver principal")
             .to_string();
-        let result = approve_live_apply_with(&pool, &cp_key, &approver_session, &body).await;
+        let result = approve_live_apply_with(
+            &pool,
+            &cp_key,
+            test_control_plane_grant_scope(),
+            &approver_session,
+            &body,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "approve_live_apply_with must succeed for valid input: {:?}",
@@ -20429,6 +20598,14 @@ mod tests {
         assert_eq!(grant.approved_plan_digest, digest);
         assert_eq!(grant.approver, approver_principal);
         assert_eq!(grant.request_id, request_id);
+        assert_eq!(
+            grant.deployment_id,
+            test_control_plane_grant_scope().deployment_id()
+        );
+        assert_eq!(
+            grant.trust_domain_id,
+            test_control_plane_grant_scope().trust_domain_id()
+        );
         assert_eq!(grant.platform, platform);
         assert_eq!(grant.approved_plan_job_id, approved_plan.job_id);
         assert_eq!(grant.approved_plan_attempt_id, approved_plan.attempt_id);
@@ -20549,6 +20726,7 @@ mod tests {
         let (first, second) = tokio::join!(
             create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 approved_plan.clone(),
                 request_id,
                 &platform,
@@ -20560,6 +20738,7 @@ mod tests {
             ),
             create_live_apply_job(
                 &pool,
+                test_control_plane_grant_scope(),
                 approved_plan.clone(),
                 request_id,
                 &platform,
@@ -20667,9 +20846,14 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result =
-            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
-                .await;
+        let result = approve_live_apply_with(
+            &pool,
+            &cp_key,
+            test_control_plane_grant_scope(),
+            &live_approver_session("ops-test"),
+            &body,
+        )
+        .await;
         assert!(result.is_err(), "non-hex digest must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -20711,9 +20895,14 @@ mod tests {
             expiry_seconds: 0,
         };
 
-        let result =
-            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
-                .await;
+        let result = approve_live_apply_with(
+            &pool,
+            &cp_key,
+            test_control_plane_grant_scope(),
+            &live_approver_session("ops-test"),
+            &body,
+        )
+        .await;
         assert!(result.is_err(), "zero expiry must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -20755,9 +20944,14 @@ mod tests {
             expiry_seconds: (MAX_GRANT_TTL_HOURS as u64) * 3600 + 1,
         };
 
-        let result =
-            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
-                .await;
+        let result = approve_live_apply_with(
+            &pool,
+            &cp_key,
+            test_control_plane_grant_scope(),
+            &live_approver_session("ops-test"),
+            &body,
+        )
+        .await;
         assert!(result.is_err(), "over-max TTL must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -20799,9 +20993,14 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result =
-            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
-                .await;
+        let result = approve_live_apply_with(
+            &pool,
+            &cp_key,
+            test_control_plane_grant_scope(),
+            &live_approver_session("ops-test"),
+            &body,
+        )
+        .await;
         assert!(result.is_err(), "OfflineDryRun spec must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -20872,7 +21071,14 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, &approver_session, &body).await;
+        let result = approve_live_apply_with(
+            &pool,
+            &cp_key,
+            test_control_plane_grant_scope(),
+            &approver_session,
+            &body,
+        )
+        .await;
         assert!(result.is_ok(), "approve must succeed: {:?}", result.err());
 
         let json_val = result.unwrap().0;
@@ -22223,6 +22429,7 @@ mod tests {
             let mut tx = pool.begin().await.expect("teardown apply tx");
             let apply_job_id = create_step_live_job(
                 &mut tx,
+                test_control_plane_grant_scope(),
                 approved_plan,
                 req_id,
                 step.id,
@@ -22436,6 +22643,11 @@ mod tests {
             active_key_id: cp_active.key_id.clone(),
             keys: vec![cp_active],
         };
+        let cp_grant_authority = ryuki_agent::live::pin_cp_grant_authority(
+            cp_keyset,
+            test_control_plane_grant_scope().clone(),
+        )
+        .expect("test CP keyset and grant scope are canonical");
 
         // Enroll a REAL agent identity on the seeded request's site platform.
         let identity = ryuki_agent::identity::AgentIdentity::generate();
@@ -22531,7 +22743,8 @@ mod tests {
         job.live_context = Some(grant);
 
         // RUN AGENT CODE (1): the REAL trust gate — no plan digest for destroy.
-        let decision = ryuki_agent::live::evaluate_live_execution(&job, &cp_keyset, true, None);
+        let decision =
+            ryuki_agent::live::evaluate_live_execution(&job, &cp_grant_authority, true, None);
         assert_eq!(
             decision,
             ryuki_agent::live::LiveDecision::Proceed,
@@ -24603,6 +24816,7 @@ mod tests {
         // 1. Mint the ONE LiveApply job for this request.
         let job_id = create_live_apply_job(
             pool,
+            test_control_plane_grant_scope(),
             approved_plan.clone(),
             req,
             &platform,
@@ -24657,6 +24871,7 @@ mod tests {
         //    "scope the index to non-terminal statuses" regression.
         let blocked_by_index = create_live_apply_job(
             pool,
+            test_control_plane_grant_scope(),
             approved_plan.clone(),
             req,
             &platform,
@@ -24683,6 +24898,7 @@ mod tests {
         // 6. Now the concluded gate ALSO refuses — a DISTINCT branch from step 4.
         let blocked_by_gate = create_live_apply_job(
             pool,
+            test_control_plane_grant_scope(),
             approved_plan,
             req,
             &platform,

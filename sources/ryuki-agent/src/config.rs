@@ -21,6 +21,8 @@
 //! | `RYUKI_AGENT_POLL_INTERVAL_SECS`       | `poll_interval_secs`       | 10      |
 //! | `RYUKI_AGENT_LEASE_SECS`               | `lease_secs`               | 300     |
 //! | `RYUKI_AGENT_ALLOW_LIVE`               | `allow_live`               | `false` |
+//! | `RYUKI_AGENT_DEPLOYMENT_ID`            | `live_grant_scope.deployment_id` | (required when live execution is enabled) |
+//! | `RYUKI_AGENT_TRUST_DOMAIN_ID`          | `live_grant_scope.trust_domain_id` | (required when live execution is enabled) |
 //! | `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`      | `max_outbox_attempts`      | 10      |
 //! | `RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS` | `outbox_drain_interval_secs` | 60  |
 //!
@@ -88,8 +90,11 @@
 //!   default).  The agent will still run `OfflineDryRun` jobs; it will refuse
 //!   `LivePlan` and `LiveApply` jobs with `LiveRefused`.
 //! - **`"true"` or `"1"` → `true`**: live execution is enabled.  The agent
-//!   must also carry real platform credentials in its environment for live
-//!   jobs to succeed.
+//!   must also carry real platform credentials plus canonical
+//!   `RYUKI_AGENT_DEPLOYMENT_ID` (`deployment:...`) and
+//!   `RYUKI_AGENT_TRUST_DOMAIN_ID` (`trust-domain:...`) values. Those values
+//!   are pinned into the grant verifier so a valid signed grant cannot be
+//!   replayed into another deployment or trust domain.
 //!
 //! Live execution must be **explicitly opted into**; a missing variable is
 //! always treated as `false`, never as an error.
@@ -99,7 +104,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use ryuki_protocol::{
-    Capabilities, AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES, AGENT_ENROLLMENT_CHALLENGE_PREFIX,
+    Capabilities, ControlPlaneGrantScope, ControlPlaneGrantScopeError,
+    AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES, AGENT_ENROLLMENT_CHALLENGE_PREFIX,
 };
 use uuid::Uuid;
 
@@ -207,6 +213,15 @@ pub struct AgentConfig {
     /// See the module-level doc comment for the full opt-in semantics.
     pub allow_live: bool,
 
+    /// Canonical deployment and trust-domain identity accepted by this agent.
+    ///
+    /// Both `RYUKI_AGENT_DEPLOYMENT_ID` and `RYUKI_AGENT_TRUST_DOMAIN_ID` are
+    /// mandatory when `allow_live` is enabled. They are parsed through the
+    /// protocol's canonical scope constructor and then pinned for the process
+    /// lifetime alongside the control-plane verification keyset. Offline-only
+    /// agents deliberately carry no live grant scope.
+    pub live_grant_scope: Option<ControlPlaneGrantScope>,
+
     /// Maximum number of transient-failure delivery attempts before an outbox
     /// entry is quarantined to `<outbox_dir>/dead/`.
     ///
@@ -241,6 +256,12 @@ impl std::fmt::Debug for AgentConfig {
             .field("lease_secs", &self.lease_secs)
             .field("capabilities", &self.capabilities)
             .field("allow_live", &self.allow_live)
+            // Deployment topology can itself be sensitive operational data.
+            // Log only whether the live trust scope was configured.
+            .field(
+                "live_grant_scope",
+                &self.live_grant_scope.as_ref().map(|_| "<configured>"),
+            )
             .field("max_outbox_attempts", &self.max_outbox_attempts)
             .field(
                 "outbox_drain_interval_secs",
@@ -414,6 +435,32 @@ impl AgentConfig {
             get("RYUKI_AGENT_ALLOW_LIVE").as_deref(),
             Some("true") | Some("1")
         );
+        let live_grant_scope = if allow_live {
+            let deployment_id = require(&get, "RYUKI_AGENT_DEPLOYMENT_ID")?;
+            let trust_domain_id = require(&get, "RYUKI_AGENT_TRUST_DOMAIN_ID")?;
+            Some(
+                ControlPlaneGrantScope::new(deployment_id, trust_domain_id).map_err(|error| {
+                    ConfigError::InvalidEnv {
+                        // The scope is one indivisible trust assertion. Keep both
+                        // raw identifiers out of diagnostics; the typed protocol
+                        // error identifies the malformed component without echoing
+                        // its value.
+                        var: match error {
+                            ControlPlaneGrantScopeError::InvalidDeploymentId => {
+                                "RYUKI_AGENT_DEPLOYMENT_ID"
+                            }
+                            ControlPlaneGrantScopeError::InvalidTrustDomainId => {
+                                "RYUKI_AGENT_TRUST_DOMAIN_ID"
+                            }
+                        },
+                        value: "<redacted>".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
 
         let max_outbox_attempts = optional_u32(&get, "RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS", 10)?;
         if max_outbox_attempts == 0 {
@@ -448,6 +495,7 @@ impl AgentConfig {
             lease_secs,
             capabilities: Capabilities::default(),
             allow_live,
+            live_grant_scope,
             max_outbox_attempts,
             outbox_drain_interval_secs,
         })
@@ -903,9 +951,81 @@ mod tests {
             ("RYUKI_AGENT_PLATFORM", "defra"),
             ("RYUKI_AGENT_TOKEN", "rya_tok"),
             ("RYUKI_AGENT_ALLOW_LIVE", "true"),
+            ("RYUKI_AGENT_DEPLOYMENT_ID", "deployment:prod-eu1"),
+            ("RYUKI_AGENT_TRUST_DOMAIN_ID", "trust-domain:ryuki.example"),
         ]))
         .expect("allow_live over https must be accepted");
         assert!(cfg.allow_live);
+        let scope = cfg
+            .live_grant_scope
+            .as_ref()
+            .expect("live execution must pin a canonical grant scope");
+        assert_eq!(scope.deployment_id(), "deployment:prod-eu1");
+        assert_eq!(scope.trust_domain_id(), "trust-domain:ryuki.example");
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("<configured>"));
+        assert!(!debug.contains("deployment:prod-eu1"));
+        assert!(!debug.contains("trust-domain:ryuki.example"));
+    }
+
+    #[test]
+    fn allow_live_requires_both_grant_scope_identifiers() {
+        let missing_deployment = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_ALLOW_LIVE", "true"),
+        ]));
+        assert!(matches!(
+            missing_deployment,
+            Err(ConfigError::MissingEnv {
+                var: "RYUKI_AGENT_DEPLOYMENT_ID"
+            })
+        ));
+
+        let missing_trust_domain = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_ALLOW_LIVE", "true"),
+            ("RYUKI_AGENT_DEPLOYMENT_ID", "deployment:prod-eu1"),
+        ]));
+        assert!(matches!(
+            missing_trust_domain,
+            Err(ConfigError::MissingEnv {
+                var: "RYUKI_AGENT_TRUST_DOMAIN_ID"
+            })
+        ));
+    }
+
+    #[test]
+    fn allow_live_rejects_noncanonical_grant_scope_without_echoing_values() {
+        for (var, deployment_id, trust_domain_id) in [
+            (
+                "RYUKI_AGENT_DEPLOYMENT_ID",
+                "PROD/EU1",
+                "trust-domain:ryuki.example",
+            ),
+            (
+                "RYUKI_AGENT_TRUST_DOMAIN_ID",
+                "deployment:prod-eu1",
+                "tenant secret value",
+            ),
+        ] {
+            let result = AgentConfig::from_source(src(&[
+                ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+                ("RYUKI_AGENT_PLATFORM", "defra"),
+                ("RYUKI_AGENT_ALLOW_LIVE", "true"),
+                ("RYUKI_AGENT_DEPLOYMENT_ID", deployment_id),
+                ("RYUKI_AGENT_TRUST_DOMAIN_ID", trust_domain_id),
+            ]));
+            assert!(matches!(
+                result,
+                Err(ConfigError::InvalidEnv {
+                    var: actual,
+                    value,
+                    ..
+                }) if actual == var && value == "<redacted>"
+            ));
+        }
     }
 
     #[test]
@@ -941,6 +1061,8 @@ mod tests {
                 ("RYUKI_AGENT_TOKEN", "rya_tok"),
                 ("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK", "true"),
                 ("RYUKI_AGENT_ALLOW_LIVE", "true"),
+                ("RYUKI_AGENT_DEPLOYMENT_ID", "deployment:prod-eu1"),
+                ("RYUKI_AGENT_TRUST_DOMAIN_ID", "trust-domain:ryuki.example"),
             ]))
             .unwrap_or_else(|e| panic!("explicit loopback endpoint {url} must be accepted: {e}"));
             assert!(cfg.allow_live);
@@ -1052,6 +1174,14 @@ mod tests {
         if let Some(v) = val {
             map.insert("RYUKI_AGENT_ALLOW_LIVE".to_owned(), v.to_owned());
         }
+        map.insert(
+            "RYUKI_AGENT_DEPLOYMENT_ID".to_owned(),
+            "deployment:prod-eu1".to_owned(),
+        );
+        map.insert(
+            "RYUKI_AGENT_TRUST_DOMAIN_ID".to_owned(),
+            "trust-domain:ryuki.example".to_owned(),
+        );
         AgentConfig::from_source(|k| map.get(k).cloned()).expect("must parse")
     }
 
@@ -1062,6 +1192,10 @@ mod tests {
         assert!(
             !cfg.allow_live,
             "absent RYUKI_AGENT_ALLOW_LIVE must default to false"
+        );
+        assert!(
+            cfg.live_grant_scope.is_none(),
+            "offline-only agents must not retain unused grant scope identifiers"
         );
     }
 

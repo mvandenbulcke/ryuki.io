@@ -621,14 +621,89 @@ pub struct LiveExecutionAuthority {
 // VerifiedLiveContext — CP-signed approval grant
 // ---------------------------------------------------------------------------
 
+/// Canonical deployment and trust-domain namespace for one control-plane
+/// mutation grant.
+///
+/// These identifiers are public routing authority, not secret material. The
+/// fields remain private so locally constructed scopes cannot bypass the same
+/// canonical scoped-id rules used by `ryuki-core`: each value must use its
+/// exact namespace and carry a 3-through-127-byte lowercase suffix whose first
+/// byte is alphanumeric and whose remaining bytes are lowercase alphanumeric,
+/// `.`, `_`, or `-`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneGrantScope {
+    deployment_id: String,
+    trust_domain_id: String,
+}
+
+/// Value-free failure reasons for control-plane grant scope validation.
+///
+/// The rejected identifier is deliberately never retained or formatted into
+/// the error, so an untrusted wire value cannot be reflected into logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ControlPlaneGrantScopeError {
+    #[error("control-plane grant deployment_id is not canonical")]
+    InvalidDeploymentId,
+    #[error("control-plane grant trust_domain_id is not canonical")]
+    InvalidTrustDomainId,
+}
+
+impl ControlPlaneGrantScope {
+    /// Validate and construct one exact deployment/trust-domain grant scope.
+    pub fn new(
+        deployment_id: impl Into<String>,
+        trust_domain_id: impl Into<String>,
+    ) -> Result<Self, ControlPlaneGrantScopeError> {
+        let deployment_id = deployment_id.into();
+        if !control_plane_grant_scoped_id_is_canonical(&deployment_id, "deployment:") {
+            return Err(ControlPlaneGrantScopeError::InvalidDeploymentId);
+        }
+
+        let trust_domain_id = trust_domain_id.into();
+        if !control_plane_grant_scoped_id_is_canonical(&trust_domain_id, "trust-domain:") {
+            return Err(ControlPlaneGrantScopeError::InvalidTrustDomainId);
+        }
+
+        Ok(Self {
+            deployment_id,
+            trust_domain_id,
+        })
+    }
+
+    /// Exact canonical deployment identity.
+    pub fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+
+    /// Exact canonical cryptographic trust-domain identity.
+    pub fn trust_domain_id(&self) -> &str {
+        &self.trust_domain_id
+    }
+}
+
+fn control_plane_grant_scoped_id_is_canonical(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    let bytes = suffix.as_bytes();
+    (3..=127).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
 /// Issued by the control plane for an approved `LiveApply` or step rollback
 /// `LiveDestroy`.
 /// The agent verifies this against the CP's own public key before executing.
 ///
 /// Signable fields (fixed order, see `signing_bytes_vlc`):
-/// `request_id, request_resource_version, platform, job_spec_digest, approved_plan_digest,
-/// approved_plan_job_id, approved_plan_attempt_id, approver, expiry
-/// (RFC 3339), step_job_id, execution_authority, signing_key_id`
+/// `request_id, request_resource_version, deployment_id, trust_domain_id,
+/// platform, job_spec_digest, approved_plan_digest, approved_plan_job_id,
+/// approved_plan_attempt_id, approver, expiry (RFC 3339), step_job_id,
+/// execution_authority, signing_key_id`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedLiveContext {
     /// The upstream change-request id.
@@ -637,6 +712,14 @@ pub struct VerifiedLiveContext {
     /// this grant authorizes. A different request version requires a new plan,
     /// approval decision, and grant.
     pub request_resource_version: RequestResourceVersion,
+    /// Exact canonical deployment identity this grant authorizes. This is a
+    /// required top-level wire field and is independently signature-bound from
+    /// the destination platform/site.
+    pub deployment_id: String,
+    /// Exact canonical cryptographic trust domain this grant authorizes. This
+    /// is a required top-level wire field and is independently signature-bound
+    /// from both deployment and destination platform/site.
+    pub trust_domain_id: String,
     /// Exact destination platform/site this grant authorizes. The issuer copies
     /// the same canonical value into the signed grant and the dispatched
     /// [`Job`]; the agent refuses a validly signed grant whose value does not
@@ -683,6 +766,13 @@ pub struct VerifiedLiveContext {
     /// Base64-encoded Ed25519 signature over the canonical bytes of the fields
     /// above.  Produced by `sign_vlc`; verified by `verify_vlc`.
     pub signature: String,
+}
+
+impl VerifiedLiveContext {
+    /// Validate the signed wire identifiers and return their typed exact scope.
+    pub fn validated_scope(&self) -> Result<ControlPlaneGrantScope, ControlPlaneGrantScopeError> {
+        ControlPlaneGrantScope::new(self.deployment_id.clone(), self.trust_domain_id.clone())
+    }
 }
 
 /// Maximum number of simultaneously published control-plane grant verifying
@@ -833,7 +923,14 @@ pub const TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION: &str =
 /// CP public-key response with a versioned active/verify-only keyset. A v7
 /// agent cannot select the correct overlap key or refuse an unknown/revoked
 /// `kid`, so mixed v7/v8 operation is intentionally unsupported.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// Version 9 makes canonical `deployment_id` and `trust_domain_id` identities
+/// required in every [`VerifiedLiveContext`] and binds both into the
+/// `ryuki-v9/verified-live-context` signature domain. A v8 grant can bind only
+/// its destination platform/site and therefore cannot be reinterpreted as
+/// deployment- and trust-domain-scoped authority. Mixed v8/v9 operation is
+/// intentionally unsupported.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The closed set of wire-protocol versions a peer will accept, gated
 /// fail-closed exactly like [`SUPPORTED_REDACTION_POLICY_VERSIONS`]. During a
@@ -841,7 +938,7 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// interoperates, then narrow to `&[N]` once every peer is upgraded. Both the CP
 /// (accepting agent requests) and the agent (accepting the CP's advertised
 /// version) reference this ONE constant, so emission and acceptance cannot drift.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[8];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[9];
 
 /// The version an absent [`PROTOCOL_VERSION_HEADER`] is resolved to. A peer that
 /// predates protocol versioning sends no header; it is, by definition, speaking

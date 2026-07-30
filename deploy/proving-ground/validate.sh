@@ -127,11 +127,16 @@ PORTAL_DOCKERFILE="$HERE/../../portal/portal-ui/Dockerfile"
 for dockerfile in "$API_DOCKERFILE" "$PORTAL_DOCKERFILE"; do
   grep -Fqx 'USER 10001:10001' "$dockerfile" || \
     fail "application runtime image must declare the reviewed non-root identity: $dockerfile"
-  grep -Fq -- '--chown=10001:10001' "$dockerfile" || \
-    fail "application runtime payload must be owned by the reviewed non-root identity: $dockerfile"
 done
+grep -Fq 'COPY --from=build --chown=0:0 --chmod=0555 /app/target/release/ryuki-api /app/ryuki-api' \
+  "$API_DOCKERFILE" || \
+  fail "platform-api executable must remain immutable and root-owned"
+grep -Fq 'RUN chmod -R a-w /app/security-contract' "$API_DOCKERFILE" || \
+  fail "platform-api security-contract payload must remain immutable"
 grep -Fq 'install -d -o 10001 -g 10001 -m 0700 /app/keys' "$API_DOCKERFILE" || \
   fail "platform-api image must prepare its signing-key directory for the non-root runtime"
+grep -Fq -- '--chown=10001:10001' "$PORTAL_DOCKERFILE" || \
+  fail "portal runtime payload must be owned by the reviewed non-root identity"
 grep -Fq 'ca-certificates curl socat' "$PORTAL_DOCKERFILE" || \
   fail "portal image must contain the fixed loopback API relay"
 
@@ -305,6 +310,8 @@ LITERAL_HCL="terraform { backend \"local\" { path = \"{STATE_DIR}/literal ; \$(t
   printf '%s\n' 'PG_VAULT_TOKEN=control-plane-only'
   printf '%s\n' 'PG_LOCAL_USERS=control-plane-only'
   printf '%s\n' 'PG_AGENT_PLATFORM=DEFRA'
+  printf '%s\n' 'PG_AGENT_DEPLOYMENT_ID=deployment:proving-ground'
+  printf '%s\n' 'PG_AGENT_TRUST_DOMAIN_ID=trust-domain:proving-ground'
   printf '%s\n' 'PG_AGENT_ALLOW_LIVE=false'
   printf 'PG_AGENT_BACKEND_HCL=%s\n' "$LITERAL_HCL"
   printf '%s\n' 'PG_TERRAFORM_EXECUTABLE=/literal/terraform'
@@ -343,6 +350,21 @@ validate_agent_env
   fail "control-plane values were assigned by the agent parser"
 
 PG_AGENT_ALLOW_LIVE=true
+PG_AGENT_DEPLOYMENT_ID=""
+PG_AGENT_TRUST_DOMAIN_ID=""
+if validate_agent_env 2>/dev/null; then
+  fail "live execution accepted missing deployment and trust-domain scope"
+fi
+PG_AGENT_DEPLOYMENT_ID=deployment:proving-ground
+if validate_agent_env 2>/dev/null; then
+  fail "live execution accepted a partial deployment/trust-domain scope"
+fi
+PG_AGENT_TRUST_DOMAIN_ID=trust-domain:INVALID
+if validate_agent_env 2>/dev/null; then
+  fail "live execution accepted a malformed trust-domain scope"
+fi
+PG_AGENT_TRUST_DOMAIN_ID=trust-domain:proving-ground
+
 if validate_agent_env 2>/dev/null; then
   fail "live execution accepted missing approved executable digests"
 fi
@@ -552,10 +574,14 @@ grep -Fq 'agent_sha256=$AGENT_ARTIFACT_SHA256' "$HERE/run-agent.sh" || \
 [[ "$(grep -Fc 'verify_agent_trust_binding' "$HERE/run-agent.sh")" -ge 6 ]] || \
   fail "agent runner must recheck trust at every credential-bearing execution boundary"
 PROTOCOL_TYPES="$HERE/../../sources/ryuki-protocol/src/types.rs"
-grep -Fqx 'pub const PROTOCOL_VERSION: u32 = 8;' "$PROTOCOL_TYPES" || \
-  fail "the proving ground requires the shared protocol-v8 wire contract"
-grep -Fqx 'pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[8];' "$PROTOCOL_TYPES" || \
+grep -Fqx 'pub const PROTOCOL_VERSION: u32 = 9;' "$PROTOCOL_TYPES" || \
+  fail "the proving ground requires the shared protocol-v9 wire contract"
+grep -Fqx 'pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[9];' "$PROTOCOL_TYPES" || \
   fail "legacy protocol peers must remain outside the shared acceptance set"
+grep -Fq 'export RYUKI_AGENT_DEPLOYMENT_ID=' "$HERE/run-agent.sh" || \
+  fail "the proving-ground agent must receive an independently pinned deployment id"
+grep -Fq 'export RYUKI_AGENT_TRUST_DOMAIN_ID=' "$HERE/run-agent.sh" || \
+  fail "the proving-ground agent must receive an independently pinned trust-domain id"
 grep -Fq 'export RYUKI_LIVE_PROVIDER_AUTHORITY_ID="$PG_PROVIDER_AUTHORITY_ID"' \
   "$HERE/run-agent.sh" || \
   fail "the proving-ground agent must receive the reviewed provider authority id"

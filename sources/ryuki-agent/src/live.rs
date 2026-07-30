@@ -17,6 +17,8 @@
 //!    - the grant's signature verifies against the **pinned** CP verifying key
 //!      (the agent independently trusts only the signed grant, never the bare
 //!      `mode` field),
+//!    - the signed deployment and trust-domain identifiers exactly match the
+//!      canonical scope pinned by this agent at startup,
 //!    - `grant.job_spec_digest == job_spec_digest(job.spec)` (the grant binds
 //!      the exact mode, IaC, variables, and Terraform state key),
 //!    - `grant.request_id == job.spec.request_id` (the grant is for THIS job),
@@ -36,15 +38,16 @@
 //! grant to pass validation; every non-refusal mutation result still requires
 //! the complete grant checks.
 //!
-//! ## Bootstrap note for `pin_cp_keyset`
+//! ## Bootstrap note for `pin_cp_grant_authority`
 //!
-//! [`pin_cp_keyset`] validates the closed keyset structure. The fetched keyset
-//! is only as trustworthy as the transport used to retrieve it. Production CP
-//! URLs therefore require HTTPS; plain HTTP is restricted to an explicit
-//! loopback development policy. This build pins the keyset once at startup and
-//! does not refresh it while running. A published rotation or revocation takes
-//! effect for an agent only after its next successful restart/bootstrap; runtime
-//! keyset refresh and monotonic update enforcement remain future work.
+//! [`pin_cp_grant_authority`] validates the closed keyset structure and binds it
+//! to the agent's canonical deployment/trust-domain scope. The fetched keyset is
+//! only as trustworthy as the transport used to retrieve it. Production CP URLs
+//! therefore require HTTPS; plain HTTP is restricted to an explicit loopback
+//! development policy. This build pins the authority once at startup and does
+//! not refresh it while running. A published rotation or revocation takes effect
+//! for an agent only after its next successful restart/bootstrap; runtime keyset
+//! refresh and monotonic update enforcement remain future work.
 
 use chrono::Utc;
 use thiserror::Error;
@@ -55,7 +58,8 @@ use ryuki_protocol::{
         job_spec_digest, public_key_fingerprint, validate_control_plane_grant_keyset,
         verify_vlc_with_keyset, VerifyError,
     },
-    ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ExecutionTrustProfile, Job, JobMode,
+    ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ControlPlaneGrantScope,
+    ExecutionTrustProfile, Job, JobMode,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +70,38 @@ use ryuki_protocol::{
 #[derive(Debug, Error)]
 #[error("failed to pin CP public key: {0}")]
 pub struct PinKeyError(#[from] VerifyError);
+
+/// Startup-pinned authority for every control-plane live grant.
+///
+/// The verification keyset and canonical deployment/trust-domain scope form
+/// one trust decision. Keeping them in one value prevents a call site from
+/// signature-verifying a grant without also enforcing the local replay scope.
+#[derive(Clone)]
+pub struct PinnedControlPlaneGrantAuthority {
+    keyset: ControlPlaneGrantKeyset,
+    scope: ControlPlaneGrantScope,
+}
+
+impl std::fmt::Debug for PinnedControlPlaneGrantAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedControlPlaneGrantAuthority")
+            .field("keyset_version", &self.keyset.keyset_version)
+            .field("key_count", &self.keyset.keys.len())
+            // Avoid exposing deployment topology in routine diagnostics.
+            .field("scope", &"<configured>")
+            .finish()
+    }
+}
+
+impl PinnedControlPlaneGrantAuthority {
+    pub fn keyset(&self) -> &ControlPlaneGrantKeyset {
+        &self.keyset
+    }
+
+    pub fn scope(&self) -> &ControlPlaneGrantScope {
+        &self.scope
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LiveDecision
@@ -83,6 +119,17 @@ pub enum LiveDecision {
     /// The agent refuses to execute — the contained string is a human-readable
     /// reason suitable for inclusion in the signed result's evidence.
     Refused(String),
+}
+
+/// Evaluate the live-read admission shared by the pure gate and the pull-loop.
+/// LivePlan does not consume a mutation grant, so this check remains usable
+/// when control-plane authority bootstrap is unavailable.
+pub fn evaluate_live_plan_admission(allow_live: bool) -> LiveDecision {
+    if allow_live {
+        LiveDecision::Proceed
+    } else {
+        LiveDecision::Refused("LivePlan requires --allow-live".to_owned())
+    }
 }
 
 /// Compare the locally authenticated agent key and the execution profile
@@ -131,8 +178,9 @@ pub fn evaluate_execution_trust_binding(
 /// # Arguments
 ///
 /// - `job` — the leased job received from the control plane.
-/// - `cp_verifying_key` — the **pinned** CP Ed25519 verification keyset;
-///   obtained once at startup via [`pin_cp_keyset`] (wrapping
+/// - `cp_grant_authority` — the **pinned** CP Ed25519 verification keyset and
+///   canonical deployment/trust-domain scope; obtained once at startup via
+///   [`pin_cp_grant_authority`] (wrapping
 ///   `fetch_cp_keyset_response`).
 ///   The gate verifies the [`VerifiedLiveContext`] grant's signature against
 ///   this key so it cannot trust a tampered or forged grant.
@@ -154,24 +202,26 @@ pub fn evaluate_execution_trust_binding(
 /// `LiveApply` → `Proceed` iff ALL of (checked in order):
 ///   1. `allow_live` is `true`
 ///   2. `job.live_context` is `Some(grant)`
-///   3. `verify_vlc_with_keyset(grant, cp_verifying_key)` succeeds
-///   4. `grant.platform == job.platform`
-///   5. `grant.job_spec_digest == job_spec_digest(job.spec)`
-///   6. `grant.request_id == job.spec.request_id`
-///   7. `grant.request_resource_version == job.spec.request_resource_version`
-///   8. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
-///      `bound_id == job.id` — a step-scoped grant only authorises the ONE
-///      dispatched step job it was minted for, preventing replay across
-///      steps and across re-dispatches (a re-dispatch mints a fresh job id).
-///      `None` is the whole-request grant shape, so the step-id comparison is
-///      skipped.
-///   9. `grant.expiry > Utc::now()`
-///   10. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
+///   3. `verify_vlc_with_keyset(grant, cp_grant_authority.keyset())` succeeds
+///   4. `grant.deployment_id == cp_grant_authority.scope().deployment_id()`
+///   5. `grant.trust_domain_id == cp_grant_authority.scope().trust_domain_id()`
+///   6. `grant.platform == job.platform`
+///   7. `grant.job_spec_digest == job_spec_digest(job.spec)`
+///   8. `grant.request_id == job.spec.request_id`
+///   9. `grant.request_resource_version == job.spec.request_resource_version`
+///   10. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
+///       `bound_id == job.id` — a step-scoped grant only authorises the ONE
+///       dispatched step job it was minted for, preventing replay across
+///       steps and across re-dispatches (a re-dispatch mints a fresh job id).
+///       `None` is the whole-request grant shape, so the step-id comparison is
+///       skipped.
+///   11. `grant.expiry > Utc::now()`
+///   12. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 ///
 /// Any failure → `Refused` with a specific reason string.
 pub fn evaluate_live_execution(
     job: &Job,
-    cp_verifying_key: &ControlPlaneGrantKeyset,
+    cp_grant_authority: &PinnedControlPlaneGrantAuthority,
     allow_live: bool,
     replanned_plan_digest: Option<&str>,
 ) -> LiveDecision {
@@ -183,17 +233,11 @@ pub fn evaluate_live_execution(
         // LivePlan does not mutate provider resources, but Terraform may update
         // backend lock/state metadata. No grant is required, while live access
         // (credentials + network path to the platform) remains explicit.
-        JobMode::LivePlan => {
-            if allow_live {
-                LiveDecision::Proceed
-            } else {
-                LiveDecision::Refused("LivePlan requires --allow-live".to_owned())
-            }
-        }
+        JobMode::LivePlan => evaluate_live_plan_admission(allow_live),
 
         // LiveApply mutates.  Every safety invariant must hold.
         JobMode::LiveApply => {
-            evaluate_live_apply(job, cp_verifying_key, allow_live, replanned_plan_digest)
+            evaluate_live_apply(job, cp_grant_authority, allow_live, replanned_plan_digest)
         }
 
         // LiveDestroy also mutates (it DESTROYS the step's applied resources for
@@ -202,7 +246,7 @@ pub fn evaluate_live_execution(
         // match: a destroy removes the step's own isolated
         // workspace state, not a pre-approved plan. `replanned_plan_digest` is
         // therefore irrelevant here.
-        JobMode::LiveDestroy => evaluate_live_destroy(job, cp_verifying_key, allow_live),
+        JobMode::LiveDestroy => evaluate_live_destroy(job, cp_grant_authority, allow_live),
     }
 }
 
@@ -214,7 +258,7 @@ pub fn evaluate_live_execution(
 /// checks directly at its mutation boundary.
 pub fn evaluate_live_authority(
     job: &Job,
-    cp_verifying_key: &ControlPlaneGrantKeyset,
+    cp_grant_authority: &PinnedControlPlaneGrantAuthority,
     allow_live: bool,
 ) -> LiveDecision {
     let (mode, require_step_bound) = match job.spec.mode {
@@ -226,21 +270,28 @@ pub fn evaluate_live_authority(
             );
         }
     };
-    match verify_live_grant(job, cp_verifying_key, allow_live, mode, require_step_bound) {
+    match verify_live_grant(
+        job,
+        cp_grant_authority,
+        allow_live,
+        mode,
+        require_step_bound,
+    ) {
         Ok(_) => LiveDecision::Proceed,
         Err(refused) => refused,
     }
 }
 
 /// Shared grant checks for the mutating live modes (`LiveApply` /
-/// `LiveDestroy`) — checks 1-9, in strict order; the first failure returns a
+/// `LiveDestroy`) — checks 1-11, in strict order; the first failure returns a
 /// `Refused` decision. Returns the verified grant so the caller can apply its
 /// mode-specific final check (LiveApply's plan-then-apply digest match, check
-/// 10). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
-/// signature, platform/request binding, step binding, and expiry.
+/// 12). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
+/// signature, deployment/trust-domain scope, platform/request binding, step
+/// binding, and expiry.
 fn verify_live_grant<'g>(
     job: &'g Job,
-    cp_verifying_key: &ControlPlaneGrantKeyset,
+    cp_grant_authority: &PinnedControlPlaneGrantAuthority,
     allow_live: bool,
     mode: &str,
     require_step_bound: bool,
@@ -265,13 +316,32 @@ fn verify_live_grant<'g>(
     // Check 3: the grant's signature must verify against the PINNED CP key.
     // This is the agent's independent trust check — it does NOT trust the bare
     // `mode` field or the grant fields without cryptographic proof.
-    if verify_vlc_with_keyset(grant, cp_verifying_key).is_err() {
+    if verify_vlc_with_keyset(grant, cp_grant_authority.keyset()).is_err() {
         return Err(LiveDecision::Refused(
             "grant signature is not from the control plane".to_owned(),
         ));
     }
 
-    // Check 4: the signed grant must authorize this EXACT destination. A grant
+    // Check 4: the signed grant must belong to this exact deployment. This is
+    // checked only after signature verification so untrusted scope strings do
+    // not influence policy, and before the platform comparison so a valid grant
+    // cannot cross a deployment boundary even when site names are reused.
+    if grant.deployment_id != cp_grant_authority.scope().deployment_id() {
+        return Err(LiveDecision::Refused(
+            "grant is for a different deployment".to_owned(),
+        ));
+    }
+
+    // Check 5: the signed grant must belong to this exact trust domain. Shared
+    // key material or a matching deployment label in another trust domain does
+    // not make the authority interchangeable.
+    if grant.trust_domain_id != cp_grant_authority.scope().trust_domain_id() {
+        return Err(LiveDecision::Refused(
+            "grant is for a different trust domain".to_owned(),
+        ));
+    }
+
+    // Check 6: the signed grant must authorize this EXACT destination. A grant
     // for another platform remains invalid even when it has a genuine CP
     // signature and an otherwise identical JobSpec.
     if grant.platform != job.platform {
@@ -280,7 +350,7 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 5: the signed grant must authorize this EXACT canonical JobSpec.
+    // Check 7: the signed grant must authorize this EXACT canonical JobSpec.
     // This binds mode, IaC, variables, and state_key before apply/destroy can
     // run. The CP's later result-digest verification is too late to prevent a
     // mutation, so the agent must enforce this independently up front.
@@ -290,14 +360,14 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 6: the grant must be for THIS job's request.
+    // Check 8: the grant must be for THIS job's request.
     if grant.request_id != job.spec.request_id {
         return Err(LiveDecision::Refused(
             "grant is for a different request".to_owned(),
         ));
     }
 
-    // Check 7: the signed grant and leased spec must name the exact same
+    // Check 9: the signed grant and leased spec must name the exact same
     // monotonic request state. The JobSpec digest also commits to this field,
     // but the explicit equality check keeps the freshness fence fail-closed at
     // the live-execution boundary and prevents future digest-shape drift from
@@ -308,7 +378,7 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 8 (#42 slice A / B2): the grant's step binding.
+    // Check 10 (#42 slice A / B2): the grant's step binding.
     //
     // A step-scoped grant (`step_job_id: Some`) may only be used against the ONE
     // dispatched step job it was minted for — closing cross-step replay (a grant
@@ -336,7 +406,7 @@ fn verify_live_grant<'g>(
         }
     }
 
-    // Check 9: the grant must not be expired.
+    // Check 11: the grant must not be expired.
     if grant.expiry <= Utc::now() {
         return Err(LiveDecision::Refused("grant has expired".to_owned()));
     }
@@ -348,18 +418,18 @@ fn verify_live_grant<'g>(
 /// readable.  Checks in strict order; the first failure returns `Refused`.
 fn evaluate_live_apply(
     job: &Job,
-    cp_verifying_key: &ControlPlaneGrantKeyset,
+    cp_grant_authority: &PinnedControlPlaneGrantAuthority,
     allow_live: bool,
     replanned_plan_digest: Option<&str>,
 ) -> LiveDecision {
-    // Checks 1-9: the shared grant rigor. LiveApply permits the whole-request
+    // Checks 1-11: the shared grant rigor. LiveApply permits the whole-request
     // (`None`) grant shape, so require_step_bound = false.
-    let grant = match verify_live_grant(job, cp_verifying_key, allow_live, "LiveApply", false) {
+    let grant = match verify_live_grant(job, cp_grant_authority, allow_live, "LiveApply", false) {
         Ok(g) => g,
         Err(refused) => return refused,
     };
 
-    // Check 10: plan-then-apply — the plan the agent just produced must match
+    // Check 12: plan-then-apply — the plan the agent just produced must match
     // the plan an operator reviewed and the CP signed off on.
     match replanned_plan_digest {
         None => LiveDecision::Refused("no plan digest available".to_owned()),
@@ -385,12 +455,12 @@ fn evaluate_live_apply(
 /// applied), signature-verified, request/version-bound, and expiry-checked.
 fn evaluate_live_destroy(
     job: &Job,
-    cp_verifying_key: &ControlPlaneGrantKeyset,
+    cp_grant_authority: &PinnedControlPlaneGrantAuthority,
     allow_live: bool,
 ) -> LiveDecision {
     // require_step_bound = true: a destroy's safety bound IS the step binding,
     // so an unbound whole-request grant must never authorise it.
-    match verify_live_grant(job, cp_verifying_key, allow_live, "LiveDestroy", true) {
+    match verify_live_grant(job, cp_grant_authority, allow_live, "LiveDestroy", true) {
         Ok(_) => LiveDecision::Proceed,
         Err(refused) => refused,
     }
@@ -421,6 +491,18 @@ pub fn pin_cp_keyset(
     Ok(keyset)
 }
 
+/// Validate and pin a CP verification keyset together with the only canonical
+/// deployment/trust-domain scope this process will accept.
+pub fn pin_cp_grant_authority(
+    keyset: ControlPlaneGrantKeyset,
+    scope: ControlPlaneGrantScope,
+) -> Result<PinnedControlPlaneGrantAuthority, PinKeyError> {
+    Ok(PinnedControlPlaneGrantAuthority {
+        keyset: pin_cp_keyset(keyset)?,
+        scope,
+    })
+}
+
 /// Development compatibility helper for tests and explicitly pinned legacy
 /// configuration. Production fetches the complete versioned keyset.
 pub fn pin_cp_key(b64: &str) -> Result<ControlPlaneGrantKeyset, PinKeyError> {
@@ -445,7 +527,8 @@ mod tests {
     use rand::rngs::OsRng;
     use ryuki_protocol::{
         crypto::{encode_verifying_key, generate_keypair, sha256_hex, sign_vlc},
-        Job, JobLease, JobMode, JobSpec, JobStatus, LiveExecutionAuthority, VerifiedLiveContext,
+        ControlPlaneGrantScope, Job, JobLease, JobMode, JobSpec, JobStatus, LiveExecutionAuthority,
+        VerifiedLiveContext,
     };
     use std::collections::BTreeMap;
     use uuid::Uuid;
@@ -456,7 +539,15 @@ mod tests {
 
     /// Generate a fresh CP keypair for a single test (parallel-safe: no global
     /// state).
-    fn cp_keypair() -> (ed25519_dalek::SigningKey, ControlPlaneGrantKeyset) {
+    fn test_scope() -> ControlPlaneGrantScope {
+        ControlPlaneGrantScope::new(
+            "deployment:test-eu1".to_owned(),
+            "trust-domain:ryuki.test".to_owned(),
+        )
+        .expect("canonical test grant scope")
+    }
+
+    fn cp_keypair() -> (ed25519_dalek::SigningKey, PinnedControlPlaneGrantAuthority) {
         let sk = generate_keypair(&mut OsRng);
         let entry = control_plane_grant_verifying_key(
             &sk.verifying_key(),
@@ -467,7 +558,9 @@ mod tests {
             active_key_id: entry.key_id.clone(),
             keys: vec![entry],
         };
-        (sk, keyset)
+        let authority = pin_cp_grant_authority(keyset, test_scope())
+            .expect("valid test keyset and canonical scope must pin");
+        (sk, authority)
     }
 
     fn test_execution_authority() -> LiveExecutionAuthority {
@@ -492,6 +585,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id,
             request_resource_version: spec.request_resource_version,
+            deployment_id: test_scope().deployment_id().to_owned(),
+            trust_domain_id: test_scope().trust_domain_id().to_owned(),
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
@@ -520,6 +615,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id,
             request_resource_version: spec.request_resource_version,
+            deployment_id: test_scope().deployment_id().to_owned(),
+            trust_domain_id: test_scope().trust_domain_id().to_owned(),
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
@@ -755,6 +852,58 @@ mod tests {
     }
 
     #[test]
+    fn live_grant_refuses_validly_signed_cross_deployment_replay() {
+        let (cp_sk, authority) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        let mut grant = make_valid_grant(&cp_sk, request_id, &plan_digest, &job.spec);
+        grant.deployment_id = "deployment:other-eu1".to_owned();
+        grant.signature.clear();
+        job.live_context = Some(sign_vlc(grant, &cp_sk));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &authority, true, Some(&plan_digest)),
+            LiveDecision::Refused("grant is for a different deployment".to_owned())
+        );
+    }
+
+    #[test]
+    fn live_grant_refuses_validly_signed_cross_trust_domain_replay() {
+        let (cp_sk, authority) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        let mut grant = make_valid_grant(&cp_sk, request_id, &plan_digest, &job.spec);
+        grant.trust_domain_id = "trust-domain:other.example".to_owned();
+        grant.signature.clear();
+        job.live_context = Some(sign_vlc(grant, &cp_sk));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &authority, true, Some(&plan_digest)),
+            LiveDecision::Refused("grant is for a different trust domain".to_owned())
+        );
+    }
+
+    #[test]
+    fn live_grant_scope_tamper_is_rejected_as_invalid_signature() {
+        let (cp_sk, authority) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        let mut grant = make_valid_grant(&cp_sk, request_id, &plan_digest, &job.spec);
+        // Change a signed field without re-signing. Signature rejection must
+        // dominate the local scope comparison.
+        grant.deployment_id = "deployment:other-eu1".to_owned();
+        job.live_context = Some(grant);
+
+        assert_eq!(
+            evaluate_live_execution(&job, &authority, true, Some(&plan_digest)),
+            LiveDecision::Refused("grant signature is not from the control plane".to_owned())
+        );
+    }
+
+    #[test]
     fn live_grant_refuses_mode_tamper_before_destroy() {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
@@ -822,6 +971,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id,
             request_resource_version: job.spec.request_resource_version,
+            deployment_id: test_scope().deployment_id().to_owned(),
+            trust_domain_id: test_scope().trust_domain_id().to_owned(),
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),
@@ -895,6 +1046,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id,
             request_resource_version: job.spec.request_resource_version,
+            deployment_id: test_scope().deployment_id().to_owned(),
+            trust_domain_id: test_scope().trust_domain_id().to_owned(),
             platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),

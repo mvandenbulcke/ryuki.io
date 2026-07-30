@@ -11818,7 +11818,7 @@ mod tests {
         .bind(request_resource_version)
         .fetch_one(&mut connection)
         .await
-        .expect("insert canonical protocol-v8 job bound to the current request version");
+        .expect("insert canonical protocol-v9 job bound to the current request version");
 
         for (column, statement) in [
             (

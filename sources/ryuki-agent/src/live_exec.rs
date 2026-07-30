@@ -36,7 +36,9 @@
 //!   `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 //! so only an operator-reviewed, CP-signed plan is applied.
 
-use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
+#[cfg(any(test, feature = "test-fixtures"))]
+use ryuki_engine::runners::RunStatus;
+use ryuki_engine::runners::{RunMode, RunPlan, RunnerKind};
 use ryuki_protocol::{
     sha256_hex, ExecutionTrustProfile, JobMode, JobSpec, EXECUTABLE_PROVENANCE_POLICY_VERSION,
     EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION, EXECUTION_TRUST_PROFILE_SCHEMA_VERSION,

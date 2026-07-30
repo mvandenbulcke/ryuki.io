@@ -407,6 +407,8 @@ mod tests {
             request_id: Uuid::new_v4(),
             request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
                 .expect("test resource version is positive"),
+            deployment_id: "deployment:cp-identity-test".to_string(),
+            trust_domain_id: "trust-domain:cp-identity-test".to_string(),
             platform: "defra".to_string(),
             job_spec_digest: ryuki_protocol::sha256_hex(b"job-spec"),
             approved_plan_digest: "abc123".to_string(),
@@ -439,6 +441,8 @@ mod tests {
             request_id: Uuid::new_v4(),
             request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
                 .expect("test resource version is positive"),
+            deployment_id: "deployment:cp-identity-test".to_string(),
+            trust_domain_id: "trust-domain:cp-identity-test".to_string(),
             platform: "defra".to_string(),
             job_spec_digest: ryuki_protocol::sha256_hex(Uuid::new_v4().as_bytes()),
             approved_plan_digest: ryuki_protocol::sha256_hex(Uuid::new_v4().as_bytes()),
@@ -512,6 +516,20 @@ mod tests {
             .expect_err("a removed key id must fail closed");
         assert!(matches!(error, VerifyError::UnknownControlPlaneGrantKey));
         assert!(!error.to_string().contains(&old_grant.signing_key_id));
+    }
+
+    #[test]
+    fn signed_grant_scope_cannot_be_rewritten() {
+        let key = generate_keypair(&mut OsRng);
+        let signed = ryuki_protocol::sign_vlc(unsigned_test_grant(), &key);
+
+        let mut deployment_tamper = signed.clone();
+        deployment_tamper.deployment_id = "deployment:foreign".into();
+        assert!(verify_vlc(&deployment_tamper, &key.verifying_key()).is_err());
+
+        let mut trust_domain_tamper = signed;
+        trust_domain_tamper.trust_domain_id = "trust-domain:foreign".into();
+        assert!(verify_vlc(&trust_domain_tamper, &key.verifying_key()).is_err());
     }
 
     #[test]

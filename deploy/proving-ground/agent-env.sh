@@ -189,6 +189,7 @@ load_agent_env() {
 
   # Discard inherited PG_* agent values before reading the selected file.
   unset PG_AGENT_PLATFORM PG_AGENT_ALLOW_LIVE PG_AGENT_BACKEND_HCL
+  unset PG_AGENT_DEPLOYMENT_ID PG_AGENT_TRUST_DOMAIN_ID
   unset PG_TERRAFORM_EXECUTABLE PG_TERRAFORM_EXPECTED_VERSION \
     PG_TERRAFORM_EXECUTABLE_SHA256
   unset PG_ANSIBLE_PLAYBOOK_EXECUTABLE PG_ANSIBLE_PLAYBOOK_EXPECTED_VERSION \
@@ -199,6 +200,8 @@ load_agent_env() {
   PG_AGENT_PLATFORM=""
   PG_AGENT_ALLOW_LIVE="false"
   PG_AGENT_BACKEND_HCL=""
+  PG_AGENT_DEPLOYMENT_ID=""
+  PG_AGENT_TRUST_DOMAIN_ID=""
   PG_TERRAFORM_EXECUTABLE=""
   PG_TERRAFORM_EXPECTED_VERSION=""
   PG_TERRAFORM_EXECUTABLE_SHA256=""
@@ -232,6 +235,7 @@ load_agent_env() {
     value="${line#*=}"
     case "$key" in
       PG_AGENT_PLATFORM | PG_AGENT_ALLOW_LIVE | PG_AGENT_BACKEND_HCL | \
+        PG_AGENT_DEPLOYMENT_ID | PG_AGENT_TRUST_DOMAIN_ID | \
         PG_TERRAFORM_EXECUTABLE | PG_TERRAFORM_EXPECTED_VERSION | \
         PG_TERRAFORM_EXECUTABLE_SHA256 | PG_ANSIBLE_PLAYBOOK_EXECUTABLE | \
         PG_ANSIBLE_PLAYBOOK_EXPECTED_VERSION | \
@@ -271,6 +275,23 @@ validate_agent_env() {
       return 1
       ;;
   esac
+
+  if [[ -n "$PG_AGENT_DEPLOYMENT_ID" || -n "$PG_AGENT_TRUST_DOMAIN_ID" ]]; then
+    if [[ ! "$PG_AGENT_DEPLOYMENT_ID" =~ ^deployment:[a-z0-9][a-z0-9._-]{2,126}$ ]]; then
+      printf 'error: PG_AGENT_DEPLOYMENT_ID must be a canonical deployment: id\n' >&2
+      return 1
+    fi
+    if [[ ! "$PG_AGENT_TRUST_DOMAIN_ID" =~ ^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$ ]]; then
+      printf 'error: PG_AGENT_TRUST_DOMAIN_ID must be a canonical trust-domain: id\n' >&2
+      return 1
+    fi
+  fi
+
+  if [[ "$PG_AGENT_ALLOW_LIVE" == "true" && \
+    ( -z "$PG_AGENT_DEPLOYMENT_ID" || -z "$PG_AGENT_TRUST_DOMAIN_ID" ) ]]; then
+    printf 'error: live execution requires PG_AGENT_DEPLOYMENT_ID and PG_AGENT_TRUST_DOMAIN_ID\n' >&2
+    return 1
+  fi
 
   if [[ -n "$PG_AGENT_BACKEND_HCL" && "$PG_AGENT_BACKEND_HCL" != *'{STATE_KEY}'* ]]; then
     printf 'error: PG_AGENT_BACKEND_HCL must contain {STATE_KEY}\n' >&2

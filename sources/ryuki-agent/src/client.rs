@@ -445,7 +445,7 @@ impl CpClient {
     /// reusable bearer.
     ///
     /// The caller should pin the returned key at startup (via
-    /// `ryuki_agent::live::pin_cp_keyset`) and use it to verify every
+    /// `ryuki_agent::live::pin_cp_grant_authority`) and use it to verify every
     /// [`VerifiedLiveContext`] grant before a `LiveApply` execution.
     ///
     /// ## TOFU note
@@ -739,7 +739,8 @@ mod tests {
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&4));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&5));
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&6));
-        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 8);
+        assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&8));
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 9);
         assert!(
             ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&ryuki_protocol::PROTOCOL_VERSION)
         );
@@ -748,7 +749,7 @@ mod tests {
     #[test]
     fn unsupported_bootstrap_protocol_version_is_rejected() {
         let error = CpClient::require_compatible_protocol(ryuki_protocol::PROTOCOL_VERSION_LEGACY)
-            .expect_err("a legacy CP must be rejected after the v8 cutover");
+            .expect_err("a legacy CP must be rejected after the v9 cutover");
         assert!(matches!(
             error,
             ClientError::IncompatibleProtocol {
@@ -893,8 +894,10 @@ mod tests {
     #[tokio::test]
     async fn malformed_keyset_bootstrap_returns_a_value_free_error() {
         let hostile_marker = "attacker-controlled-bootstrap-value";
-        let body =
-            format!(r#"{{"keyset":{{"unexpected":"{hostile_marker}"}},"protocol_version":8}}"#);
+        let protocol_version = ryuki_protocol::PROTOCOL_VERSION;
+        let body = format!(
+            r#"{{"keyset":{{"unexpected":"{hostile_marker}"}},"protocol_version":{protocol_version}}}"#
+        );
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

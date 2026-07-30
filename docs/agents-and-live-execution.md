@@ -44,9 +44,10 @@ would preserve the squatting denial. The database marker remains enrollment
 contract v3. Historically, wire protocol v6 added the exact successful plan
 job/attempt, planning-agent enrollment/key, reviewed execution trust profile,
 and immutable result enrollment; v7 then added the positive request resource
-version. The current release-wide wire protocol is v8: every grant also carries
-a signed control-plane key id and agents consume a versioned active/verify-only
-verification keyset. Deploy only matching protocol-v8 API, agent, and portal
+version; v8 added a signed control-plane key id and versioned active/verify-only
+verification keyset. The current release-wide wire protocol is v9, which also
+binds the canonical deployment and trust domain into every grant. Deploy only
+matching protocol-v9 API, agent, and portal
 components after the v3 enrollment migration is ready.
 
 Pre-cutover Approved and Revoked rows remain operable so the cutover does not
@@ -98,6 +99,8 @@ ORDER BY agent.created_at, agent.id;
 | `RYUKI_AGENT_ENROLLMENT_CHALLENGE` | with self-registration | One-time `ryc_` bootstrap secret delivered through an existing provider-neutral secret channel. Debug output redacts it; remove it after successful consumption. |
 | `RYUKI_AGENT_KEY_PATH` | no | Ed25519 seed path (default `agent.key`). |
 | `RYUKI_AGENT_ALLOW_LIVE` | no | Only the literal `true` or `1` unlocks live modes. Anything else, including typos, fails safe to dry-run-only. |
+| `RYUKI_AGENT_DEPLOYMENT_ID` | with live mode | Independently provisioned canonical `deployment:` identity. The agent compares it with every signed live grant. |
+| `RYUKI_AGENT_TRUST_DOMAIN_ID` | with live mode | Independently provisioned canonical `trust-domain:` identity. The agent compares it with every signed live grant. |
 | `RYUKI_AGENT_BACKEND_HCL` | conditional | Operator-supplied Terraform backend template. Its active backend state-location attribute must contain `{STATE_KEY}` so each request or step uses isolated durable state; a placeholder in a comment or unrelated attribute is rejected. |
 | `RYUKI_LIVE_PROVIDER_AUTHORITY_ID` | live vSphere jobs | Stable non-secret opaque provisioning reference in canonical `provider-authority/vsphere/...` form. It must not contain a hostname, account name, tenant id, credential, or provider-returned value. |
 | `RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION` | live vSphere jobs | Canonical `v...` immutable version of the referenced destination/account credential set. Rotate it whenever `VSPHERE_SERVER`, `VSPHERE_USER`, or any credential member changes. |
@@ -183,7 +186,8 @@ When live mode is enabled, the agent fetches the control plane's complete
 versioned public keyset once (`GET /api/agents/cp-public-key`), validates its
 positive version, bounded strictly sorted unique members, exact key-id/public-
 key bindings, and single active member, then pins it for the process lifetime.
-Each protocol-v8 grant signs its exact `signing_key_id`; the agent verifies with
+Each protocol-v9 grant signs its exact `signing_key_id`, `deployment_id`, and
+`trust_domain_id`; the agent verifies with
 that retained active or verify-only member and rejects an unknown or removed
 key. A rotation therefore requires a newly published higher-version keyset and
 an agent restart to acquire it. If the startup fetch or validation fails, live
@@ -208,12 +212,19 @@ control-plane rehearsal until containment is implemented.
 | `LiveApply` | never dispatched directly; whole-request jobs are minted by approval | Re-plans, requires the canonical plan digest to equal the approved digest, then applies that fresh matching binary plan. Human per-step approval is disabled in this release. |
 | `LiveDestroy` | system, during auto-teardown | Reverse-order Terraform teardown of applied steps, authorized by a step-scoped control-plane grant. Ansible destroy refuses because it has no Terraform state. |
 
+`LivePlan` intentionally has no approval grant because it creates the evidence
+that a later mutation grant authorizes. It still requires the agent's explicit
+live opt-in, but the v9 signed-scope check applies at the `LiveApply` and
+`LiveDestroy` mutation boundaries. Backend initialization, locking, or state
+metadata changes during planning remain a separate provider/backend-control
+risk and are not treated as authority to mutate provider resources.
+
 ## The live-apply trust chain
 
 1. **Plan.** An admin dispatches `POST /api/requests/{id}/execute?mode=live-plan`. The agent plans against the real backend and posts scrubbed evidence plus a SHA-256 plan digest.
 2. **Review.** The control plane stores the digest-covered plan bytes privately and derives an admin-only projection from the actual planned VM shape and the five planned vSphere placement lookups. Those values must exactly match the JobSpec; missing or mismatched `change.after` data fails closed. Raw Terraform JSON and provider object identifiers are not exposed.
-3. **Approve.** An admin calls `POST /api/requests/{id}/approve-live-apply` with the exact reviewed plan job UUID, attempt UUID, and digest. The control plane locks and re-verifies that selected row, including its attempt, lease generation, result UUID, signed-envelope identity, immutable enrollment, key, profile, spec, and digest. It then mints an Ed25519 grant binding the request id, destination platform, exact plan job and attempt, approved plan digest, complete JobSpec digest (including mode, IaC digest, variables, and state key), exact successful-planning agent id/enrollment/key, canonical execution-trust-profile digest, approver, and expiry (whole-request approvals use a 1-hour TTL; grants are capped at 24 hours). A later same-digest plan row cannot replace the row the administrator reviewed. The database allows one request-level live apply. Human per-step approval is deliberately disabled: the step route completes its admin, scope, and separation-of-duties checks, then returns `409 Conflict` without minting a job. Exact-plan step-grant support remains internal protocol groundwork rather than an enabled operator workflow.
-4. **Verify authority.** Before provider execution, the agent requires protocol v8, selects the exact retained key named by the grant's signed `signing_key_id`, re-computes the embedded IaC digest, and verifies the grant and its exact JobSpec, destination, plan job/attempt, planning-agent enrollment/key, execution-profile digest, request/step ownership, exact request resource version, and expiry. It then runs a fresh plan whose digest must equal the approved one. An unknown or removed key id and every other failure produce a signed `LiveRefused` result; mutation is never called. The control plane independently repeats the signed grant, keyset, platform, spec, state-owner, assigned-agent, profile, plan-row, request-version, and approved-digest checks on result ingest. Protocol v1 through v7 peers are rejected rather than interpreted without those bindings.
+3. **Approve.** An admin calls `POST /api/requests/{id}/approve-live-apply` with the exact reviewed plan job UUID, attempt UUID, and digest. The control plane locks and re-verifies that selected row, including its attempt, lease generation, result UUID, signed-envelope identity, immutable enrollment, key, profile, spec, and digest. It then mints an Ed25519 grant binding the canonical deployment and trust domain, request id, destination platform, exact plan job and attempt, approved plan digest, complete JobSpec digest (including mode, IaC digest, variables, and state key), exact successful-planning agent id/enrollment/key, canonical execution-trust-profile digest, approver, and expiry (whole-request approvals use a 1-hour TTL; grants are capped at 24 hours). A later same-digest plan row cannot replace the row the administrator reviewed. The database allows one request-level live apply. Human per-step approval is deliberately disabled: the step route completes its admin, scope, and separation-of-duties checks, then returns `409 Conflict` without minting a job. Exact-plan step-grant support remains internal protocol groundwork rather than an enabled operator workflow.
+4. **Verify authority.** Before provider execution, the agent requires protocol v9, selects the exact retained key named by the grant's signed `signing_key_id`, re-computes the embedded IaC digest, and verifies the grant and its independently pinned deployment/trust-domain scope, exact JobSpec, destination, plan job/attempt, planning-agent enrollment/key, execution-profile digest, request/step ownership, exact request resource version, and expiry. It then runs a fresh plan whose digest must equal the approved one. An unknown or removed key id and every other failure produce a signed `LiveRefused` result; mutation is never called. The control plane independently repeats the signed grant, keyset, platform, spec, state-owner, assigned-agent, profile, plan-row, request-version, and approved-digest checks on result ingest. Protocol v1 through v8 peers are rejected rather than interpreted without those bindings.
 5. **Apply and converge.** The LiveApply job creates a fresh binary plan, proves its canonical `terraform show -json` digest equals the reviewed digest, and applies that matching binary plan. It does not reuse a binary `tfplan` file from the earlier job. The runner then re-plans; a vSphere request cannot complete verification unless that post-apply plan is clean. Other Terraform offerings and Ansible check-mode runs remain preview-only until they have their own typed, server-derived review projection; neither approval endpoint will mint a grant for them.
 
 Plan, apply, and destroy jobs for one state key are pinned to the same approved
@@ -293,7 +304,7 @@ disposable target, the remaining deployment prerequisites are:
 
 1. **Enrol an agent** where it can reach vCenter (see the enrolment steps above), and give it a durable Terraform backend template via `RYUKI_AGENT_BACKEND_HCL`. Its active state-location attribute must contain `{STATE_KEY}`; the control plane supplies a stable `request-<id>` or `step-<id>` key shared by plan, apply, and destroy for that one unit of work.
 2. **Provide credentials and their non-secret authority reference** on the agent host: `RYUKI_LIVE_CRED_VSPHERE_USER`, `RYUKI_LIVE_CRED_VSPHERE_PASSWORD`, `RYUKI_LIVE_CRED_VSPHERE_SERVER`, `RYUKI_LIVE_PROVIDER_AUTHORITY_ID`, and `RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION`. A missing or malformed value produces a signed refusal before Terraform runs; changing the destination/account set requires a new authority version, plan, and approval.
-3. **Unlock live mode** with `RYUKI_AGENT_ALLOW_LIVE=true` and confirm the agent validated and pinned the control plane's complete versioned public keyset at startup.
+3. **Unlock live mode and pin scope** with `RYUKI_AGENT_ALLOW_LIVE=true`, a canonical `RYUKI_AGENT_DEPLOYMENT_ID`, and a canonical `RYUKI_AGENT_TRUST_DOMAIN_ID`. Confirm the independently provisioned scope matches the admitted control-plane profile and that the agent validated and pinned the complete versioned public keyset plus that exact scope at startup.
 4. **Supply placement**: the request must carry the real vSphere datacenter, cluster, datastore, network, template, and disk size. Missing live-placement inputs are rejected before dispatch; sample defaults are not substituted.
 5. **Drive the governed flow only after containment is enabled**: dispatch a `LivePlan`, wait while the request remains `executing`, review the digest-verified projection for its exact plan job and attempt, approve that same reference, and let the same backend-owning agent build and apply a fresh digest-matching plan. Only a converged apply satisfies the request-verification prerequisite.
 6. **Clean up**: successful single-job requests do not currently expose an operator-triggered `LiveDestroy`. Rehearse and approve the state-keyed cleanup procedure before live apply, then verify both the provider and Terraform state are empty.
@@ -308,7 +319,8 @@ execution. The normative future-live checklist is
 ## What is implemented, and what stays yours
 
 Implemented and tested: the no-provider-authority/no-spawn dry-run protocol
-path; protocol-v8-only negotiation and signed-`kid` keyset selection; the
+path; protocol-v9-only negotiation, signed-`kid` keyset selection, and
+deployment/trust-domain replay resistance; the
 fail-closed live protocol and acceptance paths (exact-spec and exact-plan-row
 grant binding, IaC and plan digest integrity, state-owner validation, exact
 planning-agent enrollment/key and execution-profile affinity, refusal

@@ -76,7 +76,10 @@ use crate::{
     client::{ClientError, CpClient},
     executor::{Evidence, ExecError, JobExecutor},
     identity::AgentIdentity,
-    live::{evaluate_execution_trust_binding, evaluate_live_execution},
+    live::{
+        evaluate_execution_trust_binding, evaluate_live_execution, evaluate_live_plan_admission,
+        PinnedControlPlaneGrantAuthority,
+    },
     live_exec::{LiveExecError, LiveExecutor},
     outbox::{Outbox, OutboxError},
     result::{
@@ -85,10 +88,7 @@ use crate::{
     },
 };
 use ryuki_engine::runners::RunStatus;
-use ryuki_protocol::{
-    control_plane_grant_verifying_key, AgentHeartbeatResponse, ControlPlaneGrantKeyDisposition,
-    ControlPlaneGrantKeyset, Job, JobLease, JobMode,
-};
+use ryuki_protocol::{AgentHeartbeatResponse, Job, JobLease, JobMode};
 
 /// Renew well inside the control plane's lease window. A single failed fenced
 /// renewal marks the local attempt lost; it is never treated as a best-effort
@@ -409,8 +409,9 @@ fn evidence_or_deterministic_failure_with_cancellation(
 ///
 /// ## Argument summary
 ///
-/// - `cp_verifying_key` — the **pinned** CP Ed25519 key fetched at startup.
-///   `None` → refuse all `LiveApply` jobs (can't verify the grant without it).
+/// - `cp_grant_authority` — the **pinned** CP Ed25519 keyset and canonical
+///   deployment/trust-domain scope established at startup. `None` → refuse all
+///   mutating live jobs (the grant cannot be verified and scope-bound).
 ///   `LivePlan` is still allowed when `allow_live` is `true` (no grant needed).
 /// - `allow_live` — from `AgentConfig::allow_live`; must be `true` for any
 ///   live job.
@@ -422,7 +423,7 @@ fn evidence_or_deterministic_failure_with_cancellation(
 /// For `LiveApply`:
 ///
 /// 1. `!allow_live` → refuse immediately WITHOUT calling `plan()`.
-/// 2. `cp_verifying_key` is `None` → refuse immediately WITHOUT calling `plan()`.
+/// 2. `cp_grant_authority` is `None` → refuse immediately WITHOUT calling `plan()`.
 /// 3. `plan()` → `plan_digest`.
 /// 4. Gate checks the complete signed grant/spec/request-version binding,
 ///    expiry, and digest.
@@ -440,7 +441,7 @@ fn evidence_or_deterministic_failure_with_cancellation(
 ///
 /// For `LiveDestroy` (#42 B2-3):
 ///
-/// 1. `cp_verifying_key` is `None` → refuse immediately (the gate's grant
+/// 1. `cp_grant_authority` is `None` → refuse immediately (the gate's grant
 ///    signature check requires the pinned key; a destroy grant is mandatory).
 /// 2. Gate checks the complete signed grant/spec/request-version binding,
 ///    REQUIRED step binding, and expiry — no plan digest: the destruction set
@@ -461,7 +462,7 @@ pub async fn process_job_live(
     agent_id: &str,
     outbox: &Outbox,
     job: &Job,
-    cp_verifying_key: Option<&ControlPlaneGrantKeyset>,
+    cp_grant_authority: Option<&PinnedControlPlaneGrantAuthority>,
     allow_live: bool,
 ) -> Result<(), AgentError> {
     let lease = job.lease.as_ref().ok_or(AgentError::NoLease)?;
@@ -508,15 +509,13 @@ pub async fn process_job_live(
                 .await;
             }
 
-            // Fast-path refuse: no pinned CP key → the gate's signature check
-            // (check 3) cannot run — refuse with an explicit reason instead of
-            // a misleading "bad signature". Mirrors the LiveApply fast-path.
-            let vk = match cp_verifying_key {
+            // Fast-path refuse: no pinned CP grant authority → the signature
+            // and scope checks cannot run. Mirrors the LiveApply fast-path.
+            let authority = match cp_grant_authority {
                 Some(k) => k,
                 None => {
-                    let reason =
-                        "LiveDestroy refused: no CP public key available for grant verification";
-                    warn!(job_id = %job.id, "LiveDestroy refused: no pinned CP key");
+                    let reason = "LiveDestroy refused: no pinned CP grant authority available";
+                    warn!(job_id = %job.id, "LiveDestroy refused: no pinned CP grant authority");
                     return renew_finish_and_post(
                         client,
                         outbox,
@@ -529,7 +528,7 @@ pub async fn process_job_live(
             };
 
             // Full grant/spec/request-version gate (no digest for a destroy).
-            match evaluate_live_execution(job, vk, allow_live, None) {
+            match evaluate_live_execution(job, authority, allow_live, None) {
                 crate::live::LiveDecision::Refused(reason) => {
                     warn!(
                         job_id = %job.id,
@@ -594,7 +593,7 @@ pub async fn process_job_live(
                             }
                         };
                         if let crate::live::LiveDecision::Refused(reason) =
-                            evaluate_live_execution(job, vk, allow_live, None)
+                            evaluate_live_execution(job, authority, allow_live, None)
                         {
                             warn!(
                                 job_id = %job.id,
@@ -648,22 +647,10 @@ pub async fn process_job_live(
 
         // -- LivePlan -------------------------------------------------------
         JobMode::LivePlan => {
-            // Gate: allow_live only (no grant, no digest needed for plan).
-            // Use a synthetic zeroed key when we have no pinned key — the gate
-            // won't reach the signature check for LivePlan (it only checks
-            // allow_live), so passing any key is safe here.
-            let dummy_entry = control_plane_grant_verifying_key(
-                &identity.signing_key().verifying_key(),
-                ControlPlaneGrantKeyDisposition::Active,
-            );
-            let dummy_keyset = ControlPlaneGrantKeyset {
-                keyset_version: 1,
-                active_key_id: dummy_entry.key_id.clone(),
-                keys: vec![dummy_entry],
-            };
-            let vk = cp_verifying_key.unwrap_or(&dummy_keyset);
-
-            match evaluate_live_execution(job, vk, allow_live, None) {
+            // LivePlan has no mutation grant. Its only trust-gate condition is
+            // the explicit live-execution opt-in, so no synthetic key or scope
+            // is needed when CP bootstrap is unavailable.
+            match evaluate_live_plan_admission(allow_live) {
                 crate::live::LiveDecision::Refused(reason) => {
                     warn!(
                         job_id = %job.id,
@@ -742,13 +729,13 @@ pub async fn process_job_live(
                 .await;
             }
 
-            // Fast-path refuse: no pinned CP key → can't verify grant.
-            let vk = match cp_verifying_key {
+            // Fast-path refuse: no pinned CP grant authority → neither the
+            // signature nor the deployment/trust-domain scope can be checked.
+            let authority = match cp_grant_authority {
                 Some(k) => k,
                 None => {
-                    let reason =
-                        "LiveApply refused: no CP public key available for grant verification";
-                    warn!(job_id = %job.id, "LiveApply refused: no pinned CP key");
+                    let reason = "LiveApply refused: no pinned CP grant authority available";
+                    warn!(job_id = %job.id, "LiveApply refused: no pinned CP grant authority");
                     return renew_finish_and_post(
                         client,
                         outbox,
@@ -765,7 +752,7 @@ pub async fn process_job_live(
             // The full gate is repeated after planning to bind the digest and
             // re-check expiry at the mutation boundary.
             if let crate::live::LiveDecision::Refused(reason) =
-                crate::live::evaluate_live_authority(job, vk, allow_live)
+                crate::live::evaluate_live_authority(job, authority, allow_live)
             {
                 warn!(
                     job_id = %job.id,
@@ -845,7 +832,12 @@ pub async fn process_job_live(
 
             // Repeat the complete grant/spec/request-version gate with the
             // newly computed raw-plan digest immediately before mutation.
-            match evaluate_live_execution(job, vk, allow_live, Some(raw_plan_digest.as_str())) {
+            match evaluate_live_execution(
+                job,
+                authority,
+                allow_live,
+                Some(raw_plan_digest.as_str()),
+            ) {
                 crate::live::LiveDecision::Refused(reason) => {
                     warn!(
                         job_id = %job.id,
@@ -881,7 +873,7 @@ pub async fn process_job_live(
                     };
                     match evaluate_live_execution(
                         job,
-                        vk,
+                        authority,
                         allow_live,
                         Some(raw_plan_digest.as_str()),
                     ) {
@@ -1242,10 +1234,10 @@ pub async fn replay_outbox(client: &CpClient, outbox: &Outbox, max_attempts: u32
 /// `outbox_drain_interval` has elapsed since the last drain.  The hot path
 /// (while a job is being processed) is not interrupted.
 ///
-/// ## CP key pin (`cp_verifying_key`)
+/// ## CP grant authority pin (`cp_grant_authority`)
 ///
 /// When `allow_live` is `true`, the caller should attempt
-/// `client.fetch_cp_public_keyset()` → `pin_cp_keyset()` BEFORE calling `run_loop`
+/// `client.fetch_cp_public_keyset()` → `pin_cp_grant_authority()` BEFORE calling `run_loop`
 /// and pass the result here.  If the fetch/pin fails, pass `None` — live
 /// `LiveApply` jobs will be refused (the gate requires the pinned key);
 /// `LivePlan` jobs are still allowed (they only check `allow_live`).
@@ -1260,7 +1252,7 @@ pub async fn run_loop(
     agent_id: &str,
     outbox: &Outbox,
     poll_interval: Duration,
-    cp_verifying_key: Option<&ControlPlaneGrantKeyset>,
+    cp_grant_authority: Option<&PinnedControlPlaneGrantAuthority>,
     allow_live: bool,
     max_outbox_attempts: u32,
     outbox_drain_interval: Duration,
@@ -1309,7 +1301,7 @@ pub async fn run_loop(
                             agent_id,
                             outbox,
                             &job,
-                            cp_verifying_key,
+                            cp_grant_authority,
                             allow_live,
                         )
                         .await
@@ -1373,8 +1365,10 @@ mod tests {
     use chrono::{Duration, Utc};
     use rand::rngs::OsRng;
     use ryuki_protocol::{
+        control_plane_grant_verifying_key,
         crypto::{generate_keypair, job_spec_digest, sha256_hex, sign_vlc},
-        JobLease, JobMode, JobSpec, JobStatus, VerifiedLiveContext,
+        ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ControlPlaneGrantScope, JobLease,
+        JobMode, JobSpec, JobStatus, VerifiedLiveContext,
     };
     use std::{
         collections::BTreeMap,
@@ -1385,6 +1379,7 @@ mod tests {
     use crate::{
         executor::StubExecutor,
         identity::AgentIdentity,
+        live::{pin_cp_grant_authority, PinnedControlPlaneGrantAuthority},
         live_exec::{LivePlanOutcome, StubLiveExecutor},
         outbox::Outbox,
     };
@@ -1795,7 +1790,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Generate a fresh CP keypair (parallel-safe: no global state).
-    fn cp_keypair() -> (ed25519_dalek::SigningKey, ControlPlaneGrantKeyset) {
+    fn test_grant_scope() -> ControlPlaneGrantScope {
+        ControlPlaneGrantScope::new(
+            "deployment:test-eu1".to_owned(),
+            "trust-domain:ryuki.test".to_owned(),
+        )
+        .expect("canonical test grant scope")
+    }
+
+    fn cp_keypair() -> (ed25519_dalek::SigningKey, PinnedControlPlaneGrantAuthority) {
         let sk = generate_keypair(&mut OsRng);
         let entry = control_plane_grant_verifying_key(
             &sk.verifying_key(),
@@ -1806,7 +1809,9 @@ mod tests {
             active_key_id: entry.key_id.clone(),
             keys: vec![entry],
         };
-        (sk, keyset)
+        let authority = pin_cp_grant_authority(keyset, test_grant_scope())
+            .expect("valid test keyset and canonical scope must pin");
+        (sk, authority)
     }
 
     fn exact_test_execution_authority(
@@ -1868,6 +1873,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id,
             request_resource_version: spec.request_resource_version,
+            deployment_id: test_grant_scope().deployment_id().to_owned(),
+            trust_domain_id: test_grant_scope().trust_domain_id().to_owned(),
             platform: "test-platform".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
@@ -2368,6 +2375,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_apply_refuses_signed_cross_deployment_grant_before_plan() {
+        let (cp_sk, authority) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"plan-bytes-for-scope-replay-test";
+        let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+        let plan_digest = sha256_hex(PLAN_BYTES);
+        let mut job = make_leased_job_mode(JobMode::LiveApply);
+        let mut grant = make_grant(
+            &cp_sk,
+            job.spec.request_id,
+            &plan_digest,
+            &job.spec,
+            unrelated_test_execution_authority(),
+        );
+        grant.deployment_id = "deployment:other-eu1".to_owned();
+        grant.signature.clear();
+        job.live_context = Some(sign_vlc(grant, &cp_sk));
+
+        assert_eq!(
+            crate::live::evaluate_live_authority(&job, &authority, true),
+            crate::live::LiveDecision::Refused("grant is for a different deployment".to_owned())
+        );
+        assert_eq!(
+            live_exec.plan_call_count(),
+            0,
+            "cross-deployment grants must be refused before provider contact"
+        );
+        assert_eq!(live_exec.apply_call_count(), 0);
+    }
+
     // -----------------------------------------------------------------------
     // LiveApply refused: digest mismatch → Refused, apply NOT called
     // -----------------------------------------------------------------------
@@ -2554,12 +2591,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LiveApply no pinned CP key → refused WITHOUT plan called
+    // LiveApply no pinned CP grant authority → refused WITHOUT plan called
     // -----------------------------------------------------------------------
 
     #[test]
     fn live_apply_no_cp_key_plan_not_called() {
-        // process_job_live's fast-path refuses LiveApply when cp_verifying_key=None
+        // process_job_live's fast-path refuses LiveApply when cp_grant_authority=None
         // WITHOUT calling plan(). Test by asserting plan_call_count stays 0.
         let live_exec = stub_live(b"plan", RunStatus::Applied);
         let identity = AgentIdentity::generate();
@@ -2572,7 +2609,7 @@ mod tests {
             &identity,
             "test-agent",
             &job,
-            "LiveApply refused: no CP public key available for grant verification",
+            "LiveApply refused: no pinned CP grant authority available",
         )
         .expect("refused result must build");
 
@@ -2734,6 +2771,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id,
             request_resource_version: spec.request_resource_version,
+            deployment_id: test_grant_scope().deployment_id().to_owned(),
+            trust_domain_id: test_grant_scope().trust_domain_id().to_owned(),
             platform: "test-platform".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             // The digest of the plan the step APPLIED — present in the grant but
@@ -3042,7 +3081,7 @@ mod tests {
             &identity,
             "test-agent",
             &job,
-            "LiveDestroy refused: no CP public key available for grant verification",
+            "LiveDestroy refused: no pinned CP grant authority available",
         )
         .expect("refused result must build");
 

@@ -866,12 +866,14 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
     auth_session_from_persisted_session_with_authority_admission(
         headers,
         auth_header,
-        config,
-        admission,
         proof,
-        &session_parser,
-        session_credentials.as_ref(),
-        &origin_authority,
+        PersistedSessionResolutionContext {
+            config,
+            admission,
+            session_parser: &session_parser,
+            session_credentials: session_credentials.as_ref(),
+            origin_authority: &origin_authority,
+        },
     )
     .await
     .map(|(session, source, _authority, _request_read)| (session, source))
@@ -887,21 +889,32 @@ fn test_cookie_runtime(config: &RyukiConfig) -> Arc<cookie_runtime::ApiCookieRun
         .expect("test config must construct a cookie runtime")
 }
 
+struct PersistedSessionResolutionContext<'a> {
+    config: &'a RyukiConfig,
+    admission: &'a Arc<crate::session_lookup_admission::SessionLookupAdmission>,
+    session_parser: &'a cookie_runtime::ApiSessionAuthParser,
+    session_credentials: &'a crate::session_credentials::DerivedSessionCredentialRuntime,
+    origin_authority: &'a crate::session_lookup_admission::SessionLookupOriginAuthority,
+}
+
 async fn auth_session_from_persisted_session_with_authority_admission(
     headers: &HeaderMap,
     auth_header: Option<&str>,
-    config: &RyukiConfig,
-    admission: &Arc<crate::session_lookup_admission::SessionLookupAdmission>,
     proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
-    session_parser: &cookie_runtime::ApiSessionAuthParser,
-    session_credentials: &crate::session_credentials::DerivedSessionCredentialRuntime,
-    origin_authority: &crate::session_lookup_admission::SessionLookupOriginAuthority,
+    context: PersistedSessionResolutionContext<'_>,
 ) -> Option<(
     AuthSession,
     SessionIdSource,
     Option<crate::human_authority::InteractiveHumanAuthorityContext>,
     Option<crate::request_authority::RequestReadAuthority>,
 )> {
+    let PersistedSessionResolutionContext {
+        config,
+        admission,
+        session_parser,
+        session_credentials,
+        origin_authority,
+    } = context;
     let auth_mode = &config.auth_mode;
     // Classify all credential evidence once. Any malformed session bearer or
     // simultaneous header/Authorization/cookie evidence fails closed before a
@@ -2283,12 +2296,14 @@ async fn auth_middleware(
             match auth_session_from_persisted_session_with_authority_admission(
                 &headers,
                 auth_header,
-                app_config,
-                &lookup_admission,
                 lookup_proof,
-                &session_auth_parser,
-                session_credentials.as_ref(),
-                &session_origin_authority,
+                PersistedSessionResolutionContext {
+                    config: app_config,
+                    admission: &lookup_admission,
+                    session_parser: &session_auth_parser,
+                    session_credentials: session_credentials.as_ref(),
+                    origin_authority: &session_origin_authority,
+                },
             )
             .await
             {
@@ -6765,7 +6780,16 @@ mod tests {
             "a disabled browser pointer must reject its former session generation"
         );
 
-        row.current_origin_binding_digest = Some(vec![0x5a; 32]);
+        let mut stale_digest = rand::random::<[u8; 32]>().to_vec();
+        if stale_digest
+            == row
+                .authenticator_origin_binding_digest
+                .as_deref()
+                .unwrap_or_default()
+        {
+            stale_digest[0] ^= 1;
+        }
+        row.current_origin_binding_digest = Some(stale_digest);
         assert!(
             !session_row_matches_origin(&row, &origin),
             "a stale current pointer must reject the old process-local origin"

@@ -723,9 +723,9 @@ mod inbound_webhook_db_tests {
 
     fn test_encryption_key() -> String {
         std::env::var("RYUKI_INTEGRATION__ENCRYPTION_KEY").unwrap_or_else(|_| {
-            // 32 bytes of obviously-fake test key (base64 of 0x41*32 = "AAA..."):
-            // this is NOT a real secret, it's a test fixture.
-            base64::engine::general_purpose::STANDARD.encode([0x41u8; 32])
+            // Generate per-test material so static secret detectors never need
+            // to distinguish a deterministic fixture from production key data.
+            base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 32]>())
         })
     }
 

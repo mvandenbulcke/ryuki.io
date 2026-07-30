@@ -1,18 +1,20 @@
 //! ryuki-agent binary — entry point.
 //!
 //! Loads configuration, resolves the Ed25519 identity, optionally fetches and
-//! pins the CP public key (when `allow_live` is set), then enters the pull-loop
+//! pins the CP grant keyset and deployment/trust-domain scope (when
+//! `allow_live` is set), then enters the pull-loop
 //! via [`ryuki_agent::run::run_loop`].
 //!
 //! ## CP key pin (S5b-2b-ii)
 //!
 //! When `RYUKI_AGENT_ALLOW_LIVE=true`, the agent fetches the CP's Ed25519
-//! public key via `GET /api/agents/cp-public-key` and pins it via `pin_cp_key`.
-//! The pinned key is held for the lifetime of the process and passed to
+//! public keyset via `GET /api/agents/cp-public-key` and pins it together with
+//! the canonical local grant scope via `pin_cp_grant_authority`. The combined
+//! authority is held for the lifetime of the process and passed to
 //! `run_loop` so the gate can verify `VerifiedLiveContext` grants.
 //!
 //! If the fetch fails (network error, CP unreachable), the agent logs a warning
-//! and continues with `cp_verifying_key = None`.  In that state:
+//! and continues with `cp_grant_authority = None`. In that state:
 //! - `LivePlan` jobs are still executed (the gate only checks `allow_live`).
 //! - `LiveApply` jobs are refused (the gate cannot verify the grant).
 //!
@@ -37,7 +39,7 @@ use ryuki_agent::{
     config::AgentConfig,
     executor::RunnerExecutor,
     identity::AgentIdentity,
-    live::pin_cp_keyset,
+    live::pin_cp_grant_authority,
     live_exec::RunnerLiveExecutor,
     outbox::Outbox,
     run::run_loop,
@@ -279,16 +281,19 @@ async fn main() {
     // The pinned key is required to verify VerifiedLiveContext grants before
     // any LiveApply job is executed.  If the fetch fails, we continue with
     // `None` — LivePlan jobs will still run; LiveApply jobs will be refused.
-    let cp_verifying_key = if cfg.allow_live {
-        match cp_bootstrap.map(|response| response.keyset) {
-            Some(keyset) => match pin_cp_keyset(keyset) {
-                Ok(keyset) => {
+    let cp_grant_authority = if cfg.allow_live {
+        match (
+            cp_bootstrap.map(|response| response.keyset),
+            cfg.live_grant_scope.clone(),
+        ) {
+            (Some(keyset), Some(scope)) => match pin_cp_grant_authority(keyset, scope) {
+                Ok(authority) => {
                     info!(
-                        keyset_version = keyset.keyset_version,
-                        key_count = keyset.keys.len(),
-                        "CP public keyset pinned — live grant verification is active"
+                        keyset_version = authority.keyset().keyset_version,
+                        key_count = authority.keyset().keys.len(),
+                        "CP grant authority pinned — signature and deployment/trust-domain scope verification are active"
                     );
-                    Some(keyset)
+                    Some(authority)
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -298,10 +303,18 @@ async fn main() {
                     None
                 }
             },
-            None => {
+            (None, _) => {
                 tracing::warn!(
                     "CP bootstrap keyset is unavailable — LiveApply jobs will be refused \
                      (no grant verification possible)"
+                );
+                None
+            }
+            // AgentConfig makes this unreachable when allow_live is true, but
+            // retain a fail-closed guard at the startup wiring boundary.
+            (_, None) => {
+                tracing::warn!(
+                    "live grant scope is unavailable — mutating live jobs will be refused"
                 );
                 None
             }
@@ -322,7 +335,7 @@ async fn main() {
         &agent_id,
         &outbox,
         poll_interval,
-        cp_verifying_key.as_ref(),
+        cp_grant_authority.as_ref(),
         cfg.allow_live,
         cfg.max_outbox_attempts,
         outbox_drain_interval,

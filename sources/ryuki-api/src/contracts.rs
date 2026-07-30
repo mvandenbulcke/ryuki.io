@@ -31,6 +31,19 @@ use crate::database::get_db;
 use crate::problem_details;
 use crate::ProblemDetails;
 
+#[cfg(not(test))]
+fn admitted_control_plane_grant_scope() -> Result<ryuki_protocol::ControlPlaneGrantScope, String> {
+    crate::config_store::security_contract_context_if_initialized()
+        .ok_or_else(|| "startup security contract is not initialized".to_string())?
+        .control_plane_grant_scope()
+}
+
+#[cfg(test)]
+fn admitted_control_plane_grant_scope() -> Result<ryuki_protocol::ControlPlaneGrantScope, String> {
+    ryuki_protocol::ControlPlaneGrantScope::new("deployment:api-test", "trust-domain:api-test")
+        .map_err(|_| "test control-plane grant scope is invalid".into())
+}
+
 #[derive(Debug, Deserialize)]
 struct PaginationParams {
     limit: Option<usize>,
@@ -21724,6 +21737,14 @@ async fn requests_approve_live_apply(
             Json(json!({"error": "control plane is not configured to sign grants"})),
         )
     })?;
+    let grant_scope = admitted_control_plane_grant_scope().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "control plane has no unambiguous admitted grant scope"
+            })),
+        )
+    })?;
 
     let body = crate::agents::ApproveLiveApplyBody {
         approved_plan_job_id: reviewed_plan.approved_plan_job_id,
@@ -21739,7 +21760,7 @@ async fn requests_approve_live_apply(
     // Approver = the verified session principal (never the request body). Mints
     // the CP-signed grant + inserts the LiveApply job; the agent verifies the
     // grant independently before applying.
-    crate::agents::approve_live_apply_with(pool, cp_key, &session, &body).await
+    crate::agents::approve_live_apply_with(pool, cp_key, &grant_scope, &session, &body).await
 }
 
 /// POST /api/requests/{id}/steps/{step_key}/approve-live-apply.
@@ -23677,6 +23698,15 @@ fn ready_to_teardown(
         .collect()
 }
 
+/// Scope-only part of the teardown lineage gate. The caller separately checks
+/// the signature and every request, job, step, digest, and execution binding.
+pub(crate) fn teardown_grant_matches_control_plane_scope(
+    grant: &ryuki_protocol::VerifiedLiveContext,
+    expected_scope: &ryuki_protocol::ControlPlaneGrantScope,
+) -> bool {
+    crate::agents::verified_live_context_matches_control_plane_grant_scope(grant, expected_scope)
+}
+
 /// Dispatch a `LiveDestroy` job for each ready-to-teardown `Applied` step (#42
 /// slice B2-2), INSIDE the caller's transaction. Each job carries a step-scoped
 /// CP-signed `LiveDestroy` grant (`create_step_live_job`) — authorised by the
@@ -23695,6 +23725,12 @@ pub(crate) async fn dispatch_teardown_steps(
     let cp_key = crate::cp_identity::cp_signing_key().ok_or_else(|| {
         sqlx::Error::Protocol(
             "control plane signing key not initialised; cannot mint teardown grants".into(),
+        )
+    })?;
+    let grant_scope = admitted_control_plane_grant_scope().map_err(|_| {
+        sqlx::Error::Protocol(
+            "control plane has no unambiguous admitted grant scope; cannot mint teardown grants"
+                .into(),
         )
     })?;
     // Collect ids first so we don't hold an immutable borrow of `plan` across
@@ -23749,6 +23785,7 @@ pub(crate) async fn dispatch_teardown_steps(
             })?;
         if ryuki_protocol::verify_vlc(&apply_grant, &cp_key.verifying_key()).is_err()
             || apply_grant.request_id != request_id
+            || !teardown_grant_matches_control_plane_scope(&apply_grant, &grant_scope)
             || apply_grant.platform != current.site
             || apply_grant.step_job_id != Some(apply_job_id)
             || apply_grant.approved_plan_digest != digest
@@ -23787,6 +23824,7 @@ pub(crate) async fn dispatch_teardown_steps(
         spec.mode = ryuki_protocol::JobMode::LiveDestroy;
         let job_id = crate::agents::create_step_live_job(
             tx,
+            &grant_scope,
             approved_plan,
             request_id,
             step.id,
@@ -25105,8 +25143,10 @@ mod step_authoring_db_tests {
         };
         let digest = "a".repeat(64);
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        let grant_scope = admitted_control_plane_grant_scope().expect("test grant scope");
         let result = crate::agents::create_live_apply_job(
             pool,
+            &grant_scope,
             crate::agents::ApprovedPlanReference {
                 job_id: Uuid::new_v4(),
                 attempt_id: Uuid::new_v4(),
@@ -25196,8 +25236,10 @@ mod step_authoring_db_tests {
             )
             .await;
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        let grant_scope = admitted_control_plane_grant_scope().expect("test grant scope");
         let result = crate::agents::create_live_apply_job(
             pool,
+            &grant_scope,
             approved_plan,
             id,
             "DEFRA",

@@ -1176,7 +1176,6 @@ mod oidc_login_states_db_tests {
         let mut tasks = Vec::with_capacity(CALLERS);
         for _ in 0..CALLERS {
             let pool = pool.clone();
-            let origin = origin;
             tasks.push(tokio::spawn(async move {
                 create_with_limits(&pool, &origin, per_origin_limit, global_limit).await
             }));

@@ -308,22 +308,23 @@ its fixed `http://127.0.0.1:18081` control-plane URL. This is an explicit local
 development exception to the agent's fail-closed transport default; never carry
 it into a non-loopback or deployed configuration.
 Record the startup log entry `CP wire protocol is compatible` and require
-`cp_protocol_version=8` and `agent_protocol_version=8`. Missing and v1-v7 peers
+`cp_protocol_version=9` and `agent_protocol_version=9`. Missing and v1-v8 peers
 fail closed. Historically, v6 added destination, exact planning-agent
 enrollment/key, reviewed execution-trust-profile, and exact plan-job/attempt
-bindings; v7 added the positive request resource version. Current protocol v8
-also signs the exact control-plane key id into every durable live grant and
-pins the versioned active/verify-only verification keyset.
+bindings; v7 added the positive request resource version; v8 added the exact
+control-plane key id and versioned active/verify-only verification keyset.
+Current protocol v9 also signs deployment and trust-domain identities, which
+the agent compares with independently provisioned expected values.
 
-Treat the v7-to-v8 durable-grant change as a non-overlap deployment cutover.
+Treat the v8-to-v9 durable-grant change as a non-overlap deployment cutover.
 Before changing the accepted revision, stop new approvals, stop and drain every
-v7 API and agent process, and require zero `Pending`, `Leased`, or `Running`
-`LiveApply`/`LiveDestroy` jobs. Retain terminal v7 rows as historical evidence,
+v8 API and agent process, and require zero `Pending`, `Leased`, or `Running`
+`LiveApply`/`LiveDestroy` jobs. Retain terminal v8 rows as historical evidence,
 but never rewrite, re-sign, or requeue their stored grants. An unfinished
-mutation requires reconciliation. Any later `LiveApply` requires a fresh v8
+mutation requires reconciliation. Any later `LiveApply` requires a fresh v9
 plan, approval, and grant; any permitted compensation requires its own freshly
-minted step-scoped v8 grant after only matching v8 components are running. The
-local `cp-signing.key` remains a development-only seed. The v8 keyset is protocol
+minted step-scoped v9 grant after only matching v9 components are running. The
+local `cp-signing.key` remains a development-only seed. The v9 keyset is protocol
 groundwork: external signing material, live overlap rotation/revocation, and
 recovery remain unverified production prerequisites.
 
@@ -371,7 +372,9 @@ The embedded server bundles pin `vmware/vsphere` 2.16.1 and enforce their
 checksum lock read-only. That release documents vSphere 8.x/9.x support. A
 vSphere 7.x target blocks this revision; do not override or delete the lock.
 
-1. Stop the polling agent, set `PG_AGENT_ALLOW_LIVE=true` in `.env`, configure
+1. Stop the polling agent, set `PG_AGENT_ALLOW_LIVE=true`,
+   `PG_AGENT_DEPLOYMENT_ID=deployment:proving-ground`, and
+   `PG_AGENT_TRUST_DOMAIN_ID=trust-domain:proving-ground` in `.env`, configure
    the required provider credentials plus `PG_PROVIDER_AUTHORITY_ID` and
    `PG_PROVIDER_AUTHORITY_VERSION`, `PG_BACKEND_CREDENTIAL_AUTHORITY_ID`, and
    `PG_BACKEND_CREDENTIAL_AUTHORITY_REVISION`, rerun `./validate.sh .env`, and restart

@@ -174,6 +174,17 @@ struct VerifiedAuthenticatorAuthorityGeneration<'a> {
     path_kind: &'static str,
 }
 
+struct VerifiedAuthenticatorAuthorityParts<'a> {
+    projection: &'a ryuki_core::security_profile::AuthenticatorOriginProjection,
+    encoded_origin_binding_digest: &'a str,
+    origin_binding_digest: &'a [u8; 32],
+    provider_id: &'a str,
+    path_id: &'a str,
+    path_version: u64,
+    actual_path_kind: &'a str,
+    expected_path_kind: &'static str,
+}
+
 fn decode_sha256_digest(value: &str) -> Result<[u8; 32], IdentityAuthorityError> {
     let encoded =
         value
@@ -210,15 +221,18 @@ fn digest_matches(actual: &[u8], expected: &[u8; 32]) -> bool {
 
 impl<'a> VerifiedAuthenticatorAuthorityGeneration<'a> {
     fn from_verified_parts(
-        projection: &'a ryuki_core::security_profile::AuthenticatorOriginProjection,
-        encoded_origin_binding_digest: &'a str,
-        origin_binding_digest: &'a [u8; 32],
-        provider_id: &str,
-        path_id: &str,
-        path_version: u64,
-        actual_path_kind: &str,
-        expected_path_kind: &'static str,
+        parts: VerifiedAuthenticatorAuthorityParts<'a>,
     ) -> Result<Self, IdentityAuthorityError> {
+        let VerifiedAuthenticatorAuthorityParts {
+            projection,
+            encoded_origin_binding_digest,
+            origin_binding_digest,
+            provider_id,
+            path_id,
+            path_version,
+            actual_path_kind,
+            expected_path_kind,
+        } = parts;
         let encoded_origin_digest = decode_sha256_digest(encoded_origin_binding_digest)?;
         if !digest_matches(encoded_origin_digest.as_slice(), origin_binding_digest)
             || projection.provider_id.as_str() != provider_id
@@ -264,16 +278,16 @@ impl<'a> VerifiedAuthenticatorAuthorityGeneration<'a> {
         origin
             .verify_integrity()
             .map_err(|_| IdentityAuthorityError::AuthenticatorOrigin("sealed origin integrity"))?;
-        Self::from_verified_parts(
-            origin.origin_projection(),
-            origin.origin_binding_digest(),
-            origin.origin_binding_digest_bytes(),
-            origin.provider_id(),
-            origin.path_id(),
-            origin.path_version(),
-            origin.path_kind(),
-            BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND,
-        )
+        Self::from_verified_parts(VerifiedAuthenticatorAuthorityParts {
+            projection: origin.origin_projection(),
+            encoded_origin_binding_digest: origin.origin_binding_digest(),
+            origin_binding_digest: origin.origin_binding_digest_bytes(),
+            provider_id: origin.provider_id(),
+            path_id: origin.path_id(),
+            path_version: origin.path_version(),
+            actual_path_kind: origin.path_kind(),
+            expected_path_kind: BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND,
+        })
     }
 
     fn from_direct_bearer_origin(
@@ -297,16 +311,16 @@ impl<'a> VerifiedAuthenticatorAuthorityGeneration<'a> {
                 "sealed origin provider-binding reconciliation",
             ));
         }
-        Self::from_verified_parts(
-            origin.origin_projection(),
-            origin.origin_binding_digest(),
-            origin.origin_binding_digest_bytes(),
-            origin.provider_id(),
-            origin.path_id(),
-            origin.path_version(),
-            origin.path_kind(),
-            DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
-        )
+        Self::from_verified_parts(VerifiedAuthenticatorAuthorityParts {
+            projection: origin.origin_projection(),
+            encoded_origin_binding_digest: origin.origin_binding_digest(),
+            origin_binding_digest: origin.origin_binding_digest_bytes(),
+            provider_id: origin.provider_id(),
+            path_id: origin.path_id(),
+            path_version: origin.path_version(),
+            actual_path_kind: origin.path_kind(),
+            expected_path_kind: DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+        })
     }
 
     fn matches_row(&self, row: &AuthenticatorAuthorityGenerationRow) -> bool {
@@ -1019,14 +1033,16 @@ pub(crate) async fn reconcile_test_authenticator_runtime(
             })?;
     let bearer_origin_binding_digest_bytes = decode_sha256_digest(&bearer_origin_binding_digest)?;
     let bearer_generation = VerifiedAuthenticatorAuthorityGeneration::from_verified_parts(
-        &bearer_projection,
-        &bearer_origin_binding_digest,
-        &bearer_origin_binding_digest_bytes,
-        &bearer_projection.provider_id,
-        &bearer_projection.path_id,
-        bearer_projection.path_version,
-        DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
-        DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+        VerifiedAuthenticatorAuthorityParts {
+            projection: &bearer_projection,
+            encoded_origin_binding_digest: &bearer_origin_binding_digest,
+            origin_binding_digest: &bearer_origin_binding_digest_bytes,
+            provider_id: &bearer_projection.provider_id,
+            path_id: &bearer_projection.path_id,
+            path_version: bearer_projection.path_version,
+            actual_path_kind: DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+            expected_path_kind: DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+        },
     )?;
 
     let reconciliation =
@@ -1106,14 +1122,16 @@ pub(crate) async fn reconcile_test_authenticator_epoch(
             })?;
     let bearer_digest_bytes = decode_sha256_digest(&bearer_digest)?;
     let bearer_generation = VerifiedAuthenticatorAuthorityGeneration::from_verified_parts(
-        &bearer_projection,
-        &bearer_digest,
-        &bearer_digest_bytes,
-        &bearer_projection.provider_id,
-        &bearer_projection.path_id,
-        bearer_projection.path_version,
-        DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
-        DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+        VerifiedAuthenticatorAuthorityParts {
+            projection: &bearer_projection,
+            encoded_origin_binding_digest: &bearer_digest,
+            origin_binding_digest: &bearer_digest_bytes,
+            provider_id: &bearer_projection.provider_id,
+            path_id: &bearer_projection.path_id,
+            path_version: bearer_projection.path_version,
+            actual_path_kind: DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+            expected_path_kind: DIRECT_BEARER_AUTHENTICATOR_PATH_KIND,
+        },
     )?;
 
     let browser_digest =
@@ -1125,14 +1143,16 @@ pub(crate) async fn reconcile_test_authenticator_epoch(
             })?;
     let browser_digest_bytes = decode_sha256_digest(&browser_digest)?;
     let browser_generation = VerifiedAuthenticatorAuthorityGeneration::from_verified_parts(
-        &browser_projection,
-        &browser_digest,
-        &browser_digest_bytes,
-        &browser_projection.provider_id,
-        &browser_projection.path_id,
-        browser_projection.path_version,
-        BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND,
-        BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND,
+        VerifiedAuthenticatorAuthorityParts {
+            projection: &browser_projection,
+            encoded_origin_binding_digest: &browser_digest,
+            origin_binding_digest: &browser_digest_bytes,
+            provider_id: &browser_projection.provider_id,
+            path_id: &browser_projection.path_id,
+            path_version: browser_projection.path_version,
+            actual_path_kind: BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND,
+            expected_path_kind: BROWSER_DERIVED_AUTHENTICATOR_PATH_KIND,
+        },
     )?;
 
     reconcile_authenticator_generations(
@@ -3281,7 +3301,7 @@ mod tests {
         let issuer = "https://identity.example.test/provider-admission";
         let subject = format!("admission-subject-{}", Uuid::new_v4());
         let roles = vec!["Auditor".to_string()];
-        provision_global_assignment(pool, &provider, issuer, &subject, &roles).await;
+        provision_global_assignment(pool, provider, issuer, &subject, &roles).await;
         let oidc_session = Uuid::new_v4();
         let oidc_credential =
             crate::session_credentials::issue_session_credential(&session).unwrap();

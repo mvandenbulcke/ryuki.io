@@ -2,13 +2,13 @@
   "components": {
     "parameters": {
       "ProtocolVersionHeader": {
-        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v8 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
+        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v9 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
         "in": "header",
         "name": "x-ryuki-protocol-version",
         "required": true,
         "schema": {
           "enum": [
-            8
+            9
           ],
           "format": "int64",
           "type": "integer"
@@ -1389,7 +1389,7 @@
         "type": "object"
       },
       "VerifiedLiveContext": {
-        "description": "Protocol-v8 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact request version, successful plan row and attempt, execution authority, and control-plane signing key id; live_destroy grants are also step-bound.",
+        "description": "Protocol-v9 CP-signed approval grant for a live_apply or live_destroy job. It binds the admitted deployment and trust domain, exact request version, successful plan row and attempt, execution authority, and control-plane signing key id; live_destroy grants are also step-bound.",
         "properties": {
           "approved_plan_attempt_id": {
             "description": "Exact leased attempt that produced the reviewed plan result.",
@@ -1407,6 +1407,11 @@
             "type": "string"
           },
           "approver": {
+            "type": "string"
+          },
+          "deployment_id": {
+            "description": "Startup-admitted deployment namespace; never supplied by the approval request.",
+            "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$",
             "type": "string"
           },
           "execution_authority": {
@@ -1447,11 +1452,18 @@
             "description": "Present only for a step-scoped grant: binds this grant to one dispatched step job id, preventing replay across steps or re-dispatches. Absent for a whole-request LiveApply grant.",
             "format": "uuid",
             "type": "string"
+          },
+          "trust_domain_id": {
+            "description": "Single startup-admitted trust domain; never inferred from the destination platform.",
+            "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$",
+            "type": "string"
           }
         },
         "required": [
           "request_id",
           "request_resource_version",
+          "deployment_id",
+          "trust_domain_id",
           "platform",
           "job_spec_digest",
           "approved_plan_digest",
@@ -1482,7 +1494,7 @@
     }
   },
   "info": {
-    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is an unauthenticated bootstrap read that atomically returns the protocol version and keyset without requiring a request version header. Every other agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v8-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
+    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is an unauthenticated bootstrap read that atomically returns the protocol version and keyset without requiring a request version header. Every other agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v9-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
     "title": "Ryuki Agent Protocol API",
     "version": "0.1.0"
   },

@@ -136,22 +136,25 @@ of the digest-bound IaC once external execution is admitted.
    a `LiveApply` grant **signed with its Ed25519 key**. The grant binds the
    request and platform, exact plan row/attempt, approved plan and complete
    JobSpec digests, planning-agent enrollment/key/profile authority, approver,
-   and a short expiry (<= 24 h). Protocol v8 also signs the deterministic
-   control-plane signing-key id (`kid`) into the grant. A later same-digest row
+   and a short expiry (<= 24 h). Protocol v8 added the deterministic
+   control-plane signing-key id (`kid`); protocol v9 additionally signs the
+   canonical deployment and trust-domain identities. A later same-digest row
    cannot replace the reviewed row, and a unique constraint prevents a second
    request-level apply.
    Human per-step approval is disabled: its portal control is absent and the
    route returns `409 Conflict` without minting.
-4. The protocol-v8 agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true`, it has
+4. The protocol-v9 agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true`, it has
    validated and pinned the control plane's versioned active/verify-only public
-   keyset, and external containment is available.
+   keyset plus independently provisioned deployment/trust-domain scope, and
+   external containment is available.
    It verifies the embedded IaC digest and refuses unless **all** hold: the
    grant signature verifies; its full JobSpec digest and exact plan row/attempt
-   match; request, exact request resource version, platform, step, mode, state
+   match; deployment, trust domain, request, exact request resource version,
+   platform, step, mode, state
    owner, planning-agent enrollment/key/profile, and expiry match; and the
    freshly computed raw-plan digest matches the approved one. The signed `kid`
    must select an exact retained member of the pinned keyset; an unknown or
-   removed key fails closed. Protocol v1 through v7 is rejected. Plan, apply, and
+   removed key fails closed. Protocol v1 through v8 is rejected. Plan, apply, and
    destroy for a state key remain pinned to the same agent.
 5. Once containment is implemented, the LiveApply path will apply only the
    fresh binary plan whose canonical raw JSON digest matched the reviewed plan.
@@ -171,10 +174,11 @@ prove their exact version binding before provider-connected activation.
 | Flag | Side | Effect |
 | --- | --- | --- |
 | `RYUKI_AGENT_ALLOW_LIVE` | Agent | `true`/`1` passes the live-mode configuration gate; it does not bypass the missing descendant-containment capability, so external spawn still fails closed. Anything else is dry-run-only. Cleartext non-loopback URLs are rejected at startup. |
+| `RYUKI_AGENT_DEPLOYMENT_ID` / `RYUKI_AGENT_TRUST_DOMAIN_ID` | Agent | Required together whenever live mode is enabled. The canonical, independently provisioned deployment and trust-domain scope is pinned with the control-plane grant keyset; a valid grant for another scope is refused before provider execution. |
 | `RYUKI_AGENT_CP_URL` / `RYUKI_AGENT_TOKEN` / `RYUKI_AGENT_KEY_PATH` | Agent | CP endpoint (HTTPS for live), enrolment token, and the agent signing key. |
 | `RYUKI_AGENT_BACKEND_HCL` | Agent | Terraform backend template. The active path/key attribute must contain `{STATE_KEY}` for per-request/per-step isolation; comments and unrelated attributes do not satisfy the gate. Remote-execution backend type `remote` is rejected. A privacy-safe semantic authority digest is bound from plan through mutation. |
 | `RYUKI_LIVE_PROVIDER_AUTHORITY_ID` / `RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION` | Agent | Non-secret opaque provisioning-record reference and immutable version for the exact vSphere destination/account credential set. Missing/malformed metadata fails live profile minting; changing the set requires version rotation and reapproval. |
-| `RYUKI_CP_SIGNING_KEY_PATH` | Control plane | Development-only CP Ed25519 grant-signing seed path; the default local `cp-signing.key` may be created on first boot and is published as a one-active-key v8 keyset. It is not production key-custody evidence. `ExternalSigningKeyMaterial` remains unverified; production requires externally governed, version-pinned key custody, overlap/revocation inventory, rotation, and recovery evidence. |
+| `RYUKI_CP_SIGNING_KEY_PATH` | Control plane | Development-only CP Ed25519 grant-signing seed path; the default local `cp-signing.key` may be created on first boot and is published as a one-active-key v9 keyset. It is not production key-custody evidence. `ExternalSigningKeyMaterial` remains unverified; production requires externally governed, version-pinned key custody, overlap/revocation inventory, rotation, and recovery evidence. |
 
 ### Maturity
 

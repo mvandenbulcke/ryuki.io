@@ -23,7 +23,7 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:f350796d1ef48f06be028f7afafc80b6afb698630681fa88b7ceb734372be009",
+        "content_digest": "sha256:ee31981719367886b84eb1ca9d3cb6944698850cf57849a8e4969510863bbfe1",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
@@ -35,7 +35,7 @@
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:b0a6b560eaa2539d33f636cd247b20c9be8c07a06032c96e1d6ecf41ebe0c04a",
+        "content_digest": "sha256:7ea5ba5a5a4ddb2c21ea31b9d0cbb791a7646b167a46a17e2d5c61551dcec34d",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
@@ -47,7 +47,7 @@
       {
         "document_id": "source:ryuki-api-agents",
         "document_version": 1,
-        "content_digest": "sha256:b9a0c0154803722d5030ff8ef530e1520fd4c8895511c8b1f46a9ac1266ffc86",
+        "content_digest": "sha256:09c4cccf46305a5660e47f3f70d107c0d5a8dbb6bd3f526b7671532b92dc7b44",
         "artifact_locator": "sources/ryuki-api/src/agents.rs"
       },
       {
@@ -77,7 +77,7 @@
       {
         "document_id": "source:ryuki-api-database-boundary",
         "document_version": 1,
-        "content_digest": "sha256:3acbc7b2df34c21417201d3095da1ac36bce56800c406b5943a820fea6459b18",
+        "content_digest": "sha256:9f436b8c2b1ce0f4fe2434210a22c9d0da7cdac371c6648990b2d73e179a12eb",
         "artifact_locator": "sources/ryuki-api/src/database.rs"
       },
       {
@@ -113,13 +113,13 @@
       {
         "document_id": "source:ryuki-api-identity-authority",
         "document_version": 1,
-        "content_digest": "sha256:db42b112cfbf298170c52249db857e419c4946e0c4ad5641f1fc2e795d3d14ad",
+        "content_digest": "sha256:83f755b8f78708784507230958a05c53749211af7272c336a9ffef20c05c18b3",
         "artifact_locator": "sources/ryuki-api/src/identity_authority.rs"
       },
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:113673897e0932e8d3efdd8fa96359168f15666f6c73711f6da277220dffb745",
+        "content_digest": "sha256:3a49e618f6ccd79941ec6f0ccd7af69ba1a95e691c28fd0d407913e7dd4b2e60",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {

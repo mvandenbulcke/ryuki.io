@@ -43,7 +43,7 @@ pub fn openapi_document() -> Value {
                 bootstrap read that atomically returns the protocol version and keyset \
                 without requiring a request version header. Every other agent-protocol \
                 request MUST carry the supported `x-ryuki-protocol-version` header. This build is \
-                protocol-v8-only; an absent header resolves to legacy v1 and is rejected. \
+                protocol-v9-only; an absent header resolves to legacy v1 and is rejected. \
                 (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal \
                 bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts \
                 feed, scheduler introspection) that requires an operator session and a \
@@ -84,7 +84,7 @@ pub fn openapi_document() -> Value {
                     "in": "header",
                     "required": true,
                     "description": "Required sender CP↔agent wire-schema version. This \
-                        control plane accepts protocol v8 only. An absent header resolves \
+                        control plane accepts protocol v9 only. An absent header resolves \
                         to legacy v1 and is rejected (400), as are duplicate, malformed, \
                         or unsupported values.",
                     "schema": {
@@ -294,15 +294,26 @@ pub fn openapi_document() -> Value {
                 },
                 "VerifiedLiveContext": {
                     "type": "object",
-                    "description": "Protocol-v8 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact request version, successful plan row and attempt, execution authority, and control-plane signing key id; live_destroy grants are also step-bound.",
+                    "description": "Protocol-v9 CP-signed approval grant for a live_apply or live_destroy job. It binds the admitted deployment and trust domain, exact request version, successful plan row and attempt, execution authority, and control-plane signing key id; live_destroy grants are also step-bound.",
                     "required": [
-                        "request_id", "request_resource_version", "platform", "job_spec_digest", "approved_plan_digest",
+                        "request_id", "request_resource_version", "deployment_id", "trust_domain_id",
+                        "platform", "job_spec_digest", "approved_plan_digest",
                         "approved_plan_job_id", "approved_plan_attempt_id", "approver",
                         "expiry", "execution_authority", "signing_key_id", "signature"
                     ],
                     "properties": {
                         "request_id": { "type": "string", "format": "uuid" },
                         "request_resource_version": { "type": "integer", "format": "int64", "minimum": 1 },
+                        "deployment_id": {
+                            "type": "string",
+                            "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$",
+                            "description": "Startup-admitted deployment namespace; never supplied by the approval request."
+                        },
+                        "trust_domain_id": {
+                            "type": "string",
+                            "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$",
+                            "description": "Single startup-admitted trust domain; never inferred from the destination platform."
+                        },
                         "platform": {
                             "type": "string",
                             "description": "Signed destination platform/site; must equal Job.platform before live mutation."
@@ -1528,6 +1539,8 @@ mod tests {
             .iter()
             .any(|field| field == "platform"));
         for field in [
+            "deployment_id",
+            "trust_domain_id",
             "approved_plan_job_id",
             "approved_plan_attempt_id",
             "execution_authority",
@@ -1538,7 +1551,7 @@ mod tests {
                     .expect("required fields")
                     .iter()
                     .any(|required| required == field),
-                "VerifiedLiveContext must require protocol-v8 field {field}"
+                "VerifiedLiveContext must require protocol-v9 field {field}"
             );
         }
         assert!(schemas["VerifiedLiveContext"]["required"]

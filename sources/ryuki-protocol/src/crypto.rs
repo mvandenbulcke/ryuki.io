@@ -59,9 +59,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
 use crate::types::{
-    ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ControlPlaneGrantVerifyingKey,
-    ExecutionTrustProfile, JobMode, JobResultStatus, MAX_CONTROL_PLANE_GRANT_KEYS, SignedEnvelope,
-    VerifiedLiveContext,
+    ControlPlaneGrantKeyDisposition, ControlPlaneGrantKeyset, ControlPlaneGrantScopeError,
+    ControlPlaneGrantVerifyingKey, ExecutionTrustProfile, JobMode, JobResultStatus,
+    MAX_CONTROL_PLANE_GRANT_KEYS, SignedEnvelope, VerifiedLiveContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,8 @@ pub enum VerifyError {
     ControlPlaneGrantKeysetRollback { current: u64, candidate: u64 },
     #[error("control-plane grant keyset version {0} was reused for different content")]
     ControlPlaneGrantKeysetVersionReuse(u64),
+    #[error(transparent)]
+    InvalidControlPlaneGrantScope(#[from] ControlPlaneGrantScopeError),
 }
 
 // ---------------------------------------------------------------------------
@@ -400,18 +402,21 @@ pub fn verify(envelope: &SignedEnvelope, vk: &VerifyingKey) -> Result<(), Verify
 /// Returns the canonical bytes for a [`VerifiedLiveContext`].
 ///
 /// Field order (fixed):
-/// domain, request_id, request_resource_version, platform, job_spec_digest, approved_plan_digest,
-/// approved plan job/attempt, approver, expiry, step_job_id, assigned
-/// agent/enrollment/key/profile.
+/// domain, request_id, request_resource_version, deployment_id,
+/// trust_domain_id, platform, job_spec_digest, approved_plan_digest, approved
+/// plan job/attempt, approver, expiry, step_job_id, assigned
+/// agent/enrollment/key/profile, signing_key_id.
 ///
-/// The v8 domain binds the exact key id selected from the versioned CP keyset.
-/// A legacy v7 grant cannot be reinterpreted as keyring-aware authority.
+/// The v9 domain binds the exact canonical deployment and trust-domain scope.
+/// A legacy v8 grant cannot be reinterpreted as cross-deployment authority.
 pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(512);
 
-    write_bytes(&mut buf, b"ryuki-v8/verified-live-context");
+    write_bytes(&mut buf, b"ryuki-v9/verified-live-context");
     write_str(&mut buf, &ctx.request_id.hyphenated().to_string());
     write_u64(&mut buf, ctx.request_resource_version.get());
+    write_str(&mut buf, &ctx.deployment_id);
+    write_str(&mut buf, &ctx.trust_domain_id);
     write_str(&mut buf, &ctx.platform);
     write_str(&mut buf, &ctx.job_spec_digest);
     write_str(&mut buf, &ctx.approved_plan_digest);
@@ -455,6 +460,7 @@ pub fn sign_vlc(mut ctx: VerifiedLiveContext, key: &SigningKey) -> VerifiedLiveC
 
 /// Verifies the CP's signature on a [`VerifiedLiveContext`].
 pub fn verify_vlc(ctx: &VerifiedLiveContext, vk: &VerifyingKey) -> Result<(), VerifyError> {
+    ctx.validated_scope()?;
     if ctx.signing_key_id != control_plane_grant_key_id(vk) {
         return Err(VerifyError::UnknownControlPlaneGrantKey);
     }
@@ -773,6 +779,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
             request_resource_version: request_version(7),
+            deployment_id: "deployment:test".to_string(),
+            trust_domain_id: "trust-domain:test".to_string(),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -1024,6 +1032,8 @@ mod tests {
             signing_bytes_vlc(&VerifiedLiveContext {
                 request_id: challenge_id,
                 request_resource_version: request_version(7),
+                deployment_id: "deployment:test".to_owned(),
+                trust_domain_id: "trust-domain:test".to_owned(),
                 platform: "defra".to_owned(),
                 job_spec_digest: "ab".to_owned(),
                 approved_plan_digest: "c".to_owned(),
@@ -1205,10 +1215,10 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_is_the_only_accepted_wire_contract() {
-        assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, &[8]);
-        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&7));
+    fn protocol_v9_is_the_only_accepted_wire_contract() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, &[9]);
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&8));
     }
 
     #[test]
@@ -1648,6 +1658,16 @@ mod tests {
     }
 
     #[test]
+    fn tamper_vlc_deployment_id_fails() {
+        tamper_vlc!(deployment_id, "deployment:other".to_string());
+    }
+
+    #[test]
+    fn tamper_vlc_trust_domain_id_fails() {
+        tamper_vlc!(trust_domain_id, "trust-domain:other".to_string());
+    }
+
+    #[test]
     fn tamper_vlc_platform_fails() {
         tamper_vlc!(platform, "another-platform".to_string());
     }
@@ -1683,15 +1703,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v8 grant layout, legacy fencing, key selection, and step binding
+    // v9 grant layout, legacy fencing, key selection, and step binding
     // -----------------------------------------------------------------------
 
-    /// Pin the v8 signing layout, including request version, exact plan-row,
-    /// execution authority, and key id.
+    /// Pin the v9 signing layout, including deployment/trust-domain scope,
+    /// request version, exact plan-row, execution authority, and key id.
     #[test]
-    fn vlc_v8_signing_bytes_bind_request_version_plan_authority_and_key_id() {
+    fn vlc_v9_signing_bytes_bind_scope_request_version_plan_authority_and_key_id() {
         let request_id = Uuid::new_v4();
         let request_resource_version = request_version(7);
+        let deployment_id = "deployment:test".to_string();
+        let trust_domain_id = "trust-domain:test".to_string();
         let platform = "defra".to_string();
         let job_spec_digest = sha256_hex(b"job-spec");
         let approved_plan_digest = sha256_hex(b"plan-bytes");
@@ -1703,6 +1725,8 @@ mod tests {
         let vlc = VerifiedLiveContext {
             request_id,
             request_resource_version,
+            deployment_id: deployment_id.clone(),
+            trust_domain_id: trust_domain_id.clone(),
             platform: platform.clone(),
             job_spec_digest: job_spec_digest.clone(),
             approved_plan_digest: approved_plan_digest.clone(),
@@ -1716,11 +1740,13 @@ mod tests {
             signature: String::new(),
         };
 
-        // Hand-roll the canonical v8 field order to catch accidental drift.
+        // Hand-roll the canonical v9 field order to catch accidental drift.
         let mut baseline: Vec<u8> = Vec::new();
-        write_bytes(&mut baseline, b"ryuki-v8/verified-live-context");
+        write_bytes(&mut baseline, b"ryuki-v9/verified-live-context");
         write_str(&mut baseline, &request_id.hyphenated().to_string());
         write_u64(&mut baseline, request_resource_version.get());
+        write_str(&mut baseline, &deployment_id);
+        write_str(&mut baseline, &trust_domain_id);
         write_str(&mut baseline, &platform);
         write_str(&mut baseline, &job_spec_digest);
         write_str(&mut baseline, &approved_plan_digest);
@@ -1756,12 +1782,12 @@ mod tests {
         assert_eq!(
             signing_bytes_vlc(&vlc),
             baseline,
-            "v8 signing bytes must include the request version, exact plan row, destination, spec, authority, and key id"
+            "v9 signing bytes must include deployment/trust-domain scope, request version, exact plan row, destination, spec, authority, and key id"
         );
     }
 
     #[test]
-    fn legacy_v6_vlc_without_request_version_is_rejected_by_the_v8_domain() {
+    fn legacy_v6_vlc_without_request_version_is_rejected_by_the_v9_domain() {
         let key = generate_keypair(&mut OsRng);
         let mut legacy = make_vlc(&key);
         let mut legacy_bytes = Vec::new();
@@ -1808,12 +1834,12 @@ mod tests {
 
         assert!(
             verify_vlc(&legacy, &key.verifying_key()).is_err(),
-            "a legacy v6 grant without a request version must not verify under the v8 domain"
+            "a legacy v6 grant without a request version must not verify under the v9 domain"
         );
     }
 
     #[test]
-    fn legacy_v7_vlc_without_signing_key_id_is_rejected_by_the_v8_domain() {
+    fn legacy_v7_vlc_without_signing_key_id_is_rejected_by_the_v9_domain() {
         let key = generate_keypair(&mut OsRng);
         let mut legacy = make_vlc(&key);
         let mut legacy_bytes = Vec::new();
@@ -1861,7 +1887,61 @@ mod tests {
 
         assert!(
             verify_vlc(&legacy, &key.verifying_key()).is_err(),
-            "a legacy v7 grant without the signed key id must not verify under the v8 domain"
+            "a legacy v7 grant without the signed key id must not verify under the v9 domain"
+        );
+    }
+
+    #[test]
+    fn legacy_v8_vlc_without_deployment_or_trust_domain_is_rejected_by_v9() {
+        let key = generate_keypair(&mut OsRng);
+        let mut legacy = make_vlc(&key);
+        let mut legacy_bytes = Vec::new();
+        write_bytes(&mut legacy_bytes, b"ryuki-v8/verified-live-context");
+        write_str(
+            &mut legacy_bytes,
+            &legacy.request_id.hyphenated().to_string(),
+        );
+        write_u64(&mut legacy_bytes, legacy.request_resource_version.get());
+        write_str(&mut legacy_bytes, &legacy.platform);
+        write_str(&mut legacy_bytes, &legacy.job_spec_digest);
+        write_str(&mut legacy_bytes, &legacy.approved_plan_digest);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.approved_plan_job_id.hyphenated().to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.approved_plan_attempt_id.hyphenated().to_string(),
+        );
+        write_str(&mut legacy_bytes, &legacy.approver);
+        write_str(&mut legacy_bytes, &datetime_bytes(&legacy.expiry));
+        write_opt_uuid(&mut legacy_bytes, &legacy.step_job_id);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.assigned_agent_id,
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy
+                .execution_authority
+                .assigned_agent_enrollment_id
+                .hyphenated()
+                .to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.assigned_agent_key_fingerprint,
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.execution_trust_profile_digest,
+        );
+        write_str(&mut legacy_bytes, &legacy.signing_key_id);
+        legacy.signature = B64.encode(key.sign(&legacy_bytes).to_bytes());
+
+        assert!(
+            verify_vlc(&legacy, &key.verifying_key()).is_err(),
+            "a v8 platform-only grant must not verify as v9 deployment/trust-domain authority"
         );
     }
 
@@ -1876,6 +1956,100 @@ mod tests {
             .expect_err("a substituted key id must fail before signature verification");
         assert!(matches!(error, VerifyError::UnknownControlPlaneGrantKey));
         assert!(!error.to_string().contains(&grant.signing_key_id));
+    }
+
+    #[test]
+    fn control_plane_grant_scope_uses_core_canonical_scoped_id_rules() {
+        let scope =
+            ControlPlaneGrantScope::new("deployment:abc.def_123", "trust-domain:abc-def_123")
+                .expect("canonical scope");
+        assert_eq!(scope.deployment_id(), "deployment:abc.def_123");
+        assert_eq!(scope.trust_domain_id(), "trust-domain:abc-def_123");
+
+        for invalid in [
+            "deployment:ab",
+            "deployment:Upper",
+            "deployment:-abc",
+            "trust-domain:abc",
+        ] {
+            let error = ControlPlaneGrantScope::new(invalid, "trust-domain:valid")
+                .expect_err("deployment id must use the exact canonical namespace and suffix");
+            assert_eq!(error, ControlPlaneGrantScopeError::InvalidDeploymentId);
+            assert!(
+                !error.to_string().contains(invalid),
+                "scope validation errors must not reflect rejected values"
+            );
+        }
+
+        for invalid in [
+            "trust-domain:ab",
+            "trust-domain:Upper",
+            "trust-domain:-abc",
+            "deployment:abc",
+        ] {
+            let error = ControlPlaneGrantScope::new("deployment:valid", invalid)
+                .expect_err("trust-domain id must use the exact canonical namespace and suffix");
+            assert_eq!(error, ControlPlaneGrantScopeError::InvalidTrustDomainId);
+            assert!(
+                !error.to_string().contains(invalid),
+                "scope validation errors must not reflect rejected values"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_vlc_scope_is_rejected_before_signature_acceptance_without_reflection() {
+        let key = generate_keypair(&mut OsRng);
+        let mut grant = make_vlc(&key);
+        grant.deployment_id = "deployment:RejectedValue".to_string();
+        let error = verify_vlc(&grant, &key.verifying_key())
+            .expect_err("a malformed signed deployment scope must fail closed");
+        assert!(matches!(
+            &error,
+            VerifyError::InvalidControlPlaneGrantScope(
+                ControlPlaneGrantScopeError::InvalidDeploymentId
+            )
+        ));
+        assert!(!error.to_string().contains(&grant.deployment_id));
+
+        let mut grant = make_vlc(&key);
+        grant.trust_domain_id = "trust-domain:RejectedValue".to_string();
+        let error = verify_vlc(&grant, &key.verifying_key())
+            .expect_err("a malformed signed trust-domain scope must fail closed");
+        assert!(matches!(
+            &error,
+            VerifyError::InvalidControlPlaneGrantScope(
+                ControlPlaneGrantScopeError::InvalidTrustDomainId
+            )
+        ));
+        assert!(!error.to_string().contains(&grant.trust_domain_id));
+    }
+
+    #[test]
+    fn legacy_v8_json_without_deployment_or_trust_domain_does_not_deserialize() {
+        let key = generate_keypair(&mut OsRng);
+        let current = serde_json::to_value(make_vlc(&key)).expect("VLC JSON");
+
+        for required_field in ["deployment_id", "trust_domain_id"] {
+            let mut legacy = current.clone();
+            legacy
+                .as_object_mut()
+                .expect("VLC object")
+                .remove(required_field);
+            assert!(
+                serde_json::from_value::<VerifiedLiveContext>(legacy).is_err(),
+                "legacy VLC JSON without {required_field} must fail closed"
+            );
+        }
+
+        let mut legacy = current;
+        let object = legacy.as_object_mut().expect("VLC object");
+        object.remove("deployment_id");
+        object.remove("trust_domain_id");
+        assert!(
+            serde_json::from_value::<VerifiedLiveContext>(legacy).is_err(),
+            "a v8 platform-only grant must not deserialize as a v9 grant"
+        );
     }
 
     #[test]
@@ -1935,6 +2109,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
             request_resource_version: request_version(7),
+            deployment_id: "deployment:test".to_string(),
+            trust_domain_id: "trust-domain:test".to_string(),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -1976,6 +2152,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
             request_resource_version: request_version(7),
+            deployment_id: "deployment:test".to_string(),
+            trust_domain_id: "trust-domain:test".to_string(),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
@@ -2010,6 +2188,8 @@ mod tests {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
             request_resource_version: request_version(7),
+            deployment_id: "deployment:test".to_string(),
+            trust_domain_id: "trust-domain:test".to_string(),
             platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),

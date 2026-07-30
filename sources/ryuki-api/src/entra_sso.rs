@@ -929,15 +929,14 @@ fn entra_runtime_authority_unavailable() -> (StatusCode, Json<Value>) {
     )
 }
 
+type VerifiedEntraHandlerAuthority = (
+    Arc<EntraSsoDeps>,
+    Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
+);
+
 fn verified_entra_handler_authority(
     handler: &Arc<crate::authenticator_runtime::VerifiedEntraSsoHandlerDeps>,
-) -> Result<
-    (
-        Arc<EntraSsoDeps>,
-        Arc<crate::authenticator_runtime::VerifiedBrowserAuthenticatorOrigin>,
-    ),
-    (StatusCode, Json<Value>),
-> {
+) -> Result<VerifiedEntraHandlerAuthority, (StatusCode, Json<Value>)> {
     handler.verify_integrity().map_err(|error| {
         tracing::error!(error = %error, "retained Entra SSO handler authority failed integrity verification");
         entra_runtime_authority_unavailable()
@@ -2334,16 +2333,19 @@ mod entra_sso_db_tests {
             &test_session_config(),
         )
         .expect("test verifier");
-        let row: (
-            Uuid,
-            Uuid,
-            String,
-            Vec<String>,
-            String,
-            String,
-            String,
-            Vec<u8>,
-        ) = sqlx::query_as(
+        #[derive(sqlx::FromRow)]
+        struct PersistedEntraSessionRow {
+            session_record_id: Uuid,
+            principal_id: Uuid,
+            display_name: String,
+            roles: Vec<String>,
+            provider_id: String,
+            issuer: String,
+            subject: String,
+            authenticator_origin_binding_digest: Vec<u8>,
+        }
+
+        let row: PersistedEntraSessionRow = sqlx::query_as(
             "SELECT s.session_record_id, s.principal_id, s.display_name, s.roles, \
                     k.provider_id, k.issuer, k.subject, \
                     s.authenticator_origin_binding_digest \
@@ -2356,16 +2358,16 @@ mod entra_sso_db_tests {
         .await
         .expect("session row");
         assert_ne!(
-            row.1,
+            row.principal_id,
             Uuid::nil(),
             "the persisted session must use a registry-issued opaque principal id"
         );
-        assert_eq!(row.2, "Entra Test User");
-        assert_eq!(row.3, vec!["PlatformAdmin".to_string()]);
-        assert_eq!(row.4, origin.provider_id());
-        assert_eq!(row.5, expected_issuer);
-        assert_eq!(row.6, TEST_ENTRA_OID);
-        assert_eq!(row.7, origin_digest);
+        assert_eq!(row.display_name, "Entra Test User");
+        assert_eq!(row.roles, vec!["PlatformAdmin".to_string()]);
+        assert_eq!(row.provider_id, origin.provider_id());
+        assert_eq!(row.issuer, expected_issuer);
+        assert_eq!(row.subject, TEST_ENTRA_OID);
+        assert_eq!(row.authenticator_origin_binding_digest, origin_digest);
 
         // The token exchange must have been a PKCE PUBLIC client exchange:
         // grant/code/redirect/client + a verifier that hashes to the
@@ -2387,7 +2389,7 @@ mod entra_sso_db_tests {
 
         // Cleanup the minted session row.
         let _ = sqlx::query("DELETE FROM sessions WHERE session_record_id = $1")
-            .bind(row.0)
+            .bind(row.session_record_id)
             .execute(pool)
             .await;
     }
