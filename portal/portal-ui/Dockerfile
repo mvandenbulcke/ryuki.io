@@ -9,7 +9,7 @@
 # cargo-chef layer tricks.
 
 # rust:1.96-bookworm, pinned to the reviewed multi-platform index.
-FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
+FROM rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS build
 
 # Toolchain layer: cached independently of the workspace sources
 RUN ["/usr/local/cargo/bin/rustup", "target", "add", "wasm32-unknown-unknown"]
