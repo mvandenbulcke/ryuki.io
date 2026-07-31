@@ -5787,13 +5787,89 @@ pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
     });
 }
 
-/// One row for the agent-offline scan (#11 slice 2d).
+/// One atomically claimed liveness transition for the agent-offline scan.
+///
+/// The claim is the `agents.offline_alerted` state change itself. PostgreSQL
+/// rechecks the update predicate after waiting for a concurrent heartbeat or
+/// scanner that holds the row lock, so only the transaction that changes the
+/// current state receives a row and may emit the matching event/notification.
 #[derive(sqlx::FromRow)]
-struct AgentOfflineScanRow {
+struct ClaimedAgentLivenessTransition {
     agent_id: String,
     platform: String,
-    last_seen_at: Option<DateTime<Utc>>,
+    last_seen_at: DateTime<Utc>,
     offline_alerted: bool,
+}
+
+async fn emit_agent_liveness_transition_if_current(
+    pool: &PgPool,
+    agent_id: &str,
+    scan_now: &DateTime<Utc>,
+    threshold_secs: i64,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let transition = sqlx::query_as::<_, ClaimedAgentLivenessTransition>(
+        "UPDATE agents \
+         SET offline_alerted = ( \
+                 FLOOR(EXTRACT(EPOCH FROM ($2::timestamptz - last_seen_at))) > $3 \
+             ), \
+             updated_at = NOW() \
+         WHERE agent_id = $1 \
+           AND status = 'approved' \
+           AND last_seen_at IS NOT NULL \
+           AND offline_alerted <> ( \
+                 FLOOR(EXTRACT(EPOCH FROM ($2::timestamptz - last_seen_at))) > $3 \
+             ) \
+         RETURNING agent_id, platform, last_seen_at, offline_alerted",
+    )
+    .bind(agent_id)
+    .bind(scan_now)
+    .bind(threshold_secs)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(transition) = transition else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let now_offline = transition.offline_alerted;
+    let event_type = if now_offline {
+        "agent.offline"
+    } else {
+        "agent.online"
+    };
+
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type,
+            aggregate_type: "agent",
+            aggregate_id: &transition.agent_id,
+            site: None,
+            environment: None,
+            actor: "system",
+            payload: json!({
+                "to_status": if now_offline { "offline" } else { "online" },
+                "platform": &transition.platform,
+                "last_seen_at": transition.last_seen_at.to_rfc3339(),
+            }),
+        },
+    )
+    .await?;
+
+    // #11 slice 2f/2g: notify the monitoring role on both directions —
+    // Warning when an agent goes offline, Success when it returns.
+    let severity = if now_offline {
+        ryuki_engine::notifications::Severity::Warning
+    } else {
+        ryuki_engine::notifications::Severity::Success
+    };
+    let draft =
+        ryuki_engine::notifications::draft_for_alert(event_type, &transition.agent_id, severity);
+    crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
+
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// One agent-offline scan pass (#11 slice 2d): emit `agent.offline` when an
@@ -5807,71 +5883,25 @@ pub async fn agent_offline_scan_once(
     pool: &PgPool,
     threshold_secs: i64,
 ) -> Result<u64, sqlx::Error> {
-    let agents: Vec<AgentOfflineScanRow> = sqlx::query_as(
-        "SELECT agent_id, platform, last_seen_at, offline_alerted \
-         FROM agents WHERE status = 'approved'",
+    // This first pass is only a worklist. Every security-relevant value is
+    // re-read and conditionally changed by the UPDATE in the per-agent tx.
+    // A heartbeat, revoke, or competing scan after this SELECT therefore makes
+    // the stale candidate harmless instead of producing a false/duplicate emit.
+    let agent_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT agent_id FROM agents \
+         WHERE status = 'approved' AND last_seen_at IS NOT NULL \
+         ORDER BY agent_id",
     )
     .fetch_all(pool)
     .await?;
-    let now = Utc::now();
+    let scan_now = Utc::now();
     let mut emitted = 0u64;
-    for a in &agents {
-        let Some(seen) = a.last_seen_at else {
-            continue; // never checked in — no definitive offline transition
-        };
-        let now_offline = (now - seen).num_seconds() > threshold_secs;
-        if now_offline == a.offline_alerted {
-            continue; // no transition
-        }
-        let mut tx = pool.begin().await?;
-        crate::repos::domain_events::insert(
-            &mut *tx,
-            crate::repos::domain_events::NewEvent {
-                event_type: if now_offline {
-                    "agent.offline"
-                } else {
-                    "agent.online"
-                },
-                aggregate_type: "agent",
-                aggregate_id: &a.agent_id,
-                site: None,
-                environment: None,
-                actor: "system",
-                payload: json!({
-                    "to_status": if now_offline { "offline" } else { "online" },
-                    "platform": &a.platform,
-                    "last_seen_at": seen.to_rfc3339(),
-                }),
-            },
-        )
-        .await?;
-        // #11 slice 2f/2g: notify the monitoring role on both directions —
-        // Warning when an agent goes offline, Success when it returns.
+    for agent_id in &agent_ids {
+        if emit_agent_liveness_transition_if_current(pool, agent_id, &scan_now, threshold_secs)
+            .await?
         {
-            let (event_type, severity) = if now_offline {
-                (
-                    "agent.offline",
-                    ryuki_engine::notifications::Severity::Warning,
-                )
-            } else {
-                (
-                    "agent.online",
-                    ryuki_engine::notifications::Severity::Success,
-                )
-            };
-            let draft =
-                ryuki_engine::notifications::draft_for_alert(event_type, &a.agent_id, severity);
-            crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
+            emitted += 1;
         }
-        sqlx::query(
-            "UPDATE agents SET offline_alerted = $1, updated_at = NOW() WHERE agent_id = $2",
-        )
-        .bind(now_offline)
-        .bind(&a.agent_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        emitted += 1;
     }
     Ok(emitted)
 }
@@ -10801,6 +10831,29 @@ mod tests {
             .ok();
     }
 
+    async fn cleanup_agent_liveness_artifacts(pool: &PgPool, agent_id: &str) {
+        let offline_body = format!("agent.offline for {agent_id}; review the alert feed.");
+        let online_body = format!("agent.online for {agent_id}; review the alert feed.");
+        sqlx::query(
+            "DELETE FROM portal_notifications \
+             WHERE body = $1 OR body = $2",
+        )
+        .bind(offline_body)
+        .bind(online_body)
+        .execute(pool)
+        .await
+        .ok();
+        sqlx::query(
+            "DELETE FROM domain_events \
+             WHERE aggregate_type = 'agent' AND aggregate_id = $1",
+        )
+        .bind(agent_id)
+        .execute(pool)
+        .await
+        .ok();
+        cleanup_agent(pool, agent_id).await;
+    }
+
     async fn enrollment_review_binding(pool: &PgPool, agent_id: &str) -> (Uuid, String) {
         let (id, public_key): (Uuid, String) =
             sqlx::query_as("SELECT id, public_key FROM agents WHERE agent_id = $1")
@@ -10927,6 +10980,176 @@ mod tests {
         );
 
         cleanup_agent(pool, &agent_id).await;
+    }
+
+    /// Two scanner iterations that race on the same stale row must share the
+    /// `(agent_id, offline_alerted)` transition claim: exactly one event and one
+    /// notification commit. A fresh heartbeat then produces one online recovery
+    /// through the same boundary and repeated processing remains a no-op.
+    #[tokio::test]
+    async fn db_agent_liveness_transition_claim_dedups_concurrent_scanners() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("liveness-cas-{}", Uuid::new_v4());
+        let platform = format!("ci-liveness-cas-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, &platform, "approved").await;
+        sqlx::query(
+            "UPDATE agents \
+             SET last_seen_at = statement_timestamp() - INTERVAL '10 minutes', \
+                 offline_alerted = FALSE \
+             WHERE agent_id = $1",
+        )
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .expect("seed stale agent liveness");
+
+        let scan_now = Utc::now();
+        let (left, right) = tokio::join!(
+            emit_agent_liveness_transition_if_current(pool, &agent_id, &scan_now, 180),
+            emit_agent_liveness_transition_if_current(pool, &agent_id, &scan_now, 180),
+        );
+        let claims = [
+            left.expect("left scanner claim"),
+            right.expect("right scanner claim"),
+        ]
+        .into_iter()
+        .filter(|claimed| *claimed)
+        .count();
+        assert_eq!(claims, 1, "exactly one concurrent scanner may emit");
+
+        let offline_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE aggregate_type = 'agent' \
+               AND aggregate_id = $1 \
+               AND event_type = 'agent.offline'",
+        )
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("count offline events");
+        let offline_notifications: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portal_notifications \
+             WHERE event = 'agent.offline' AND body = $1",
+        )
+        .bind(format!(
+            "agent.offline for {agent_id}; review the alert feed."
+        ))
+        .fetch_one(pool)
+        .await
+        .expect("count offline notifications");
+        let flagged: bool =
+            sqlx::query_scalar("SELECT offline_alerted FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("read offline transition state");
+        assert_eq!(offline_events, 1);
+        assert_eq!(offline_notifications, 1);
+        assert!(flagged);
+
+        sqlx::query("UPDATE agents SET last_seen_at = statement_timestamp() WHERE agent_id = $1")
+            .bind(&agent_id)
+            .execute(pool)
+            .await
+            .expect("record recovery heartbeat");
+        let recovery_now = Utc::now();
+        assert!(
+            emit_agent_liveness_transition_if_current(pool, &agent_id, &recovery_now, 180)
+                .await
+                .expect("claim online recovery"),
+            "a fresh heartbeat must produce the legitimate online transition"
+        );
+        assert!(
+            !emit_agent_liveness_transition_if_current(pool, &agent_id, &recovery_now, 180)
+                .await
+                .expect("dedup online recovery"),
+            "the already-claimed online transition must be idempotent"
+        );
+        let online_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE aggregate_type = 'agent' \
+               AND aggregate_id = $1 \
+               AND event_type = 'agent.online'",
+        )
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("count online events");
+        assert_eq!(online_events, 1);
+
+        cleanup_agent_liveness_artifacts(pool, &agent_id).await;
+    }
+
+    /// Revalidate a scanner worklist entry after a heartbeat. The agent was
+    /// stale when selected, but the atomic transition predicate sees the newer
+    /// `last_seen_at` and refuses the obsolete offline alert.
+    #[tokio::test]
+    async fn db_agent_liveness_transition_rejects_stale_candidate_after_heartbeat() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("liveness-heartbeat-race-{}", Uuid::new_v4());
+        let platform = format!("ci-liveness-race-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, &platform, "approved").await;
+        sqlx::query(
+            "UPDATE agents \
+             SET last_seen_at = statement_timestamp() - INTERVAL '10 minutes', \
+                 offline_alerted = FALSE \
+             WHERE agent_id = $1",
+        )
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .expect("seed stale candidate");
+
+        let scan_now = Utc::now();
+        let candidate_was_stale: bool = sqlx::query_scalar(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM ($2::timestamptz - last_seen_at))) > 180 \
+             FROM agents WHERE agent_id = $1",
+        )
+        .bind(&agent_id)
+        .bind(&scan_now)
+        .fetch_one(pool)
+        .await
+        .expect("read original stale candidate state");
+        assert!(candidate_was_stale);
+
+        sqlx::query("UPDATE agents SET last_seen_at = statement_timestamp() WHERE agent_id = $1")
+            .bind(&agent_id)
+            .execute(pool)
+            .await
+            .expect("commit heartbeat after candidate selection");
+        assert!(
+            !emit_agent_liveness_transition_if_current(pool, &agent_id, &scan_now, 180)
+                .await
+                .expect("revalidate stale worklist entry"),
+            "a heartbeat committed after discovery must invalidate the stale candidate"
+        );
+
+        let emitted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE aggregate_type = 'agent' AND aggregate_id = $1",
+        )
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("count stale-candidate events");
+        let flagged: bool =
+            sqlx::query_scalar("SELECT offline_alerted FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("read post-heartbeat transition state");
+        assert_eq!(emitted, 0, "the obsolete candidate must emit nothing");
+        assert!(!flagged, "the heartbeat must remain classified online");
+
+        cleanup_agent_liveness_artifacts(pool, &agent_id).await;
     }
 
     /// A non-assignee agent acking a job leased to a DIFFERENT agent must get a

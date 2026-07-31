@@ -14,6 +14,27 @@ Verification evidence identifies the focused regression proof and the relevant c
 
 The final column preserves the pre-final follow-up captured when each row was reconciled. For every `fixed-and-verified` row, those historical follow-ups and any shared-evidence wording that a local gate “remains open” are superseded by `FINAL-VERIFICATION` below. Only `deferred-trusted-access` rows retain an outstanding operator-owned residual.
 
+## Scan 34 remediation continuation
+
+This addendum tracks the current remediation continuation for completed Codex
+Security diff scan `34dd2f56-f231-4e6f-a99f-1490a30b93d4`. It is separate from
+the 231-row scan and disposition counts above. The four rows below are
+implemented in the working tree but remain `implemented-pending-verification`;
+neither source review nor the presence of focused regressions is recorded as
+final runtime proof.
+
+| Scan item / finding ID | Status | Implemented control | Source and focused regression evidence |
+| --- | --- | --- | --- |
+| `R09-C001`<br>`csf_0f3923f8573235fd00b5b87f` | implemented-pending-verification | Agent liveness alerting now rechecks the current heartbeat and claims each offline/online transition with a conditional update in the same transaction as its event and notification. Stale snapshots and concurrent scanners therefore cannot emit a duplicate or obsolete transition. | `sources/ryuki-api/src/agents.rs`, `sources/ryuki-api/src/background.rs`; `db_agent_liveness_transition_claim_dedups_concurrent_scanners`, `db_agent_liveness_transition_rejects_stale_candidate_after_heartbeat`. |
+| `R10-C001`<br>`csf_490c86a19354c9c8e0207c83` | implemented-pending-verification | Platform-global access-recertification campaign create, get, and list operations require an administrator that is an exact verified-human global principal on both scope axes. Central middleware and repeated handler guards deny scoped or machine principals before validation, lookup, or storage. | `sources/ryuki-api/src/main.rs`, `sources/ryuki-api/src/contracts.rs`; `platform_global_administration_requires_exact_global_human_authority`, `campaign_control_requires_global_verified_human_admin`, `scoped_admin_is_denied_by_every_campaign_handler_before_storage`. |
+| `R10-C002`<br>`csf_09d7fb8852b80db2c4d5bbab` | implemented-pending-verification | AIOps type reads resolve the caller's site authority before repository access, bind authorized sites in SQL before ordering and limiting, fail closed for empty scope, and cap every materialized result set. | `sources/ryuki-api/src/contracts.rs`, `sources/ryuki-api/src/repos/aiops.rs`; query-shape and hard-cap tests plus `list_by_type_scopes_before_materialization_and_honors_limit`. |
+| `R10-C008`<br>`csf_fa49d26751f76ee26b70bd1e` | implemented-pending-verification | Expiring access-review reads apply the authorized-site and expiry predicates in SQL before materialization, use the same predicate for totals, and enforce bounded horizon, page size, and offset. | `sources/ryuki-api/src/contracts.rs`, `sources/ryuki-api/src/repos/access_recertification.rs`; `expiring_review_horizon_is_bounded_with_compatible_defaults` and the scoped, paginated `list_due_and_expiring` database regression. |
+
+The other 24 indexed findings from scan 34 are not closed by this addendum and
+remain in the continuation queue unless separately reconciled with concrete
+verification evidence. These four rows move to a verified status only after the
+focused bounded API gates and the closing repository verification wave pass.
+
 ## Shared verification evidence
 
 `FINAL-VERIFICATION` records the closing verification wave for the active targeted hardening patches. Row evidence distinguishes repository-local proof from operator-owned deployed readback. Every `deferred-trusted-access` row states only the remaining operator-owned readback, repair, or live integration proof.

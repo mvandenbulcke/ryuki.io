@@ -286,7 +286,7 @@
 <h3 class="ep-sub">Path parameters</h3>
 <p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>days</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>days</code> query parameter.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>days</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>days</code> query parameter.</td></tr><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Maximum number of results requested.</td></tr><tr><td><code>offset</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Number of results to skip before returning the page.</td></tr></tbody></table>
 <h3 class="ep-sub">Request headers</h3>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
@@ -294,6 +294,7 @@
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
 <p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<p>Returns a paginated JSON object with total/limit/offset keys.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>

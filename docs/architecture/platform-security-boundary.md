@@ -2047,6 +2047,21 @@ The words **must**, **must not**, **should**, and **may** are normative.
   authoritative support-group plus queue-state transition policy. At that point
   a narrower action may replace this exception only with positive and negative
   scope, destination, transition, race, and audit proofs.
+- **SB-AZ-09B — Global recertification control and bounded collection reads.**
+  Access-recertification campaign create, get, and list are platform-global
+  control-plane operations. Their exact central route classifications and
+  repeated handler guards require an administrator that is a verified human
+  with empty site and environment scopes before input validation, object
+  lookup, list execution, or database access; scoped, workload, simulated, and
+  unknown actors fail closed. Collection authorization is likewise a
+  persistence boundary rather than an in-memory filter. AIOps type reads and
+  expiring access-review reads resolve the caller's authorized sites before
+  repository access and place those sites in the SQL predicate before ordering,
+  limiting, counting, or materialization; an empty authorized set returns no
+  rows. AIOps type results are capped at 1,000 rows. Expiring-review queries
+  bound the horizon to at most 3,650 days, the page to at most 1,000 rows, and
+  the offset to at most 10,000 rows, with a stable order and an identically
+  scoped count.
 - **SB-AZ-10 — Monitoring configuration and alerts retain resource authority.**
   Every alert route created by the API is an immutable dual-axis
   site/environment resource whose canonical site must have a current active

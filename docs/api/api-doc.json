@@ -20955,6 +20955,18 @@
               "type": "i64",
               "optional": true,
               "doc": null
+            },
+            {
+              "name": "limit",
+              "type": "i64",
+              "optional": true,
+              "doc": null
+            },
+            {
+              "name": "offset",
+              "type": "i64",
+              "optional": true,
+              "doc": null
             }
           ],
           "request_headers": [
@@ -20985,7 +20997,7 @@
               "headers": []
             }
           ],
-          "response_notes": null
+          "response_notes": "Returns a paginated JSON object with total/limit/offset keys."
         },
         {
           "method": "GET",

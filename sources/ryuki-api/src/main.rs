@@ -1720,14 +1720,19 @@ fn member_action_path(path: &str, collection: &str, action: &str) -> bool {
     !id.is_empty() && !id.contains('/')
 }
 
-/// Credential inventory and lifecycle are themselves a global human control
-/// plane. API tokens may retain explicitly granted machine operations, but can
-/// neither mint/revoke peer credentials nor enumerate their metadata.
-fn requires_global_verified_human_credential_admin(path: &str) -> bool {
-    path == "/api/admin/tokens"
+/// Platform-global identity administration must stay on the exact interactive
+/// Global-human authority path. API tokens may retain explicitly granted
+/// machine operations, but can neither administer peer credentials nor create
+/// or enumerate access-recertification campaigns whose counts span every site.
+fn requires_global_verified_human_administration(path: &str) -> bool {
+    let credential_administration = path == "/api/admin/tokens"
         || is_single_segment_member(path, "/api/admin/tokens")
         || path == "/api/admin/sessions"
-        || is_single_segment_member(path, "/api/admin/sessions")
+        || is_single_segment_member(path, "/api/admin/sessions");
+    let access_campaign_administration = path == "/api/identity/access-review/campaign"
+        || is_single_segment_member(path, "/api/identity/access-review/campaign")
+        || path == "/api/identity/access-review/campaigns";
+    credential_administration || access_campaign_administration
 }
 
 fn interactive_authority_matches_session(
@@ -2462,8 +2467,8 @@ async fn auth_middleware(
         };
         let actor_requirement = if requires_verified_human_signoff(&method, &path) {
             Some("verified-human-signoff")
-        } else if requires_global_verified_human_credential_admin(&path) {
-            Some("global-verified-human-credential-admin")
+        } else if requires_global_verified_human_administration(&path) {
+            Some("global-verified-human-administration")
         } else {
             None
         };
@@ -2471,7 +2476,7 @@ async fn auth_middleware(
             Some("verified-human-signoff") => {
                 interactive_authority_matches_session(&session, interactive_authority.as_ref())
             }
-            Some("global-verified-human-credential-admin") => {
+            Some("global-verified-human-administration") => {
                 global_interactive_authority_matches_session(
                     &session,
                     interactive_authority.as_ref(),
@@ -2480,7 +2485,12 @@ async fn auth_middleware(
             Some(_) => false,
             None => true,
         };
-        let required = if let Some(capability) = operation_capability {
+        let required = if actor_requirement == Some("global-verified-human-administration") {
+            // These objects have platform-wide authority and no resource scope
+            // that could narrow them. Require the admin role centrally for
+            // both safe enumeration and unsafe lifecycle operations.
+            "admin"
+        } else if let Some(capability) = operation_capability {
             capability.as_str()
         } else if is_unsafe_method(&method) && !self_service {
             route_permission_for(&method, &path)
@@ -2492,7 +2502,9 @@ async fn auth_middleware(
         // ordinary -> audit OR request) so a recipient can manage their own feed,
         // a user can set their own preferences, and a Requester can view their
         // own requests.
-        let role_authorized = if let Some(capability) = operation_capability {
+        let role_authorized = if actor_requirement == Some("global-verified-human-administration") {
+            ryuki_engine::auth::check_permission(&session, required)
+        } else if let Some(capability) = operation_capability {
             ryuki_engine::auth::check_operation_capability(&session, capability)
         } else if is_unsafe_method(&method) && !self_service {
             ryuki_engine::auth::check_permission(&session, required)
@@ -8250,7 +8262,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_administration_requires_exact_global_human_authority() {
+    fn platform_global_administration_requires_exact_global_human_authority() {
         use crate::human_authority::{HumanAuthorityMode, InteractiveHumanAuthorityContext};
         use ryuki_engine::auth::{ActorClass, APP_ROLE_PLATFORM_ADMIN};
 
@@ -8259,11 +8271,20 @@ mod tests {
             "/api/admin/tokens/t1",
             "/api/admin/sessions",
             "/api/admin/sessions/s1",
+            "/api/identity/access-review/campaign",
+            "/api/identity/access-review/campaign/c1",
+            "/api/identity/access-review/campaigns",
         ] {
-            assert!(requires_global_verified_human_credential_admin(path));
+            assert!(requires_global_verified_human_administration(path));
         }
-        assert!(!requires_global_verified_human_credential_admin(
+        assert!(!requires_global_verified_human_administration(
             "/api/admin/platform-settings"
+        ));
+        assert!(!requires_global_verified_human_administration(
+            "/api/identity/access-review/campaign/c1/extra"
+        ));
+        assert!(!requires_global_verified_human_administration(
+            "/api/identity/access-review/reviews"
         ));
 
         let principal_binding = test_principal_binding();
@@ -8300,6 +8321,8 @@ mod tests {
             &session,
             Some(&authority)
         ));
+        authority.site_mode = HumanAuthorityMode::Global;
+        authority.site_scope.clear();
         let workload = AuthSession {
             actor_class: ActorClass::Workload,
             provider_mode: "persisted-session".into(),

@@ -59,8 +59,9 @@ pub enum IterError<E> {
 /// transactions keeps its already-committed ones. This is safe ONLY because every
 /// work fn routed through here is RETRY-IDEMPOTENT (they are recurring scans
 /// designed to be re-run): `expire_leases` (single tx; re-running re-claims the
-/// same expired leases), `agent_offline_scan_once` (per-agent tx, deduped by the
-/// `offline_alerted` flag so a re-run never double-emits), `sweep_expired_records`
+/// same expired leases), `agent_offline_scan_once` (per-agent tx whose conditional
+/// `offline_alerted` update atomically claims one transition, so a stale or
+/// concurrent re-run cannot emit), `sweep_expired_records`
 /// (idempotent DELETE of expired idempotency rows), `slo_breach_scan_once` /
 /// `budget_breach_scan_once` (breach events deduped by the same `to_status`/marker
 /// pattern as the other scans), `notifications_retention_sweep_once` (bounded

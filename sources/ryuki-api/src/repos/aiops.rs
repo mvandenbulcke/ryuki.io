@@ -45,6 +45,25 @@ pub const COLUMNS: &str = "id, suggestion_type, title, description, affected_com
      estimated_savings, confidence_score, status, reviewer, rejection_reason, \
      implementation_plan, site, created_at, updated_at";
 
+fn list_by_type_sql(scoped: bool) -> String {
+    if scoped {
+        format!(
+            "SELECT {COLUMNS} FROM aiops_suggestions \
+             WHERE suggestion_type = $1 \
+               AND site = ANY($2::text[]) \
+               AND (status IN ('New', 'Rejected') OR reviewer_actor_class = 'verified-human') \
+             ORDER BY created_at, id LIMIT $3"
+        )
+    } else {
+        format!(
+            "SELECT {COLUMNS} FROM aiops_suggestions \
+             WHERE suggestion_type = $1 \
+               AND (status IN ('New', 'Rejected') OR reviewer_actor_class = 'verified-human') \
+             ORDER BY created_at, id LIMIT $2"
+        )
+    }
+}
+
 // ─── Row struct ───────────────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]
@@ -135,21 +154,56 @@ pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<AIOpsSuggesti
 }
 
 /// List suggestions filtered by suggestion_type DB form.
+///
+/// This is the unrestricted variant. The result is still capped at the
+/// repository boundary so a high-cardinality suggestion type cannot cause an
+/// unbounded materialization. Scoped callers must use
+/// [`list_by_type_for_sites`], which applies their site predicate before the
+/// same bound.
 pub async fn list_by_type(
     pool: &PgPool,
     suggestion_type_db: &str,
+    limit: i64,
 ) -> Result<Vec<AIOpsSuggestion>, sqlx::Error> {
-    let rows: Vec<AiopsSuggestionRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM aiops_suggestions \
-         WHERE suggestion_type = $1 \
-           AND (status IN ('New', 'Rejected') OR reviewer_actor_class = 'verified-human') \
-         ORDER BY created_at"
-    ))
-    .bind(suggestion_type_db)
-    .fetch_all(pool)
-    .await?;
+    let limit = bounded_type_list_limit(limit);
+    let sql = list_by_type_sql(false);
+    let rows: Vec<AiopsSuggestionRow> = sqlx::query_as(&sql)
+        .bind(suggestion_type_db)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// List suggestions of one type whose site is in the caller's authorized set.
+///
+/// The `site = ANY(...)` predicate is intentionally part of the database query
+/// and precedes `LIMIT`: out-of-scope rows are never materialized in the API
+/// process and cannot consume the bounded result window. An empty `sites`
+/// slice fails closed to an empty result.
+pub async fn list_by_type_for_sites(
+    pool: &PgPool,
+    suggestion_type_db: &str,
+    sites: &[String],
+    limit: i64,
+) -> Result<Vec<AIOpsSuggestion>, sqlx::Error> {
+    let limit = bounded_type_list_limit(limit);
+    let sql = list_by_type_sql(true);
+    let rows: Vec<AiopsSuggestionRow> = sqlx::query_as(&sql)
+        .bind(suggestion_type_db)
+        .bind(sites)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+const MAX_TYPE_LIST_ROWS: i64 = 1000;
+
+fn bounded_type_list_limit(limit: i64) -> i64 {
+    limit.clamp(0, MAX_TYPE_LIST_ROWS)
 }
 
 /// Get a single suggestion by TEXT id. Returns Ok(None) when absent.
@@ -690,6 +744,33 @@ mod aiops_db_tests {
 
     // ─── list_by_type uses DB form ────────────────────────────────────────────
 
+    #[test]
+    fn type_list_limit_is_bounded_at_repository_boundary() {
+        assert_eq!(bounded_type_list_limit(-1), 0);
+        assert_eq!(bounded_type_list_limit(25), 25);
+        assert_eq!(
+            bounded_type_list_limit(MAX_TYPE_LIST_ROWS + 1),
+            MAX_TYPE_LIST_ROWS
+        );
+    }
+
+    #[test]
+    fn scoped_type_query_applies_authorization_before_limit() {
+        let sql = list_by_type_sql(true);
+        let scope_position = sql
+            .find("site = ANY($2::text[])")
+            .expect("scoped query must bind the authorized sites");
+        let limit_position = sql.find("LIMIT $3").expect("scoped query must be bounded");
+        assert!(
+            scope_position < limit_position,
+            "site authorization must be applied before the result bound"
+        );
+
+        let unrestricted = list_by_type_sql(false);
+        assert!(!unrestricted.contains("site = ANY"));
+        assert!(unrestricted.contains("LIMIT $2"));
+    }
+
     #[tokio::test]
     async fn list_by_type_rightsizing() {
         let _guard = DB_TEST_SERIAL.lock().await;
@@ -699,9 +780,13 @@ mod aiops_db_tests {
         };
 
         // The DB stores 'RightSizing'; query with DB form, not display form.
-        let rows = list_by_type(&pool, suggestion_type_to_db(&SuggestionType::RightSizing))
-            .await
-            .expect("list_by_type");
+        let rows = list_by_type(
+            &pool,
+            suggestion_type_to_db(&SuggestionType::RightSizing),
+            MAX_TYPE_LIST_ROWS,
+        )
+        .await
+        .expect("list_by_type");
         assert!(
             rows.iter()
                 .all(|r| r.suggestion_type == SuggestionType::RightSizing),
@@ -711,5 +796,87 @@ mod aiops_db_tests {
             !rows.is_empty(),
             "migration 035 seeds at least one RightSizing row"
         );
+    }
+
+    #[tokio::test]
+    async fn list_by_type_scopes_before_materialization_and_honors_limit() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: DB unavailable");
+            return;
+        };
+
+        let defra_id = "test-aiops-type-scope-defra-001";
+        let gblon_id = "test-aiops-type-scope-gblon-001";
+        cleanup(&pool, defra_id).await;
+        cleanup(&pool, gblon_id).await;
+        insert_test_suggestion(
+            &pool,
+            defra_id,
+            "PerformanceImprovement",
+            "New",
+            "DEFRA",
+            None,
+        )
+        .await;
+        insert_test_suggestion(
+            &pool,
+            gblon_id,
+            "PerformanceImprovement",
+            "New",
+            "GBLON",
+            None,
+        )
+        .await;
+
+        let defra_only = list_by_type_for_sites(
+            &pool,
+            "PerformanceImprovement",
+            &["DEFRA".to_string()],
+            MAX_TYPE_LIST_ROWS,
+        )
+        .await
+        .expect("scoped type list");
+        assert!(
+            defra_only
+                .iter()
+                .all(|suggestion| suggestion.site == "DEFRA"),
+            "the scoped SQL query must never materialize a foreign-site row"
+        );
+        assert!(defra_only
+            .iter()
+            .any(|suggestion| suggestion.id == defra_id));
+        assert!(
+            defra_only
+                .iter()
+                .all(|suggestion| suggestion.id != gblon_id),
+            "a GBLON row must not cross the DEFRA persistence boundary"
+        );
+
+        let both_sites = vec!["DEFRA".to_string(), "GBLON".to_string()];
+        let permitted = list_by_type_for_sites(
+            &pool,
+            "PerformanceImprovement",
+            &both_sites,
+            MAX_TYPE_LIST_ROWS,
+        )
+        .await
+        .expect("multi-site type list");
+        assert!(permitted.iter().any(|suggestion| suggestion.id == defra_id));
+        assert!(permitted.iter().any(|suggestion| suggestion.id == gblon_id));
+
+        let bounded = list_by_type_for_sites(&pool, "PerformanceImprovement", &both_sites, 1)
+            .await
+            .expect("bounded type list");
+        assert_eq!(bounded.len(), 1, "LIMIT must bound materialized rows");
+
+        let empty_scope =
+            list_by_type_for_sites(&pool, "PerformanceImprovement", &[], MAX_TYPE_LIST_ROWS)
+                .await
+                .expect("empty scoped type list");
+        assert!(empty_scope.is_empty(), "an empty scope must fail closed");
+
+        cleanup(&pool, defra_id).await;
+        cleanup(&pool, gblon_id).await;
     }
 }

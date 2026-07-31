@@ -49,7 +49,7 @@
         "mandatory_baseline_ref": {
           "document_id": "baseline:repository-development-fixture-v1",
           "document_version": 1,
-          "content_digest": "sha256:d1c8b051a7c40c9157175a6eeac6d2d6a9476fa4b8aed3870b4ee809b01e6911",
+          "content_digest": "sha256:4bde8c55acbe3ce1257a95c6777bd677e611b7b90b214f9e47f63e536edcd52f",
           "artifact_locator": "docs/architecture/platform-security-boundary.md"
         },
         "implementation_applicable": true,
@@ -80,7 +80,7 @@
       "governing_contract_ref": {
         "document_id": "security-boundary:platform-production-v1",
         "document_version": 1,
-        "content_digest": "sha256:d1c8b051a7c40c9157175a6eeac6d2d6a9476fa4b8aed3870b4ee809b01e6911",
+        "content_digest": "sha256:4bde8c55acbe3ce1257a95c6777bd677e611b7b90b214f9e47f63e536edcd52f",
         "artifact_locator": "docs/architecture/platform-security-boundary.md"
       }
     }

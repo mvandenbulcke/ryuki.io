@@ -17506,14 +17506,24 @@ async fn aiops_type(
             .unwrap_or_else(|| display.clone())
     };
 
-    let suggestions = match get_db() {
-        Some(pool) => crate::repos::aiops::list_by_type(pool, &db_form)
-            .await
-            .map_err(db_error)?,
-        None => vec![],
+    // Scope at the persistence boundary, before LIMIT/materialization. The old
+    // path fetched every site's rows for this type and only then filtered in
+    // Rust, exposing out-of-scope data to the API process and allowing foreign
+    // rows to consume an unbounded working set.
+    let suggestions = match (get_db(), list_site_scope(&session)) {
+        (_, ListSiteScope::Empty) => Vec::new(),
+        (Some(pool), ListSiteScope::All) => {
+            crate::repos::aiops::list_by_type(pool, &db_form, MAX_LIST_ROWS)
+                .await
+                .map_err(db_error)?
+        }
+        (Some(pool), ListSiteScope::Sites(sites)) => {
+            crate::repos::aiops::list_by_type_for_sites(pool, &db_form, &sites, MAX_LIST_ROWS)
+                .await
+                .map_err(db_error)?
+        }
+        (None, _) => Vec::new(),
     };
-    // #2: a scoped principal sees only its own site's suggestions (env-scoped → none).
-    let suggestions = retain_site_scoped(&session, suggestions, |s| s.site.as_str());
     Ok(Json(aiops::get_suggestions_by_type(
         &params.suggestion_type,
         &suggestions,
@@ -42474,6 +42484,38 @@ struct AccessReviewExemptRequest {
 #[allow(dead_code)]
 struct AccessReviewExpiringQuery {
     days: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+const ACCESS_REVIEW_DEFAULT_EXPIRY_DAYS: i64 = 30;
+const ACCESS_REVIEW_MAX_EXPIRY_DAYS: i64 = 3_650;
+const ACCESS_REVIEW_DEFAULT_EXPIRING_LIMIT: i64 = 500;
+const ACCESS_REVIEW_MAX_EXPIRING_LIMIT: i64 = 1_000;
+const ACCESS_REVIEW_MAX_EXPIRING_OFFSET: i64 = 10_000;
+
+fn validated_access_review_expiry_days(
+    days: Option<i64>,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    let days = days.unwrap_or(ACCESS_REVIEW_DEFAULT_EXPIRY_DAYS);
+    if !(0..=ACCESS_REVIEW_MAX_EXPIRY_DAYS).contains(&days) {
+        return Err(status_400(&format!(
+            "days must be between 0 and {ACCESS_REVIEW_MAX_EXPIRY_DAYS}"
+        )));
+    }
+    Ok(days)
+}
+
+fn validated_access_review_expiring_offset(
+    offset: Option<i64>,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    let offset = offset.unwrap_or(0);
+    if !(0..=ACCESS_REVIEW_MAX_EXPIRING_OFFSET).contains(&offset) {
+        return Err(status_400(&format!(
+            "offset must be between 0 and {ACCESS_REVIEW_MAX_EXPIRING_OFFSET}"
+        )));
+    }
+    Ok(offset)
 }
 
 #[derive(Debug, Deserialize)]
@@ -42485,6 +42527,24 @@ struct AccessCampaignCreateRequest {
     #[serde(rename = "reviewerGroup")]
     reviewer_group: String,
     days: i64,
+}
+
+/// Recertification campaigns describe and count a platform-wide review set;
+/// they have no site/environment ownership column that could safely narrow
+/// them for a scoped principal. Keep the handler-level defense aligned with
+/// the middleware's stronger interactive-authority proof and deny before any
+/// validation, existence check, aggregate query, or write.
+fn require_access_campaign_global_verified_human_admin(
+    session: &AuthSession,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    require_global_verified_human_admin_permission(session).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "access-recertification campaigns require a verified human administrator with Global authority"
+            })),
+        )
+    })
 }
 
 async fn access_reviews_list(
@@ -42568,21 +42628,40 @@ async fn access_reviews_expiring(
     AuthExtractor(session): AuthExtractor,
     Query(params): Query<AccessReviewExpiringQuery>,
 ) -> ApiResult {
-    let days = params.days.unwrap_or(30);
-    if days < 0 {
-        return Err(status_400("days must be zero or greater"));
-    }
-    let reviews = match get_db() {
-        Some(pool) => crate::repos::access_recertification::list_expiring(pool, days)
+    let days = validated_access_review_expiry_days(params.days)?;
+    let limit = params
+        .limit
+        .unwrap_or(ACCESS_REVIEW_DEFAULT_EXPIRING_LIMIT)
+        .clamp(1, ACCESS_REVIEW_MAX_EXPIRING_LIMIT);
+    let offset = validated_access_review_expiring_offset(params.offset)?;
+    // This resource has a site axis but no environment axis. Resolve the
+    // principal's full authorized site set once, then push it into both SQL
+    // queries before pagination. `Some([])` deliberately yields an empty set.
+    let sites: Option<Vec<String>> = match list_site_scope(&session) {
+        ListSiteScope::Empty => Some(Vec::new()),
+        ListSiteScope::All => None,
+        ListSiteScope::Sites(sites) => Some(sites),
+    };
+    let (reviews, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::access_recertification::list_expiring_page(
+                pool,
+                days,
+                sites.as_deref(),
+                limit,
+                offset,
+            )
             .await
             .map_err(db_error)?,
-        None => Vec::new(),
+            crate::repos::access_recertification::count_expiring(pool, days, sites.as_deref())
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
     };
-    // #2: a scoped principal only sees its own site's expiring reviews.
-    let reviews = retain_site_scoped(&session, reviews, |r| r.site.as_str());
-    Ok(Json(access_recertification::list_expiring_pure(
-        &reviews, days,
-    )))
+    let mut response = access_recertification::list_expiring_pure(&reviews, days);
+    add_page_meta(&mut response, total, limit, offset);
+    Ok(Json(response))
 }
 
 async fn access_review_start(
@@ -42878,6 +42957,7 @@ async fn access_campaign_create(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<AccessCampaignCreateRequest>,
 ) -> ApiResult {
+    require_access_campaign_global_verified_human_admin(&session)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let review_type =
         access_recertification::parse_review_type(&body.review_type).map_err(|e| status_400(&e))?;
@@ -42911,7 +42991,11 @@ async fn access_campaign_create(
     Ok(Json(access_recertification::campaign_response(&inserted)))
 }
 
-async fn access_campaign_get(Path(id): Path<String>) -> ApiResult {
+async fn access_campaign_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_access_campaign_global_verified_human_admin(&session)?;
     // Read surface: degrade to 404-as-absent when no DB (only mutations 503).
     let Some(pool) = get_db() else {
         return Err(status_404(&id));
@@ -42923,7 +43007,11 @@ async fn access_campaign_get(Path(id): Path<String>) -> ApiResult {
     Ok(Json(access_recertification::campaign_response(&campaign)))
 }
 
-async fn access_campaigns_list(Query(page): Query<AdminListPage>) -> ApiResult {
+async fn access_campaigns_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
+) -> ApiResult {
+    require_access_campaign_global_verified_human_admin(&session)?;
     // #14: bound the page (generous default keeps seed-scale callers unaffected).
     let limit = page.limit.unwrap_or(500).clamp(1, 1000);
     let offset = page.offset.unwrap_or(0).max(0);
@@ -78054,6 +78142,111 @@ mod access_recertification_db_tests {
         test_principal_id(user_id).to_string()
     }
 
+    #[test]
+    fn campaign_control_requires_global_verified_human_admin() {
+        let mut global_human = caller_session("campaign-global-admin");
+        global_human.roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
+        assert!(require_access_campaign_global_verified_human_admin(&global_human).is_ok());
+
+        let scoped_site = AuthSession {
+            site_scope: vec!["GBLON".into()],
+            ..global_human.clone()
+        };
+        let scoped_environment = AuthSession {
+            environment_scope: vec!["production".into()],
+            ..global_human.clone()
+        };
+        let workload = AuthSession {
+            actor_class: ryuki_engine::auth::ActorClass::Workload,
+            provider_mode: "api-token".into(),
+            ..global_human
+        };
+        for rejected in [scoped_site, scoped_environment, workload] {
+            let Err((status, _)) = require_access_campaign_global_verified_human_admin(&rejected)
+            else {
+                panic!("scoped and non-human campaign administrators must be rejected");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_admin_is_denied_by_every_campaign_handler_before_storage() {
+        let mut scoped = caller_session("campaign-scoped-admin");
+        scoped.roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
+        scoped.site_scope = vec!["GBLON".into()];
+
+        let create = access_campaign_create(
+            AuthExtractor(scoped.clone()),
+            Json(AccessCampaignCreateRequest {
+                name: "must-not-be-created".into(),
+                review_type: "ADGroup".into(),
+                reviewer_group: "identity-governance".into(),
+                days: 30,
+            }),
+        )
+        .await;
+        let get = access_campaign_get(
+            AuthExtractor(scoped.clone()),
+            Path("must-not-be-observed".into()),
+        )
+        .await;
+        let list = access_campaigns_list(
+            AuthExtractor(scoped),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await;
+
+        for rejected in [create, get, list] {
+            let Err((status, _)) = rejected else {
+                panic!("a scoped admin must not reach a global campaign boundary");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[test]
+    fn expiring_review_horizon_is_bounded_with_compatible_defaults() {
+        assert_eq!(
+            validated_access_review_expiry_days(None).expect("default window"),
+            30
+        );
+        assert_eq!(
+            validated_access_review_expiry_days(Some(0)).expect("zero-day window"),
+            0
+        );
+        assert_eq!(
+            validated_access_review_expiry_days(Some(ACCESS_REVIEW_MAX_EXPIRY_DAYS))
+                .expect("maximum window"),
+            ACCESS_REVIEW_MAX_EXPIRY_DAYS
+        );
+        for rejected in [-1, ACCESS_REVIEW_MAX_EXPIRY_DAYS + 1] {
+            let Err((status, _)) = validated_access_review_expiry_days(Some(rejected)) else {
+                panic!("out-of-range expiry window must be rejected");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        assert_eq!(
+            validated_access_review_expiring_offset(None).expect("default offset"),
+            0
+        );
+        assert_eq!(
+            validated_access_review_expiring_offset(Some(ACCESS_REVIEW_MAX_EXPIRING_OFFSET))
+                .expect("maximum offset"),
+            ACCESS_REVIEW_MAX_EXPIRING_OFFSET
+        );
+        for rejected in [-1, ACCESS_REVIEW_MAX_EXPIRING_OFFSET + 1] {
+            let Err((status, _)) = validated_access_review_expiring_offset(Some(rejected)) else {
+                panic!("out-of-range expiry offset must be rejected");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
     #[tokio::test]
     async fn nonhuman_actor_classes_are_rejected_before_access_review_lookup() {
         use ryuki_engine::auth::ActorClass;
@@ -78863,8 +79056,10 @@ mod access_recertification_db_tests {
             .await
             .ok();
 
+        let mut campaign_admin = caller_session("dbtest-campaign-admin");
+        campaign_admin.roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
         let result = access_campaign_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(campaign_admin),
             Json(AccessCampaignCreateRequest {
                 name: name.to_string(),
                 review_type: "ADGroup".to_string(),

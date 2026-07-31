@@ -368,20 +368,87 @@ pub async fn list_due(pool: &PgPool) -> Result<Vec<AccessReview>, sqlx::Error> {
         .collect()
 }
 
-/// List reviews expiring within the next `days` days.
-pub async fn list_expiring(pool: &PgPool, days: i64) -> Result<Vec<AccessReview>, sqlx::Error> {
-    let rows: Vec<AccessReviewRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM access_reviews \
-         WHERE next_review_due >= NOW() AND next_review_due <= NOW() + ($1 * INTERVAL '1 day') \
-         ORDER BY next_review_due"
-    ))
-    .bind(days)
-    .fetch_all(pool)
-    .await?;
+/// List one bounded page of reviews expiring within the next `days` days.
+///
+/// `sites = None` is the explicit unrestricted-principal case. `Some(sites)`
+/// applies the caller's already-resolved site authority in SQL before rows are
+/// decoded or paged; an empty slice therefore returns no rows. The unique `id`
+/// tie-breaker makes offset pages deterministic when due timestamps collide.
+pub async fn list_expiring_page(
+    pool: &PgPool,
+    days: i64,
+    sites: Option<&[String]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AccessReview>, sqlx::Error> {
+    let rows: Vec<AccessReviewRow> = match sites {
+        None => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM access_reviews \
+                 WHERE next_review_due >= NOW() \
+                   AND next_review_due <= NOW() + ($1 * INTERVAL '1 day') \
+                 ORDER BY next_review_due, id LIMIT $2 OFFSET $3"
+            ))
+            .bind(days)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        Some(sites) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM access_reviews \
+                 WHERE next_review_due >= NOW() \
+                   AND next_review_due <= NOW() + ($1 * INTERVAL '1 day') \
+                   AND site = ANY($2) \
+                 ORDER BY next_review_due, id LIMIT $3 OFFSET $4"
+            ))
+            .bind(days)
+            .bind(sites)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     rows.into_iter()
         .map(|r| r.into_model().map(|(m, _)| m))
         .collect()
+}
+
+/// Count expiring reviews under the same time and site predicates as
+/// [`list_expiring_page`], so pagination metadata cannot disclose a global
+/// total to a scoped principal.
+pub async fn count_expiring(
+    pool: &PgPool,
+    days: i64,
+    sites: Option<&[String]>,
+) -> Result<i64, sqlx::Error> {
+    match sites {
+        None => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM access_reviews \
+                 WHERE next_review_due >= NOW() \
+                   AND next_review_due <= NOW() + ($1 * INTERVAL '1 day')",
+            )
+            .bind(days)
+            .fetch_one(pool)
+            .await
+        }
+        Some(sites) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM access_reviews \
+                 WHERE next_review_due >= NOW() \
+                   AND next_review_due <= NOW() + ($1 * INTERVAL '1 day') \
+                   AND site = ANY($2)",
+            )
+            .bind(days)
+            .bind(sites)
+            .fetch_one(pool)
+            .await
+        }
+    }
 }
 
 /// Summary: COUNT per status.
@@ -1221,8 +1288,22 @@ mod access_recertification_db_tests {
 
         let id_due = uuid::Uuid::new_v4();
         let id_expiring = uuid::Uuid::new_v4();
-        insert_test_review(&pool, id_due, "Sudo", "Pending", "TEST", -5).await; // overdue
-        insert_test_review(&pool, id_expiring, "Sudo", "Pending", "TEST", 10).await; // expiring within 30 days
+        let id_expiring_second = uuid::Uuid::new_v4();
+        let id_foreign_expiring = uuid::Uuid::new_v4();
+        let site = format!("TEST-{}", uuid::Uuid::new_v4().simple());
+        let foreign_site = format!("OTHER-{}", uuid::Uuid::new_v4().simple());
+        insert_test_review(&pool, id_due, "Sudo", "Pending", &site, -5).await; // overdue
+        insert_test_review(&pool, id_expiring, "Sudo", "Pending", &site, 10).await; // expiring within 30 days
+        insert_test_review(&pool, id_expiring_second, "Sudo", "Pending", &site, 11).await;
+        insert_test_review(
+            &pool,
+            id_foreign_expiring,
+            "Sudo",
+            "Pending",
+            &foreign_site,
+            10,
+        )
+        .await;
 
         let due = list_due(&pool).await.expect("list_due");
         assert!(
@@ -1230,14 +1311,56 @@ mod access_recertification_db_tests {
             "overdue row should appear in list_due"
         );
 
-        let expiring = list_expiring(&pool, 30).await.expect("list_expiring");
+        let sites = vec![site];
+        let first_page = list_expiring_page(&pool, 30, Some(sites.as_slice()), 1, 0)
+            .await
+            .expect("first bounded expiring page");
+        let second_page = list_expiring_page(&pool, 30, Some(sites.as_slice()), 1, 1)
+            .await
+            .expect("second bounded expiring page");
+        assert_eq!(first_page.len(), 1, "the SQL LIMIT must bound decoded rows");
+        assert_eq!(second_page.len(), 1, "the second page remains bounded");
+        assert_ne!(
+            first_page[0].id, second_page[0].id,
+            "stable ordering plus OFFSET must advance to a distinct row"
+        );
+
+        let expiring = list_expiring_page(&pool, 30, Some(sites.as_slice()), 1_000, 0)
+            .await
+            .expect("list_expiring_page");
+        assert_eq!(
+            expiring.len(),
+            2,
+            "only the two in-scope rows may materialize"
+        );
         assert!(
             expiring.iter().any(|r| r.id == id_expiring.to_string()),
-            "expiring row should appear in list_expiring"
+            "in-scope expiring row should appear"
+        );
+        assert!(
+            expiring
+                .iter()
+                .any(|r| r.id == id_expiring_second.to_string()),
+            "the next in-scope page candidate should appear in the full bounded page"
+        );
+        assert!(
+            expiring
+                .iter()
+                .all(|r| r.id != id_foreign_expiring.to_string()),
+            "the SQL site predicate must exclude a foreign expiring row"
+        );
+        assert_eq!(
+            count_expiring(&pool, 30, Some(sites.as_slice()))
+                .await
+                .expect("count_expiring"),
+            expiring.len() as i64,
+            "the scoped total must match the same filtered set"
         );
 
         cleanup_review(&pool, id_due).await;
         cleanup_review(&pool, id_expiring).await;
+        cleanup_review(&pool, id_expiring_second).await;
+        cleanup_review(&pool, id_foreign_expiring).await;
     }
 
     #[tokio::test]
