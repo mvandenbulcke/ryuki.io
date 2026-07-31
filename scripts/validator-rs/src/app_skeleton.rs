@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use syn::visit::Visit as _;
@@ -44,6 +44,10 @@ const REQUIRED_FILES: &[&str] = &[
     "sources/ryuki-engine/src/adapter_framework.rs",
 ];
 const LEGACY_PORTAL_NGINX_PATH: &str = "portal/portal-ui/nginx.conf";
+const PORTAL_CARGO_LEPTOS_INSTALL_INSTRUCTION: &str = r#"RUN ["/usr/local/cargo/bin/cargo", "install", "cargo-leptos", "--version", "0.3.7", "--locked", "--root", "/opt/ryuki-tools/cargo-leptos-0.3.7"]"#;
+const PORTAL_CARGO_LEPTOS_BUILD_INSTRUCTION: &str = r#"RUN ["/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos", "build", "--release", "-p", "ryuki-portal-ui"]"#;
+const PORTAL_CARGO_LEPTOS_CRATE_BUILD_INSTRUCTION: &str =
+    r#"RUN ["/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos", "build", "--release"]"#;
 const TEXT_SCAN_ROOTS: &[&str] = &["api", "portal", "sources"];
 const EXTRA_TEXT_FILES: &[&str] = &[".gitignore"];
 const CRATES_IO_LOCK_SOURCE: &str =
@@ -844,9 +848,22 @@ fn validate_portal(
         "portal app.rs must not depend on legacy Trunk asset processing",
     );
     expect(
-        (dockerfile.contains("COPY Cargo.toml Cargo.lock ./")
-            || dockerfile.contains("COPY Cargo.toml styles.css ./"))
-            && !dockerfile.contains("COPY Cargo.toml index.html styles.css ./"),
+        (dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./",
+        ) || dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY --link --chown=10001:10001 Cargo.toml styles.css ./",
+        )) && !dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY --link --chown=10001:10001 Cargo.toml index.html styles.css ./",
+        ) && !dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY --link Cargo.toml index.html styles.css ./",
+        ) && !dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY Cargo.toml index.html styles.css ./",
+        ),
         errors,
         "portal Dockerfile must not copy the retired Trunk index.html",
     );
@@ -2281,7 +2298,14 @@ fn validate_portal(
         "portal CSS must style the server boundary status band",
     );
     expect(
-        dockerfile.contains("cargo leptos build --release"),
+        dockerfile_has_active_instruction(dockerfile, PORTAL_CARGO_LEPTOS_INSTALL_INSTRUCTION)
+            && (dockerfile_has_active_instruction(
+                dockerfile,
+                PORTAL_CARGO_LEPTOS_BUILD_INSTRUCTION,
+            ) || dockerfile_has_active_instruction(
+                dockerfile,
+                PORTAL_CARGO_LEPTOS_CRATE_BUILD_INSTRUCTION,
+            )),
         errors,
         "portal Dockerfile must build the full-stack Leptos app",
     );
@@ -2290,7 +2314,15 @@ fn validate_portal(
             && dockerfile.contains(" AS runtime")
             && dockerfile.contains("CMD [\"/app/ryuki-portal-ui\"]")
             && dockerfile.contains("LEPTOS_SITE_ROOT=/app/site")
-            && dockerfile.contains("RYUKI_PORTAL_EXECUTION_MODE=static-dry-run"),
+            && dockerfile.contains("RYUKI_PORTAL_EXECUTION_MODE=static-dry-run")
+            && dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui",
+            )
+            && dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --from=build --chown=10001:10001 /app/target/site /app/site",
+            ),
         errors,
         "portal Dockerfile must run the Rust portal server runtime",
     );
@@ -2299,6 +2331,10 @@ fn validate_portal(
         errors,
         "portal Dockerfile must not remain a static-only Nginx/Trunk runtime",
     );
+}
+
+fn dockerfile_has_active_instruction(dockerfile: &str, expected: &str) -> bool {
+    dockerfile.lines().any(|line| line.trim() == expected)
 }
 
 fn validate_text(path: &str, text: &str, errors: &mut Vec<String>) {
@@ -2342,10 +2378,32 @@ struct RouterBinding {
     exposes_health_routes: bool,
 }
 
+type LocalValueLineage = usize;
+
+#[derive(Debug)]
+struct LeptosRouteBinding {
+    options: String,
+    context: LocalValueLineage,
+}
+
+const PORTAL_MAIN_TRUSTED_PATH_ROOTS: &[&str] =
+    &["axum", "leptos", "leptos_axum", "ryuki_portal_ui", "tokio"];
+const PORTAL_MAIN_WILDCARD_VALUES: &[&str] = &["get_configuration", "provide_context"];
+
 pub(crate) fn inspect_portal_main(main_rs: &str) -> PortalMainInspection {
     let Ok(file) = syn::parse_file(main_rs) else {
         return PortalMainInspection::default();
     };
+    if file.items.iter().any(|item| {
+        PORTAL_MAIN_WILDCARD_VALUES
+            .iter()
+            .any(|name| item_binds_value_name(item, name))
+            || PORTAL_MAIN_TRUSTED_PATH_ROOTS
+                .iter()
+                .any(|root| item_binds_type_root(item, root))
+    }) {
+        return PortalMainInspection::default();
+    }
     let matching_mains: Vec<&syn::ItemFn> = file
         .items
         .iter()
@@ -2389,6 +2447,10 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
     if imports.iter().any(|path| {
         path.last()
             .is_some_and(|segment| segment == "get_configuration")
+    }) || imports.iter().any(|path| {
+        path.last()
+            .is_some_and(|segment| segment == "provide_context")
+            && !path_matches_segments(path, &["leptos", "prelude", "provide_context"])
     }) || !imported(&imports, &["axum", "Router"])
         || !imported(&imports, &["leptos_axum", "LeptosRoutes"])
         || !imported(&imports, &["leptos_axum", "generate_route_list"])
@@ -2404,12 +2466,11 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
         return PortalMainInspection::default();
     }
 
-    let has_legacy_handler = imported(&imports, &["leptos_axum", "file_and_error_handler"]);
     let has_context_handler = imported(
         &imports,
         &["leptos_axum", "file_and_error_handler_with_context"],
     );
-    if !has_legacy_handler && !has_context_handler {
+    if !has_context_handler {
         return PortalMainInspection::default();
     }
     if block
@@ -2424,6 +2485,14 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
     let mut current_configurations = BTreeSet::new();
     let mut current_leptos_options = BTreeSet::new();
     let mut current_boundaries = BTreeSet::new();
+    let mut current_public_origins = BTreeSet::new();
+    let mut current_server_function_limits = BTreeSet::new();
+    let mut current_server_function_routers = BTreeSet::new();
+    let mut trusted_context_lineages = BTreeSet::new();
+    // The canonical SSR router uses distinct clones for its route and fallback
+    // callbacks. Preserve their common source binding so a valid fallback
+    // cannot serve as a decoy for a different route context.
+    let mut local_value_lineages = BTreeMap::new();
     let mut local_bindings = Vec::new();
     let mut routers = Vec::new();
     let mut listeners = Vec::new();
@@ -2432,6 +2501,12 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
     let mut core_plans = Vec::new();
 
     for (statement_index, statement) in block.stmts.iter().enumerate() {
+        if statement_assignment_targets(statement)
+            .iter()
+            .any(|name| local_value_lineages.contains_key(name))
+        {
+            return PortalMainInspection::default();
+        }
         match statement {
             syn::Stmt::Local(local) => {
                 let Some(name) = local_ident(&local.pat) else {
@@ -2441,11 +2516,13 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                     "App",
                     "Router",
                     "PortalServerBoundary",
-                    "file_and_error_handler",
+                    "any",
                     "file_and_error_handler_with_context",
                     "generate_route_list",
                     "get",
                     "get_configuration",
+                    "provide_context",
+                    "protect_server_function_routes",
                     "shell",
                     "validate_live_provider_auth_posture",
                 ]
@@ -2458,9 +2535,17 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                     current_configurations.remove(&name);
                     current_leptos_options.remove(&name);
                     current_boundaries.remove(&name);
+                    current_public_origins.remove(&name);
+                    current_server_function_limits.remove(&name);
+                    current_server_function_routers.remove(&name);
+                    local_value_lineages.remove(&name);
                     local_bindings.push((name, statement_index));
                     continue;
                 };
+
+                let inherited_lineage = cloned_simple_ident(initializer)
+                    .and_then(|source| local_value_lineages.get(&source))
+                    .cloned();
 
                 if expression_calls_core_plan(initializer, &current_boundaries) {
                     core_plans.push(statement_index);
@@ -2472,8 +2557,9 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                     &imports,
                     &generated_routes,
                     &current_leptos_options,
-                    has_legacy_handler,
-                    has_context_handler,
+                    &local_value_lineages,
+                    &trusted_context_lineages,
+                    &current_server_function_routers,
                 ) {
                     routers.push(router);
                 }
@@ -2486,10 +2572,29 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                 let derives_leptos_options =
                     expression_derives_leptos_options(initializer, &current_configurations);
                 let creates_boundary = expression_creates_static_boundary(initializer, &imports);
+                let creates_public_origin = expression_creates_public_origin(initializer, &imports);
+                let creates_trusted_context = expression_creates_upstream_client(
+                    initializer,
+                    &imports,
+                    &current_public_origins,
+                );
+                let creates_server_function_limits =
+                    expression_creates_server_function_limits(initializer, &imports);
+                let creates_server_function_router = expression_creates_server_function_router(
+                    initializer,
+                    &imports,
+                    &current_public_origins,
+                    &current_server_function_limits,
+                    &local_value_lineages,
+                    &trusted_context_lineages,
+                );
                 generated_routes.remove(&name);
                 current_configurations.remove(&name);
                 current_leptos_options.remove(&name);
                 current_boundaries.remove(&name);
+                current_public_origins.remove(&name);
+                current_server_function_limits.remove(&name);
+                current_server_function_routers.remove(&name);
                 if generates_routes {
                     generated_routes.insert(name.clone());
                 }
@@ -2503,6 +2608,20 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                     current_boundaries.insert(name.clone());
                     boundaries.push((name.clone(), statement_index));
                 }
+                if creates_public_origin {
+                    current_public_origins.insert(name.clone());
+                }
+                if creates_trusted_context {
+                    trusted_context_lineages.insert(statement_index);
+                }
+                if creates_server_function_limits {
+                    current_server_function_limits.insert(name.clone());
+                }
+                if creates_server_function_router {
+                    current_server_function_routers.insert(name.clone());
+                }
+                local_value_lineages
+                    .insert(name.clone(), inherited_lineage.unwrap_or(statement_index));
                 local_bindings.push((name, statement_index));
             }
             syn::Stmt::Expr(expression, _) => {
@@ -2572,8 +2691,9 @@ fn inspect_router_initializer(
     imports: &[Vec<String>],
     generated_routes: &BTreeSet<String>,
     leptos_options: &BTreeSet<String>,
-    has_legacy_handler: bool,
-    has_context_handler: bool,
+    local_value_lineages: &BTreeMap<String, LocalValueLineage>,
+    trusted_context_lineages: &BTreeSet<LocalValueLineage>,
+    server_function_routers: &BTreeSet<String>,
 ) -> Option<RouterBinding> {
     let mut methods = Vec::new();
     let mut cursor = strip_paren_group(initializer);
@@ -2587,35 +2707,48 @@ fn inspect_router_initializer(
     methods.reverse();
 
     let mut leptos_route_index = None;
+    let mut merge_index = None;
     let mut fallback_index = None;
     let mut state_index = None;
-    let mut route_options = None;
+    let mut route_binding = None;
+    let mut fallback_context = None;
     let mut state_options = None;
     let mut healthz_routes = 0usize;
     let mut readyz_routes = 0usize;
     let mut health_routes_are_get = true;
     for (index, method) in methods.iter().enumerate() {
         match method.method.to_string().as_str() {
-            "leptos_routes" | "leptos_routes_with_context" => {
+            "leptos_routes_with_context" => {
                 if leptos_route_index.is_some() {
                     return None;
                 }
-                route_options =
-                    leptos_route_method_options(method, imports, generated_routes, leptos_options);
-                route_options.as_ref()?;
+                route_binding = leptos_route_method_binding(
+                    method,
+                    imports,
+                    generated_routes,
+                    leptos_options,
+                    local_value_lineages,
+                    trusted_context_lineages,
+                );
+                route_binding.as_ref()?;
                 leptos_route_index = Some(index);
             }
-            "fallback" => {
-                if fallback_index.is_some()
-                    || !fallback_method_is_valid(
-                        method,
-                        imports,
-                        has_legacy_handler,
-                        has_context_handler,
-                    )
-                {
+            "merge" => {
+                if merge_index.is_some() || method.args.len() != 1 {
                     return None;
                 }
+                let merged = method.args.first().and_then(simple_ident)?;
+                if !server_function_routers.contains(&merged) {
+                    return None;
+                }
+                merge_index = Some(index);
+            }
+            "fallback" => {
+                if fallback_index.is_some() || fallback_context.is_some() {
+                    return None;
+                }
+                fallback_context = fallback_method_context(method, imports, local_value_lineages);
+                fallback_context.as_ref()?;
                 fallback_index = Some(index);
             }
             "with_state" => {
@@ -2626,6 +2759,9 @@ fn inspect_router_initializer(
                 state_index = Some(index);
             }
             "route" => {
+                if method.args.len() != 2 {
+                    return None;
+                }
                 if let Some(path) = method.args.first().and_then(string_literal) {
                     if path == "/healthz" {
                         healthz_routes += 1;
@@ -2636,18 +2772,27 @@ fn inspect_router_initializer(
                     }
                 }
             }
-            _ => {}
+            "layer" => {
+                if method.args.len() != 1 {
+                    return None;
+                }
+            }
+            _ => return None,
         }
     }
 
-    let (Some(leptos_route_index), Some(fallback_index), Some(state_index)) =
-        (leptos_route_index, fallback_index, state_index)
+    let (Some(merge_index), Some(leptos_route_index), Some(fallback_index), Some(state_index)) =
+        (merge_index, leptos_route_index, fallback_index, state_index)
     else {
         return None;
     };
-    if leptos_route_index >= fallback_index
+    let route_binding = route_binding?;
+    if merge_index >= leptos_route_index
+        || leptos_route_index >= fallback_index
         || fallback_index >= state_index
-        || route_options != state_options
+        || state_index + 1 != methods.len()
+        || Some(route_binding.options) != state_options
+        || Some(route_binding.context) != fallback_context
     {
         return None;
     }
@@ -2659,23 +2804,18 @@ fn inspect_router_initializer(
     })
 }
 
-fn leptos_route_method_options(
+fn leptos_route_method_binding(
     method: &syn::ExprMethodCall,
     imports: &[Vec<String>],
     generated_routes: &BTreeSet<String>,
     leptos_options: &BTreeSet<String>,
-) -> Option<String> {
+    local_value_lineages: &BTreeMap<String, LocalValueLineage>,
+    trusted_context_lineages: &BTreeSet<LocalValueLineage>,
+) -> Option<LeptosRouteBinding> {
     if !imported(imports, &["leptos_axum", "LeptosRoutes"]) {
         return None;
     }
-    let expected_arguments = if method.method == "leptos_routes" {
-        3
-    } else if method.method == "leptos_routes_with_context" {
-        4
-    } else {
-        return None;
-    };
-    if method.args.len() != expected_arguments {
+    if method.method != "leptos_routes_with_context" || method.args.len() != 4 {
         return None;
     }
     let routes_are_generated = method.args.iter().nth(1).is_some_and(|routes| {
@@ -2685,7 +2825,19 @@ fn leptos_route_method_options(
     if !routes_are_generated {
         return None;
     }
-    referenced_simple_ident(method.args.first()?).filter(|name| leptos_options.contains(name))
+    let options = referenced_simple_ident(method.args.first()?)
+        .filter(|name| leptos_options.contains(name))?;
+    let context =
+        context_provider_lineage(method.args.iter().nth(2)?, imports, local_value_lineages)?;
+    if !trusted_context_lineages.contains(&context) {
+        return None;
+    }
+    method
+        .args
+        .iter()
+        .nth(3)
+        .filter(|app| expression_is_context_shell_factory(app, &options, imports))?;
+    Some(LeptosRouteBinding { options, context })
 }
 
 fn route_method_uses_get(method: &syn::ExprMethodCall, imports: &[Vec<String>]) -> bool {
@@ -2700,52 +2852,102 @@ fn route_method_uses_get(method: &syn::ExprMethodCall, imports: &[Vec<String>]) 
         && handler.args.len() == 1
 }
 
-fn fallback_method_is_valid(
+fn fallback_method_context(
     method: &syn::ExprMethodCall,
     imports: &[Vec<String>],
-    has_legacy_handler: bool,
-    has_context_handler: bool,
-) -> bool {
-    let Some(handler) = method.args.first().and_then(expression_call) else {
-        return false;
-    };
+    local_value_lineages: &BTreeMap<String, LocalValueLineage>,
+) -> Option<LocalValueLineage> {
+    let handler = method.args.first().and_then(expression_call)?;
     if method.args.len() != 1 {
-        return false;
+        return None;
     }
-    let Some(handler_path) = expression_path(&handler.func) else {
+    let handler_path = expression_path(&handler.func)?;
+
+    if !path_is_bound(
+        handler_path,
+        "file_and_error_handler_with_context",
+        &["leptos_axum", "file_and_error_handler_with_context"],
+        imports,
+    ) || handler.args.len() != 2
+        || !handler
+            .args
+            .iter()
+            .nth(1)
+            .is_some_and(|producer| expression_is_shell(producer, imports))
+    {
+        return None;
+    }
+    context_provider_lineage(handler.args.first()?, imports, local_value_lineages)
+}
+
+fn context_provider_lineage(
+    expression: &syn::Expr,
+    imports: &[Vec<String>],
+    local_value_lineages: &BTreeMap<String, LocalValueLineage>,
+) -> Option<LocalValueLineage> {
+    let source = context_provider_source(expression, imports)?;
+    local_value_lineages.get(&source).cloned()
+}
+
+fn context_provider_source(expression: &syn::Expr, imports: &[Vec<String>]) -> Option<String> {
+    let syn::Expr::Closure(closure) = strip_paren_group(expression) else {
+        return None;
+    };
+    if closure.capture.is_none() || closure.asyncness.is_some() || !closure.inputs.is_empty() {
+        return None;
+    }
+    let call = expression_call(&closure.body)?;
+    let function = expression_path(&call.func)?;
+    let calls_leptos_context = path_matches(function, &["leptos", "prelude", "provide_context"])
+        || (path_matches(function, &["provide_context"])
+            && (imported(imports, &["leptos", "prelude", "provide_context"])
+                || imported(imports, &["leptos", "prelude", "*"])));
+    if !calls_leptos_context || call.args.len() != 1 {
+        return None;
+    }
+    call.args.first().and_then(cloned_simple_ident)
+}
+
+fn expression_is_context_shell_factory(
+    expression: &syn::Expr,
+    options: &str,
+    imports: &[Vec<String>],
+) -> bool {
+    let syn::Expr::Block(expression_block) = strip_paren_group(expression) else {
         return false;
     };
-
-    if has_legacy_handler
-        && path_is_bound(
-            handler_path,
-            "file_and_error_handler",
-            &["leptos_axum", "file_and_error_handler"],
-            imports,
-        )
-    {
-        return handler.args.len() == 1
-            && handler
-                .args
-                .first()
-                .is_some_and(|producer| expression_is_shell(producer, imports));
+    if expression_block.label.is_some() || expression_block.block.stmts.len() != 2 {
+        return false;
     }
-    if has_context_handler
-        && path_is_bound(
-            handler_path,
-            "file_and_error_handler_with_context",
-            &["leptos_axum", "file_and_error_handler_with_context"],
-            imports,
-        )
+    let syn::Stmt::Local(options_clone) = &expression_block.block.stmts[0] else {
+        return false;
+    };
+    let Some(clone_name) = local_ident(&options_clone.pat) else {
+        return false;
+    };
+    let Some(initializer) = &options_clone.init else {
+        return false;
+    };
+    if initializer.diverge.is_some()
+        || cloned_simple_ident(&initializer.expr).as_deref() != Some(options)
     {
-        return handler.args.len() == 2
-            && handler
-                .args
-                .iter()
-                .nth(1)
-                .is_some_and(|producer| expression_is_shell(producer, imports));
+        return false;
     }
-    false
+    let syn::Stmt::Expr(tail, None) = &expression_block.block.stmts[1] else {
+        return false;
+    };
+    let syn::Expr::Closure(closure) = strip_paren_group(tail) else {
+        return false;
+    };
+    if closure.capture.is_none() || closure.asyncness.is_some() || !closure.inputs.is_empty() {
+        return false;
+    }
+    let Some(call) = expression_call(&closure.body) else {
+        return false;
+    };
+    call.args.len() == 1
+        && expression_path(&call.func).is_some_and(|path| expression_path_is_shell(path, imports))
+        && call.args.first().and_then(cloned_simple_ident).as_deref() == Some(clone_name.as_str())
 }
 
 fn expression_generates_app_routes(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
@@ -2773,9 +2975,12 @@ fn expression_is_app(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
 }
 
 fn expression_is_shell(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
-    expression_path(strip_paren_group(expression)).is_some_and(|path| {
-        path_is_bound(path, "shell", &["ryuki_portal_ui", "app", "shell"], imports)
-    })
+    expression_path(strip_paren_group(expression))
+        .is_some_and(|path| expression_path_is_shell(path, imports))
+}
+
+fn expression_path_is_shell(path: &syn::Path, imports: &[Vec<String>]) -> bool {
+    path_is_bound(path, "shell", &["ryuki_portal_ui", "app", "shell"], imports)
 }
 
 fn expression_is_router_new(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
@@ -2848,6 +3053,224 @@ fn expression_creates_static_boundary(expression: &syn::Expr, imports: &[Vec<Str
                     "static_dry_run",
                 ],
             ))
+}
+
+fn expression_creates_public_origin(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
+    let Some(call) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    let Some(path) = expression_path(&call.func) else {
+        return false;
+    };
+    call.args.is_empty()
+        && ((path_matches(path, &["PortalPublicOrigin", "from_env"])
+            && imported(
+                imports,
+                &["ryuki_portal_ui", "security", "PortalPublicOrigin"],
+            ))
+            || path_matches(
+                path,
+                &[
+                    "ryuki_portal_ui",
+                    "security",
+                    "PortalPublicOrigin",
+                    "from_env",
+                ],
+            ))
+}
+
+fn expression_creates_upstream_client(
+    expression: &syn::Expr,
+    imports: &[Vec<String>],
+    public_origins: &BTreeSet<String>,
+) -> bool {
+    let Some(call) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    let Some(path) = expression_path(&call.func) else {
+        return false;
+    };
+    let calls_approved_constructor = (path_matches(path, &["UpstreamClient", "from_env"])
+        && imported(imports, &["ryuki_portal_ui", "upstream", "UpstreamClient"]))
+        || path_matches(
+            path,
+            &["ryuki_portal_ui", "upstream", "UpstreamClient", "from_env"],
+        );
+    calls_approved_constructor
+        && call.args.len() == 1
+        && call
+            .args
+            .first()
+            .and_then(referenced_simple_ident)
+            .is_some_and(|origin| public_origins.contains(&origin))
+}
+
+fn expression_creates_server_function_limits(
+    expression: &syn::Expr,
+    imports: &[Vec<String>],
+) -> bool {
+    let Some(call) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    let Some(path) = expression_path(&call.func) else {
+        return false;
+    };
+    call.args.is_empty()
+        && ((path_matches(path, &["PortalServerFunctionLimits", "from_env"])
+            && imported(
+                imports,
+                &["ryuki_portal_ui", "security", "PortalServerFunctionLimits"],
+            ))
+            || path_matches(
+                path,
+                &[
+                    "ryuki_portal_ui",
+                    "security",
+                    "PortalServerFunctionLimits",
+                    "from_env",
+                ],
+            ))
+}
+
+fn expression_creates_server_function_router(
+    expression: &syn::Expr,
+    imports: &[Vec<String>],
+    public_origins: &BTreeSet<String>,
+    server_function_limits: &BTreeSet<String>,
+    local_value_lineages: &BTreeMap<String, LocalValueLineage>,
+    trusted_context_lineages: &BTreeSet<LocalValueLineage>,
+) -> bool {
+    let Some(protected) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    let Some(protect_path) = expression_path(&protected.func) else {
+        return false;
+    };
+    if !path_is_bound(
+        protect_path,
+        "protect_server_function_routes",
+        &[
+            "ryuki_portal_ui",
+            "security",
+            "protect_server_function_routes",
+        ],
+        imports,
+    ) || protected.args.len() != 3
+        || !protected
+            .args
+            .iter()
+            .nth(1)
+            .and_then(simple_ident)
+            .is_some_and(|origin| public_origins.contains(&origin))
+        || !protected
+            .args
+            .iter()
+            .nth(2)
+            .and_then(simple_ident)
+            .is_some_and(|limits| server_function_limits.contains(&limits))
+    {
+        return false;
+    }
+
+    let Some(syn::Expr::MethodCall(route)) = protected.args.first().map(strip_paren_group) else {
+        return false;
+    };
+    if route.method != "route"
+        || route.args.len() != 2
+        || !expression_is_router_new(&route.receiver, imports)
+        || route.args.first().and_then(string_literal).as_deref() != Some("/portal/api/{*fn_name}")
+    {
+        return false;
+    }
+    let Some(handler) = route.args.iter().nth(1).and_then(expression_call) else {
+        return false;
+    };
+    if !expression_path(&handler.func)
+        .is_some_and(|path| path_is_bound(path, "any", &["axum", "routing", "any"], imports))
+        || handler.args.len() != 1
+    {
+        return false;
+    }
+    let Some(syn::Expr::Closure(request_handler)) = handler.args.first().map(strip_paren_group)
+    else {
+        return false;
+    };
+    if request_handler.capture.is_none()
+        || request_handler.asyncness.is_some()
+        || request_handler.inputs.len() != 1
+    {
+        return false;
+    }
+    let Some(syn::Pat::Type(request_pattern)) = request_handler.inputs.first() else {
+        return false;
+    };
+    let Some(request_name) = local_ident(&request_pattern.pat) else {
+        return false;
+    };
+    let syn::Type::Path(request_type) = request_pattern.ty.as_ref() else {
+        return false;
+    };
+    if request_type.qself.is_some()
+        || !path_matches(&request_type.path, &["axum", "extract", "Request"])
+    {
+        return false;
+    }
+    let syn::Expr::Block(handler_block) = strip_paren_group(&request_handler.body) else {
+        return false;
+    };
+    if handler_block.label.is_some() {
+        return false;
+    }
+    let [syn::Stmt::Local(context_clone), syn::Stmt::Expr(async_expression, None)] =
+        handler_block.block.stmts.as_slice()
+    else {
+        return false;
+    };
+    let Some(context_name) = local_ident(&context_clone.pat) else {
+        return false;
+    };
+    let Some(context_source) = context_clone
+        .init
+        .as_ref()
+        .filter(|initializer| initializer.diverge.is_none())
+        .and_then(|initializer| cloned_simple_ident(&initializer.expr))
+    else {
+        return false;
+    };
+    let Some(context_lineage) = local_value_lineages.get(&context_source) else {
+        return false;
+    };
+    if !trusted_context_lineages.contains(context_lineage) {
+        return false;
+    }
+    let syn::Expr::Async(async_block) = strip_paren_group(async_expression) else {
+        return false;
+    };
+    if async_block.capture.is_none() {
+        return false;
+    }
+    let [syn::Stmt::Expr(response, None)] = async_block.block.stmts.as_slice() else {
+        return false;
+    };
+    let Some(server_function_call) = awaited_call(response) else {
+        return false;
+    };
+    expression_path(&server_function_call.func)
+        .is_some_and(|path| path_matches(path, &["leptos_axum", "handle_server_fns_with_context"]))
+        && server_function_call.args.len() == 2
+        && server_function_call
+            .args
+            .first()
+            .and_then(|context| context_provider_source(context, imports))
+            .as_deref()
+            == Some(context_name.as_str())
+        && server_function_call
+            .args
+            .iter()
+            .nth(1)
+            .and_then(simple_ident)
+            .as_deref()
+            == Some(request_name.as_str())
 }
 
 fn expression_calls_core_plan(
@@ -3036,6 +3459,93 @@ fn statement_has_early_exit(statement: &syn::Stmt) -> bool {
 }
 
 #[derive(Default)]
+struct AssignmentTargetDetector {
+    targets: BTreeSet<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for AssignmentTargetDetector {
+    fn visit_expr_assign(&mut self, expression: &'ast syn::ExprAssign) {
+        collect_assignment_target_names(&expression.left, &mut self.targets);
+        syn::visit::visit_expr_assign(self, expression);
+    }
+
+    fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
+        if matches!(
+            &expression.op,
+            syn::BinOp::AddAssign(_)
+                | syn::BinOp::SubAssign(_)
+                | syn::BinOp::MulAssign(_)
+                | syn::BinOp::DivAssign(_)
+                | syn::BinOp::RemAssign(_)
+                | syn::BinOp::BitXorAssign(_)
+                | syn::BinOp::BitAndAssign(_)
+                | syn::BinOp::BitOrAssign(_)
+                | syn::BinOp::ShlAssign(_)
+                | syn::BinOp::ShrAssign(_)
+        ) {
+            collect_assignment_target_names(&expression.left, &mut self.targets);
+        }
+        syn::visit::visit_expr_binary(self, expression);
+    }
+}
+
+fn statement_assignment_targets(statement: &syn::Stmt) -> BTreeSet<String> {
+    let mut detector = AssignmentTargetDetector::default();
+    match statement {
+        syn::Stmt::Local(local) => detector.visit_local(local),
+        syn::Stmt::Expr(expression, _) => detector.visit_expr(expression),
+        syn::Stmt::Item(syn::Item::Use(_)) => {}
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => return detector.targets,
+    }
+    detector.targets
+}
+
+fn collect_assignment_target_names(expression: &syn::Expr, targets: &mut BTreeSet<String>) {
+    match strip_paren_group(expression) {
+        syn::Expr::Path(_) => {
+            if let Some(name) = simple_ident(expression) {
+                targets.insert(name);
+            }
+        }
+        syn::Expr::Field(field) => collect_assignment_target_names(&field.base, targets),
+        syn::Expr::Index(index) => collect_assignment_target_names(&index.expr, targets),
+        syn::Expr::Unary(unary) if matches!(&unary.op, syn::UnOp::Deref(_)) => {
+            collect_assignment_target_names(&unary.expr, targets);
+        }
+        syn::Expr::Reference(reference) => {
+            collect_assignment_target_names(&reference.expr, targets);
+        }
+        // Tuple-struct and enum-variant destructuring assignees are parsed as
+        // calls; their arguments, rather than the constructor path, are the
+        // places whose values are replaced.
+        syn::Expr::Call(call) => {
+            for argument in &call.args {
+                collect_assignment_target_names(argument, targets);
+            }
+        }
+        syn::Expr::Tuple(tuple) => {
+            for element in &tuple.elems {
+                collect_assignment_target_names(element, targets);
+            }
+        }
+        syn::Expr::Array(array) => {
+            for element in &array.elems {
+                collect_assignment_target_names(element, targets);
+            }
+        }
+        syn::Expr::Struct(structure) => {
+            for field in &structure.fields {
+                collect_assignment_target_names(&field.expr, targets);
+            }
+            if let Some(rest) = &structure.rest {
+                collect_assignment_target_names(rest, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Default)]
 struct MainFlowAwaitDetector {
     count: usize,
 }
@@ -3178,6 +3688,16 @@ fn cloned_or_simple_ident(expression: &syn::Expr) -> Option<String> {
     simple_ident(&clone.receiver)
 }
 
+fn cloned_simple_ident(expression: &syn::Expr) -> Option<String> {
+    let syn::Expr::MethodCall(clone) = strip_paren_group(expression) else {
+        return None;
+    };
+    if clone.method != "clone" || !clone.args.is_empty() {
+        return None;
+    }
+    simple_ident(&clone.receiver)
+}
+
 fn string_literal(expression: &syn::Expr) -> Option<String> {
     match strip_paren_group(expression) {
         syn::Expr::Lit(syn::ExprLit {
@@ -3252,6 +3772,69 @@ fn collect_use_paths(
     }
 }
 
+fn item_binds_value_name(item: &syn::Item, name: &str) -> bool {
+    match item {
+        syn::Item::Fn(function) => function.sig.ident == name,
+        syn::Item::Const(constant) => constant.ident == name,
+        syn::Item::Static(static_item) => static_item.ident == name,
+        syn::Item::Struct(structure) => {
+            structure.ident == name
+                && matches!(
+                    &structure.fields,
+                    syn::Fields::Unnamed(_) | syn::Fields::Unit
+                )
+        }
+        syn::Item::Use(item_use) => use_tree_binds_name_or_glob(&item_use.tree, name),
+        syn::Item::ForeignMod(foreign) => foreign.items.iter().any(|item| match item {
+            syn::ForeignItem::Fn(function) => function.sig.ident == name,
+            syn::ForeignItem::Static(static_item) => static_item.ident == name,
+            _ => false,
+        }),
+        // Item macros and unparsed future syntax can introduce value bindings
+        // that Syn cannot resolve. Fail closed while this call remains
+        // intentionally unqualified under the Leptos prelude glob.
+        syn::Item::Macro(_) | syn::Item::Verbatim(_) => true,
+        _ => false,
+    }
+}
+
+fn item_binds_type_root(item: &syn::Item, name: &str) -> bool {
+    match item {
+        syn::Item::Enum(item) => item.ident == name,
+        syn::Item::ExternCrate(item) => {
+            item.rename
+                .as_ref()
+                .map(|(_, rename)| rename)
+                .unwrap_or(&item.ident)
+                == name
+        }
+        syn::Item::Mod(item) => item.ident == name,
+        syn::Item::Struct(item) => item.ident == name,
+        syn::Item::Trait(item) => item.ident == name,
+        syn::Item::TraitAlias(item) => item.ident == name,
+        syn::Item::Type(item) => item.ident == name,
+        syn::Item::Union(item) => item.ident == name,
+        syn::Item::Use(item_use) => use_tree_binds_name_or_glob(&item_use.tree, name),
+        // These were already rejected by the value-binding proof, but keeping
+        // the type-root proof independently fail-closed prevents future drift.
+        syn::Item::Macro(_) | syn::Item::Verbatim(_) => true,
+        _ => false,
+    }
+}
+
+fn use_tree_binds_name_or_glob(tree: &syn::UseTree, name: &str) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => use_tree_binds_name_or_glob(&path.tree, name),
+        syn::UseTree::Name(bound) => bound.ident == name,
+        syn::UseTree::Rename(bound) => bound.rename == name,
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| use_tree_binds_name_or_glob(item, name)),
+        syn::UseTree::Glob(_) => true,
+    }
+}
+
 fn use_tree_contains_rename(tree: &syn::UseTree) -> bool {
     match tree {
         syn::UseTree::Path(path) => use_tree_contains_rename(&path.tree),
@@ -3289,6 +3872,14 @@ fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
             .iter()
             .zip(expected)
             .all(|(segment, expected)| segment.ident == *expected)
+}
+
+fn path_matches_segments(path: &[String], expected: &[&str]) -> bool {
+    path.len() == expected.len()
+        && path
+            .iter()
+            .zip(expected)
+            .all(|(segment, expected)| segment == *expected)
 }
 
 fn validate_forbidden_code_tokens(
@@ -3922,14 +4513,209 @@ mod tests {
         let main_rs = context_aware_ssr_main();
         for invalid_main in [
             main_rs.replace(
-                "file_and_error_handler_with_context(|| {}, shell)",
-                "file_and_error_handler_with_context(|| {}, other_shell)",
+                "move || provide_context(upstream_for_fallback.clone()),\n            shell,",
+                "move || provide_context(upstream_for_fallback.clone()),\n            other_shell,",
             ),
             main_rs.replace("axum::serve(", "serve_without_axum("),
             main_rs.replace(
                 "app.into_make_service()",
                 "unrelated_router.into_make_service()",
             ),
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn served_leptos_app_and_context_are_bound_to_the_approved_runtime() {
+        let main_rs = context_aware_ssr_main();
+        let attacker_context = main_rs
+            .replace(
+                "    let upstream_for_routes = upstream.clone();",
+                concat!(
+                    "    let upstream_for_routes = upstream.clone();\n",
+                    "    let attacker_context = String::from(\"attacker\");"
+                ),
+            )
+            .replace(
+                "move || provide_context(upstream_for_routes.clone()),",
+                "move || provide_context(attacker_context.clone()),",
+            );
+        let shared_attacker_context =
+            attacker_context.replace("upstream_for_fallback.clone()", "attacker_context.clone()");
+        let empty_context = main_rs.replace(
+            "move || provide_context(upstream_for_routes.clone()),",
+            "move || {},",
+        );
+        let attacker_app = main_rs.replace(
+            "move || shell(leptos_options.clone())",
+            "move || attacker_shell(leptos_options.clone())",
+        );
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for invalid_main in [
+            attacker_context,
+            shared_attacker_context,
+            empty_context,
+            attacker_app,
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn trusted_portal_runtime_bindings_cannot_be_reassigned() {
+        let main_rs = context_aware_ssr_main();
+        let reassigned_origin = main_rs.replace(
+            "    let upstream = UpstreamClient::from_env(&public_origin)?;",
+            concat!(
+                "    public_origin = PortalPublicOrigin::from_env()?;\n",
+                "    let upstream = UpstreamClient::from_env(&public_origin)?;"
+            ),
+        );
+        let reassigned_upstream = main_rs.replace(
+            "    let upstream_for_routes = upstream.clone();",
+            concat!(
+                "    upstream = UpstreamClient::from_env(&public_origin)?;\n",
+                "    let upstream_for_routes = upstream.clone();"
+            ),
+        );
+        let reassigned_route_context = main_rs.replace(
+            "    let app = Router::new()",
+            concat!(
+                "    upstream_for_routes = upstream.clone();\n",
+                "    let app = Router::new()"
+            ),
+        );
+        let nested_field_assignment = main_rs.replace(
+            "    let app = Router::new()",
+            concat!(
+                "    let mutation = { upstream_for_routes.inner = upstream.clone(); };\n",
+                "    let app = Router::new()"
+            ),
+        );
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for invalid_main in [
+            reassigned_origin,
+            reassigned_upstream,
+            reassigned_route_context,
+            nested_field_assignment,
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn assignment_targets_cover_indirect_destructuring_and_compound_forms() {
+        let block: syn::Block = syn::parse_str(
+            r#"{
+                direct = replacement;
+                tuple.field = replacement;
+                indexed[0] = replacement;
+                *pointer = replacement;
+                (left, right) = (replacement, replacement);
+                Wrapper(wrapped) = replacement;
+                compound += 1;
+                let nested_result = { nested = replacement; };
+            }"#,
+        )
+        .expect("assignment fixture parses");
+        let targets: BTreeSet<String> = block
+            .stmts
+            .iter()
+            .flat_map(statement_assignment_targets)
+            .collect();
+        let expected: BTreeSet<String> = [
+            "compound", "direct", "indexed", "left", "nested", "pointer", "right", "tuple",
+            "wrapped",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(targets, expected);
+    }
+
+    #[test]
+    fn module_scope_context_provider_shadow_is_rejected() {
+        let main_rs = context_aware_ssr_main();
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for shadow in [
+            "fn provide_context<T>(_value: T) {}",
+            "const provide_context: fn(String) = |_| {};",
+            "static provide_context: fn(String) = |_| {};",
+            "struct provide_context<T>(T);",
+            "use attacker::provide_context;",
+            "use attacker::provider as provide_context;",
+            "use attacker::*;",
+            "unsafe extern \"Rust\" { fn provide_context(value: String); }",
+            "include!(\"attacker.rs\");",
+        ] {
+            let shadowed_main = format!("{shadow}\n{main_rs}");
+            assert!(
+                !inspect_portal_main(&shadowed_main).runs_axum_leptos_ssr,
+                "module-scope binding remained accepted: {shadow}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_crate_roots_cannot_be_shadowed() {
+        let main_rs = context_aware_ssr_main();
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for shadow in [
+            "mod leptos { pub mod prelude {} }",
+            "mod ryuki_portal_ui { pub mod security {} }",
+            "extern crate attacker as axum;",
+            "type leptos_axum = Attacker;",
+            "struct tokio;",
+            "use attacker as ryuki_portal_ui;",
+        ] {
+            let shadowed_main = format!("{shadow}\n{main_rs}");
+            assert!(
+                !inspect_portal_main(&shadowed_main).runs_axum_leptos_ssr,
+                "trusted crate root remained shadowable: {shadow}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_router_requires_closed_chain_and_protected_server_functions() {
+        let main_rs = context_aware_ssr_main();
+        let unknown_tail = main_rs.replace(
+            "        .with_state(leptos_options);",
+            "        .with_state(leptos_options).replace_with_attacker();",
+        );
+        let recognized_tail = main_rs.replace(
+            "        .with_state(leptos_options);",
+            concat!(
+                "        .with_state(leptos_options)\n",
+                "        .route(\"/attacker\", get(|| async { \"attacker\" }));"
+            ),
+        );
+        let missing_merge = main_rs.replace("        .merge(server_function_routes)\n", "");
+        let attacker_merge = main_rs.replace(
+            ".merge(server_function_routes)",
+            ".merge(attacker_server_function_routes)",
+        );
+        let unprotected_routes = main_rs.replace(
+            "protect_server_function_routes(",
+            "attacker_server_function_routes(",
+        );
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for invalid_main in [
+            unknown_tail,
+            recognized_tail,
+            missing_merge,
+            attacker_merge,
+            unprotected_routes,
         ] {
             assert_ne!(invalid_main, main_rs);
             assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
@@ -4109,19 +4895,19 @@ async fn main() {}"#
         // trigger the "retired Trunk index.html" error.
         let dockerfile = concat!(
             "FROM rust:1.88-bookworm AS build\n",
+            "RUN [\"/usr/local/cargo/bin/rustup\", \"target\", \"add\", \"wasm32-unknown-unknown\"]\n",
+            "RUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n",
             "WORKDIR /app\n",
-            "RUN rustup target add wasm32-unknown-unknown \\\n",
-            "    && cargo install cargo-leptos --locked\n",
-            "COPY Cargo.toml Cargo.lock ./\n",
-            "COPY sources/ sources/\n",
-            "COPY portal/ portal/\n",
-            "RUN cargo leptos build --release -p ryuki-portal-ui\n",
+            "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./\n",
+            "COPY --link --chown=10001:10001 sources/ sources/\n",
+            "COPY --link --chown=10001:10001 portal/ portal/\n",
+            "RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\", \"-p\", \"ryuki-portal-ui\"]\n",
             "FROM debian:bookworm-slim AS runtime\n",
             "WORKDIR /app\n",
             "ENV LEPTOS_SITE_ROOT=/app/site \\\n",
             "    LEPTOS_SITE_ADDR=0.0.0.0:8080\n",
-            "COPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\n",
-            "COPY --from=build /app/target/site /app/site\n",
+            "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\n",
+            "COPY --from=build --chown=10001:10001 /app/target/site /app/site\n",
             "EXPOSE 8080\n",
             "CMD [\"/app/ryuki-portal-ui\"]\n",
         );
@@ -4169,14 +4955,15 @@ async fn main() {}"#
     }
 
     #[test]
-    fn crate_local_non_trunk_dockerfile_is_still_accepted() {
-        // TRIANGULATE: old crate-local Dockerfile (without index.html) still passes
+    fn linked_crate_local_non_trunk_dockerfile_is_still_accepted() {
+        // TRIANGULATE: a crate-local Dockerfile without the retired index still passes.
         let dockerfile = concat!(
             "FROM rust:1.88-bookworm AS build\n",
+            "RUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n",
             "WORKDIR /app\n",
-            "COPY Cargo.toml styles.css ./\n",
-            "COPY src ./src\n",
-            "RUN cargo leptos build --release\n",
+            "COPY --link --chown=10001:10001 Cargo.toml styles.css ./\n",
+            "COPY --link --chown=10001:10001 src ./src\n",
+            "RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\"]\n",
         );
         let json = serde_json::json!({
             "css": "",
@@ -4187,7 +4974,7 @@ async fn main() {}"#
         let errors = result.unwrap();
         assert!(
             !errors.iter().any(|e| e.contains("Trunk")),
-            "Old crate-local non-Trunk Dockerfile should still pass but got: {:?}",
+            "Linked crate-local non-Trunk Dockerfile should still pass but got: {:?}",
             errors
         );
     }
@@ -4196,32 +4983,63 @@ async fn main() {}"#
         r#"#[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum::{routing::get, Router};
+    use axum::{routing::{any, get}, Router};
     use leptos::prelude::*;
     use leptos_axum::{
         file_and_error_handler_with_context, generate_route_list, LeptosRoutes,
     };
     use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::security::{
+        protect_server_function_routes, PortalPublicOrigin, PortalServerFunctionLimits,
+    };
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    use ryuki_portal_ui::upstream::UpstreamClient;
     let configuration = get_configuration(None)?;
     let leptos_options = configuration.leptos_options;
     let address = leptos_options.site_addr;
     let routes = generate_route_list(App);
     let boundary = PortalServerBoundary::static_dry_run();
     boundary.plan_core_platform_reads()?;
+    let public_origin = PortalPublicOrigin::from_env()?;
+    let server_function_limits = PortalServerFunctionLimits::from_env()?;
+    let upstream = UpstreamClient::from_env(&public_origin)?;
+    let upstream_for_server_fns = upstream.clone();
+    let upstream_for_routes = upstream.clone();
+    let upstream_for_fallback = upstream.clone();
+    let server_function_routes = protect_server_function_routes(
+        Router::new().route(
+            "/portal/api/{*fn_name}",
+            any(move |request: axum::extract::Request| {
+                let upstream = upstream_for_server_fns.clone();
+                async move {
+                    leptos_axum::handle_server_fns_with_context(
+                        move || provide_context(upstream.clone()),
+                        request,
+                    )
+                    .await
+                }
+            }),
+        ),
+        public_origin,
+        server_function_limits,
+    );
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
+        .merge(server_function_routes)
         .leptos_routes_with_context(
             &leptos_options,
             routes,
-            || {},
+            move || provide_context(upstream_for_routes.clone()),
             {
                 let leptos_options = leptos_options.clone();
                 move || shell(leptos_options.clone())
             },
         )
-        .fallback(file_and_error_handler_with_context(|| {}, shell))
+        .fallback(file_and_error_handler_with_context(
+            move || provide_context(upstream_for_fallback.clone()),
+            shell,
+        ))
         .with_state(leptos_options);
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app.into_make_service()).await?;

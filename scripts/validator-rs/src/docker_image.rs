@@ -10,6 +10,7 @@
 //! mode baked in.
 
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -17,6 +18,32 @@ const API_EXECUTION_MODE_ENV: &str = "RYUKI_API_EXECUTION_MODE=static-dry-run";
 const PORTAL_EXECUTION_MODE_ENV: &str = "RYUKI_PORTAL_EXECUTION_MODE=static-dry-run";
 const CARGO_CHEF_VERSION: &str = "0.1.77";
 const CARGO_LEPTOS_VERSION: &str = "0.3.7";
+const BASE_CARGO_PATH: &str = "/usr/local/cargo/bin/cargo";
+const BASE_RUSTUP_PATH: &str = "/usr/local/cargo/bin/rustup";
+const PROTECTED_TOOL_ROOT: &str = "/opt/ryuki-tools";
+const BUILD_USER: &str = "10001:10001";
+const BUILD_ENVIRONMENT: &str = "HOME=/home/ryuki-build CARGO_HOME=/var/cache/ryuki-cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:/var/cache/ryuki-cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const API_SOURCE_REVISION_ARG: &str = "RYUKI_SOURCE_REVISION";
+const API_FINAL_BUILD_RUN: &str = concat!(
+    "set -eu; ",
+    "if [ -n \"${RYUKI_SOURCE_REVISION:-}\" ]; then ",
+    "case \"${RYUKI_SOURCE_REVISION}\" in ",
+    "*[!0-9a-f]*) ",
+    "echo \"RYUKI_SOURCE_REVISION must be exactly 40 or 64 lowercase hexadecimal characters\" >&2; ",
+    "exit 1; ",
+    ";; ",
+    "esac; ",
+    "revision_length=\"${#RYUKI_SOURCE_REVISION}\"; ",
+    "if [ \"${revision_length}\" -ne 40 ] && [ \"${revision_length}\" -ne 64 ]; then ",
+    "echo \"RYUKI_SOURCE_REVISION must be exactly 40 or 64 lowercase hexadecimal characters\" >&2; ",
+    "exit 1; ",
+    "fi; ",
+    "export RYUKI_SOURCE_REVISION; ",
+    "else ",
+    "unset RYUKI_SOURCE_REVISION; ",
+    "fi; ",
+    "/usr/local/cargo/bin/cargo build --locked --release -p ryuki-api",
+);
 
 /// `sqlx::migrate!("../../migrations")` in sources/ryuki-api/src/database.rs
 /// embeds the migrations directory at compile time.
@@ -74,7 +101,7 @@ fn validate_api_dockerfile(content: &str, members: &[String]) -> Vec<String> {
         return errors;
     }
     validate_immutable_base_images(content, label, &mut errors);
-    validate_cargo_install_pin(
+    validate_protected_cargo_tool_lifecycle(
         content,
         label,
         "cargo-chef",
@@ -104,7 +131,7 @@ fn validate_portal_dockerfile(content: &str, members: &[String]) -> Vec<String> 
         return errors;
     }
     validate_immutable_base_images(content, label, &mut errors);
-    validate_cargo_install_pin(
+    validate_protected_cargo_tool_lifecycle(
         content,
         label,
         "cargo-leptos",
@@ -280,1179 +307,642 @@ fn is_immutable_image_reference(image: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_cargo_install_pin(
+#[derive(Clone)]
+struct ProtectedToolStage {
+    available: bool,
+    preinstall_clean: bool,
+    portal_prerequisite_seen: bool,
+    external_rust_base: bool,
+    setup_step: usize,
+    environment_locked: bool,
+    workdir_locked: bool,
+    non_root: bool,
+    tainted: bool,
+    stage_protected_use_seen: bool,
+    source_revision_arg_declared: bool,
+    final_build_seen: bool,
+    workdir: String,
+}
+
+impl Default for ProtectedToolStage {
+    fn default() -> Self {
+        Self {
+            available: false,
+            preinstall_clean: true,
+            portal_prerequisite_seen: false,
+            external_rust_base: false,
+            setup_step: 0,
+            environment_locked: false,
+            workdir_locked: false,
+            non_root: false,
+            tainted: false,
+            stage_protected_use_seen: false,
+            source_revision_arg_declared: false,
+            final_build_seen: false,
+            workdir: "/".to_string(),
+        }
+    }
+}
+
+impl ProtectedToolStage {
+    fn ready(&self, setup_steps: usize) -> bool {
+        self.available
+            && self.setup_step == setup_steps
+            && self.environment_locked
+            && self.workdir_locked
+            && self.non_root
+            && !self.tainted
+            && self.workdir == "/app"
+    }
+
+    fn reset_stage_local_state(&mut self) {
+        self.stage_protected_use_seen = false;
+        self.source_revision_arg_declared = false;
+        self.final_build_seen = false;
+    }
+}
+
+/// Prove a finite, least-privilege install-to-use lifecycle for build tools.
+///
+/// The official Rust image exposes root-owned toolchains that are writable
+/// while the image still runs as root. Trying to enumerate every shell,
+/// interpreter, or file-copy primitive that could replace a protected binary
+/// is not a complete defense. This contract therefore admits only a canonical
+/// JSON-exec install and root-hardening sequence, permanently drops to an
+/// unprivileged builder, and keeps every protected use on an immutable absolute
+/// path. Descendant stages inherit both the proof state and any taint.
+fn validate_protected_cargo_tool_lifecycle(
     content: &str,
     label: &str,
     package: &str,
     version: &str,
     errors: &mut Vec<String>,
 ) {
-    if dockerfile_uses_custom_escape_directive(content) {
+    if dockerfile_uses_syntax_frontend_directive(content) {
         errors.push(format!(
-            "{label}: {package} install must use the default Dockerfile escape character so RUN instructions remain directly analyzable"
+            "{label}: protected tool lifecycle does not allow a custom Dockerfile syntax frontend"
         ));
         return;
     }
-    if dockerfile_uses_unsupported_shell_directive(content) {
+    if dockerfile_uses_nondefault_escape_directive(content) {
         errors.push(format!(
-            "{label}: {package} install cannot be validated with a custom Dockerfile SHELL directive"
+            "{label}: protected tool lifecycle requires the default Dockerfile escape character"
         ));
         return;
     }
 
-    let package_with_version = format!("{package}@");
-    let mut installs: Vec<Vec<String>> = Vec::new();
-    let mut total_install_count = 0usize;
-    let mut unresolved_shell_control_flow = false;
+    let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
+    let tool_path = format!("{tool_root}/bin/{package}");
+    let canonical_install = vec![
+        BASE_CARGO_PATH.to_string(),
+        "install".to_string(),
+        package.to_string(),
+        "--version".to_string(),
+        version.to_string(),
+        "--locked".to_string(),
+        "--root".to_string(),
+        tool_root.clone(),
+    ];
+    let expected_uses = canonical_protected_tool_uses(package, &tool_path);
+    let expected_use_stages: &[&str] = match package {
+        "cargo-chef" => &["planner", "build"],
+        "cargo-leptos" => &["build"],
+        _ => &[],
+    };
+    let install_stage = if package == "cargo-chef" {
+        "chef"
+    } else {
+        "build"
+    };
+    let root_setup = canonical_protected_root_setup(&tool_root);
+    let portal_prerequisite = vec![
+        BASE_RUSTUP_PATH.to_string(),
+        "target".to_string(),
+        "add".to_string(),
+        "wasm32-unknown-unknown".to_string(),
+    ];
+
+    let mut stages: HashMap<String, ProtectedToolStage> = HashMap::new();
+    let mut aliases = HashSet::new();
+    let mut current_name: Option<String> = None;
+    let mut current = ProtectedToolStage::default();
+    let mut anonymous_stage = 0usize;
+    let mut install_count = 0usize;
+    let mut prerequisite_count = 0usize;
+    let mut uses_seen = 0usize;
+    let mut api_final_build_count = 0usize;
 
     for instruction in logical_dockerfile_instructions(content) {
-        let Some(separator) = instruction.find(|character: char| character.is_whitespace()) else {
+        let Some(separator) = instruction.find(char::is_whitespace) else {
             continue;
         };
-        let (keyword, run) = instruction.split_at(separator);
-        if !keyword.eq_ignore_ascii_case("RUN") {
+        let (keyword, arguments) = instruction.split_at(separator);
+        let arguments = arguments.trim();
+
+        if keyword.eq_ignore_ascii_case("FROM") {
+            if let Some(name) = current_name.take() {
+                stages.insert(name, current.clone());
+            }
+            let Some((base, alias)) = docker_from_base_and_alias(arguments) else {
+                errors.push(format!(
+                    "{label}: malformed FROM instruction in protected tool lifecycle"
+                ));
+                current = ProtectedToolStage::default();
+                continue;
+            };
+            let inherited = stages.get(&base.to_ascii_lowercase()).cloned();
+            current = inherited.clone().unwrap_or_default();
+            current.external_rust_base =
+                inherited.is_none() && base.starts_with("rust:") && base.contains("@sha256:");
+            if inherited.is_some() {
+                current.reset_stage_local_state();
+            }
+            let (name, named_stage) = alias.map_or_else(
+                || {
+                    anonymous_stage += 1;
+                    (format!("\0anonymous-stage-{anonymous_stage}"), false)
+                },
+                |alias| (alias, true),
+            );
+            let name = name.to_ascii_lowercase();
+            if named_stage && !aliases.insert(name.clone()) {
+                errors.push(format!(
+                    "{label}: duplicate stage alias {name} is not allowed in the protected tool lifecycle"
+                ));
+                current.tainted = true;
+            }
+            current_name = Some(name);
             continue;
         }
-        let Some(run) = docker_run_command_after_options(run.trim()) else {
-            unresolved_shell_control_flow = true;
+
+        if current_name.is_none() {
             continue;
-        };
-        let commands = if let Some(arguments) = docker_json_exec_arguments(run) {
-            if json_exec_has_unresolved_cargo_install(&arguments, package) {
-                unresolved_shell_control_flow = true;
-            }
-            vec![arguments]
-        } else {
-            if shell_run_has_unresolved_cargo_install(run, package) {
-                unresolved_shell_control_flow = true;
-            }
-            split_shell_commands(run)
-        };
-        for command in commands {
-            for arguments in cargo_install_invocations(&command) {
-                total_install_count += 1;
-                if arguments.iter().any(|argument| {
-                    argument == package || argument.starts_with(&package_with_version)
-                }) {
-                    installs.push(arguments);
+        }
+
+        if keyword.eq_ignore_ascii_case("RUN") {
+            let direct_json_exec = arguments.starts_with('[');
+            let json_arguments = direct_json_exec
+                .then(|| docker_json_exec_arguments(arguments))
+                .flatten();
+            let is_install =
+                direct_json_exec && json_arguments.as_ref() == Some(&canonical_install);
+
+            if is_install {
+                install_count += 1;
+                let prerequisite_ready = package != "cargo-leptos"
+                    || (current.portal_prerequisite_seen && prerequisite_count == 1);
+                if install_count != 1
+                    || current.available
+                    || !current.preinstall_clean
+                    || !prerequisite_ready
+                    || !current.external_rust_base
+                    || current_name.as_deref() != Some(install_stage)
+                {
+                    errors.push(format!(
+                        "{label}: {package} must be installed exactly once by canonical JSON exec in the pinned rust {install_stage} stage before any untrusted action"
+                    ));
+                    current.tainted = true;
                 }
+                current.available = true;
+                current.setup_step = 0;
+                continue;
             }
-        }
-    }
 
-    if unresolved_shell_control_flow {
-        errors.push(format!(
-            "{label}: {package} install must be a directly analyzable command; shell control flow or dynamic command construction around cargo install is not allowed"
-        ));
-        return;
-    }
+            let is_portal_prerequisite = package == "cargo-leptos"
+                && !current.available
+                && current.preinstall_clean
+                && current.external_rust_base
+                && current_name.as_deref() == Some(install_stage)
+                && direct_json_exec
+                && json_arguments.as_ref() == Some(&portal_prerequisite);
+            if is_portal_prerequisite {
+                prerequisite_count += 1;
+                if prerequisite_count != 1 || current.portal_prerequisite_seen {
+                    errors.push(format!(
+                        "{label}: the canonical wasm target prerequisite must run exactly once before cargo-leptos installation"
+                    ));
+                    current.tainted = true;
+                }
+                current.portal_prerequisite_seen = true;
+                continue;
+            }
 
-    if total_install_count != 1 {
-        errors.push(format!(
-            "{label}: must contain exactly one cargo install command total while pinning {package}; found {total_install_count}"
-        ));
-        return;
-    }
+            if !current.available {
+                current.preinstall_clean = false;
+                continue;
+            }
 
-    if installs.len() != 1 {
-        errors.push(format!(
-            "{label}: must contain exactly one cargo install command for {package}; found {}",
-            installs.len()
-        ));
-        return;
-    }
+            if current.setup_step < root_setup.len() {
+                if !direct_json_exec
+                    || json_arguments.as_ref() != root_setup.get(current.setup_step)
+                {
+                    errors.push(format!(
+                        "{label}: protected {package} root setup step {} must be the next exact JSON-exec action after installation",
+                        current.setup_step + 1
+                    ));
+                    current.tainted = true;
+                } else {
+                    current.setup_step += 1;
+                }
+                continue;
+            }
 
-    let arguments = &installs[0];
-    let package_count = arguments
-        .iter()
-        .filter(|argument| argument.as_str() == package)
-        .count();
-    let locked_count = arguments
-        .iter()
-        .filter(|argument| argument.as_str() == "--locked")
-        .count();
-    let mut versions = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let argument = &arguments[index];
-        if argument == "--version" {
-            versions.push(arguments.get(index + 1).map_or("", String::as_str));
-            index += 2;
+            let invokes_protected_path = json_arguments
+                .as_ref()
+                .and_then(|arguments| arguments.first())
+                == Some(&tool_path);
+            if invokes_protected_path {
+                let expected = expected_uses.get(uses_seen);
+                let expected_stage = expected_use_stages.get(uses_seen).copied();
+                if !direct_json_exec
+                    || !current.ready(root_setup.len())
+                    || current.stage_protected_use_seen
+                    || expected != json_arguments.as_ref()
+                    || expected_stage != current_name.as_deref()
+                {
+                    errors.push(format!(
+                        "{label}: protected {package} use must be the canonical JSON-exec action in its required non-root stage inheriting an untainted immutable install"
+                    ));
+                    current.tainted = true;
+                } else {
+                    current.stage_protected_use_seen = true;
+                    uses_seen += 1;
+                }
+                continue;
+            }
+
+            let is_api_final_build = package == "cargo-chef"
+                && current_name.as_deref() == Some("build")
+                && current.stage_protected_use_seen
+                && current.source_revision_arg_declared
+                && !current.final_build_seen
+                && arguments == API_FINAL_BUILD_RUN;
+            if is_api_final_build && current.ready(root_setup.len()) {
+                current.final_build_seen = true;
+                api_final_build_count += 1;
+                continue;
+            }
+
+            errors.push(format!(
+                "{label}: arbitrary RUN instructions are forbidden once protected {package} installation begins"
+            ));
+            current.tainted = true;
             continue;
         }
-        if let Some(value) = argument.strip_prefix("--version=") {
-            versions.push(value);
+
+        if !current.available {
+            current.preinstall_clean = false;
+            continue;
         }
-        index += 1;
+
+        let stage_is_closed = current.final_build_seen
+            || (current.stage_protected_use_seen
+                && (package == "cargo-leptos" || current_name.as_deref() == Some("planner")));
+        if stage_is_closed {
+            errors.push(format!(
+                "{label}: no instruction is allowed after the final protected {package} action in this build stage"
+            ));
+            current.tainted = true;
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("ENV") {
+            if current.setup_step == root_setup.len()
+                && !current.environment_locked
+                && !current.workdir_locked
+                && !current.non_root
+                && arguments == BUILD_ENVIRONMENT
+            {
+                current.environment_locked = true;
+            } else {
+                errors.push(format!(
+                    "{label}: protected {package} stages permit only the canonical locked HOME/CARGO_HOME/RUSTUP_HOME/PATH environment before privilege drop"
+                ));
+                current.tainted = true;
+            }
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("WORKDIR") {
+            if arguments == "/app"
+                && current.environment_locked
+                && (!current.workdir_locked || current.non_root)
+            {
+                current.workdir = "/app".to_string();
+                current.workdir_locked = true;
+            } else {
+                errors.push(format!(
+                    "{label}: protected {package} stages must use the literal WORKDIR /app after locking the builder environment"
+                ));
+                current.tainted = true;
+            }
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("USER") {
+            if arguments == BUILD_USER
+                && current.setup_step == root_setup.len()
+                && current.environment_locked
+                && current.workdir_locked
+                && !current.non_root
+            {
+                current.non_root = true;
+            } else {
+                errors.push(format!(
+                    "{label}: protected {package} stages must drop permanently to USER {BUILD_USER} after root setup"
+                ));
+                current.tainted = true;
+            }
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("COPY") {
+            let valid_copy = docker_link_copy_destination(arguments)
+                .and_then(|destination| normalize_docker_path(&current.workdir, &destination))
+                .is_some_and(|destination| {
+                    current.ready(root_setup.len())
+                        && (destination == "/app" || destination.starts_with("/app/"))
+                        && !paths_overlap(&destination, &tool_root)
+                        && !paths_overlap(&destination, "/usr/local/cargo")
+                });
+            if !valid_copy {
+                errors.push(format!(
+                    "{label}: protected {package} COPY must use literal --link --chown={BUILD_USER} shell syntax after privilege drop and a static /app destination"
+                ));
+                current.tainted = true;
+            }
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("ARG")
+            && package == "cargo-chef"
+            && current_name.as_deref() == Some("build")
+            && current.ready(root_setup.len())
+            && current.stage_protected_use_seen
+            && !current.source_revision_arg_declared
+            && !current.final_build_seen
+            && arguments == API_SOURCE_REVISION_ARG
+        {
+            current.source_revision_arg_declared = true;
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("ADD") {
+            errors.push(format!(
+                "{label}: ADD is forbidden in protected {package} stages; use canonical COPY --link --chown={BUILD_USER} under /app"
+            ));
+        } else {
+            errors.push(format!(
+                "{label}: {keyword} is not allowed after protected {package} installation"
+            ));
+        }
+        current.tainted = true;
     }
 
-    if package_count != 1
-        || locked_count != 1
-        || versions.len() != 1
-        || versions.first().copied() != Some(version)
-        || arguments
-            .iter()
-            .any(|argument| is_forbidden_cargo_source_flag(argument))
-        || arguments
-            .iter()
-            .any(|argument| argument.starts_with(&package_with_version))
-    {
+    if let Some(name) = current_name {
+        stages.insert(name, current);
+    }
+    if install_count != 1 {
         errors.push(format!(
-            "{label}: {package} must be installed once with literal --version {version} and exactly one --locked"
+            "{label}: expected one canonical JSON-exec {package} install rooted at {tool_root}; found {install_count}"
+        ));
+    }
+    if package == "cargo-leptos" && prerequisite_count != 1 {
+        errors.push(format!(
+            "{label}: expected one canonical JSON-exec wasm32-unknown-unknown rustup prerequisite; found {prerequisite_count}"
+        ));
+    }
+    if package == "cargo-chef" && api_final_build_count != 1 {
+        errors.push(format!(
+            "{label}: expected one canonical non-root absolute-path ryuki-api build; found {api_final_build_count}"
+        ));
+    }
+    if uses_seen != expected_uses.len() {
+        errors.push(format!(
+            "{label}: expected {} canonical absolute-path {package} uses; found {uses_seen}",
+            expected_uses.len()
         ));
     }
 }
 
-fn is_forbidden_cargo_source_flag(argument: &str) -> bool {
-    [
-        "--git",
-        "--path",
-        "--registry",
-        "--index",
-        "--branch",
-        "--tag",
-        "--rev",
+fn canonical_protected_root_setup(tool_root: &str) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "/usr/sbin/groupadd".to_string(),
+            "--system".to_string(),
+            "--gid".to_string(),
+            "10001".to_string(),
+            "ryuki-build".to_string(),
+        ],
+        vec![
+            "/usr/sbin/useradd".to_string(),
+            "--system".to_string(),
+            "--uid".to_string(),
+            "10001".to_string(),
+            "--gid".to_string(),
+            "ryuki-build".to_string(),
+            "--create-home".to_string(),
+            "--home-dir".to_string(),
+            "/home/ryuki-build".to_string(),
+            "--shell".to_string(),
+            "/usr/sbin/nologin".to_string(),
+            "ryuki-build".to_string(),
+        ],
+        vec![
+            "/usr/bin/install".to_string(),
+            "-d".to_string(),
+            "-o".to_string(),
+            "10001".to_string(),
+            "-g".to_string(),
+            "10001".to_string(),
+            "-m".to_string(),
+            "0755".to_string(),
+            "/app".to_string(),
+            "/var/cache/ryuki-cargo".to_string(),
+        ],
+        vec![
+            "/usr/bin/chown".to_string(),
+            "-R".to_string(),
+            "0:0".to_string(),
+            tool_root.to_string(),
+            "/usr/local/cargo".to_string(),
+            "/usr/local/rustup".to_string(),
+        ],
+        vec![
+            "/usr/bin/chmod".to_string(),
+            "-R".to_string(),
+            "a-w".to_string(),
+            tool_root.to_string(),
+            "/usr/local/cargo".to_string(),
+            "/usr/local/rustup".to_string(),
+        ],
     ]
-    .iter()
-    .any(|flag| {
-        argument == *flag
-            || argument
-                .strip_prefix(*flag)
-                .is_some_and(|rest| rest.starts_with('='))
-    })
 }
 
-fn dockerfile_uses_custom_escape_directive(content: &str) -> bool {
+fn canonical_protected_tool_uses(package: &str, tool_path: &str) -> Vec<Vec<String>> {
+    match package {
+        "cargo-chef" => vec![
+            vec![
+                tool_path.to_string(),
+                "chef".to_string(),
+                "prepare".to_string(),
+                "--recipe-path".to_string(),
+                "recipe.json".to_string(),
+            ],
+            vec![
+                tool_path.to_string(),
+                "chef".to_string(),
+                "cook".to_string(),
+                "--locked".to_string(),
+                "--release".to_string(),
+                "--recipe-path".to_string(),
+                "recipe.json".to_string(),
+                "--package".to_string(),
+                "ryuki-api".to_string(),
+            ],
+        ],
+        "cargo-leptos" => vec![vec![
+            tool_path.to_string(),
+            "build".to_string(),
+            "--release".to_string(),
+            "-p".to_string(),
+            "ryuki-portal-ui".to_string(),
+        ]],
+        _ => Vec::new(),
+    }
+}
+
+fn docker_from_base_and_alias(arguments: &str) -> Option<(String, Option<String>)> {
+    let fields: Vec<&str> = arguments.split_whitespace().collect();
+    let base_index = fields.iter().position(|field| !field.starts_with("--"))?;
+    let base = fields.get(base_index)?.to_ascii_lowercase();
+    let alias = fields
+        .get(base_index + 1)
+        .filter(|field| field.eq_ignore_ascii_case("AS"))
+        .and_then(|_| fields.get(base_index + 2))
+        .map(|alias| alias.to_ascii_lowercase());
+    Some((base, alias))
+}
+
+fn docker_link_copy_destination(arguments: &str) -> Option<String> {
+    let arguments = arguments.trim();
+    if arguments
+        .chars()
+        .any(|character| matches!(character, '"' | '\'' | '[' | ']' | '\\'))
+    {
+        return None;
+    }
+    let mut fields = arguments.split_whitespace().peekable();
+    let mut has_link = false;
+    let mut has_chown = false;
+    let mut has_from = false;
+    while fields.peek().is_some_and(|field| field.starts_with("--")) {
+        let option = fields.next()?;
+        if option == "--link" {
+            if has_link {
+                return None;
+            }
+            has_link = true;
+            continue;
+        }
+        let (name, value) = option.split_once('=')?;
+        let allowed = match name {
+            "--from" => {
+                let valid = !has_from
+                    && !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                    });
+                has_from = true;
+                valid
+            }
+            "--chown" => {
+                let valid = !has_chown && value == BUILD_USER;
+                has_chown = true;
+                valid
+            }
+            _ => false,
+        };
+        if !allowed {
+            return None;
+        }
+    }
+    let paths: Vec<&str> = fields.collect();
+    (has_link && has_chown && paths.len() >= 2).then(|| paths[paths.len() - 1].to_string())
+}
+
+fn normalize_docker_path(workdir: &str, path: &str) -> Option<String> {
+    if path.is_empty()
+        || path.contains('$')
+        || path.contains('*')
+        || path.contains('?')
+        || path.contains('[')
+        || path.split('/').any(|component| component == "..")
+    {
+        return None;
+    }
+    let combined = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{path}", workdir.trim_end_matches('/'))
+    };
+    let mut components = Vec::new();
+    for component in combined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            component => components.push(component),
+        }
+    }
+    Some(format!("/{}", components.join("/")))
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == "/"
+        || right == "/"
+        || left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+fn dockerfile_uses_nondefault_escape_directive(content: &str) -> bool {
     for raw in content.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
         let Some(comment) = line.strip_prefix('#') else {
-            return false;
+            break;
         };
-        let Some((name, value)) = comment.split_once('=') else {
+        let Some((name, value)) = comment.trim().split_once('=') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("escape") {
-            return value.trim() != "\\";
+        if name.trim().eq_ignore_ascii_case("escape") && value.trim() != "\\" {
+            return true;
         }
     }
     false
 }
 
-fn dockerfile_uses_unsupported_shell_directive(content: &str) -> bool {
-    logical_dockerfile_instructions(content)
-        .into_iter()
-        .filter_map(|instruction| {
-            let separator = instruction.find(char::is_whitespace)?;
-            let (keyword, arguments) = instruction.split_at(separator);
-            keyword
-                .eq_ignore_ascii_case("SHELL")
-                .then(|| arguments.trim().to_owned())
-        })
-        .any(|arguments| {
-            serde_json::from_str::<Vec<String>>(&arguments).map_or(true, |arguments| {
-                arguments.len() != 2
-                    || !matches!(arguments[0].as_str(), "/bin/sh" | "sh")
-                    || arguments[1] != "-c"
-            })
-        })
-}
-
-/// Reject target-tool installs embedded in shell grammar that this validator
-/// intentionally does not try to execute or fully parse. Without this guard,
-/// a Dockerfile could keep one valid direct pin while hiding a later
-/// replacement install behind `if`, `case`, a loop, a function, or a
-/// subshell; the direct-command collector would see only the harmless pin.
-fn shell_run_has_unresolved_cargo_install(run: &str, package: &str) -> bool {
-    analyze_shell_install(run, package, 0).unresolved
-}
-
-#[derive(Default)]
-struct ShellInstallAnalysis {
-    has_target_install: bool,
-    unresolved: bool,
-}
-
-struct ShellSyntax {
-    commands: Vec<Vec<ShellSyntaxWord>>,
-    has_control_flow: bool,
-    has_pipeline: bool,
-    has_heredoc: bool,
-}
-
-struct ShellSyntaxWord {
-    value: String,
-    quoted: bool,
-    expanded: bool,
-}
-
-fn analyze_shell_install(run: &str, package: &str, depth: usize) -> ShellInstallAnalysis {
-    if depth > 8 {
-        return ShellInstallAnalysis {
-            has_target_install: true,
-            unresolved: true,
-        };
-    }
-
-    let syntax = shell_syntax(run);
-    if syntax.has_heredoc {
-        return ShellInstallAnalysis {
-            has_target_install: true,
-            unresolved: true,
-        };
-    }
-
-    let package_is_present = syntax
-        .commands
-        .iter()
-        .flatten()
-        .any(|word| shell_syntax_word_is_package(word, package));
-    let constructed_target_install = syntax
-        .commands
-        .iter()
-        .flatten()
-        .any(|word| shell_assignment_constructs_target_install(word, package));
-    let has_install_word = syntax
-        .commands
-        .iter()
-        .flatten()
-        .any(|word| !word.quoted && word.value == "install");
-    let cargo_has_dynamic_argv = syntax.commands.iter().any(|command| {
-        command.iter().enumerate().any(|(index, word)| {
-            !word.expanded
-                && executable_name(&word.value) == "cargo"
-                && command[index + 1..].iter().any(|argument| {
-                    argument.expanded && shell_word_is_positional_parameter(&argument.value)
-                })
-        })
-    });
-    let mut analysis = ShellInstallAnalysis::default();
-
-    for command in &syntax.commands {
-        let (mut command_has_target, positional_expansion) =
-            shell_command_has_target_install(command, package);
-        let directly_embedded_target = command_has_target;
-        let (executable_index, has_unsafe_wrapper) = shell_effective_executable_index(command);
-
-        for script in command
-            .iter()
-            .filter(|word| word.expanded)
-            .flat_map(|word| shell_command_substitution_bodies(&word.value))
-        {
-            let nested = analyze_shell_install(&script, package, depth + 1);
-            command_has_target |= nested.has_target_install;
-            analysis.unresolved |= nested.has_target_install || nested.unresolved;
-        }
-
-        if let Some(script) = shell_env_split_string(command) {
-            let nested = analyze_shell_install(script, package, depth + 1);
-            command_has_target |= nested.has_target_install;
-            analysis.unresolved |= nested.unresolved;
-        }
-
-        if let Some(index) = executable_index {
-            let executable = executable_name(&command[index].value);
-            if command[index].expanded && !command[index].quoted {
-                // Unquoted executable expansion can field-split into an
-                // arbitrary executable, subcommand, and package argv sourced
-                // from ENV/ARG values outside this RUN instruction.
-                command_has_target = true;
-                analysis.unresolved = true;
-            }
-            if directly_embedded_target && executable != "cargo" {
-                let shell_positional_execution = if is_shell_executable(executable) {
-                    shell_syntax_command_string(command, index)
-                        .is_some_and(shell_script_uses_positional_command)
-                } else if executable == "busybox"
-                    && command
-                        .get(index + 1)
-                        .is_some_and(|word| is_shell_executable(executable_name(&word.value)))
-                {
-                    shell_syntax_command_string(command, index + 1)
-                        .is_some_and(shell_script_uses_positional_command)
-                } else {
-                    true
-                };
-                analysis.unresolved |= shell_positional_execution;
-            }
-            if command[index].expanded {
-                if let Some(script_word) = shell_syntax_command_word(command, index) {
-                    if script_word.expanded {
-                        command_has_target = true;
-                        analysis.unresolved = true;
-                    } else {
-                        let nested = analyze_shell_install(&script_word.value, package, depth + 1);
-                        command_has_target |= nested.has_target_install;
-                        analysis.unresolved |= nested.has_target_install || nested.unresolved;
-                    }
-                }
-            } else if is_shell_executable(executable) {
-                if let Some(script_word) = shell_syntax_command_word(command, index) {
-                    if script_word.expanded {
-                        command_has_target = true;
-                        analysis.unresolved = true;
-                    } else {
-                        let nested = analyze_shell_install(&script_word.value, package, depth + 1);
-                        command_has_target |= nested.has_target_install;
-                        analysis.unresolved |= nested.unresolved
-                            || (is_alternate_shell_executable(executable)
-                                && nested.has_target_install);
-                    }
-                } else {
-                    command_has_target = true;
-                    analysis.unresolved = true;
-                }
-            } else if executable == "busybox"
-                && command
-                    .get(index + 1)
-                    .is_some_and(|word| is_shell_executable(executable_name(&word.value)))
-            {
-                if let Some(script_word) = shell_syntax_command_word(command, index + 1) {
-                    if script_word.expanded {
-                        command_has_target = true;
-                        analysis.unresolved = true;
-                    } else {
-                        let nested = analyze_shell_install(&script_word.value, package, depth + 1);
-                        command_has_target |= nested.has_target_install;
-                        analysis.unresolved |= nested.has_target_install || nested.unresolved;
-                    }
-                } else {
-                    command_has_target = true;
-                    analysis.unresolved = true;
-                }
-            } else if executable == "eval" {
-                let script = command[index + 1..]
-                    .iter()
-                    .map(|word| word.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let nested = analyze_shell_install(&script, package, depth + 1);
-                command_has_target |= nested.has_target_install;
-                analysis.unresolved |= nested.has_target_install || nested.unresolved;
-            } else if matches!(executable, "." | "source") {
-                command_has_target = true;
-                analysis.unresolved = true;
-            } else if executable == "xargs" && shell_command_contains_cargo_install(command) {
-                // xargs can obtain the package operand from stdin, so the
-                // target cannot be proven even when it is absent from argv.
-                command_has_target = true;
-                analysis.unresolved = true;
-            }
-        }
-
-        if command_has_target {
-            analysis.has_target_install = true;
-            analysis.unresolved |= positional_expansion || has_unsafe_wrapper;
-        }
-    }
-
-    if syntax.has_pipeline
-        && syntax
-            .commands
-            .iter()
-            .any(|command| shell_command_is_interpreter_sink(command))
-    {
-        analysis.has_target_install = true;
-        analysis.unresolved = true;
-    }
-
-    if package_is_present
-        && syntax.commands.iter().any(|command| {
-            let (index, _) = shell_effective_executable_index(command);
-            index.is_some_and(|index| {
-                command[index].expanded
-                    && command
-                        .get(index + 1)
-                        .is_some_and(|word| word.value == "install" || word.expanded)
-            })
-        })
-    {
-        analysis.has_target_install = true;
-        analysis.unresolved = true;
-    }
-
-    if constructed_target_install
-        && syntax.commands.iter().any(|command| {
-            let (index, _) = shell_effective_executable_index(command);
-            index.is_some_and(|index| command[index].expanded)
-        })
-    {
-        analysis.has_target_install = true;
-        analysis.unresolved = true;
-    }
-
-    if package_is_present && has_install_word && cargo_has_dynamic_argv {
-        analysis.has_target_install = true;
-        analysis.unresolved = true;
-    }
-
-    if analysis.has_target_install && (syntax.has_control_flow || syntax.has_pipeline) {
-        analysis.unresolved = true;
-    }
-    analysis
-}
-
-fn shell_command_has_target_install(command: &[ShellSyntaxWord], package: &str) -> (bool, bool) {
-    for (index, word) in command.iter().enumerate() {
-        if !word.expanded && executable_name(&word.value) == "cargo" {
-            let Some(subcommand_index) = shell_cargo_install_subcommand_index(command, index)
-            else {
-                if command.get(index + 1).is_some_and(|subcommand| {
-                    subcommand.expanded
-                        && (!subcommand.quoted
-                            || command[index + 2..].iter().any(|argument| {
-                                argument.expanded || shell_syntax_word_is_package(argument, package)
-                            }))
-                }) {
-                    return (true, true);
-                }
-                continue;
-            };
-            if command[subcommand_index + 1..]
-                .iter()
-                .any(|argument| is_forbidden_cargo_source_flag(&argument.value))
-            {
-                return (true, false);
-            }
-            let (has_literal_target, has_dynamic_target) =
-                shell_cargo_install_target_operands(&command[subcommand_index + 1..], package);
-            if has_literal_target || has_dynamic_target {
-                return (true, has_dynamic_target);
-            }
-        }
-
-        if word.expanded {
-            let Some(subcommand) = command.get(index + 1) else {
-                continue;
-            };
-            if (subcommand.value == "install" || subcommand.expanded)
-                && command[index + 2..].iter().any(|argument| {
-                    argument.expanded || shell_syntax_word_is_package(argument, package)
-                })
-            {
-                return (true, true);
-            }
-        }
-    }
-    (false, false)
-}
-
-fn shell_command_contains_cargo_install(command: &[ShellSyntaxWord]) -> bool {
-    command.iter().enumerate().any(|(index, word)| {
-        !word.expanded
-            && executable_name(&word.value) == "cargo"
-            && shell_cargo_install_subcommand_index(command, index).is_some()
-    })
-}
-
-fn shell_cargo_install_subcommand_index(
-    command: &[ShellSyntaxWord],
-    cargo_index: usize,
-) -> Option<usize> {
-    let mut index = cargo_index + 1;
-    if command
-        .get(index)
-        .is_some_and(|word| !word.expanded && word.value.starts_with('+'))
-    {
-        index += 1;
-    }
-    loop {
-        let word = command.get(index)?;
-        if word.expanded {
-            return None;
-        }
-        if word.value == "install" {
-            return Some(index);
-        }
-        if cargo_global_option_consumes_value(&word.value) {
-            index += 2;
+fn dockerfile_uses_syntax_frontend_directive(content: &str) -> bool {
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
             continue;
         }
-        if word.value.starts_with('-') && word.value != "--" {
-            index += 1;
-            continue;
-        }
-        return None;
-    }
-}
-
-fn cargo_global_option_consumes_value(option: &str) -> bool {
-    matches!(option, "--color" | "--config" | "-Z")
-}
-
-fn shell_cargo_install_target_operands(
-    arguments: &[ShellSyntaxWord],
-    package: &str,
-) -> (bool, bool) {
-    let mut literal_target = false;
-    let mut dynamic_target = false;
-    let mut options = true;
-    let mut index = 0;
-
-    while let Some(argument) = arguments.get(index) {
-        if let Some(consumes_following_operand) =
-            shell_redirection_consumes_following_operand(&argument.value)
-        {
-            index += if consumes_following_operand { 2 } else { 1 };
-            continue;
-        }
-        if options && argument.value == "--" {
-            options = false;
-            index += 1;
-            continue;
-        }
-        if options && cargo_install_option_consumes_value(&argument.value) {
-            index += 2;
-            continue;
-        }
-        if options && argument.value.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        literal_target |= shell_syntax_word_is_package(argument, package);
-        dynamic_target |= argument.expanded;
-        index += 1;
-    }
-    (literal_target, dynamic_target)
-}
-
-fn shell_redirection_consumes_following_operand(word: &str) -> Option<bool> {
-    let redirection = word.trim_start_matches(|character: char| character.is_ascii_digit());
-    if redirection.starts_with(">&") || redirection.starts_with("<&") {
-        return Some(false);
-    }
-    for operator in ["&>>", "&>", "<>", ">>", "<<", ">", "<"] {
-        if let Some(operand) = redirection.strip_prefix(operator) {
-            return Some(operand.is_empty());
-        }
-    }
-    None
-}
-
-fn cargo_install_option_consumes_value(option: &str) -> bool {
-    matches!(
-        option,
-        "--version"
-            | "--root"
-            | "--path"
-            | "--git"
-            | "--branch"
-            | "--tag"
-            | "--rev"
-            | "--registry"
-            | "--index"
-            | "--target"
-            | "--target-dir"
-            | "--bin"
-            | "--example"
-            | "--features"
-            | "--profile"
-            | "--jobs"
-            | "--config"
-            | "--color"
-            | "-j"
-            | "-F"
-            | "-Z"
-    )
-}
-
-fn shell_assignment_constructs_target_install(word: &ShellSyntaxWord, package: &str) -> bool {
-    let Some((_, value)) = word.value.split_once('=') else {
-        return false;
-    };
-    let words: Vec<ShellSyntaxWord> = value
-        .split_whitespace()
-        .map(|value| ShellSyntaxWord {
-            value: value.to_string(),
-            quoted: false,
-            expanded: false,
-        })
-        .collect();
-    shell_command_has_target_install(&words, package).0
-}
-
-fn shell_command_substitution_bodies(value: &str) -> Vec<String> {
-    let characters: Vec<char> = value.chars().collect();
-    let mut bodies = Vec::new();
-    let mut index = 0;
-
-    while index < characters.len() {
-        if characters[index] == '`' {
-            let start = index + 1;
-            index = start;
-            while index < characters.len() && characters[index] != '`' {
-                if characters[index] == '\\' {
-                    index += 1;
-                }
-                index += 1;
-            }
-            if index <= characters.len() {
-                bodies.push(characters[start..index].iter().collect());
-            }
-            index += 1;
-            continue;
-        }
-        if characters[index] != '$'
-            || characters.get(index + 1) != Some(&'(')
-            || characters.get(index + 2) == Some(&'(')
-        {
-            index += 1;
-            continue;
-        }
-
-        let start = index + 2;
-        index = start;
-        let mut depth = 1usize;
-        let mut quote: Option<char> = None;
-        let mut escaped = false;
-        while index < characters.len() {
-            let character = characters[index];
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if let Some(delimiter) = quote {
-                if character == delimiter {
-                    quote = None;
-                }
-            } else if matches!(character, '\'' | '"') {
-                quote = Some(character);
-            } else if character == '(' {
-                depth += 1;
-            } else if character == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            index += 1;
-        }
-        if depth == 0 {
-            bodies.push(characters[start..index].iter().collect());
-        }
-        index += 1;
-    }
-    bodies
-}
-
-fn shell_command_is_interpreter_sink(command: &[ShellSyntaxWord]) -> bool {
-    let (Some(index), _) = shell_effective_executable_index(command) else {
-        return false;
-    };
-    let executable = executable_name(&command[index].value);
-    is_shell_executable(executable)
-        || executable == "xargs"
-        || matches!(executable, "." | "source")
-        || (executable == "busybox"
-            && command
-                .get(index + 1)
-                .is_some_and(|word| is_shell_executable(executable_name(&word.value))))
-}
-
-fn shell_script_uses_positional_command(script: &str) -> bool {
-    let syntax = shell_syntax(script);
-    syntax.commands.iter().any(|command| {
-        let (Some(index), _) = shell_effective_executable_index(command) else {
-            return false;
-        };
-        command[index].expanded && shell_word_is_positional_parameter(&command[index].value)
-    })
-}
-
-fn shell_word_is_positional_parameter(value: &str) -> bool {
-    let parameter = value
-        .strip_prefix("${")
-        .and_then(|value| value.strip_suffix('}'))
-        .or_else(|| value.strip_prefix('$'))
-        .unwrap_or(value);
-    let parameter = parameter.strip_prefix('!').unwrap_or(parameter);
-    matches!(parameter, "@" | "*")
-        || (!parameter.is_empty() && parameter.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-fn shell_syntax_word_is_package(word: &ShellSyntaxWord, package: &str) -> bool {
-    let package_with_version = format!("{package}@");
-    word.value == package
-        || word.value.starts_with(&package_with_version)
-        || word
-            .value
-            .split_once('=')
-            .is_some_and(|(_, value)| value == package || value.starts_with(&package_with_version))
-}
-
-fn shell_effective_executable_index(command: &[ShellSyntaxWord]) -> (Option<usize>, bool) {
-    let mut index = 0;
-    let mut has_unsafe_wrapper = false;
-
-    loop {
-        while command
-            .get(index)
-            .is_some_and(|word| is_shell_assignment(&word.value))
-        {
-            index += 1;
-        }
-        let Some(executable) = command.get(index).map(|word| executable_name(&word.value)) else {
-            return (None, has_unsafe_wrapper);
-        };
-        match executable {
-            "command" => {
-                index += 1;
-                while let Some(option) = command.get(index) {
-                    if matches!(option.value.as_str(), "-v" | "-V") {
-                        return (None, has_unsafe_wrapper);
-                    }
-                    if option.value == "--" || option.value == "-p" || option.value.starts_with('-')
-                    {
-                        index += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            "env" => {
-                index += 1;
-                let mut options = true;
-                loop {
-                    let Some(argument) = command.get(index) else {
-                        return (None, has_unsafe_wrapper);
-                    };
-                    if is_shell_assignment(&argument.value) {
-                        index += 1;
-                        continue;
-                    }
-                    if options && argument.value == "--" {
-                        options = false;
-                        index += 1;
-                        continue;
-                    }
-                    if options
-                        && matches!(argument.value.as_str(), "-u" | "--unset" | "-C" | "--chdir")
-                    {
-                        index += 2;
-                        continue;
-                    }
-                    if options && argument.value.starts_with('-') {
-                        index += 1;
-                        continue;
-                    }
-                    break;
-                }
-            }
-            "exec" => {
-                has_unsafe_wrapper = true;
-                index += 1;
-            }
-            _ => return (Some(index), has_unsafe_wrapper),
-        }
-    }
-}
-
-fn shell_env_split_string(command: &[ShellSyntaxWord]) -> Option<&str> {
-    let mut index = 0;
-    while command
-        .get(index)
-        .is_some_and(|word| is_shell_assignment(&word.value))
-    {
-        index += 1;
-    }
-    if command
-        .get(index)
-        .is_some_and(|word| executable_name(&word.value) == "command")
-    {
-        index += 1;
-        while command
-            .get(index)
-            .is_some_and(|word| word.value.starts_with('-'))
-        {
-            index += 1;
-        }
-    }
-    if !command
-        .get(index)
-        .is_some_and(|word| executable_name(&word.value) == "env")
-    {
-        return None;
-    }
-
-    for (option_index, option) in command.iter().enumerate().skip(index + 1) {
-        if matches!(option.value.as_str(), "-S" | "--split-string") {
-            return command
-                .get(option_index + 1)
-                .map(|word| word.value.as_str());
-        }
-        if let Some(script) = option.value.strip_prefix("--split-string=") {
-            return Some(script);
-        }
-    }
-    None
-}
-
-fn shell_syntax_command_word(
-    command: &[ShellSyntaxWord],
-    shell_index: usize,
-) -> Option<&ShellSyntaxWord> {
-    command
-        .iter()
-        .enumerate()
-        .skip(shell_index + 1)
-        .find(|(_, option)| {
-            option.value.starts_with('-')
-                && !option.value.starts_with("--")
-                && option.value[1..].bytes().any(|byte| byte == b'c')
-        })
-        .and_then(|(index, _)| command.get(index + 1))
-}
-
-fn shell_syntax_command_string(command: &[ShellSyntaxWord], shell_index: usize) -> Option<&str> {
-    shell_syntax_command_word(command, shell_index).map(|word| word.value.as_str())
-}
-
-fn is_shell_executable(executable: &str) -> bool {
-    matches!(
-        executable,
-        "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish"
-    )
-}
-
-fn is_alternate_shell_executable(executable: &str) -> bool {
-    is_shell_executable(executable) && !matches!(executable, "sh" | "bash")
-}
-
-fn append_balanced_shell_expansion(
-    value: &mut String,
-    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    opening: char,
-    closing: char,
-) {
-    if characters.peek() != Some(&opening) {
-        return;
-    }
-    value.push(characters.next().expect("peeked expansion delimiter"));
-    let mut depth = 1usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-
-    for character in characters.by_ref() {
-        value.push(character);
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            quote = Some(character);
-        } else if character == opening {
-            depth += 1;
-        } else if character == closing {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-    }
-}
-
-fn append_backtick_shell_expansion(
-    value: &mut String,
-    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) {
-    let mut escaped = false;
-    for character in characters.by_ref() {
-        value.push(character);
-        if escaped {
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '`' {
+        let Some(comment) = line.strip_prefix('#') else {
             break;
-        }
-    }
-}
-
-fn shell_syntax(run: &str) -> ShellSyntax {
-    fn push_word(
-        value: &mut String,
-        quoted: &mut bool,
-        expanded: &mut bool,
-        command: &mut Vec<ShellSyntaxWord>,
-    ) {
-        if !value.is_empty() {
-            command.push(ShellSyntaxWord {
-                value: std::mem::take(value),
-                quoted: std::mem::take(quoted),
-                expanded: std::mem::take(expanded),
-            });
-        }
-    }
-
-    fn push_command(
-        value: &mut String,
-        quoted: &mut bool,
-        expanded: &mut bool,
-        command: &mut Vec<ShellSyntaxWord>,
-        commands: &mut Vec<Vec<ShellSyntaxWord>>,
-    ) {
-        push_word(value, quoted, expanded, command);
-        if !command.is_empty() {
-            commands.push(std::mem::take(command));
-        }
-    }
-
-    let mut commands = Vec::new();
-    let mut command = Vec::new();
-    let mut value = String::new();
-    let mut word_quoted = false;
-    let mut word_expanded = false;
-    let mut quote: Option<char> = None;
-    let mut has_control_flow = false;
-    let mut has_pipeline = false;
-    let mut has_heredoc = false;
-    let mut characters = run.chars().peekable();
-
-    while let Some(character) = characters.next() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            } else if delimiter == '"' && character == '\\' {
-                word_quoted = true;
-                if let Some(escaped) = characters.next() {
-                    value.push(escaped);
-                }
-            } else {
-                if delimiter == '"' && matches!(character, '$' | '`') {
-                    word_expanded = true;
-                    if character == '`' {
-                        has_control_flow = true;
-                    }
-                }
-                value.push(character);
-            }
+        };
+        let Some((name, _)) = comment.trim().split_once('=') else {
             continue;
-        }
-
-        match character {
-            '\\' => {
-                word_quoted = true;
-                if let Some(escaped) = characters.next() {
-                    value.push(escaped);
-                }
-            }
-            '\'' | '"' => {
-                word_quoted = true;
-                quote = Some(character);
-            }
-            '$' => {
-                word_expanded = true;
-                value.push(character);
-                if characters.peek() == Some(&'{') {
-                    append_balanced_shell_expansion(&mut value, &mut characters, '{', '}');
-                } else if characters.peek() == Some(&'(') {
-                    has_control_flow = true;
-                    append_balanced_shell_expansion(&mut value, &mut characters, '(', ')');
-                }
-            }
-            '`' => {
-                word_expanded = true;
-                has_control_flow = true;
-                value.push(character);
-                append_backtick_shell_expansion(&mut value, &mut characters);
-            }
-            '<' if characters.peek() == Some(&'<') => {
-                characters.next();
-                has_heredoc = true;
-                value.push_str("<<");
-            }
-            ';' => push_command(
-                &mut value,
-                &mut word_quoted,
-                &mut word_expanded,
-                &mut command,
-                &mut commands,
-            ),
-            '|' => {
-                let logical_or = characters.peek() == Some(&'|');
-                if logical_or {
-                    characters.next();
-                } else {
-                    has_pipeline = true;
-                    if characters.peek() == Some(&'&') {
-                        characters.next();
-                    }
-                }
-                push_command(
-                    &mut value,
-                    &mut word_quoted,
-                    &mut word_expanded,
-                    &mut command,
-                    &mut commands,
-                );
-            }
-            '&' => {
-                let redirects_file_descriptor = (value.ends_with('>') || value.ends_with('<'))
-                    && characters
-                        .peek()
-                        .is_some_and(|next| next.is_ascii_digit() || *next == '-' || *next == '$');
-                let redirects_both_streams = value.is_empty() && characters.peek() == Some(&'>');
-                if redirects_file_descriptor || redirects_both_streams {
-                    value.push('&');
-                    continue;
-                }
-                let logical_and = characters.peek() == Some(&'&');
-                if logical_and {
-                    characters.next();
-                } else {
-                    has_control_flow = true;
-                }
-                push_command(
-                    &mut value,
-                    &mut word_quoted,
-                    &mut word_expanded,
-                    &mut command,
-                    &mut commands,
-                );
-            }
-            '(' | ')' | '{' | '}' => {
-                has_control_flow = true;
-                push_command(
-                    &mut value,
-                    &mut word_quoted,
-                    &mut word_expanded,
-                    &mut command,
-                    &mut commands,
-                );
-            }
-            '#' if value.is_empty() => {
-                for remainder in characters.by_ref() {
-                    if remainder == '\n' {
-                        break;
-                    }
-                }
-                push_command(
-                    &mut value,
-                    &mut word_quoted,
-                    &mut word_expanded,
-                    &mut command,
-                    &mut commands,
-                );
-            }
-            '\n' => push_command(
-                &mut value,
-                &mut word_quoted,
-                &mut word_expanded,
-                &mut command,
-                &mut commands,
-            ),
-            character if character.is_whitespace() => push_word(
-                &mut value,
-                &mut word_quoted,
-                &mut word_expanded,
-                &mut command,
-            ),
-            character => value.push(character),
-        }
-    }
-    push_command(
-        &mut value,
-        &mut word_quoted,
-        &mut word_expanded,
-        &mut command,
-        &mut commands,
-    );
-
-    for word in commands.iter().flatten() {
-        if !word.quoted
-            && (word.value == "!"
-                || matches!(
-                    word.value.as_str(),
-                    "if" | "then"
-                        | "elif"
-                        | "else"
-                        | "fi"
-                        | "case"
-                        | "esac"
-                        | "for"
-                        | "select"
-                        | "while"
-                        | "until"
-                        | "do"
-                        | "done"
-                        | "function"
-                        | "eval"
-                ))
-        {
-            has_control_flow = true;
-        }
-    }
-
-    ShellSyntax {
-        commands,
-        has_control_flow,
-        has_pipeline,
-        has_heredoc,
-    }
-}
-
-fn json_exec_has_unresolved_cargo_install(arguments: &[String], package: &str) -> bool {
-    let words: Vec<ShellSyntaxWord> = arguments
-        .iter()
-        .map(|argument| ShellSyntaxWord {
-            value: argument.clone(),
-            quoted: true,
-            expanded: false,
-        })
-        .collect();
-    if let Some(script) = shell_env_split_string(&words) {
-        let nested = analyze_shell_install(script, package, 0);
-        if nested.unresolved {
+        };
+        if name.trim().eq_ignore_ascii_case("syntax") {
             return true;
         }
     }
-    let (Some(index), has_unsafe_wrapper) = shell_effective_executable_index(&words) else {
-        return false;
-    };
-    let executable = executable_name(&words[index].value);
-    let (embedded_target, _) = shell_command_has_target_install(&words, package);
-    if embedded_target && (executable != "cargo" || has_unsafe_wrapper) {
-        return true;
-    }
-    if is_shell_executable(executable) {
-        let Some(script) = shell_syntax_command_string(&words, index) else {
-            return true;
-        };
-        return {
-            let nested = analyze_shell_install(script, package, 0);
-            let (positional_target, _) = shell_command_has_target_install(&words, package);
-            nested.unresolved
-                || (has_unsafe_wrapper && nested.has_target_install)
-                || (is_alternate_shell_executable(executable) && nested.has_target_install)
-                || (positional_target && shell_script_uses_positional_command(script))
-        };
-    }
-    if executable == "busybox"
-        && words
-            .get(index + 1)
-            .is_some_and(|word| is_shell_executable(executable_name(&word.value)))
-    {
-        let Some(script) = shell_syntax_command_string(&words, index + 1) else {
-            return true;
-        };
-        return {
-            let nested = analyze_shell_install(script, package, 0);
-            nested.unresolved || nested.has_target_install
-        };
-    }
-    executable == "xargs" && shell_command_contains_cargo_install(&words)
+    false
 }
 
 /// Join Dockerfile line continuations so policy applies to logical RUN
@@ -1490,264 +980,12 @@ fn logical_dockerfile_instructions(content: &str) -> Vec<String> {
 /// Tokenize shell-form RUN commands just far enough to distinguish executable
 /// commands, quoted arguments, assignments, and command separators. This keeps
 /// comments or `echo "cargo install ..."` from satisfying the policy.
-fn split_shell_commands(run: &str) -> Vec<Vec<String>> {
-    fn push_token(token: &mut String, command: &mut Vec<String>) {
-        if !token.is_empty() {
-            command.push(std::mem::take(token));
-        }
-    }
-
-    fn push_command(command: &mut Vec<String>, commands: &mut Vec<Vec<String>>) {
-        if !command.is_empty() {
-            commands.push(std::mem::take(command));
-        }
-    }
-
-    let mut commands = Vec::new();
-    let mut command = Vec::new();
-    let mut token = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-
-    for character in run.chars() {
-        if escaped {
-            token.push(character);
-            escaped = false;
-            continue;
-        }
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            } else if delimiter == '"' && character == '\\' {
-                escaped = true;
-            } else {
-                token.push(character);
-            }
-            continue;
-        }
-
-        match character {
-            '\\' => escaped = true,
-            '\'' | '"' => quote = Some(character),
-            ';' | '|' | '&' => {
-                push_token(&mut token, &mut command);
-                push_command(&mut command, &mut commands);
-            }
-            '#' if token.is_empty() => {
-                push_command(&mut command, &mut commands);
-                break;
-            }
-            value if value.is_whitespace() => push_token(&mut token, &mut command),
-            value => token.push(value),
-        }
-    }
-    if escaped {
-        token.push('\\');
-    }
-    push_token(&mut token, &mut command);
-    push_command(&mut command, &mut commands);
-    commands
-}
-
-fn docker_run_command_after_options(mut run: &str) -> Option<&str> {
-    while run.starts_with("--") {
-        let separator = run.find(char::is_whitespace)?;
-        let (option, remainder) = run.split_at(separator);
-        if !["--mount=", "--network=", "--security=", "--device="]
-            .iter()
-            .any(|prefix| option.starts_with(prefix) && option.len() > prefix.len())
-        {
-            return None;
-        }
-        run = remainder.trim_start();
-    }
-    (!run.is_empty()).then_some(run)
-}
-
 fn docker_json_exec_arguments(run: &str) -> Option<Vec<String>> {
     let run = run.trim();
     if run.starts_with('[') {
         return serde_json::from_str::<Vec<String>>(run).ok();
     }
     None
-}
-
-fn cargo_install_invocations(command: &[String]) -> Vec<Vec<String>> {
-    let mut installs = Vec::new();
-    collect_cargo_install_invocations(command, 0, &mut installs);
-    installs
-}
-
-fn collect_cargo_install_invocations(
-    command: &[String],
-    depth: usize,
-    installs: &mut Vec<Vec<String>>,
-) {
-    if depth > 8 {
-        // Fail closed for adversarial wrapper depth. The flattened tokens make
-        // any target-package reference count as an unresolved replacement
-        // install instead of disappearing from the policy model.
-        installs.push(
-            command
-                .iter()
-                .flat_map(|token| token.split_whitespace())
-                .map(str::to_string)
-                .collect(),
-        );
-        return;
-    }
-
-    let mut index = 0;
-    loop {
-        while command
-            .get(index)
-            .is_some_and(|token| is_shell_assignment(token))
-        {
-            index += 1;
-        }
-
-        let Some(executable) = command.get(index).map(|token| executable_name(token)) else {
-            return;
-        };
-        match executable {
-            "command" => {
-                index += 1;
-                while let Some(option) = command.get(index) {
-                    if matches!(option.as_str(), "-v" | "-V") {
-                        return;
-                    }
-                    if option == "--" || option == "-p" || option.starts_with('-') {
-                        index += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            "env" => {
-                index += 1;
-                let mut options = true;
-                loop {
-                    let Some(argument) = command.get(index) else {
-                        return;
-                    };
-                    if is_shell_assignment(argument) {
-                        index += 1;
-                        continue;
-                    }
-                    if options && argument == "--" {
-                        options = false;
-                        index += 1;
-                        continue;
-                    }
-                    if options && matches!(argument.as_str(), "-S" | "--split-string") {
-                        if let Some(script) = command.get(index + 1) {
-                            for nested in split_shell_commands(script) {
-                                collect_cargo_install_invocations(&nested, depth + 1, installs);
-                            }
-                        }
-                        return;
-                    }
-                    if options {
-                        if let Some(script) = argument.strip_prefix("--split-string=") {
-                            for nested in split_shell_commands(script) {
-                                collect_cargo_install_invocations(&nested, depth + 1, installs);
-                            }
-                            return;
-                        }
-                    }
-                    if options && matches!(argument.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
-                        index += 2;
-                        continue;
-                    }
-                    if options && argument.starts_with('-') {
-                        index += 1;
-                        continue;
-                    }
-                    break;
-                }
-            }
-            "exec" => {
-                index += 1;
-            }
-            "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish" => {
-                if let Some(script) = shell_command_string(command, index) {
-                    for nested in split_shell_commands(script) {
-                        collect_cargo_install_invocations(&nested, depth + 1, installs);
-                    }
-                }
-                return;
-            }
-            "busybox"
-                if command
-                    .get(index + 1)
-                    .is_some_and(|argument| is_shell_executable(executable_name(argument))) =>
-            {
-                if let Some(script) = shell_command_string(command, index + 1) {
-                    for nested in split_shell_commands(script) {
-                        collect_cargo_install_invocations(&nested, depth + 1, installs);
-                    }
-                }
-                return;
-            }
-            "cargo" => {
-                if let Some(subcommand_index) = cargo_install_subcommand_index(command, index) {
-                    installs.push(command[subcommand_index + 1..].to_vec());
-                }
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-
-fn cargo_install_subcommand_index(command: &[String], cargo_index: usize) -> Option<usize> {
-    let mut index = cargo_index + 1;
-    if command.get(index).is_some_and(|word| word.starts_with('+')) {
-        index += 1;
-    }
-    loop {
-        let word = command.get(index)?;
-        if word == "install" {
-            return Some(index);
-        }
-        if cargo_global_option_consumes_value(word) {
-            index += 2;
-            continue;
-        }
-        if word.starts_with('-') && word != "--" {
-            index += 1;
-            continue;
-        }
-        return None;
-    }
-}
-
-fn executable_name(token: &str) -> &str {
-    token.rsplit('/').next().unwrap_or(token)
-}
-
-fn shell_command_string(command: &[String], shell_index: usize) -> Option<&str> {
-    command
-        .iter()
-        .enumerate()
-        .skip(shell_index + 1)
-        .find(|(_, option)| {
-            option.starts_with('-')
-                && !option.starts_with("--")
-                && option[1..].bytes().any(|byte| byte == b'c')
-        })
-        .and_then(|(index, _)| command.get(index + 1))
-        .map(String::as_str)
-}
-
-fn is_shell_assignment(token: &str) -> bool {
-    let Some((name, _)) = token.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -1775,12 +1013,74 @@ name = "ryuki-integration-tests"
 
     fn full_copy_set() -> &'static str {
         concat!(
-            "COPY Cargo.toml Cargo.lock ./\n",
-            "COPY sources/ sources/\n",
-            "COPY portal/ portal/\n",
-            "COPY scripts/validator-rs/ scripts/validator-rs/\n",
-            "COPY tests/ tests/\n",
+            "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./\n",
+            "COPY --link --chown=10001:10001 sources/ sources/\n",
+            "COPY --link --chown=10001:10001 portal/ portal/\n",
+            "COPY --link --chown=10001:10001 scripts/validator-rs/ scripts/validator-rs/\n",
+            "COPY --link --chown=10001:10001 tests/ tests/\n",
         )
+    }
+
+    fn canonical_root_setup_fixture(package: &str, version: &str) -> String {
+        let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
+        let runs = canonical_protected_root_setup(&tool_root)
+            .into_iter()
+            .map(|arguments| {
+                format!(
+                    "RUN {}\n",
+                    serde_json::to_string(&arguments).expect("serialize root setup fixture")
+                )
+            })
+            .collect::<String>();
+        format!("{runs}ENV {BUILD_ENVIRONMENT}\nWORKDIR /app\nUSER {BUILD_USER}\n")
+    }
+
+    fn canonical_lifecycle_fixture(
+        package: &str,
+        version: &str,
+        intervening: &str,
+        install_run_prefix: &str,
+        use_run_prefix: &str,
+    ) -> String {
+        let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
+        let tool_path = format!("{tool_root}/bin/{package}");
+        let install = serde_json::to_string(&vec![
+            BASE_CARGO_PATH.to_string(),
+            "install".to_string(),
+            package.to_string(),
+            "--version".to_string(),
+            version.to_string(),
+            "--locked".to_string(),
+            "--root".to_string(),
+            tool_root,
+        ])
+        .expect("serialize canonical install fixture");
+        let uses = canonical_protected_tool_uses(package, &tool_path)
+            .into_iter()
+            .map(|arguments| {
+                serde_json::to_string(&arguments).expect("serialize canonical use fixture")
+            })
+            .collect::<Vec<_>>();
+        let root_setup = canonical_root_setup_fixture(package, version);
+
+        if package == "cargo-chef" {
+            format!(
+                "FROM rust:1.96-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS chef\n{install_run_prefix}{install}\n{root_setup}{intervening}FROM chef AS planner\n{use_run_prefix}{}\nFROM chef AS build\n{use_run_prefix}{}\nARG {API_SOURCE_REVISION_ARG}\nRUN {API_FINAL_BUILD_RUN}\n",
+                uses[0], uses[1],
+            )
+        } else {
+            let prerequisite = serde_json::to_string(&vec![
+                BASE_RUSTUP_PATH.to_string(),
+                "target".to_string(),
+                "add".to_string(),
+                "wasm32-unknown-unknown".to_string(),
+            ])
+            .expect("serialize portal prerequisite fixture");
+            format!(
+                "FROM rust:1.96-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\nRUN {prerequisite}\n{install_run_prefix}{install}\n{root_setup}{intervening}{use_run_prefix}{}\n",
+                uses[0]
+            )
+        }
     }
 
     // ── workspace member parsing ──────────────────────────────────────────
@@ -1918,9 +1218,11 @@ name = "ryuki-integration-tests"
 
     #[test]
     fn complete_api_dockerfile_passes() {
+        let setup = canonical_root_setup_fixture("cargo-chef", CARGO_CHEF_VERSION);
         let dockerfile = format!(
-            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n{}COPY migrations/ migrations/\nRUN cargo install cargo-chef --version 0.1.77 --locked\nRUN cargo build --release -p ryuki-api\nFROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\nENV RYUKI_API_EXECUTION_MODE=static-dry-run\nCOPY --from=build /app/target/release/ryuki-api /app/ryuki-api\n",
-            full_copy_set()
+            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS chef\nRUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-chef\", \"--version\", \"0.1.77\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-chef-0.1.77\"]\n{setup}FROM chef AS planner\n{}COPY --link --chown=10001:10001 migrations/ migrations/\nRUN [\"/opt/ryuki-tools/cargo-chef-0.1.77/bin/cargo-chef\", \"chef\", \"prepare\", \"--recipe-path\", \"recipe.json\"]\nFROM chef AS build\nCOPY --link --chown=10001:10001 --from=planner /app/recipe.json recipe.json\nRUN [\"/opt/ryuki-tools/cargo-chef-0.1.77/bin/cargo-chef\", \"chef\", \"cook\", \"--locked\", \"--release\", \"--recipe-path\", \"recipe.json\", \"--package\", \"ryuki-api\"]\n{}COPY --link --chown=10001:10001 migrations/ migrations/\nARG {API_SOURCE_REVISION_ARG}\nRUN {API_FINAL_BUILD_RUN}\nFROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\nENV RYUKI_API_EXECUTION_MODE=static-dry-run\nCOPY --from=build /app/target/release/ryuki-api /app/ryuki-api\n",
+            full_copy_set(),
+            full_copy_set(),
         );
         let errors = validate_api_dockerfile(&dockerfile, &members());
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1941,12 +1243,272 @@ name = "ryuki-integration-tests"
 
     #[test]
     fn complete_portal_dockerfile_passes() {
+        let setup = canonical_root_setup_fixture("cargo-leptos", CARGO_LEPTOS_VERSION);
         let dockerfile = format!(
-            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n{}RUN cargo install cargo-leptos --version 0.3.7 --locked\nRUN cargo leptos build --release -p ryuki-portal-ui\nFROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\nENV RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\nCOPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\nCOPY --from=build /app/target/site /app/site\n",
+            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\nRUN [\"/usr/local/cargo/bin/rustup\", \"target\", \"add\", \"wasm32-unknown-unknown\"]\nRUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n{setup}{}RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\", \"-p\", \"ryuki-portal-ui\"]\nFROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\nENV RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\nCOPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\nCOPY --from=build /app/target/site /app/site\n",
             full_copy_set()
         );
         let errors = validate_portal_dockerfile(&dockerfile, &members());
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn checked_in_dockerfiles_prove_canonical_protected_tool_lifecycles() {
+        for (content, label, package, version) in [
+            (
+                include_str!("../../../sources/ryuki-api/Dockerfile"),
+                "platform-api Dockerfile",
+                "cargo-chef",
+                CARGO_CHEF_VERSION,
+            ),
+            (
+                include_str!("../../../portal/portal-ui/Dockerfile"),
+                "portal-ui Dockerfile",
+                "cargo-leptos",
+                CARGO_LEPTOS_VERSION,
+            ),
+        ] {
+            let mut errors = Vec::new();
+            validate_protected_cargo_tool_lifecycle(content, label, package, version, &mut errors);
+            assert!(
+                errors.is_empty(),
+                "checked-in {package} lifecycle failed structural proof: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_decoys_overwrites_and_identity_changes() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
+            for intervening in [
+                "RUN [\"/bin/sh\", \"-c\", \"true\"]\n".to_string(),
+                format!("COPY --from=evil /tmp/fake \"{tool_root}/bin/{package}\"\n"),
+                format!("COPY --from=evil [\"/tmp/fake\", \"{tool_root}/bin/{package}\"]\n"),
+                format!("COPY tool-link /app/tool-link\nCOPY fake /app/tool-link/{package}\n"),
+                "USER 10001:10001\nUSER 0:0\n".to_string(),
+            ] {
+                let dockerfile =
+                    canonical_lifecycle_fixture(package, version, &intervening, "RUN ", "RUN ");
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    !errors.is_empty(),
+                    "unsafe intervening lifecycle action was accepted for {package}: {intervening:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_buildkit_mount_shadowing() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            for (install_prefix, use_prefix) in [
+                ("RUN --mount=from=evil,target=/usr/local/cargo ", "RUN "),
+                ("RUN ", "RUN --mount=from=evil,target=/opt/ryuki-tools "),
+            ] {
+                let dockerfile =
+                    canonical_lifecycle_fixture(package, version, "", install_prefix, use_prefix);
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    !errors.is_empty(),
+                    "BuildKit mount shadowing was accepted for {package}: {dockerfile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_nondefault_dockerfile_escape() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let dockerfile = format!(
+                "# escape=`\n{}",
+                canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
+            );
+            let mut errors = Vec::new();
+            validate_protected_cargo_tool_lifecycle(
+                &dockerfile,
+                "Dockerfile",
+                package,
+                version,
+                &mut errors,
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("default Dockerfile escape")),
+                "nondefault Dockerfile escape was accepted for {package}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_custom_syntax_frontends() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let dockerfile = format!(
+                "# syntax=attacker.example/dockerfile:latest\n{}",
+                canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
+            );
+            let mut errors = Vec::new();
+            validate_protected_cargo_tool_lifecycle(
+                &dockerfile,
+                "Dockerfile",
+                package,
+                version,
+                &mut errors,
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("custom Dockerfile syntax frontend")),
+                "custom syntax frontend was accepted for {package}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_renamed_interpreters_before_use() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let python = format!(
+                r#"import subprocess; subprocess.run(["cargo", "install", "attacker-tool", "--bin", "{package}", "--force"], check=True)"#
+            );
+            let intervening = format!(
+                "RUN I=/usr/bin/python3 && ln -s \"$I\" /tmp/opaque-runner\nRUN /tmp/opaque-runner -c '{python}'\n"
+            );
+            let dockerfile =
+                canonical_lifecycle_fixture(package, version, &intervening, "RUN ", "RUN ");
+            let mut errors = Vec::new();
+            validate_protected_cargo_tool_lifecycle(
+                &dockerfile,
+                "Dockerfile",
+                package,
+                version,
+                &mut errors,
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("arbitrary RUN instructions")),
+                "renamed interpreter lifecycle bypass was accepted for {package}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_mutable_copies_and_builder_control_changes() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            for intervening in [
+                "COPY --link source /app/source\n",
+                "COPY --chown=10001:10001 source /app/source\n",
+                "COPY --link --chown=10001:10001 source /app/../opt/escape\n",
+                "COPY --link --chown=10001:10001 [\"source\", \"/app/source\"]\n",
+                "ADD source /app/source\n",
+                "ENV PATH=/tmp:/usr/local/cargo/bin\n",
+                "USER 0:0\n",
+                "SHELL [\"/bin/bash\", \"-c\"]\n",
+                "ONBUILD RUN [\"/bin/true\"]\n",
+                "VOLUME /usr/local/cargo\n",
+            ] {
+                let dockerfile =
+                    canonical_lifecycle_fixture(package, version, intervening, "RUN ", "RUN ");
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    !errors.is_empty(),
+                    "mutable builder action was accepted for {package}: {intervening:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_missing_hardening_and_external_use_stages() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
+            let chmod = serde_json::to_string(
+                canonical_protected_root_setup(&tool_root)
+                    .last()
+                    .expect("canonical chmod step"),
+            )
+            .expect("serialize chmod step");
+            let without_hardening =
+                canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
+                    .replace(&format!("RUN {chmod}\n"), "");
+            let external_required_stage = canonical_lifecycle_fixture(
+                package,
+                version,
+                "",
+                "RUN ",
+                "RUN ",
+            )
+            .replace(
+                if package == "cargo-chef" {
+                    "FROM chef AS planner"
+                } else {
+                    "USER 10001:10001"
+                },
+                if package == "cargo-chef" {
+                    "FROM rust:1.96-bookworm@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS planner"
+                } else {
+                    "USER 10001:10001\nFROM rust:1.96-bookworm@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS decoy"
+                },
+            );
+
+            for dockerfile in [without_hardening, external_required_stage] {
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    !errors.is_empty(),
+                    "incomplete or externally detached lifecycle was accepted for {package}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1977,450 +1539,5 @@ name = "ryuki-integration-tests"
         );
         assert_eq!(errors.len(), 1, "unexpected base-image errors: {errors:?}");
         assert!(errors[0].contains("rust:1.96-bookworm"));
-    }
-
-    #[test]
-    fn cargo_install_pin_accepts_flag_order_assignments_and_continuations() {
-        let content = concat!(
-            "RUN rustup target add wasm32-unknown-unknown \\\n",
-            "    && CARGO_NET_OFFLINE=true cargo install --locked \\\n",
-            "       --version=0.3.7 cargo-leptos\n",
-        );
-        let mut errors = Vec::new();
-        validate_cargo_install_pin(
-            content,
-            "portal-ui Dockerfile",
-            "cargo-leptos",
-            "0.3.7",
-            &mut errors,
-        );
-        assert!(
-            errors.is_empty(),
-            "valid exact install was rejected: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn cargo_install_pin_accepts_command_and_env_wrappers() {
-        let content = concat!(
-            "RUN env CARGO_NET_OFFLINE=true command cargo install --locked \\\n",
-            "    --version=0.3.7 cargo-leptos\n",
-        );
-        let mut errors = Vec::new();
-        validate_cargo_install_pin(
-            content,
-            "portal-ui Dockerfile",
-            "cargo-leptos",
-            "0.3.7",
-            &mut errors,
-        );
-        assert!(
-            errors.is_empty(),
-            "wrapped exact install failed: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn cargo_install_pin_preserves_direct_continued_pins_for_both_build_tools() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            let content = format!(
-                "RUN CARGO_NET_OFFLINE=true command cargo install --locked \\\n                 --version={version} {package}\n"
-            );
-            let mut errors = Vec::new();
-            validate_cargo_install_pin(&content, "Dockerfile", package, version, &mut errors);
-            assert!(
-                errors.is_empty(),
-                "valid direct {package} pin was rejected: {errors:?}"
-            );
-
-            let json_exec = format!(
-                "RUN [\"cargo\", \"install\", \"{package}\", \"--version\", \"{version}\", \"--locked\"]\n"
-            );
-            let mut json_errors = Vec::new();
-            validate_cargo_install_pin(
-                &json_exec,
-                "Dockerfile",
-                package,
-                version,
-                &mut json_errors,
-            );
-            assert!(
-                json_errors.is_empty(),
-                "valid JSON-exec {package} pin was rejected: {json_errors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_if_case_and_loop_replacement_installs() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            for replacement in [
-                format!(
-                    "RUN if true; then \\\n                         cargo install {package} --force; fi\n"
-                ),
-                format!(
-                    "RUN tool={package}; case \"$tool\" in *)cargo install \"$tool\" --force ;; esac\n"
-                ),
-                format!(
-                    "RUN for tool in {package}; do cargo install \"$tool\" --force; done\n"
-                ),
-                "RUN if true; then cargo install \"$BUILD_TOOL\" --force; fi\n"
-                    .to_string(),
-                format!(
-                    "RUN cargo_cmd=cargo; tool={package}; if true; then \"$cargo_cmd\" install \"$tool\" --force; fi\n"
-                ),
-            ] {
-                assert_shell_control_flow_replacement_is_rejected(
-                    package,
-                    version,
-                    &replacement,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_dynamic_positions_without_control_keywords() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            for replacement in [
-                format!("RUN CARGO=cargo; \"$CARGO\" install {package} --force\n"),
-                format!("RUN TOOL={package}; cargo install \"$TOOL\" --force\n"),
-                format!("RUN SUBCOMMAND=install; cargo \"$SUBCOMMAND\" {package} --force\n"),
-                format!(
-                    "RUN SHELL=dash; \"$SHELL\" -c 'cargo install {package} --force'\n"
-                ),
-                format!(
-                    "ENV REINSTALL=\"cargo install {package} --force\"\nRUN $REINSTALL\n"
-                ),
-                format!(
-                    "ENV ARGS=\"install {package} --force\"\nRUN cargo $ARGS\n"
-                ),
-                format!("RUN cmd='cargo install {package} --force'; $cmd\n"),
-                format!("ENV CARGO=cargo\nRUN ${{CARGO}} install {package} --force\n"),
-                format!("RUN $(printf cargo) install {package} --force\n"),
-                format!("RUN `printf cargo` install {package} --force\n"),
-                format!("RUN echo \"$(cargo install {package} --force)\"\n"),
-                format!(
-                    "RUN c() {{ cargo \"$@\"; }}; c install {package} --force\n"
-                ),
-                format!("RUN set -- install {package} --force; cargo \"$@\"\n"),
-                format!(
-                    "RUN CARGO=cargo; SUBCOMMAND=install; TOOL={package}; \"$CARGO\" \"$SUBCOMMAND\" \"$TOOL\" --force\n"
-                ),
-            ] {
-                assert_shell_control_flow_replacement_is_rejected(
-                    package,
-                    version,
-                    &replacement,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_function_subshell_and_nested_shell_replacements() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            for replacement in [
-                format!(
-                    "RUN install_tool() {{ cargo install {package} --force; }}; install_tool\n"
-                ),
-                format!("RUN (cargo install {package} --force)\n"),
-                format!(
-                    "RUN result=$(cargo install {package} --force)\n"
-                ),
-                format!("RUN ! cargo install {package} --force\n"),
-                format!(
-                    "RUN /bin/sh -c 'if true; then cargo install {package} --force; fi'\n"
-                ),
-                format!(
-                    "RUN [\"/bin/bash\", \"-c\", \"if true; then cargo install {package} --force; fi\"]\n"
-                ),
-            ] {
-                assert_shell_control_flow_replacement_is_rejected(
-                    package,
-                    version,
-                    &replacement,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_exec_alternate_shell_and_pipeline_wrappers() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            let positional_json = format!(
-                "RUN {}\n",
-                serde_json::to_string(&[
-                    "sh",
-                    "-c",
-                    "\"$0\" \"$@\"",
-                    "cargo",
-                    "install",
-                    package,
-                    "--force",
-                ])
-                .expect("serialize positional shell fixture")
-            );
-            for replacement in [
-                format!("RUN exec cargo install {package} --force\n"),
-                format!("RUN /bin/dash -c 'cargo install {package} --force'\n"),
-                format!("RUN busybox sh -c 'cargo install {package} --force'\n"),
-                format!("RUN env -S 'if true; then cargo install {package} --force; fi'\n"),
-                format!("RUN printf '%s\\n' '{package}' | xargs cargo install --force\n"),
-                format!("RUN printf 'cargo install {package} --force\\n' | sh\n"),
-                format!(
-                    "RUN printf '%s\\n' 'cargo install {package} --force' >/tmp/reinstall.sh && sh /tmp/reinstall.sh\n"
-                ),
-                format!(
-                    "RUN printf '%s\\n' 'cargo install {package} --force' >/tmp/reinstall.sh && . /tmp/reinstall.sh\n"
-                ),
-                format!("RUN [\"dash\", \"-c\", \"cargo install {package} --force\"]\n"),
-                format!("RUN timeout 600 cargo install {package} --force\n"),
-                format!(
-                    "RUN find /tmp -name marker -exec cargo install {package} --force \\;\n"
-                ),
-                format!(
-                    "RUN sh -c '\"$0\" \"$@\"' cargo install {package} --force\n"
-                ),
-                format!("RUN sh -c '$1' _ 'cargo install {package} --force'\n"),
-                format!(
-                    "RUN sh -c \"$(printf '%s' 'cargo install {package} --force')\"\n"
-                ),
-                format!(
-                    "RUN [\"timeout\", \"600\", \"cargo\", \"install\", \"{package}\", \"--force\"]\n"
-                ),
-                format!(
-                    "RUN [\"rustup\", \"run\", \"stable\", \"cargo\", \"install\", \"{package}\", \"--force\"]\n"
-                ),
-                positional_json,
-            ] {
-                assert_shell_control_flow_replacement_is_rejected(package, version, &replacement);
-            }
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_cargo_global_and_buildkit_replacements() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            for replacement in [
-                format!("RUN cargo +stable install {package} --force\n"),
-                format!("RUN cargo --color=never install {package} --force\n"),
-                format!(
-                    "RUN --mount=type=cache,target=/tmp/cargo-cache cargo install {package} --force\n"
-                ),
-                format!(
-                    "RUN --mount=type=cache,target=/tmp/cargo-cache [\"cargo\", \"install\", \"{package}\", \"--force\"]\n"
-                ),
-                "COPY attacker /tmp/tool\nRUN cargo install --path /tmp/tool --force\n"
-                    .to_string(),
-            ] {
-                assert_replacement_is_rejected(package, version, &replacement);
-            }
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_heredocs_and_custom_escape_directives() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            let pinned = format!("RUN cargo install {package} --version {version} --locked\n");
-            for content in [
-                format!("{pinned}RUN <<'EOF'\ncargo install {package} --force\nEOF\n"),
-                format!("# escape=`\n{pinned}RUN `\n    cargo install {package} --force\n"),
-                format!("{pinned}SHELL [\"cargo\", \"install\", \"--force\"]\nRUN {package}\n"),
-            ] {
-                let mut errors = Vec::new();
-                validate_cargo_install_pin(&content, "Dockerfile", package, version, &mut errors);
-                assert!(
-                    errors.iter().any(|error| error.contains(package)),
-                    "unsupported Docker framing was accepted for {package}: {content:?}; {errors:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_preserves_json_arguments_and_quoted_shell_data() {
-        for (package, version) in [
-            ("cargo-chef", CARGO_CHEF_VERSION),
-            ("cargo-leptos", CARGO_LEPTOS_VERSION),
-        ] {
-            let json_exec = format!(
-                "RUN [\"cargo\", \"install\", \"{package}\", \"--version\", \"{version}\", \"--locked\", \"--root\", \"/opt/{{tools}}\"]\n"
-            );
-            let mut json_errors = Vec::new();
-            validate_cargo_install_pin(
-                &json_exec,
-                "Dockerfile",
-                package,
-                version,
-                &mut json_errors,
-            );
-            assert!(
-                json_errors.is_empty(),
-                "JSON-exec data was mistaken for shell grammar for {package}: {json_errors:?}"
-            );
-
-            let shell = format!(
-                "RUN cargo install {package} --version {version} --locked\n\
-                 RUN if true; then printf '%s\\n' 'cargo install {package} (documentation only)' | grep -q documentation; fi\n"
-            );
-            let mut shell_errors = Vec::new();
-            validate_cargo_install_pin(&shell, "Dockerfile", package, version, &mut shell_errors);
-            assert!(
-                shell_errors.is_empty(),
-                "quoted shell data was mistaken for an invocation for {package}: {shell_errors:?}"
-            );
-
-            let default_escape = format!(
-                r#"# escape=\
-SHELL ["/bin/sh", "-c"]
-RUN cargo install {package} --version {version} --locked
-"#
-            );
-            let mut default_escape_errors = Vec::new();
-            validate_cargo_install_pin(
-                &default_escape,
-                "Dockerfile",
-                package,
-                version,
-                &mut default_escape_errors,
-            );
-            assert!(
-                default_escape_errors.is_empty(),
-                "default Docker escape directive was rejected for {package}: {default_escape_errors:?}"
-            );
-
-            let expanded_option_values = format!(
-                "RUN cargo install {package} --version {version} --locked --root \"$CARGO_HOME\" --color \"$CARGO_COLOR\" > \"$LOG\" 2> \"$ERROR_LOG\" 3>&1\n"
-            );
-            let mut expanded_option_errors = Vec::new();
-            validate_cargo_install_pin(
-                &expanded_option_values,
-                "Dockerfile",
-                package,
-                version,
-                &mut expanded_option_errors,
-            );
-            assert!(
-                expanded_option_errors.is_empty(),
-                "expanded install-option values or fd redirection were mistaken for a package operand for {package}: {expanded_option_errors:?}"
-            );
-        }
-    }
-
-    fn assert_shell_control_flow_replacement_is_rejected(
-        package: &str,
-        version: &str,
-        replacement: &str,
-    ) {
-        let pinned = format!("RUN cargo install {package} --version {version} --locked\n");
-        let mut errors = Vec::new();
-        validate_cargo_install_pin(
-            &format!("{pinned}{replacement}"),
-            "Dockerfile",
-            package,
-            version,
-            &mut errors,
-        );
-        assert!(
-            errors.iter().any(|error| {
-                error.contains(package) && error.contains("shell control flow")
-            }),
-            "shell-control-flow replacement install was accepted for {package}: {replacement:?}; {errors:?}"
-        );
-    }
-
-    fn assert_replacement_is_rejected(package: &str, version: &str, replacement: &str) {
-        let pinned = format!("RUN cargo install {package} --version {version} --locked\n");
-        let mut errors = Vec::new();
-        validate_cargo_install_pin(
-            &format!("{pinned}{replacement}"),
-            "Dockerfile",
-            package,
-            version,
-            &mut errors,
-        );
-        assert!(
-            !errors.is_empty(),
-            "replacement install was accepted for {package}: {replacement:?}"
-        );
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_wrapped_and_nested_replacement_installs() {
-        let pinned = "RUN cargo install cargo-leptos --version 0.3.7 --locked\n";
-        for replacement in [
-            "RUN command cargo install --force cargo-leptos\n",
-            "RUN env CARGO_NET_OFFLINE=false cargo install --force cargo-leptos\n",
-            "RUN /bin/sh -c 'command cargo install --force cargo-leptos'\n",
-            "RUN [\"/bin/bash\", \"-c\", \"env cargo install --force cargo-leptos\"]\n",
-        ] {
-            let mut errors = Vec::new();
-            validate_cargo_install_pin(
-                &format!("{pinned}{replacement}"),
-                "portal-ui Dockerfile",
-                "cargo-leptos",
-                "0.3.7",
-                &mut errors,
-            );
-            assert!(
-                errors.iter().any(|error| error.contains("found 2")),
-                "wrapped replacement install was accepted: {replacement:?}; {errors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cargo_install_pin_rejects_missing_ranges_variables_decoys_and_duplicates() {
-        let vulnerable = [
-            "RUN cargo install cargo-leptos --locked\n",
-            "RUN cargo install cargo-leptos --version ^0.3.7 --locked\n",
-            "RUN cargo install cargo-leptos --version ${CARGO_LEPTOS_VERSION} --locked\n",
-            "RUN cargo install cargo-leptos --version 0.3.7\n",
-            "RUN echo 'cargo install cargo-leptos --version 0.3.7 --locked'\n",
-            "RUN cargo build --release\n",
-            concat!(
-                "RUN cargo install cargo-leptos --version 0.3.7 --locked\n",
-                "RUN cargo install --locked --version=0.3.7 cargo-leptos\n",
-            ),
-            "RUN cargo install cargo-leptos@0.3.7 --locked\n",
-            "RUN cargo install cargo-leptos --version 0.3.7 --locked --git https://example.invalid/tool\n",
-        ];
-
-        for content in vulnerable {
-            let mut errors = Vec::new();
-            validate_cargo_install_pin(
-                content,
-                "portal-ui Dockerfile",
-                "cargo-leptos",
-                "0.3.7",
-                &mut errors,
-            );
-            assert!(
-                !errors.is_empty(),
-                "vulnerable cargo install fixture was accepted: {content:?}"
-            );
-        }
     }
 }

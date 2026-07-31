@@ -59,7 +59,9 @@ ALTER TABLE api_tokens
     DROP CONSTRAINT IF EXISTS api_tokens_issued_by_authority_shape_check,
     DROP CONSTRAINT IF EXISTS api_tokens_issued_by_roles_canonical_check,
     DROP CONSTRAINT IF EXISTS api_tokens_issued_by_site_scope_canonical_check,
-    DROP CONSTRAINT IF EXISTS api_tokens_issued_by_environment_scope_canonical_check;
+    DROP CONSTRAINT IF EXISTS api_tokens_issued_by_environment_scope_canonical_check,
+    DROP CONSTRAINT IF EXISTS api_tokens_site_scope_canonical_check,
+    DROP CONSTRAINT IF EXISTS api_tokens_environment_scope_canonical_check;
 
 DROP INDEX IF EXISTS sessions_identity_authority_idx;
 DROP INDEX IF EXISTS sessions_human_authority_idx;

@@ -58,7 +58,7 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 2,
-    "content_digest": "sha256:77f150427c87280344a9b6e5657acc7193d2f340806ac4801d5dbd288b1f3850",
+    "content_digest": "sha256:96afd23407e68ffb4f59530ba929b9d9e2221e1a3969f4efd631a43b84a31bea",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {

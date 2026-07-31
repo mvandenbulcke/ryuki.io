@@ -2078,6 +2078,23 @@ mod tests {
     #[test]
     fn principal_registry_migration_is_an_opaque_exact_binding_cutover() {
         let migration = include_str!("../../../migrations/199_principal_registry.sql");
+        for constraint in [
+            "api_tokens_site_scope_canonical_check",
+            "api_tokens_environment_scope_canonical_check",
+        ] {
+            let drop_constraint = format!("DROP CONSTRAINT IF EXISTS {constraint}");
+            let add_constraint = format!("ADD CONSTRAINT {constraint}");
+            let drop_position = migration
+                .find(&drop_constraint)
+                .unwrap_or_else(|| panic!("migration 199 must drop the pre-existing {constraint}"));
+            let add_position = migration
+                .find(&add_constraint)
+                .unwrap_or_else(|| panic!("migration 199 must restore {constraint}"));
+            assert!(
+                drop_position < add_position,
+                "migration 199 must drop {constraint} before restoring it"
+            );
+        }
         assert!(migration.contains("DROP COLUMN user_id"));
         assert!(migration.contains("DROP COLUMN identity_subject"));
         assert!(migration.contains("principal_id UUID PRIMARY KEY DEFAULT gen_random_uuid()"));

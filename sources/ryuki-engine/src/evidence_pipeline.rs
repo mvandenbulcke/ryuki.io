@@ -1,6 +1,9 @@
 use crate::models::*;
 use chrono::Utc;
-use std::collections::HashMap;
+use serde::Deserialize;
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use uuid::Uuid;
 
 const SENSITIVE_KEY_PATTERNS: &[&str] = &[
@@ -73,8 +76,267 @@ const STRUCTURED_HEADER_VALUE_FIELDS: &[&str] = &[
 const MAX_NESTED_JSON_SECRET_DEPTH: usize = 4;
 const MAX_STRUCTURED_SECRET_BYTES: usize = 256 * 1024;
 const MAX_STRUCTURED_SECRET_NODES: usize = 4_096;
+const MAX_EMBEDDED_STRUCTURED_END_CANDIDATES: usize = 32;
 /// Canonical replacement emitted by every evidence and audit projection.
 pub const REDACTED_EVIDENCE_VALUE: &str = "***REDACTED***";
+
+struct DuplicateKeyScanState {
+    remaining_nodes: usize,
+    fail_closed: bool,
+}
+
+impl DuplicateKeyScanState {
+    fn consume_node(&mut self) -> bool {
+        if self.remaining_nodes == 0 {
+            self.fail_closed = true;
+            false
+        } else {
+            self.remaining_nodes -= 1;
+            true
+        }
+    }
+}
+
+struct DuplicateKeyScanSeed<'a> {
+    state: &'a mut DuplicateKeyScanState,
+}
+
+impl<'de> DeserializeSeed<'de> for DuplicateKeyScanSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if !self.state.consume_node() {
+            return Err(serde::de::Error::custom(
+                "structured evidence duplicate-key scan exhausted its node budget",
+            ));
+        }
+        deserializer.deserialize_any(DuplicateKeyScanVisitor { state: self.state })
+    }
+}
+
+struct DuplicateKeyScanVisitor<'a> {
+    state: &'a mut DuplicateKeyScanState,
+}
+
+impl<'de> Visitor<'de> for DuplicateKeyScanVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a valid JSON evidence value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(DuplicateKeyScanSeed {
+                state: &mut *self.state,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !self.state.consume_node() {
+                return Err(serde::de::Error::custom(
+                    "structured evidence duplicate-key scan exhausted its node budget",
+                ));
+            }
+            if !keys.insert(key) {
+                self.state.fail_closed = true;
+                return Err(serde::de::Error::custom(
+                    "structured evidence contains a duplicate object key",
+                ));
+            }
+            object.next_value_seed(DuplicateKeyScanSeed {
+                state: &mut *self.state,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// `serde_json::Value` intentionally retains only one value for a duplicate
+/// object key. Evidence redaction cannot accept that ambiguity because a raw
+/// credential can occupy a discarded occurrence. This bounded validation pass
+/// observes every decoded key before materializing the ordinary value tree and
+/// fails closed on either a duplicate key or budget exhaustion.
+fn valid_json_has_ambiguous_structure(value: &str) -> bool {
+    let mut state = DuplicateKeyScanState {
+        remaining_nodes: MAX_STRUCTURED_SECRET_NODES,
+        fail_closed: false,
+    };
+    let mut deserializer = serde_json::Deserializer::from_str(value);
+    let scan = DuplicateKeyScanSeed { state: &mut state }
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end());
+
+    state.fail_closed || scan.is_err()
+}
+
+enum StructuredFragmentScan {
+    Safe { consumed_bytes: usize },
+    Sensitive,
+}
+
+fn fragment_start_looks_structured(value: &str, offset: usize, opening: char) -> bool {
+    let assigned = value[..offset]
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|character| matches!(character, ':' | '='));
+    if assigned {
+        return true;
+    }
+
+    let after_opening = value[offset + opening.len_utf8()..].trim_start();
+    match opening {
+        '{' => {
+            after_opening.is_empty()
+                || after_opening.starts_with('}')
+                || after_opening.starts_with('"')
+                || after_opening.starts_with("\\\"")
+        }
+        '[' => {
+            after_opening.is_empty()
+                || after_opening.starts_with(']')
+                || after_opening.starts_with('"')
+                || after_opening.starts_with("\\\"")
+                || after_opening.starts_with('{')
+                || after_opening.starts_with('[')
+                || after_opening.starts_with('-')
+                || after_opening.chars().next().is_some_and(|character| {
+                    character.is_ascii_digit() || matches!(character, 't' | 'f' | 'n')
+                })
+        }
+        _ => false,
+    }
+}
+
+fn inspect_structured_fragment_prefix(value: &str, opening: char) -> StructuredFragmentScan {
+    let closing = match opening {
+        '{' => '}',
+        '[' => ']',
+        _ => return StructuredFragmentScan::Sensitive,
+    };
+    let mut candidates = 0;
+
+    for (offset, character) in value.char_indices() {
+        if offset >= MAX_STRUCTURED_SECRET_BYTES {
+            return StructuredFragmentScan::Sensitive;
+        }
+        if character != closing {
+            continue;
+        }
+        candidates += 1;
+        if candidates > MAX_EMBEDDED_STRUCTURED_END_CANDIDATES {
+            return StructuredFragmentScan::Sensitive;
+        }
+
+        let consumed_bytes = offset + character.len_utf8();
+        if consumed_bytes > MAX_STRUCTURED_SECRET_BYTES {
+            return StructuredFragmentScan::Sensitive;
+        }
+        let fragment = &value[..consumed_bytes];
+
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(fragment) {
+            return if valid_json_has_ambiguous_structure(fragment)
+                || structured_value_bears_secret(&parsed)
+            {
+                StructuredFragmentScan::Sensitive
+            } else {
+                StructuredFragmentScan::Safe { consumed_bytes }
+            };
+        }
+
+        let encoded = format!("\"{fragment}\"");
+        let Ok(decoded) = serde_json::from_str::<String>(&encoded) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decoded) else {
+            continue;
+        };
+        return if valid_json_has_ambiguous_structure(&decoded)
+            || structured_value_bears_secret(&parsed)
+        {
+            StructuredFragmentScan::Sensitive
+        } else {
+            StructuredFragmentScan::Safe { consumed_bytes }
+        };
+    }
+
+    StructuredFragmentScan::Sensitive
+}
+
+/// Inspect complete direct or one-layer JSON-escaped objects/arrays embedded in
+/// otherwise free-form evidence. Candidate counts and bytes are capped; a
+/// structured-looking fragment that cannot be decoded completely fails closed.
+fn embedded_structured_text_bears_secret(value: &str) -> bool {
+    let mut search_offset = 0;
+    while search_offset < value.len() {
+        let Some((relative, opening)) = value[search_offset..]
+            .char_indices()
+            .find(|(_, character)| matches!(character, '{' | '['))
+        else {
+            break;
+        };
+        let offset = search_offset + relative;
+        if !fragment_start_looks_structured(value, offset, opening) {
+            search_offset = offset + opening.len_utf8();
+            continue;
+        }
+
+        match inspect_structured_fragment_prefix(&value[offset..], opening) {
+            StructuredFragmentScan::Sensitive => return true,
+            StructuredFragmentScan::Safe { consumed_bytes } => {
+                search_offset = offset + consumed_bytes;
+            }
+        }
+    }
+    false
+}
 
 fn is_cookie_header_name(value: &str) -> bool {
     COOKIE_HEADER_LABELS
@@ -96,23 +358,79 @@ fn is_named_field(key: &str, names: &[&str]) -> bool {
     names.iter().any(|name| key.eq_ignore_ascii_case(name))
 }
 
-fn object_is_cookie_header_entry(entries: &serde_json::Map<String, serde_json::Value>) -> bool {
+/// Validate a value only after its direct map key or sibling/tuple name has
+/// been bound to the exact `Authorization` header. This keeps unrelated header
+/// values and empty Basic/Bearer scheme metadata from triggering redaction.
+fn structured_authorization_value_bears_secret(
+    value: &serde_json::Value,
+    remaining_nodes: &mut usize,
+) -> bool {
+    if *remaining_nodes == 0 {
+        return true;
+    }
+    *remaining_nodes -= 1;
+
+    match value {
+        serde_json::Value::String(value) => authorization_scheme_bears_secret(value),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                if *remaining_nodes == 0 {
+                    return true;
+                }
+                *remaining_nodes -= 1;
+                if value
+                    .as_str()
+                    .is_some_and(authorization_scheme_bears_secret)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn object_is_sensitive_header_entry(
+    entries: &serde_json::Map<String, serde_json::Value>,
+    remaining_nodes: &mut usize,
+) -> bool {
     let names_cookie_header = entries.iter().any(|(key, value)| {
         is_named_field(key, STRUCTURED_HEADER_NAME_FIELDS)
             && value.as_str().is_some_and(is_sensitive_cookie_name)
     });
+    let names_authorization_header = entries.iter().any(|(key, value)| {
+        is_named_field(key, STRUCTURED_HEADER_NAME_FIELDS)
+            && value
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(AUTHORIZATION_LABEL))
+    });
     let has_header_value = entries
         .keys()
         .any(|key| is_named_field(key, STRUCTURED_HEADER_VALUE_FIELDS));
-    names_cookie_header && has_header_value
+
+    (names_cookie_header && has_header_value)
+        || (names_authorization_header
+            && entries.iter().any(|(key, value)| {
+                is_named_field(key, STRUCTURED_HEADER_VALUE_FIELDS)
+                    && structured_authorization_value_bears_secret(value, remaining_nodes)
+            }))
 }
 
-fn array_is_cookie_header_entry(values: &[serde_json::Value]) -> bool {
-    values.len() >= 2
-        && values
-            .first()
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(is_sensitive_cookie_name)
+fn array_is_sensitive_header_entry(
+    values: &[serde_json::Value],
+    remaining_nodes: &mut usize,
+) -> bool {
+    let Some(name) = values.first().and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(value) = values.get(1) else {
+        return false;
+    };
+
+    is_sensitive_cookie_name(name)
+        || (name.eq_ignore_ascii_case(AUTHORIZATION_LABEL)
+            && structured_authorization_value_bears_secret(value, remaining_nodes))
 }
 
 fn authorization_scheme_bears_secret(value: &str) -> bool {
@@ -133,8 +451,8 @@ fn authorization_scheme_bears_secret(value: &str) -> bool {
 /// teaching the fallback a partial JSON decoder.
 ///
 /// Depth and node budgets bound nested/encoded traversal. Exhaustion is treated
-/// as sensitive so an attacker cannot bypass redaction by hiding a cookie after
-/// an oversized prefix.
+/// as sensitive so an attacker cannot bypass redaction by hiding a credential
+/// after an oversized prefix.
 fn structured_header_bears_secret(
     value: &serde_json::Value,
     depth: usize,
@@ -147,18 +465,16 @@ fn structured_header_bears_secret(
 
     match value {
         serde_json::Value::Object(entries) => {
-            object_is_cookie_header_entry(entries)
+            object_is_sensitive_header_entry(entries, remaining_nodes)
                 || entries.iter().any(|(key, value)| {
                     (key.eq_ignore_ascii_case(AUTHORIZATION_LABEL)
-                        && value
-                            .as_str()
-                            .is_some_and(authorization_scheme_bears_secret))
+                        && structured_authorization_value_bears_secret(value, remaining_nodes))
                         || is_sensitive_cookie_name(key)
                         || structured_header_bears_secret(value, depth + 1, remaining_nodes)
                 })
         }
         serde_json::Value::Array(values) => {
-            array_is_cookie_header_entry(values)
+            array_is_sensitive_header_entry(values, remaining_nodes)
                 || values
                     .iter()
                     .any(|value| structured_header_bears_secret(value, depth + 1, remaining_nodes))
@@ -168,17 +484,20 @@ fn structured_header_bears_secret(
                 return true;
             }
             let encoded = encoded.trim_start();
-            if depth >= MAX_NESTED_JSON_SECRET_DEPTH
-                || (!encoded.starts_with('{') && !encoded.starts_with('['))
-            {
+            if !encoded.starts_with('{') && !encoded.starts_with('[') {
                 return false;
+            }
+            if depth >= MAX_NESTED_JSON_SECRET_DEPTH {
+                return true;
             }
             if encoded.len() > MAX_STRUCTURED_SECRET_BYTES {
                 return true;
             }
-            serde_json::from_str::<serde_json::Value>(encoded).is_ok_and(|nested| {
-                structured_header_bears_secret(&nested, depth + 1, remaining_nodes)
-            })
+            let Ok(nested) = serde_json::from_str::<serde_json::Value>(encoded) else {
+                return true;
+            };
+            valid_json_has_ambiguous_structure(encoded)
+                || structured_header_bears_secret(&nested, depth + 1, remaining_nodes)
         }
         _ => false,
     }
@@ -198,6 +517,59 @@ fn trim_assignment_syntax(value: &str) -> &str {
     })
 }
 
+fn parse_json_array_prefix(value: &str) -> Option<serde_json::Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(value);
+    let parsed = serde_json::Value::deserialize(&mut deserializer).ok()?;
+    parsed.is_array().then_some(parsed)
+}
+
+fn parse_escaped_json_array_prefix(value: &str) -> Option<serde_json::Value> {
+    let mut candidates = 0;
+    for (offset, character) in value.char_indices() {
+        if character != ']' {
+            continue;
+        }
+        candidates += 1;
+        if candidates > MAX_EMBEDDED_STRUCTURED_END_CANDIDATES {
+            return None;
+        }
+
+        // Decode only through this candidate terminator. This keeps unrelated
+        // trailing log text outside the synthetic JSON string while serde_json
+        // decides whether a quoted `]` was data or the actual array boundary.
+        let fragment = &value[..offset + character.len_utf8()];
+        let encoded = format!("\"{fragment}\"");
+        let Ok(decoded) = serde_json::from_str::<String>(&encoded) else {
+            continue;
+        };
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decoded)
+            && parsed.is_array()
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn authorization_array_assignment_bears_secret(value: &str) -> bool {
+    if !value.starts_with('[') {
+        return false;
+    }
+    if value.len() > MAX_STRUCTURED_SECRET_BYTES {
+        return true;
+    }
+
+    let parsed = parse_json_array_prefix(value).or_else(|| parse_escaped_json_array_prefix(value));
+    let Some(parsed) = parsed else {
+        // An Authorization assignment that looks like an array but cannot be
+        // decoded unambiguously is not safe evidence.
+        return true;
+    };
+
+    let mut remaining_nodes = MAX_STRUCTURED_SECRET_NODES;
+    structured_authorization_value_bears_secret(&parsed, &mut remaining_nodes)
+}
+
 /// Fallback for log lines or provider output that embeds a header or escaped
 /// JSON fragment inside otherwise non-JSON text. The label must start at a word
 /// boundary, be followed by `:`/`=`, and carry a non-empty Basic/Bearer value.
@@ -215,7 +587,9 @@ fn authorization_assignment_bears_secret(value_lower: &str) -> bool {
             let after = trim_assignment_syntax(&value_lower[after_label..]);
             if let Some(assigned) = after.strip_prefix(':').or_else(|| after.strip_prefix('=')) {
                 let assigned = trim_assignment_syntax(assigned);
-                if authorization_scheme_bears_secret(assigned) {
+                if authorization_scheme_bears_secret(assigned)
+                    || authorization_array_assignment_bears_secret(assigned)
+                {
                     return true;
                 }
             }
@@ -266,6 +640,96 @@ fn header_text_bears_secret(value: &str) -> bool {
         || cookie_assignment_bears_secret(&value_lower)
 }
 
+fn normalize_json_unicode_escapes_once(value: &str) -> Result<Option<String>, ()> {
+    if !value.contains("\\u") {
+        return Ok(None);
+    }
+    if value.len() > MAX_STRUCTURED_SECRET_BYTES {
+        return Err(());
+    }
+
+    let bytes = value.as_bytes();
+    let mut normalized = String::with_capacity(value.len());
+    let mut copied_from = 0;
+    let mut offset = 0;
+    let mut changed = false;
+    while offset < bytes.len() {
+        if bytes[offset] != b'\\' {
+            offset += value[offset..].chars().next().ok_or(())?.len_utf8();
+            continue;
+        }
+
+        // Decode active JSON-style escapes while preserving escaped literals.
+        // An even backslash run leaves `uXXXX` literal; an odd run makes only
+        // its final slash active. Invalid escapes remain ordinary text, so
+        // paths such as `C:\\users` are preserved.
+        let escape_start = offset;
+        while bytes.get(offset) == Some(&b'\\') {
+            offset += 1;
+        }
+        let backslash_count = offset - escape_start;
+        if backslash_count.is_multiple_of(2) || bytes.get(offset) != Some(&b'u') {
+            continue;
+        }
+
+        let Some(first_hex) = bytes.get(offset + 1..offset + 5) else {
+            continue;
+        };
+        let Ok(first_hex) = std::str::from_utf8(first_hex) else {
+            continue;
+        };
+        let Ok(first) = u16::from_str_radix(first_hex, 16) else {
+            continue;
+        };
+        let first_end = offset + 5;
+
+        let (character, escape_end) = if (0xD800..=0xDBFF).contains(&first) {
+            if bytes.get(first_end) != Some(&b'\\') || bytes.get(first_end + 1) != Some(&b'u') {
+                continue;
+            }
+            let Some(second_hex) = bytes.get(first_end + 2..first_end + 6) else {
+                continue;
+            };
+            let Ok(second_hex) = std::str::from_utf8(second_hex) else {
+                continue;
+            };
+            let Ok(second) = u16::from_str_radix(second_hex, 16) else {
+                continue;
+            };
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                continue;
+            }
+            let scalar =
+                0x1_0000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00);
+            let Some(character) = char::from_u32(scalar) else {
+                continue;
+            };
+            (character, first_end + 6)
+        } else if (0xDC00..=0xDFFF).contains(&first) {
+            continue;
+        } else {
+            let Some(character) = char::from_u32(u32::from(first)) else {
+                continue;
+            };
+            (character, first_end)
+        };
+
+        let active_escape_start = escape_start + backslash_count - 1;
+        normalized.push_str(&value[copied_from..active_escape_start]);
+        normalized.push(character);
+        offset = escape_end;
+        copied_from = escape_end;
+        changed = true;
+    }
+
+    if !changed {
+        Ok(None)
+    } else {
+        normalized.push_str(&value[copied_from..]);
+        Ok(Some(normalized))
+    }
+}
+
 /// True if an evidence value looks like it carries a secret: an exact structured
 /// Authorization/Cookie header, a robust embedded header assignment, a
 /// standalone auth marker, or a known secret label immediately followed by a
@@ -273,18 +737,40 @@ fn header_text_bears_secret(value: &str) -> bool {
 /// prose mention ("the password was rotated"); when in doubt this errs toward
 /// OVER-redaction, which is fail-safe for audit/evidence output.
 fn value_bears_secret(value: &str) -> bool {
+    value_bears_secret_inner(value, true)
+}
+
+fn value_bears_secret_inner(value: &str, normalize_unicode: bool) -> bool {
     let structured_candidate = value.trim_start();
-    if structured_candidate.starts_with('{')
-        || structured_candidate.starts_with('[')
-        || structured_candidate.starts_with('"')
-    {
+    let starts_structured_value = structured_candidate.starts_with('"')
+        || structured_candidate
+            .chars()
+            .next()
+            .filter(|opening| matches!(opening, '{' | '['))
+            .is_some_and(|opening| {
+                fragment_start_looks_structured(structured_candidate, 0, opening)
+            });
+    if starts_structured_value {
         if value.len() > MAX_STRUCTURED_SECRET_BYTES {
             return true;
         }
-        if serde_json::from_str::<serde_json::Value>(value)
-            .is_ok_and(|structured| structured_value_bears_secret(&structured))
-        {
+        let Ok(structured) = serde_json::from_str::<serde_json::Value>(value) else {
             return true;
+        };
+        if valid_json_has_ambiguous_structure(value) || structured_value_bears_secret(&structured) {
+            return true;
+        }
+    }
+
+    if embedded_structured_text_bears_secret(value) {
+        return true;
+    }
+
+    if normalize_unicode && !starts_structured_value {
+        match normalize_json_unicode_escapes_once(value) {
+            Ok(Some(normalized)) if value_bears_secret_inner(&normalized, false) => return true,
+            Err(()) => return true,
+            Ok(Some(_)) | Ok(None) => {}
         }
     }
 
@@ -478,7 +964,7 @@ fn redact_json_evidence_value_inner(
 
     match value {
         serde_json::Value::Object(entries) => {
-            if object_is_cookie_header_entry(entries) {
+            if object_is_sensitive_header_entry(entries, remaining_nodes) {
                 return serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string());
             }
             let mut redacted = serde_json::Map::with_capacity(entries.len());
@@ -493,7 +979,7 @@ fn redact_json_evidence_value_inner(
             serde_json::Value::Object(redacted)
         }
         serde_json::Value::Array(values) => {
-            if array_is_cookie_header_entry(values) {
+            if array_is_sensitive_header_entry(values, remaining_nodes) {
                 return serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string());
             }
             serde_json::Value::Array(
@@ -785,6 +1271,21 @@ mod tests {
         for value in [
             r#"{"Authorization":"Basic SYNTH-BASIC-MARKER"}"#,
             r#"{"authorization":"Bearer SYNTH-BEARER-MARKER"}"#,
+            r#"{"Authorization":["Basic SYNTH-BASIC-ARRAY-MARKER"]}"#,
+            r#"{"headers":{"authorization":["Digest public-metadata","Basic SYNTH-NESTED-BASIC-ARRAY-MARKER"]}}"#,
+            r#"{"Authorization":["Basic SYNTH-DUPLICATE-DIRECT-MARKER"],"Authorization":["Basic"]}"#,
+            r#"{"name":"Authorization","value":"Basic SYNTH-DUPLICATE-NAMED-MARKER","value":"Basic"}"#,
+            r#""{\"Authorization\":[\"Basic SYNTH-NESTED-DUPLICATE-MARKER\"],\"Authorization\":[\"Basic\"]}""#,
+            r#"nested={\"Authorization\":[\"Basic SYNTH-EMBEDDED-ARRAY-MARKER\"]}"#,
+            r#"nested={\"Authorization\":[\"Digest public-metadata\",\"Basic SYNTH-EMBEDDED-LATER-ARRAY-MARKER\"],\"Authorization\":[\"Basic\"]}"#,
+            r#"nested={\"Authorization\":[\"Digest ] public\",\"Basic SYNTH-QUOTED-DELIMITER-MARKER\"]}"#,
+            r#"nested={\"Authorization\":[\"Bas\u0069c SYNTH-UNICODE-ARRAY-MARKER\"]}"#,
+            r#"nested={\"\\u0041uthorization\":\"Bas\\u0069c SYNTH-ESCAPED-KEY-SCALAR-MARKER\"}"#,
+            r#"nested={\"Authoriz\\u0061tion\":[\"Basic SYNTH-PARTIAL-ESCAPED-KEY-MARKER\"]}"#,
+            r#"context {\u0022\u0041uthorization\u0022\u003a\u0022Bas\u0069c SYNTH-UNICODE-STRUCTURE-MARKER\u0022}"#,
+            r#"context \u007b\u0022\u0041uthorization\u0022\u003a\u0022Bas\u0069c SYNTH-FULLY-ESCAPED-STRUCTURE-MARKER\u0022\u007d"#,
+            r#"context \u0041uthorization: Bas\u0069c SYNTH-UNICODE-PLAINTEXT-MARKER"#,
+            r#"note \uZZZZ; \u0041uthorization: Bas\u0069c SYNTH-LATE-UNICODE-PLAINTEXT-MARKER"#,
             r#"{"headers":{"\u0041uthorization":"Basic SYNTH-UNICODE-MARKER"}}"#,
             r#"nested={\"Authorization\":\"Basic SYNTH-ESCAPED-MARKER\"}"#,
             "Authorization = 'Bearer SYNTH-HEADER-MARKER'",
@@ -798,7 +1299,23 @@ mod tests {
         for value in [
             r#"{"authorization":"Digest SYNTH-NONSECRET-METADATA"}"#,
             r#"{"authorization":"Basic"}"#,
+            r#"{"authorization":["Basic","Bearer","Digest public-metadata"]}"#,
             r#"{"authorization_url":"Basic SYNTH-NONSECRET-METADATA"}"#,
+            r#"{"x-authorization-mode":["Basic delegated"]}"#,
+            r#"nested={\"Authorization\":[\"Basic\",\"Bearer\",\"Digest public-metadata\"]}"#,
+            r#"nested={\"Authorization\":[\"Digest ] public\",\"Bas\u0069c\"]}"#,
+            r#"nested={\"\\u0041uthorization\":\"Basic\"} status="ok""#,
+            r#"nested={\"message\":\"ordinary\"} status="ok""#,
+            r#"context {\u0022\u0041uthorization\u0022\u003a\u0022Basic\u0022}"#,
+            r#"context \u007b\u0022message\u0022\u003a\u0022ordinary\u0022\u007d"#,
+            r#"context \uD83D\uDE80 deployment complete"#,
+            r#"path=C:\users\operator\artifact.json"#,
+            r#"literal=\uZZZZ ordinary metadata"#,
+            r#"literal=\uD83D ordinary metadata"#,
+            r#"literal=\\u0041uthorization: Basic public metadata"#,
+            r#"nested={\"x-authorization-mode\":[\"Basic delegated\"]}"#,
+            r#"{"left":{"value":"ordinary"},"right":{"value":"ordinary"}}"#,
+            r#"[{"name":"X-Mode","value":"ordinary"},{"name":"X-Mode","value":"ordinary"}]"#,
             r#"{"message":"authorization policy metadata only"}"#,
         ] {
             assert!(
@@ -806,6 +1323,29 @@ mod tests {
                 "non-credential metadata must not be over-redacted: {value}"
             );
         }
+    }
+
+    #[test]
+    fn test_malformed_structured_evidence_fails_closed_without_redacting_prose() {
+        for value in [
+            r#"{"Authorization":["Basic SYNTH-MALFORMED-WHOLE""#,
+            r#"nested={\"Authorization\":[\"Basic SYNTH-MALFORMED-EMBEDDED\""#,
+            r#"nested={\"\\u0043ookie\":\"SYNTH-MALFORMED-COOKIE"#,
+        ] {
+            assert!(
+                should_redact("execution_log", value),
+                "malformed structured-looking evidence must fail closed: {value}"
+            );
+        }
+
+        assert!(
+            !should_redact("execution_log", "deployment {complete} successfully"),
+            "ordinary brace-delimited prose must not be treated as JSON"
+        );
+        assert!(
+            !should_redact("execution_log", "[INFO] deployment completed"),
+            "ordinary bracket-prefixed log levels must not be treated as JSON"
+        );
     }
 
     #[test]
@@ -840,6 +1380,10 @@ mod tests {
                 "provider_output",
                 r#"{"response":"{\"headers\":{\"Set-Cookie\":\"__Host-ryuki_session=SYNTH-NESTED-RESPONSE\"}}"}"#,
             ),
+            (
+                "provider_output",
+                r#"nested={\"\\u0043ookie\":\"__Host-ryuki_session=SYNTH-ESCAPED-COOKIE-KEY\"}"#,
+            ),
             ("reason", "__Host-ryuki_session=SYNTH-BARE-SECURE-SESSION"),
             ("reason", "ryuki_session=SYNTH-BARE-LOOPBACK-SESSION"),
             ("reason", "__Host-entra_login_csrf=SYNTH-BARE-ENTRA-BINDING"),
@@ -865,6 +1409,10 @@ mod tests {
             (
                 "configuration",
                 r#"{"cookie_policy":{"secure":true,"http_only":true}}"#,
+            ),
+            (
+                "configuration",
+                r#"nested={\"\\u0043ookiePolicy\":\"ordinary metadata\"}"#,
             ),
             ("summary", "browser compatibility check completed"),
         ] {
@@ -1076,6 +1624,113 @@ mod tests {
         assert!(!serialized.contains(named_marker));
         assert!(!serialized.contains(tuple_marker));
         assert_eq!(redacted["note"], "ordinary audit context");
+    }
+
+    #[test]
+    fn test_structured_json_redactor_handles_named_and_tuple_authorization_entries() {
+        let named_marker = "SYNTH-NAMED-BASIC-CANARY";
+        let tuple_marker = "SYNTH-TUPLE-BASIC-CANARY";
+        let values_marker = "SYNTH-VALUES-BASIC-CANARY";
+        let detail = serde_json::json!({
+            "request": {
+                "headers": [
+                    {
+                        "name": "Authorization",
+                        "value": format!("Basic {named_marker}")
+                    },
+                    [
+                        "authorization",
+                        format!("Basic {tuple_marker}")
+                    ],
+                    {
+                        "header_name": "AUTHORIZATION",
+                        "header_values": [format!("Basic {values_marker}")]
+                    }
+                ]
+            },
+            "controls": [
+                {"name": "Authorization", "value": "Basic"},
+                ["Authorization", "Bearer"],
+                {"name": "Authorization", "value": "Digest public-metadata"},
+                {"name": "X-Authentication-Mode", "value": "Basic delegated"}
+            ],
+            "note": "ordinary audit context"
+        });
+
+        assert!(structured_value_bears_secret(&detail));
+        assert!(
+            should_redact("provider_output", &serde_json::to_string(&detail).unwrap()),
+            "serialized structured evidence must use the same header-pair detector"
+        );
+        assert!(
+            !structured_value_bears_secret(&detail["controls"]),
+            "scheme-only and non-Authorization metadata must remain non-secret"
+        );
+        assert!(
+            !should_redact(
+                "provider_output",
+                &serde_json::to_string(&detail["controls"]).unwrap()
+            ),
+            "serialized safe controls must not be over-redacted"
+        );
+
+        let redacted = redact_json_evidence_value(&detail);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        for marker in [named_marker, tuple_marker, values_marker] {
+            assert!(
+                !serialized.contains(marker),
+                "structured Basic credential marker must not survive: {marker}"
+            );
+        }
+        assert_eq!(redacted["request"]["headers"][0], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(redacted["request"]["headers"][1], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(redacted["request"]["headers"][2], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(redacted["controls"][0]["value"], "Basic");
+        assert_eq!(redacted["controls"][1][1], "Bearer");
+        assert_eq!(redacted["controls"][2]["value"], "Digest public-metadata");
+        assert_eq!(redacted["controls"][3]["value"], "Basic delegated");
+        assert_eq!(redacted["note"], "ordinary audit context");
+    }
+
+    #[test]
+    fn test_structured_authorization_values_fail_closed_at_node_budget() {
+        let oversized_values =
+            vec![serde_json::Value::String("Basic".to_string()); MAX_STRUCTURED_SECRET_NODES + 1];
+        let detail = serde_json::json!({
+            "name": "Authorization",
+            "values": oversized_values
+        });
+
+        assert!(
+            structured_value_bears_secret(&detail),
+            "an oversized named Authorization value list must fail closed"
+        );
+        assert_eq!(
+            redact_json_evidence_value(&detail),
+            REDACTED_EVIDENCE_VALUE,
+            "the redactor must stop at the same bounded traversal limit"
+        );
+    }
+
+    #[test]
+    fn test_encoded_structured_value_fails_closed_at_depth_budget() {
+        let mut credential = serde_json::Value::String(
+            r#"{"Authorization":["Basic SYNTH-DEPTH-BUDGET-MARKER"]}"#.to_string(),
+        );
+        let mut safe_text = serde_json::Value::String("ordinary audit context".to_string());
+        for _ in 0..MAX_NESTED_JSON_SECRET_DEPTH {
+            credential = serde_json::json!({"nested": credential});
+            safe_text = serde_json::json!({"nested": safe_text});
+        }
+
+        assert!(
+            structured_value_bears_secret(&credential),
+            "structured-looking content at the depth limit must fail closed"
+        );
+        assert!(
+            !structured_value_bears_secret(&safe_text),
+            "ordinary text at the depth limit must remain available"
+        );
     }
 
     #[test]

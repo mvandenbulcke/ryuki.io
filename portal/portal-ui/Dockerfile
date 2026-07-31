@@ -11,20 +11,27 @@
 # rust:1.96-bookworm, pinned to the reviewed multi-platform index.
 FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 
-WORKDIR /app
-
 # Toolchain layer: cached independently of the workspace sources
-RUN rustup target add wasm32-unknown-unknown \
-    && cargo install cargo-leptos --version 0.3.7 --locked
+RUN ["/usr/local/cargo/bin/rustup", "target", "add", "wasm32-unknown-unknown"]
+RUN ["/usr/local/cargo/bin/cargo", "install", "cargo-leptos", "--version", "0.3.7", "--locked", "--root", "/opt/ryuki-tools/cargo-leptos-0.3.7"]
+RUN ["/usr/sbin/groupadd", "--system", "--gid", "10001", "ryuki-build"]
+RUN ["/usr/sbin/useradd", "--system", "--uid", "10001", "--gid", "ryuki-build", "--create-home", "--home-dir", "/home/ryuki-build", "--shell", "/usr/sbin/nologin", "ryuki-build"]
+RUN ["/usr/bin/install", "-d", "-o", "10001", "-g", "10001", "-m", "0755", "/app", "/var/cache/ryuki-cargo"]
+RUN ["/usr/bin/chown", "-R", "0:0", "/opt/ryuki-tools/cargo-leptos-0.3.7", "/usr/local/cargo", "/usr/local/rustup"]
+RUN ["/usr/bin/chmod", "-R", "a-w", "/opt/ryuki-tools/cargo-leptos-0.3.7", "/usr/local/cargo", "/usr/local/rustup"]
+
+ENV HOME=/home/ryuki-build CARGO_HOME=/var/cache/ryuki-cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:/var/cache/ryuki-cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR /app
+USER 10001:10001
 
 # Full workspace COPY set so `cargo metadata` resolves every member
-COPY Cargo.toml Cargo.lock ./
-COPY scripts/validator-rs/ scripts/validator-rs/
-COPY tests/ tests/
-COPY sources/ sources/
-COPY portal/ portal/
+COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./
+COPY --link --chown=10001:10001 scripts/validator-rs/ scripts/validator-rs/
+COPY --link --chown=10001:10001 tests/ tests/
+COPY --link --chown=10001:10001 sources/ sources/
+COPY --link --chown=10001:10001 portal/ portal/
 
-RUN cargo leptos build --release -p ryuki-portal-ui
+RUN ["/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos", "build", "--release", "-p", "ryuki-portal-ui"]
 
 # debian:bookworm-slim, pinned to the reviewed multi-platform index.
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime

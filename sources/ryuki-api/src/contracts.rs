@@ -26251,6 +26251,10 @@ async fn rework_one(
     if !check_permission(session, "approve") {
         return Err(status_403());
     }
+    // One reason crosses the request row, mutation response, and audit detail
+    // boundaries. Normalize it once before any branch can persist or return it.
+    let safe_reason = ryuki_engine::evidence_pipeline::redact_sensitive_text("reason", reason);
+    let reason = safe_reason.as_str();
     let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
@@ -26374,6 +26378,10 @@ async fn fail_one(
     request_id: &str,
     reason: &str,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
+    // One reason crosses the request row, mutation response, and audit detail
+    // boundaries. Normalize it once before any branch can persist or return it.
+    let safe_reason = ryuki_engine::evidence_pipeline::redact_sensitive_text("reason", reason);
+    let reason = safe_reason.as_str();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
@@ -26493,6 +26501,10 @@ async fn cancel_one(
     request_id: &str,
     reason: &str,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
+    // One reason crosses stage evidence, the request row, mutation response,
+    // and audit detail. Normalize it before either persistence branch.
+    let safe_reason = ryuki_engine::evidence_pipeline::redact_sensitive_text("reason", reason);
+    let reason = safe_reason.as_str();
     let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
@@ -53088,6 +53100,116 @@ mod unit_tests {
     }
 
     #[tokio::test]
+    async fn requests_rework_fail_cancel_cookie_reasons_are_redacted_before_storage_and_return() {
+        if get_db().is_some() {
+            eprintln!("SKIP: lifecycle reason redaction regression requires no-DB mode");
+            return;
+        }
+
+        let rework_id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&rework_id, "requester-1").await;
+        let rework_marker = "SYNTH-REWORK-ENDPOINT-COOKIE-CANARY";
+        let Json(rework_response) = requests_rework(
+            Path(rework_id.clone()),
+            AuthExtractor(single_role_session(
+                "approver-reason-redaction",
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            )),
+            Json(ReasonBody {
+                reason: format!("__Host-ryuki_session={rework_marker}"),
+            }),
+        )
+        .await
+        .expect("approver may rework a planned request");
+
+        let fail_id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&fail_id, "requester-1").await;
+        let fail_marker = "SYNTH-FAIL-ENDPOINT-COOKIE-CANARY";
+        let Json(fail_response) = requests_fail(
+            Path(fail_id.clone()),
+            AuthExtractor(single_role_session(
+                "operator-reason-redaction",
+                ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR,
+            )),
+            Json(ReasonBody {
+                reason: format!("Cookie: __Host-ryuki_session={fail_marker}"),
+            }),
+        )
+        .await
+        .expect("operator may fail a planned request");
+
+        let cancel_id = format!("req-test-{}", Uuid::new_v4());
+        let mut cancel_request = test_request(&cancel_id);
+        cancel_request.requester = test_principal_id("requester-reason-redaction").to_string();
+        cancel_request.owner = cancel_request.requester.clone();
+        request_store().lock().await.push(cancel_request);
+        let cancel_marker = "SYNTH-CANCEL-ENDPOINT-COOKIE-CANARY";
+        let Json(cancel_response) = requests_cancel(
+            Path(cancel_id.clone()),
+            AuthExtractor(single_role_session(
+                "requester-reason-redaction",
+                ryuki_engine::auth::APP_ROLE_REQUESTER,
+            )),
+            Json(ReasonBody {
+                reason: format!("__Host-entra_login_csrf={cancel_marker}"),
+            }),
+        )
+        .await
+        .expect("requester may cancel their own request");
+
+        for (id, action, marker, response) in [
+            (rework_id, "request.rework", rework_marker, rework_response),
+            (fail_id, "request.fail", fail_marker, fail_response),
+            (cancel_id, "request.cancel", cancel_marker, cancel_response),
+        ] {
+            let response_json = serde_json::to_string(&response).unwrap();
+            assert!(!response_json.contains(marker));
+            assert!(
+                response_json.contains(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+            );
+
+            let stored = request_store()
+                .lock()
+                .await
+                .iter()
+                .find(|request| request.id == id)
+                .cloned()
+                .expect("mutated request is retained");
+            let stored_json = serde_json::to_string(&stored).unwrap();
+            assert!(!stored_json.contains(marker));
+            assert!(stored_json.contains(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE));
+
+            let Json(request_detail) = requests_get_for_test(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path(id.clone()),
+            )
+            .await
+            .expect("request detail remains readable");
+            assert!(!serde_json::to_string(&request_detail)
+                .unwrap()
+                .contains(marker));
+
+            let Json(audit_trail) =
+                requests_audit(AuthExtractor(AuthSession::static_dry_run()), Path(id))
+                    .await
+                    .expect("audit trail remains readable");
+            let entry = audit_trail["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["action"] == action)
+                .expect("transition audit entry is present");
+            assert_eq!(
+                entry["detail"]["reason"],
+                ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+            );
+            assert!(!serde_json::to_string(&audit_trail)
+                .unwrap()
+                .contains(marker));
+        }
+    }
+
+    #[tokio::test]
     async fn evidence_redact_endpoint_rejects_hostile_replacement_cookie_value() {
         let raw_marker = "SYNTH-ENDPOINT-RAW-COOKIE-CANARY";
         let replacement_marker = "SYNTH-ENDPOINT-REPLACEMENT-COOKIE-CANARY";
@@ -69757,6 +69879,98 @@ mod db_lifecycle_tests {
         bind_test_principal(&mut s, "operator-db");
         s.roles = vec![ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string()];
         s
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cookie_reasons_are_redacted_before_db_persistence() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let rework_id = seed_request(pool, "planned", "approve").await;
+        let rework_marker = "SYNTH-REWORK-DB-COOKIE-CANARY";
+        let rework_response = rework_one(
+            &approver_session(),
+            &rework_id.to_string(),
+            &format!("__Host-ryuki_session={rework_marker}"),
+        )
+        .await
+        .expect("rework persists");
+
+        let fail_id = seed_request(pool, "planned", "approve").await;
+        let fail_marker = "SYNTH-FAIL-DB-COOKIE-CANARY";
+        let fail_response = fail_one(
+            &operator_session(),
+            &fail_id.to_string(),
+            &format!("Cookie: __Host-ryuki_session={fail_marker}"),
+        )
+        .await
+        .expect("failure persists");
+
+        let cancel_id = seed_request(pool, "planned", "approve").await;
+        let cancel_marker = "SYNTH-CANCEL-DB-COOKIE-CANARY";
+        let created_by = read_row(pool, cancel_id)
+            .await
+            .created_by
+            .expect("seeded request has an exact creator")
+            .parse::<PrincipalId>()
+            .expect("seeded creator is an opaque principal id");
+        let mut requester =
+            request_read_session("requester-db", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        requester.display_user_id = created_by.to_string();
+        requester.principal_id = Some(created_by);
+        let cancel_response = cancel_one(
+            &requester,
+            &cancel_id.to_string(),
+            &format!("__Host-entra_login_csrf={cancel_marker}"),
+        )
+        .await
+        .expect("cancellation persists");
+
+        for (id, action, marker, response) in [
+            (rework_id, "request.rework", rework_marker, rework_response),
+            (fail_id, "request.fail", fail_marker, fail_response),
+            (cancel_id, "request.cancel", cancel_marker, cancel_response),
+        ] {
+            let response_json = serde_json::to_string(&response).unwrap();
+            assert!(!response_json.contains(marker));
+            assert!(
+                response_json.contains(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+            );
+
+            let detail: Value = sqlx::query_scalar(
+                "SELECT detail FROM audit_log \
+                 WHERE request_id = $1 AND action = $2 AND outcome = 'applied' \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(id)
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .expect("read raw persisted transition audit detail");
+            assert_eq!(
+                detail["reason"],
+                ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+            );
+            assert!(!serde_json::to_string(&detail).unwrap().contains(marker));
+        }
+
+        let cancel_stages: Value = sqlx::query_scalar("SELECT stages FROM requests WHERE id = $1")
+            .bind(cancel_id)
+            .fetch_one(pool)
+            .await
+            .expect("read raw persisted cancellation stages");
+        let cancel_stages_json = serde_json::to_string(&cancel_stages).unwrap();
+        assert!(!cancel_stages_json.contains(cancel_marker));
+        assert!(
+            cancel_stages_json.contains(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+
+        for id in [rework_id, fail_id, cancel_id] {
+            cleanup_request(pool, id).await;
+        }
     }
 
     /// Happy batch rework: two planned DEFRA requests → all reworked back to Intake,

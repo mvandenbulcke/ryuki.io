@@ -10,37 +10,44 @@
 # rust:1.96-bookworm, pinned to the reviewed multi-platform index.
 FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS chef
 
-RUN cargo install cargo-chef --version 0.1.77 --locked
+RUN ["/usr/local/cargo/bin/cargo", "install", "cargo-chef", "--version", "0.1.77", "--locked", "--root", "/opt/ryuki-tools/cargo-chef-0.1.77"]
+RUN ["/usr/sbin/groupadd", "--system", "--gid", "10001", "ryuki-build"]
+RUN ["/usr/sbin/useradd", "--system", "--uid", "10001", "--gid", "ryuki-build", "--create-home", "--home-dir", "/home/ryuki-build", "--shell", "/usr/sbin/nologin", "ryuki-build"]
+RUN ["/usr/bin/install", "-d", "-o", "10001", "-g", "10001", "-m", "0755", "/app", "/var/cache/ryuki-cargo"]
+RUN ["/usr/bin/chown", "-R", "0:0", "/opt/ryuki-tools/cargo-chef-0.1.77", "/usr/local/cargo", "/usr/local/rustup"]
+RUN ["/usr/bin/chmod", "-R", "a-w", "/opt/ryuki-tools/cargo-chef-0.1.77", "/usr/local/cargo", "/usr/local/rustup"]
 
+ENV HOME=/home/ryuki-build CARGO_HOME=/var/cache/ryuki-cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:/var/cache/ryuki-cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WORKDIR /app
+USER 10001:10001
 
 FROM chef AS planner
 
 # Full workspace COPY set so `cargo metadata` resolves every member
-COPY Cargo.toml Cargo.lock ./
-COPY sources/ sources/
-COPY portal/ portal/
-COPY scripts/validator-rs/ scripts/validator-rs/
-COPY tests/ tests/
-COPY migrations/ migrations/
-COPY catalog/ catalog/
+COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./
+COPY --link --chown=10001:10001 sources/ sources/
+COPY --link --chown=10001:10001 portal/ portal/
+COPY --link --chown=10001:10001 scripts/validator-rs/ scripts/validator-rs/
+COPY --link --chown=10001:10001 tests/ tests/
+COPY --link --chown=10001:10001 migrations/ migrations/
+COPY --link --chown=10001:10001 catalog/ catalog/
 
-RUN cargo chef prepare --recipe-path recipe.json
+RUN ["/opt/ryuki-tools/cargo-chef-0.1.77/bin/cargo-chef", "chef", "prepare", "--recipe-path", "recipe.json"]
 
 FROM chef AS build
 
 # Dependency layer: cached until the workspace dependency set changes
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --locked --release --recipe-path recipe.json --package ryuki-api
+COPY --link --chown=10001:10001 --from=planner /app/recipe.json recipe.json
+RUN ["/opt/ryuki-tools/cargo-chef-0.1.77/bin/cargo-chef", "chef", "cook", "--locked", "--release", "--recipe-path", "recipe.json", "--package", "ryuki-api"]
 
 # Source layer: same full workspace COPY set as the planner stage
-COPY Cargo.toml Cargo.lock ./
-COPY sources/ sources/
-COPY portal/ portal/
-COPY scripts/validator-rs/ scripts/validator-rs/
-COPY tests/ tests/
-COPY migrations/ migrations/
-COPY catalog/ catalog/
+COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./
+COPY --link --chown=10001:10001 sources/ sources/
+COPY --link --chown=10001:10001 portal/ portal/
+COPY --link --chown=10001:10001 scripts/validator-rs/ scripts/validator-rs/
+COPY --link --chown=10001:10001 tests/ tests/
+COPY --link --chown=10001:10001 migrations/ migrations/
+COPY --link --chown=10001:10001 catalog/ catalog/
 
 # Release builds pass the already validated tag commit. Keep the argument
 # optional so ordinary local builds do not define option_env!("RYUKI_SOURCE_REVISION").
@@ -62,7 +69,7 @@ RUN set -eu; \
     else \
         unset RYUKI_SOURCE_REVISION; \
     fi; \
-    cargo build --locked --release -p ryuki-api
+    /usr/local/cargo/bin/cargo build --locked --release -p ryuki-api
 
 # debian:bookworm-slim, pinned to the reviewed multi-platform index.
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime

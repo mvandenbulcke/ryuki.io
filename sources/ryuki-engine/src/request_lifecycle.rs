@@ -447,6 +447,11 @@ pub fn cancel_request(request: &Request, actor: &str, reason: &str) -> Result<Re
         ));
     }
 
+    // Cancellation reasons are returned in stage evidence and metadata. Redact
+    // at the engine boundary so direct callers cannot persist or return a
+    // replayable credential before an API read-side guard runs.
+    let reason = crate::evidence_pipeline::redact_sensitive_text("reason", reason);
+
     let mut cancelled = request.clone();
     cancelled.status = RequestStatus::Cancelled;
     cancelled.updated_at = Utc::now().to_rfc3339();
@@ -465,7 +470,7 @@ pub fn cancel_request(request: &Request, actor: &str, reason: &str) -> Result<Re
         }],
         metadata: HashMap::from([
             ("actor".into(), actor.to_string()),
-            ("reason".into(), reason.to_string()),
+            ("reason".into(), reason),
         ]),
     });
 
@@ -861,12 +866,15 @@ pub fn fail_request(request: &Request, reason: &str) -> Result<Request, String> 
         return Err("Cannot fail a request that has already concluded.".into());
     }
 
+    // The failure reason is part of the returned request and is persisted by
+    // API callers. Redact it here as well as at the API persistence boundary so
+    // direct engine callers cannot retain a replayable credential.
+    let reason = crate::evidence_pipeline::redact_sensitive_text("reason", reason);
+
     let mut failed = request.clone();
     failed.status = RequestStatus::Failed;
     failed.updated_at = Utc::now().to_rfc3339();
-    failed
-        .metadata
-        .insert("failure_reason".into(), reason.to_string());
+    failed.metadata.insert("failure_reason".into(), reason);
 
     Ok(failed)
 }
@@ -903,12 +911,15 @@ pub fn rework_request(request: &Request, actor: &str, reason: &str) -> Result<Re
         ));
     }
 
+    // The rework reason is returned in request metadata and persisted by API
+    // callers. Redact at this source boundary so direct engine callers cannot
+    // retain a replayable credential.
+    let reason = crate::evidence_pipeline::redact_sensitive_text("reason", reason);
+
     let mut reworked = request.clone();
     reworked.status = RequestStatus::Intake;
     reworked.updated_at = Utc::now().to_rfc3339();
-    reworked
-        .metadata
-        .insert("rework_reason".into(), reason.to_string());
+    reworked.metadata.insert("rework_reason".into(), reason);
     reworked
         .metadata
         .insert("reworked_by".into(), actor.to_string());
@@ -1320,6 +1331,22 @@ mod tests {
     }
 
     #[test]
+    fn test_fail_request_redacts_session_cookie_before_return() {
+        let marker = "SYNTH-FAILURE-COOKIE-CANARY";
+        let failed = fail_request(
+            &make_test_request(),
+            &format!("__Host-ryuki_session={marker}"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            failed.metadata.get("failure_reason").map(String::as_str),
+            Some(crate::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert!(!serde_json::to_string(&failed).unwrap().contains(marker));
+    }
+
+    #[test]
     fn test_fail_completed_request_fails() {
         let mut req = make_test_request();
         req.status = RequestStatus::Completed;
@@ -1344,6 +1371,29 @@ mod tests {
             );
             assert_eq!(reworked.metadata.get("reworked_by").unwrap(), "carol");
         }
+    }
+
+    #[test]
+    fn test_rework_request_redacts_session_cookie_before_return() {
+        let marker = "SYNTH-REWORK-COOKIE-CANARY";
+        let mut req = make_test_request();
+        req.status = RequestStatus::Planned;
+        let reworked = rework_request(
+            &req,
+            "carol",
+            &format!("Cookie: __Host-ryuki_session={marker}"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reworked.metadata.get("rework_reason").map(String::as_str),
+            Some(crate::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(
+            reworked.metadata.get("reworked_by").map(String::as_str),
+            Some("carol")
+        );
+        assert!(!serde_json::to_string(&reworked).unwrap().contains(marker));
     }
 
     #[test]
@@ -1522,6 +1572,33 @@ mod tests {
             cancel_request(&draft, "alice", "abandoned").unwrap().status,
             RequestStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn test_cancel_request_redacts_session_cookie_before_stage_storage() {
+        let marker = "SYNTH-CANCELLATION-COOKIE-CANARY";
+        let cancelled = cancel_request(
+            &make_test_request(),
+            "alice",
+            &format!("__Host-entra_login_csrf={marker}"),
+        )
+        .unwrap();
+        let cancel_stage = cancelled
+            .stages
+            .iter()
+            .find(|stage| stage.name == "cancel")
+            .unwrap();
+
+        assert_eq!(
+            cancel_stage.metadata.get("reason").map(String::as_str),
+            Some(crate::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert!(
+            cancel_stage.evidence[0]
+                .value
+                .contains(crate::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert!(!serde_json::to_string(&cancelled).unwrap().contains(marker));
     }
 
     #[test]

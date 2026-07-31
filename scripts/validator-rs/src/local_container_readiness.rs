@@ -17,6 +17,8 @@ const PORTAL_SERVER_BOUNDARY_PATH: &str = "portal/portal-ui/src/server_boundary.
 const ENDPOINT: &str = "/api/platform/local-container-readiness-contract";
 const PORTAL_RUNTIME_IMAGE: &str =
     "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818";
+const PORTAL_CARGO_LEPTOS_INSTALL_INSTRUCTION: &str = r#"RUN ["/usr/local/cargo/bin/cargo", "install", "cargo-leptos", "--version", "0.3.7", "--locked", "--root", "/opt/ryuki-tools/cargo-leptos-0.3.7"]"#;
+const PORTAL_CARGO_LEPTOS_BUILD_INSTRUCTION: &str = r#"RUN ["/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos", "build", "--release", "-p", "ryuki-portal-ui"]"#;
 
 const REQUIRED_SURFACES: &[&str] = &[
     "compose-file-readiness",
@@ -685,7 +687,16 @@ fn validate_portal_runtime_boundary(
     errors: &mut Vec<String>,
 ) {
     expect(
-        dockerfile.contains("cargo leptos build --release"),
+        dockerfile_has_active_instruction(dockerfile, PORTAL_CARGO_LEPTOS_INSTALL_INSTRUCTION)
+            && dockerfile_has_active_instruction(dockerfile, PORTAL_CARGO_LEPTOS_BUILD_INSTRUCTION)
+            && dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./",
+            )
+            && dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 portal/ portal/",
+            ),
         errors,
         "portal Dockerfile must build the full-stack Leptos app",
     );
@@ -713,6 +724,17 @@ fn validate_portal_runtime_boundary(
         dockerfile.contains("CMD [\"/app/ryuki-portal-ui\"]"),
         errors,
         "portal Dockerfile must run the Rust portal server",
+    );
+    expect(
+        dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui",
+        ) && dockerfile_has_active_instruction(
+            dockerfile,
+            "COPY --from=build --chown=10001:10001 /app/target/site /app/site",
+        ),
+        errors,
+        "portal Dockerfile must copy runtime artifacts with the reviewed non-root ownership",
     );
     expect(
         !dockerfile.contains("FROM nginx:alpine") && !dockerfile.contains("trunk build --release"),
@@ -761,6 +783,10 @@ fn validate_portal_runtime_boundary(
         errors,
         "portal server boundary must block evidence export by default",
     );
+}
+
+fn dockerfile_has_active_instruction(dockerfile: &str, expected: &str) -> bool {
+    dockerfile.lines().any(|line| line.trim() == expected)
 }
 
 fn has_reviewed_portal_runtime_stage(dockerfile: &str) -> bool {

@@ -9,7 +9,9 @@ graphify-out
 # in-container /app/target instead of the host's sibling development cache.
 .cargo
 target
+target/
 **/target
+**/target/
 *.log
 .env.*
 *.key

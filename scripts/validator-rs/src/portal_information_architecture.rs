@@ -22,6 +22,12 @@ const PORTAL_WORKSPACES_PATH: &str = "portal/portal-ui/src/views/workspaces.rs";
 const PORTAL_API_PATH: &str = "portal/portal-ui/src/api.rs";
 const PORTAL_SERVER_BOUNDARY_PATH: &str = "portal/portal-ui/src/server_boundary.rs";
 const ENDPOINT: &str = "/api/platform/portal-information-architecture-contract";
+const PORTAL_RUSTUP_TARGET_INSTRUCTION: &str =
+    r#"RUN ["/usr/local/cargo/bin/rustup", "target", "add", "wasm32-unknown-unknown"]"#;
+const PORTAL_CARGO_LEPTOS_INSTALL_INSTRUCTION: &str = r#"RUN ["/usr/local/cargo/bin/cargo", "install", "cargo-leptos", "--version", "0.3.7", "--locked", "--root", "/opt/ryuki-tools/cargo-leptos-0.3.7"]"#;
+const PORTAL_CARGO_LEPTOS_BUILD_INSTRUCTION: &str = r#"RUN ["/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos", "build", "--release", "-p", "ryuki-portal-ui"]"#;
+const PORTAL_CARGO_LEPTOS_CRATE_BUILD_INSTRUCTION: &str =
+    r#"RUN ["/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos", "build", "--release"]"#;
 // The portal's standalone image and local-development command use this exact
 // fail-closed loopback origin. The value scanner admits no suffix, alternate
 // port, credential, query, fragment, or non-loopback host.
@@ -1108,13 +1114,32 @@ fn validate_portal_runtime_text(
     );
     expect(
         dockerfile.contains("FROM rust:")
-            && dockerfile.contains("rustup target add wasm32-unknown-unknown")
-            && dockerfile.contains("cargo install cargo-leptos --version 0.3.7 --locked")
-            && (dockerfile.contains("COPY Cargo.toml Cargo.lock ./")
-                || dockerfile.contains("COPY Cargo.toml styles.css ./"))
-            && (dockerfile.contains("COPY portal/ portal/")
-                || dockerfile.contains("COPY src ./src"))
-            && dockerfile.contains("cargo leptos build --release"),
+            && dockerfile_has_active_instruction(dockerfile, PORTAL_RUSTUP_TARGET_INSTRUCTION)
+            && dockerfile_has_active_instruction(
+                dockerfile,
+                PORTAL_CARGO_LEPTOS_INSTALL_INSTRUCTION,
+            )
+            && (dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./",
+            ) || dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 Cargo.toml styles.css ./",
+            ))
+            && (dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 portal/ portal/",
+            ) || dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 src ./src",
+            ))
+            && (dockerfile_has_active_instruction(
+                dockerfile,
+                PORTAL_CARGO_LEPTOS_BUILD_INSTRUCTION,
+            ) || dockerfile_has_active_instruction(
+                dockerfile,
+                PORTAL_CARGO_LEPTOS_CRATE_BUILD_INSTRUCTION,
+            )),
         errors,
         "portal IA runtime Dockerfile must build the full-stack Leptos server and hydration assets",
     );
@@ -1124,10 +1149,12 @@ fn validate_portal_runtime_text(
             && dockerfile.contains("LEPTOS_SITE_ROOT=/app/site")
             && dockerfile.contains("LEPTOS_SITE_ADDR=0.0.0.0:8080")
             && dockerfile.contains("RYUKI_PORTAL_EXECUTION_MODE=static-dry-run")
-            && dockerfile.contains(
+            && dockerfile_has_active_instruction(
+                dockerfile,
                 "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui",
             )
-            && dockerfile.contains(
+            && dockerfile_has_active_instruction(
+                dockerfile,
                 "COPY --from=build --chown=10001:10001 /app/target/site /app/site",
             )
             && dockerfile.contains("USER 10001:10001")
@@ -1139,10 +1166,25 @@ fn validate_portal_runtime_text(
     expect(
         !dockerfile_lower.contains("from nginx:alpine")
             && !dockerfile_lower.contains("trunk build --release")
-            && !dockerfile.contains("COPY Cargo.toml index.html styles.css ./"),
+            && !dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link --chown=10001:10001 Cargo.toml index.html styles.css ./",
+            )
+            && !dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY --link Cargo.toml index.html styles.css ./",
+            )
+            && !dockerfile_has_active_instruction(
+                dockerfile,
+                "COPY Cargo.toml index.html styles.css ./",
+            ),
         errors,
         "portal IA runtime Dockerfile must not return to static-only NGINX/Trunk hosting",
     );
+}
+
+fn dockerfile_has_active_instruction(dockerfile: &str, expected: &str) -> bool {
+    dockerfile.lines().any(|line| line.trim() == expected)
 }
 
 fn validate_portal_app_text(app: &str, errors: &mut Vec<String>) {
@@ -2739,16 +2781,14 @@ mod tests {
     }
 
     #[test]
-    fn context_aware_leptos_fallback_is_accepted() {
+    fn trusted_context_leptos_runtime_is_required() {
         let inspection = crate::app_skeleton::inspect_portal_main(&context_aware_ssr_main());
         assert!(inspection.runs_axum_leptos_ssr);
         assert!(inspection.plans_core_platform_reads);
         assert!(inspection.exposes_health_routes);
 
         let legacy = crate::app_skeleton::inspect_portal_main(&minimal_ssr_main());
-        assert!(legacy.runs_axum_leptos_ssr);
-        assert!(legacy.plans_core_platform_reads);
-        assert!(legacy.exposes_health_routes);
+        assert!(!legacy.runs_axum_leptos_ssr);
     }
 
     #[test]
@@ -2772,13 +2812,13 @@ mod tests {
         // "portal IA runtime Dockerfile must build the full-stack Leptos" error
         let dockerfile = concat!(
             "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n",
+            "RUN [\"/usr/local/cargo/bin/rustup\", \"target\", \"add\", \"wasm32-unknown-unknown\"]\n",
+            "RUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n",
             "WORKDIR /app\n",
-            "RUN rustup target add wasm32-unknown-unknown \\\n",
-            "    && cargo install cargo-leptos --version 0.3.7 --locked\n",
-            "COPY Cargo.toml Cargo.lock ./\n",
-            "COPY sources/ sources/\n",
-            "COPY portal/ portal/\n",
-            "RUN cargo leptos build --release -p ryuki-portal-ui\n",
+            "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./\n",
+            "COPY --link --chown=10001:10001 sources/ sources/\n",
+            "COPY --link --chown=10001:10001 portal/ portal/\n",
+            "RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\", \"-p\", \"ryuki-portal-ui\"]\n",
             "FROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\n",
             "WORKDIR /app\n",
             "ENV LEPTOS_SITE_ROOT=/app/site \\\n",
@@ -2793,7 +2833,7 @@ mod tests {
         let mut errors = Vec::new();
         validate_portal_runtime_text(
             &standard_test_cargo_toml(),
-            &minimal_ssr_main(),
+            &context_aware_ssr_main(),
             &minimal_hydrate_lib(),
             dockerfile,
             &mut errors,
@@ -2809,15 +2849,15 @@ mod tests {
     }
 
     #[test]
-    fn crate_local_dockerfile_still_passes_runtime_check() {
+    fn linked_crate_local_dockerfile_still_passes_runtime_check() {
         let dockerfile = concat!(
             "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n",
+            "RUN [\"/usr/local/cargo/bin/rustup\", \"target\", \"add\", \"wasm32-unknown-unknown\"]\n",
+            "RUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n",
             "WORKDIR /app\n",
-            "RUN rustup target add wasm32-unknown-unknown \\\n",
-            "    && cargo install cargo-leptos --version 0.3.7 --locked\n",
-            "COPY Cargo.toml styles.css ./\n",
-            "COPY src ./src\n",
-            "RUN cargo leptos build --release\n",
+            "COPY --link --chown=10001:10001 Cargo.toml styles.css ./\n",
+            "COPY --link --chown=10001:10001 src ./src\n",
+            "RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\"]\n",
             "FROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\n",
             "WORKDIR /app\n",
             "ENV LEPTOS_SITE_ROOT=/app/site \\\n",
@@ -2832,7 +2872,7 @@ mod tests {
         let mut errors = Vec::new();
         validate_portal_runtime_text(
             &standard_test_cargo_toml(),
-            &minimal_ssr_main(),
+            &context_aware_ssr_main(),
             &minimal_hydrate_lib(),
             dockerfile,
             &mut errors,
@@ -2842,7 +2882,7 @@ mod tests {
             .any(|e| e.contains("full-stack") || e.contains("hydration assets"));
         assert!(
             !leptos_error,
-            "Old crate-local Dockerfile should still pass runtime check but got: {:?}",
+            "Linked crate-local Dockerfile should still pass runtime check but got: {:?}",
             errors
         );
     }
@@ -2852,13 +2892,13 @@ mod tests {
         let dockerfile = concat!(
             "FROM rust:1.88-bookworm AS build\n",
             "WORKDIR /app\n",
-            "COPY Cargo.toml Cargo.lock ./\n",
+            "COPY --link --chown=10001:10001 Cargo.toml Cargo.lock ./\n",
             "RUN cargo build --release\n",
         );
         let mut errors = Vec::new();
         validate_portal_runtime_text(
             &standard_test_cargo_toml(),
-            &minimal_ssr_main(),
+            &context_aware_ssr_main(),
             &minimal_hydrate_lib(),
             dockerfile,
             &mut errors,
@@ -2933,32 +2973,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         r#"#[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum::{routing::get, Router};
+    use axum::{routing::{any, get}, Router};
     use leptos::prelude::*;
     use leptos_axum::{
         file_and_error_handler_with_context, generate_route_list, LeptosRoutes,
     };
     use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::security::{
+        protect_server_function_routes, PortalPublicOrigin, PortalServerFunctionLimits,
+    };
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    use ryuki_portal_ui::upstream::UpstreamClient;
     let configuration = get_configuration(None)?;
     let leptos_options = configuration.leptos_options;
     let address = leptos_options.site_addr;
     let routes = generate_route_list(App);
     let boundary = PortalServerBoundary::static_dry_run();
     boundary.plan_core_platform_reads()?;
+    let public_origin = PortalPublicOrigin::from_env()?;
+    let server_function_limits = PortalServerFunctionLimits::from_env()?;
+    let upstream = UpstreamClient::from_env(&public_origin)?;
+    let upstream_for_server_fns = upstream.clone();
+    let upstream_for_routes = upstream.clone();
+    let upstream_for_fallback = upstream.clone();
+    let server_function_routes = protect_server_function_routes(
+        Router::new().route(
+            "/portal/api/{*fn_name}",
+            any(move |request: axum::extract::Request| {
+                let upstream = upstream_for_server_fns.clone();
+                async move {
+                    leptos_axum::handle_server_fns_with_context(
+                        move || provide_context(upstream.clone()),
+                        request,
+                    )
+                    .await
+                }
+            }),
+        ),
+        public_origin,
+        server_function_limits,
+    );
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
+        .merge(server_function_routes)
         .leptos_routes_with_context(
             &leptos_options,
             routes,
-            || {},
+            move || provide_context(upstream_for_routes.clone()),
             {
                 let leptos_options = leptos_options.clone();
                 move || shell(leptos_options.clone())
             },
         )
-        .fallback(file_and_error_handler_with_context(|| {}, shell))
+        .fallback(file_and_error_handler_with_context(
+            move || provide_context(upstream_for_fallback.clone()),
+            shell,
+        ))
         .with_state(leptos_options);
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app.into_make_service()).await?;
