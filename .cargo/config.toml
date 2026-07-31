@@ -1,4 +1,10 @@
 [build]
+# Keep persistent development artifacts outside the checkout. Cargo resolves
+# this path relative to the workspace root that owns this `.cargo` directory.
+# The tracked `target` file is a fail-closed fallback for invocations launched
+# outside the repository with only `--manifest-path` (which skips this config).
+target-dir = "../.ryuki-target-ryuki.io"
+
 # Every Cargo entry point (direct commands, Make, cargo-leptos, rust-analyzer,
 # and the disposable verification wrapper) passes rustc through the same hard
 # disk ceiling. The wrapper delegates transparently while the effective target

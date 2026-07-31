@@ -38,7 +38,7 @@ form for an individual build gate:
 
 The checked-in Cargo rustc wrapper is a final hard stop for accidental direct,
 Make, IDE, and cargo-leptos compilation paths: it refuses new compiler work
-once the effective target exceeds 48 GiB or free space falls below 30 GiB.
+once the effective target exceeds 24 GiB or free space falls below 30 GiB.
 
 For iterative human development, the individual commands remain available:
 
@@ -52,9 +52,17 @@ cargo clippy --workspace -- -D warnings
 git diff --check
 ```
 
-Use `make cache-status` to inspect the persistent development cache and
-`make clean` when it is no longer useful. The one-shot defaults reserve 30 GiB
-of free disk and cap the disposable target at 64 GiB; override them only with
+Persistent human-development artifacts live in the sibling
+`../.ryuki-target-ryuki.io`, never under the checkout. Use `make cache-status`
+to inspect that cache and `make clean` when it is no longer useful. Prefer
+`make run-api` and `make run-portal`; the latter also keeps the Leptos site
+output in the external cache. The tracked `target` regular file deliberately
+blocks Cargo launched outside the repository with only `--manifest-path` from
+silently recreating a checkout-local target directory. Docker builds do not
+copy that blocker and retain their normal in-container `/app/target`.
+
+The one-shot defaults reserve 30 GiB of free disk and cap the disposable target
+at 24 GiB; override them only with
 `RYUKI_VERIFY_MIN_FREE_GIB` and `RYUKI_VERIFY_MAX_TARGET_GIB` after an explicit
 capacity review.
 

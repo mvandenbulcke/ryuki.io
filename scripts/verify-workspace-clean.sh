@@ -13,14 +13,16 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUSTC_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
-HARD_MAX_TARGET_GIB=64
+HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_WATCH_INTERVAL_SECONDS=5
+TEST_MODE="${RYUKI_VERIFY_TEST_MODE:-0}"
+TEST_MAX_KIB="${RYUKI_VERIFY_TEST_MAX_KIB:-}"
 if [[ ! -f "$RUSTC_GUARD" || -L "$RUSTC_GUARD" || ! -x "$RUSTC_GUARD" ]]; then
   echo "error: repository Cargo rustc guard is missing or unsafe: ${RUSTC_GUARD}" >&2
   exit 75
 fi
-if [[ -n "${RYUKI_VERIFY_STATE_BASE:-}" && "${RYUKI_VERIFY_TEST_MODE:-0}" != "1" ]]; then
+if [[ -n "${RYUKI_VERIFY_STATE_BASE:-}" && "$TEST_MODE" != "1" ]]; then
   echo "error: RYUKI_VERIFY_STATE_BASE is reserved for verify-clean regression tests" >&2
   exit 64
 fi
@@ -29,7 +31,7 @@ GIT_COMMON_DIR_RAW="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-
 GIT_COMMON_DIR="$(cd "$GIT_COMMON_DIR_RAW" && pwd -P)"
 REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object --stdin)"
 MIN_FREE_GIB="${RYUKI_VERIFY_MIN_FREE_GIB:-30}"
-MAX_TARGET_GIB="${RYUKI_VERIFY_MAX_TARGET_GIB:-64}"
+MAX_TARGET_GIB="${RYUKI_VERIFY_MAX_TARGET_GIB:-24}"
 KEEP_TARGET="${RYUKI_VERIFY_KEEP_TARGET:-0}"
 WATCH_INTERVAL_SECONDS="${RYUKI_VERIFY_WATCH_INTERVAL_SECONDS:-5}"
 ACTIVE_GATE_PID=""
@@ -50,6 +52,7 @@ SENTINEL_PUBLISHED=0
 # Do not let an inherited IDE, sccache, or caller configuration redirect the
 # target or replace the repository guard inside this bounded verification.
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+unset CARGO_BUILD_BUILD_DIR
 unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
 unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
@@ -80,6 +83,22 @@ require_positive_integer RYUKI_VERIFY_MIN_FREE_GIB "$MIN_FREE_GIB"
 require_positive_integer RYUKI_VERIFY_MAX_TARGET_GIB "$MAX_TARGET_GIB"
 require_positive_integer RYUKI_VERIFY_WATCH_INTERVAL_SECONDS "$WATCH_INTERVAL_SECONDS"
 
+case "$TEST_MODE" in
+  0|1) ;;
+  *)
+    echo "error: RYUKI_VERIFY_TEST_MODE must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+
+if [[ -n "$TEST_MAX_KIB" && "$TEST_MODE" != "1" ]]; then
+  echo "error: RYUKI_VERIFY_TEST_MAX_KIB is reserved for regression tests" >&2
+  exit 64
+fi
+if [[ -n "$TEST_MAX_KIB" ]]; then
+  require_positive_integer RYUKI_VERIFY_TEST_MAX_KIB "$TEST_MAX_KIB"
+fi
+
 if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
   echo "error: RYUKI_VERIFY_MAX_TARGET_GIB must not exceed ${HARD_MAX_TARGET_GIB}" >&2
   exit 64
@@ -100,6 +119,44 @@ case "$KEEP_TARGET" in
     exit 64
     ;;
 esac
+
+if du --apparent-size --count-links -s -k /dev/null >/dev/null 2>&1; then
+  APPARENT_DU_STYLE=gnu
+elif du -A -l -s -k /dev/null >/dev/null 2>&1; then
+  APPARENT_DU_STYLE=bsd
+else
+  echo "error: du cannot measure apparent file size on this host" >&2
+  exit 69
+fi
+
+measure_tree_kib() {
+  local path="$1"
+  local allocated_output="" allocated_kib=""
+  local apparent_output="" apparent_kib=""
+
+  if ! allocated_output="$(du -s -k "$path" 2>/dev/null)"; then
+    : # Concurrent Cargo renames may make du nonzero while retaining its total.
+  fi
+  allocated_kib="$(printf '%s\n' "$allocated_output" | awk 'END {print $1}')"
+
+  if [[ "$APPARENT_DU_STYLE" == "gnu" ]]; then
+    if ! apparent_output="$(du --apparent-size --count-links -s -k "$path" 2>/dev/null)"; then
+      :
+    fi
+  else
+    if ! apparent_output="$(du -A -l -s -k "$path" 2>/dev/null)"; then
+      :
+    fi
+  fi
+  apparent_kib="$(printf '%s\n' "$apparent_output" | awk 'END {print $1}')"
+
+  [[ "$allocated_kib" =~ ^[0-9]+$ && "$apparent_kib" =~ ^[0-9]+$ ]] || return 1
+  if (( apparent_kib > allocated_kib )); then
+    printf '%s\n' "$apparent_kib"
+  else
+    printf '%s\n' "$allocated_kib"
+  fi
+}
 
 sentinel_value() {
   local state_file="$1"
@@ -287,10 +344,17 @@ disk_guard() {
   free_kib="$(df -Pk "$CARGO_TARGET_DIR" | awk 'END {print $4}')"
   # Bound the complete repository verification namespace, including any
   # explicitly retained successful run, rather than just this invocation.
-  target_kib="$(du -sk "$VERIFY_TARGET_ROOT" 2>/dev/null | awk '{print $1}')"
-  target_kib="${target_kib:-0}"
+  target_kib="$(measure_tree_kib "$VERIFY_TARGET_ROOT")" || target_kib=""
   min_free_kib=$((MIN_FREE_GIB * 1024 * 1024))
   max_target_kib=$((MAX_TARGET_GIB * 1024 * 1024))
+  if [[ -n "$TEST_MAX_KIB" ]]; then
+    max_target_kib="$TEST_MAX_KIB"
+  fi
+
+  if [[ ! "$free_kib" =~ ^[0-9]+$ || ! "$target_kib" =~ ^[0-9]+$ ]]; then
+    echo "error: verification target allocated/apparent size or free space could not be measured" >&2
+    return 75
+  fi
 
   if (( free_kib < min_free_kib )); then
     echo "error: verification stopped: less than ${MIN_FREE_GIB} GiB remains free" >&2
@@ -490,9 +554,9 @@ validate_focused_cargo_command() {
     subcommand="${3:-}"
   fi
   case "$subcommand" in
-    build|check|clippy|test) ;;
+    build|check|clippy|run|test) ;;
     *)
-      echo "error: focused verification accepts only cargo build, check, clippy, or test" >&2
+      echo "error: focused verification accepts only cargo build, check, clippy, run, or test" >&2
       return 64
       ;;
   esac

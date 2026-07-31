@@ -16,6 +16,8 @@ FAKE_GROWER="$TEST_ROOT/fake-growing-rustc"
 FAKE_PEER="$TEST_ROOT/fake-peer-rustc"
 FAST_GROWER_FINISHED="$TEST_ROOT/fast-grower-finished"
 FAKE_FAST_GROWER="$TEST_ROOT/fake-fast-growing-rustc"
+SPARSE_TARGET="$TEST_ROOT/sparse-target"
+SPARSE_OUT_DIR="$SPARSE_TARGET/debug/deps"
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -34,12 +36,12 @@ printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ndd if=/dev/zero of=%q bs=1024 c
   "$TARGET/fast-oversized.bin" "$FAST_GROWER_FINISHED" > "$FAKE_FAST_GROWER"
 chmod +x "$FAKE_GROWER" "$FAKE_PEER" "$FAKE_FAST_GROWER"
 
-if RYUKI_CARGO_MAX_TARGET_GIB=49 \
+if RYUKI_CARGO_MAX_TARGET_GIB=25 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/max-target.log"; then
-  echo "error: production guard accepted a target ceiling above 48 GiB" >&2
+  echo "error: production guard accepted a target ceiling above 24 GiB" >&2
   exit 1
 fi
-grep -q "RYUKI_CARGO_MAX_TARGET_GIB must not exceed 48" "$TEST_ROOT/max-target.log"
+grep -q "RYUKI_CARGO_MAX_TARGET_GIB must not exceed 24" "$TEST_ROOT/max-target.log"
 
 if RYUKI_CARGO_MIN_FREE_GIB=29 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/min-free.log"; then
@@ -73,6 +75,36 @@ fi
 grep -q "Cargo compilation refused" "$TEST_ROOT/refused.log"
 [[ ! -e "$MARKER" ]] || {
   echo "error: rustc ran after the target ceiling was exceeded" >&2
+  exit 1
+}
+
+# A sparse file consumes few allocated blocks while presenting a large logical
+# size in Finder and other apparent-size accounting. The guard must enforce the
+# larger measurement rather than allowing sparse growth through the ceiling.
+mkdir -p "$SPARSE_OUT_DIR"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$SPARSE_TARGET/CACHEDIR.TAG"
+dd if=/dev/zero of="$SPARSE_TARGET/sparse.bin" bs=1 count=0 seek=1048576 2>/dev/null
+sparse_allocated_kib="$(du -s -k "$SPARSE_TARGET" | awk 'END {print $1}')"
+if du --apparent-size --count-links -s -k "$SPARSE_TARGET" >/dev/null 2>&1; then
+  sparse_apparent_kib="$(du --apparent-size --count-links -s -k "$SPARSE_TARGET" | awk 'END {print $1}')"
+else
+  sparse_apparent_kib="$(du -A -l -s -k "$SPARSE_TARGET" | awk 'END {print $1}')"
+fi
+[[ "$sparse_allocated_kib" -le 128 && "$sparse_apparent_kib" -gt 128 ]] || {
+  echo "error: sparse-file fixture did not separate allocated and apparent size" >&2
+  exit 1
+}
+if RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=128 \
+  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$SPARSE_OUT_DIR" 2>"$TEST_ROOT/sparse-refused.log"; then
+  echo "error: sparse target escaped the apparent-size ceiling" >&2
+  exit 1
+fi
+grep -q "Cargo compilation refused" "$TEST_ROOT/sparse-refused.log"
+[[ ! -e "$MARKER" ]] || {
+  echo "error: rustc ran after sparse target growth exceeded the ceiling" >&2
   exit 1
 }
 

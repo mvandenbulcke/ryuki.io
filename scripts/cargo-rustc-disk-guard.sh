@@ -14,14 +14,58 @@ set -Eeuo pipefail
 # target triples, and the disposable verification target are all covered.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-HARD_MAX_TARGET_GIB=48
+DEFAULT_TARGET_DIR="$(cd "$ROOT_DIR/.." && pwd -P)/.ryuki-target-ryuki.io"
+HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_CHECK_INTERVAL_SECONDS=2
-MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-48}"
+MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-24}"
 MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
 CHECK_INTERVAL_SECONDS="${RYUKI_CARGO_GUARD_INTERVAL_SECONDS:-2}"
 TEST_MODE="${RYUKI_CARGO_GUARD_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_CARGO_GUARD_TEST_MAX_KIB:-}"
+
+if du --apparent-size --count-links -s -k /dev/null >/dev/null 2>&1; then
+  APPARENT_DU_STYLE=gnu
+elif du -A -l -s -k /dev/null >/dev/null 2>&1; then
+  APPARENT_DU_STYLE=bsd
+else
+  echo "error: du cannot measure apparent file size on this host" >&2
+  exit 69
+fi
+
+# Return the larger of allocated blocks and logical/apparent bytes, in KiB.
+# Allocated size protects the filesystem; apparent size also catches sparse
+# files and matches macOS Finder's directory-size accounting. Count hard-linked
+# directory entries for the apparent total so a cache cannot hide logical
+# growth behind aliases while retaining normal once-per-inode allocated usage.
+measure_tree_kib() {
+  local path="$1"
+  local allocated_output="" allocated_kib=""
+  local apparent_output="" apparent_kib=""
+
+  if ! allocated_output="$(du -s -k "$path" 2>/dev/null)"; then
+    : # Concurrent Cargo renames may make du nonzero while retaining its total.
+  fi
+  allocated_kib="$(printf '%s\n' "$allocated_output" | awk 'END {print $1}')"
+
+  if [[ "$APPARENT_DU_STYLE" == "gnu" ]]; then
+    if ! apparent_output="$(du --apparent-size --count-links -s -k "$path" 2>/dev/null)"; then
+      :
+    fi
+  else
+    if ! apparent_output="$(du -A -l -s -k "$path" 2>/dev/null)"; then
+      :
+    fi
+  fi
+  apparent_kib="$(printf '%s\n' "$apparent_output" | awk 'END {print $1}')"
+
+  [[ "$allocated_kib" =~ ^[0-9]+$ && "$apparent_kib" =~ ^[0-9]+$ ]] || return 1
+  if (( apparent_kib > allocated_kib )); then
+    printf '%s\n' "$apparent_kib"
+  else
+    printf '%s\n' "$allocated_kib"
+  fi
+}
 
 require_positive_integer() {
   local name="$1"
@@ -106,7 +150,7 @@ find_target_root() {
     done
   fi
 
-  configured_target="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+  configured_target="${CARGO_TARGET_DIR:-$DEFAULT_TARGET_DIR}"
   if [[ "$configured_target" != /* ]]; then
     configured_target="$PWD/$configured_target"
   fi
@@ -256,14 +300,12 @@ guard_check() (
   trap release_guard_lock EXIT INT TERM
 
   target_kib=""
-  if ! target_kib="$(du -sk "$target_root" 2>/dev/null | awk 'END {print $1}')"; then
-    : # Concurrent Cargo renames can make `du` nonzero while retaining a total.
-  fi
+  target_kib="$(measure_tree_kib "$target_root")" || target_kib=""
   free_kib="$(df -Pk "$target_root" | awk 'END {print $4}')"
 
   if [[ ! "$target_kib" =~ ^[0-9]+$ || ! "$free_kib" =~ ^[0-9]+$ ]]; then
     trip_guard
-    echo "error: Cargo target size or free space could not be measured" >&2
+    echo "error: Cargo target allocated/apparent size or free space could not be measured" >&2
     return 75
   fi
 

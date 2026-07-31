@@ -4,8 +4,12 @@
 .atl
 graphify-out
 .env
-target/
-**/target/
+# Exclude the host-only Cargo config, Cargo directories, and the tracked
+# checkout-target blocker. Docker stages intentionally build into their normal
+# in-container /app/target instead of the host's sibling development cache.
+.cargo
+target
+**/target
 *.log
 .env.*
 *.key

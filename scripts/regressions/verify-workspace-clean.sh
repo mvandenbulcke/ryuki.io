@@ -4,6 +4,8 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE_SCRIPT="${ROOT_DIR}/scripts/verify-workspace-clean.sh"
 SOURCE_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
+SOURCE_CARGO_CONFIG="${ROOT_DIR}/.cargo/config.toml"
+SOURCE_TARGET_BLOCKER="${ROOT_DIR}/target"
 BLOCKING_GATE_FIXTURE="${ROOT_DIR}/scripts/regressions/fixtures/verify-workspace-clean-blocking-gate.sh"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-verify-regression.XXXXXX")"
 FIXTURE_ROOT="${WORK_DIR}/repo"
@@ -18,6 +20,8 @@ WRAPPER_PID=""
 FAKE_BIN="${WORK_DIR}/bin"
 FAKE_CARGO="${FAKE_BIN}/cargo"
 CARGO_ENV_CAPTURE="${WORK_DIR}/cargo-env"
+OUTSIDE_CWD="${WORK_DIR}/outside-cwd"
+MANIFEST_TARGET_PROBE="${WORK_DIR}/manifest-target-probe"
 
 cleanup() {
   local blocker_pid=""
@@ -62,14 +66,18 @@ wait_for_exit() {
   return 1
 }
 
-mkdir -p "${FIXTURE_ROOT}/scripts/regressions" "$STATE_BASE" "$TMP_A" "$TMP_B" "$FAKE_BIN"
+mkdir -p "${FIXTURE_ROOT}/scripts/regressions" "${FIXTURE_ROOT}/.cargo" \
+  "$STATE_BASE" "$TMP_A" "$TMP_B" "$FAKE_BIN" "$OUTSIDE_CWD"
 FIXTURE_ROOT="$(cd "$FIXTURE_ROOT" && pwd -P)"
 STATE_BASE="$(cd "$STATE_BASE" && pwd -P)"
 cp "$SOURCE_SCRIPT" "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh"
 chmod 700 "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh"
 cp "$SOURCE_GUARD" "${FIXTURE_ROOT}/scripts/cargo-rustc-disk-guard.sh"
 chmod 700 "${FIXTURE_ROOT}/scripts/cargo-rustc-disk-guard.sh"
+cp "$SOURCE_CARGO_CONFIG" "${FIXTURE_ROOT}/.cargo/config.toml"
+cp "$SOURCE_TARGET_BLOCKER" "${FIXTURE_ROOT}/target"
 git -C "$FIXTURE_ROOT" init -q
+printf '[workspace]\nmembers = []\n' > "${FIXTURE_ROOT}/Cargo.toml"
 
 cp "$BLOCKING_GATE_FIXTURE" "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
 chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
@@ -81,6 +89,7 @@ chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
   printf '%s\n' '{'
   printf '%s\n' '  printf "CARGO_TARGET_DIR=%s\n" "${CARGO_TARGET_DIR-}"'
   printf '%s\n' '  printf "CARGO_BUILD_TARGET_DIR=%s\n" "${CARGO_BUILD_TARGET_DIR-}"'
+  printf '%s\n' '  printf "CARGO_BUILD_BUILD_DIR=%s\n" "${CARGO_BUILD_BUILD_DIR-}"'
   printf '%s\n' '  printf "RUSTC_WRAPPER=%s\n" "${RUSTC_WRAPPER-}"'
   printf '%s\n' '  printf "RUSTC_WORKSPACE_WRAPPER=%s\n" "${RUSTC_WORKSPACE_WRAPPER-}"'
   printf '%s\n' '  printf "CARGO_BUILD_RUSTC_WRAPPER=%s\n" "${CARGO_BUILD_RUSTC_WRAPPER-}"'
@@ -97,6 +106,35 @@ chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
   printf '%s\n' '} > "$RYUKI_VERIFY_TEST_CARGO_ENV"'
 } > "$FAKE_CARGO"
 chmod 700 "$FAKE_CARGO"
+
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -Eeuo pipefail'
+  printf '%s\n' 'manifest_path=""'
+  printf '%s\n' 'while (( $# > 0 )); do'
+  printf '%s\n' '  if [[ "$1" == "--manifest-path" ]]; then'
+  printf '%s\n' '    shift'
+  printf '%s\n' '    manifest_path="${1:-}"'
+  printf '%s\n' '    break'
+  printf '%s\n' '  fi'
+  printf '%s\n' '  shift'
+  printf '%s\n' 'done'
+  printf '%s\n' '[[ -n "$manifest_path" ]]'
+  printf '%s\n' 'mkdir "$(cd "$(dirname "$manifest_path")" && pwd -P)/target"'
+} > "$MANIFEST_TARGET_PROBE"
+chmod 700 "$MANIFEST_TARGET_PROBE"
+
+[[ -f "${FIXTURE_ROOT}/target" && ! -L "${FIXTURE_ROOT}/target" ]] \
+  || fail "checkout target blocker is not a regular file"
+grep -Fqx 'target-dir = "../.ryuki-target-ryuki.io"' \
+  "${FIXTURE_ROOT}/.cargo/config.toml" \
+  || fail "Cargo config does not place the development target outside the checkout"
+if (cd "$OUTSIDE_CWD" && "$MANIFEST_TARGET_PROBE" check \
+  --manifest-path "${FIXTURE_ROOT}/Cargo.toml") > "$OUTPUT_FILE" 2>&1; then
+  fail "outside-cwd manifest invocation could create a checkout target directory"
+fi
+[[ -f "${FIXTURE_ROOT}/target" && ! -L "${FIXTURE_ROOT}/target" ]] \
+  || fail "outside-cwd manifest probe replaced the checkout target blocker"
 
 GIT_COMMON_DIR="$(git -C "$FIXTURE_ROOT" rev-parse --path-format=absolute --git-common-dir)"
 REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$FIXTURE_ROOT" hash-object --stdin)"
@@ -148,11 +186,11 @@ fi
 
 if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
-  RYUKI_VERIFY_MAX_TARGET_GIB=65 \
+  RYUKI_VERIFY_MAX_TARGET_GIB=25 \
   "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
   fail "verification accepted a target ceiling above the repository maximum"
 fi
-grep -q "RYUKI_VERIFY_MAX_TARGET_GIB must not exceed 64" "$OUTPUT_FILE" \
+grep -q "RYUKI_VERIFY_MAX_TARGET_GIB must not exceed 24" "$OUTPUT_FILE" \
   || fail "oversized verification target ceiling refusal was not reported"
 
 if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
@@ -182,6 +220,7 @@ PATH="${FAKE_BIN}:$PATH" \
   RYUKI_VERIFY_TEST_CARGO_ENV="$CARGO_ENV_CAPTURE" \
   CARGO_TARGET_DIR="$hostile_target" \
   CARGO_BUILD_TARGET_DIR="${hostile_target}-config" \
+  CARGO_BUILD_BUILD_DIR="${hostile_target}-build-dir" \
   RUSTC_WRAPPER="${WORK_DIR}/hostile-rustc-wrapper" \
   RUSTC_WORKSPACE_WRAPPER="${WORK_DIR}/hostile-workspace-wrapper" \
   CARGO_BUILD_RUSTC_WRAPPER="${WORK_DIR}/hostile-config-wrapper" \
@@ -207,7 +246,7 @@ esac
 grep -Fxq "RUSTC_WRAPPER=${FIXTURE_ROOT}/scripts/cargo-rustc-disk-guard.sh" \
   "$CARGO_ENV_CAPTURE" \
   || fail "focused verification did not install the absolute repository rustc guard"
-for cleared in CARGO_BUILD_TARGET_DIR RUSTC_WORKSPACE_WRAPPER \
+for cleared in CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR RUSTC_WORKSPACE_WRAPPER \
   CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER RUSTFLAGS \
   CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_BUILD_INCREMENTAL \
   CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL; do
@@ -218,7 +257,8 @@ for pinned in CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
   grep -Fxq "${pinned}=0" "$CARGO_ENV_CAPTURE" \
     || fail "focused verification did not pin ${pinned} to zero"
 done
-[[ ! -e "$hostile_target" && ! -e "${hostile_target}-config" ]] \
+[[ ! -e "$hostile_target" && ! -e "${hostile_target}-config" \
+  && ! -e "${hostile_target}-build-dir" ]] \
   || fail "focused verification wrote to an inherited Cargo target"
 
 TMPDIR="$TMP_A" \
@@ -267,6 +307,32 @@ run_preflight "$TMP_A" > "$OUTPUT_FILE" 2>&1
   || fail "multi-target reclamation or explicit retention failed"
 grep -q "preserving explicitly retained verification target" "$OUTPUT_FILE" \
   || fail "retained target handling was not reported"
+
+# The verifier must apply its cap to apparent size as well as allocated blocks.
+# A sparse retained target keeps the fixture cheap while reproducing the
+# Finder-visible growth that previously escaped allocated-block accounting.
+dd if=/dev/zero of="${VERIFY_TARGET_ROOT}/run.retained/sparse.bin" \
+  bs=1 count=0 seek=1048576 2>/dev/null
+sparse_allocated_kib="$(du -s -k "${VERIFY_TARGET_ROOT}/run.retained" | awk 'END {print $1}')"
+if du --apparent-size --count-links -s -k "${VERIFY_TARGET_ROOT}/run.retained" \
+  >/dev/null 2>&1; then
+  sparse_apparent_kib="$(du --apparent-size --count-links -s -k \
+    "${VERIFY_TARGET_ROOT}/run.retained" | awk 'END {print $1}')"
+else
+  sparse_apparent_kib="$(du -A -l -s -k \
+    "${VERIFY_TARGET_ROOT}/run.retained" | awk 'END {print $1}')"
+fi
+[[ "$sparse_allocated_kib" -le 128 && "$sparse_apparent_kib" -gt 128 ]] \
+  || fail "verifier sparse fixture did not separate allocated and apparent size"
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
+  RYUKI_VERIFY_TEST_MAX_KIB=128 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
+  fail "verification accepted a sparse target over the apparent-size ceiling"
+fi
+grep -q "managed targets exceeded" "$OUTPUT_FILE" \
+  || fail "sparse verification target refusal was not reported"
+rm -f "${VERIFY_TARGET_ROOT}/run.retained/sparse.bin"
 
 mkdir -p "${VERIFY_TARGET_ROOT}/run.interrupted-setup"
 touch "${VERIFY_TARGET_ROOT}/.run.interrupted-setup.owner.tmp"
@@ -368,7 +434,7 @@ if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   -- cargo untrusted-plugin > "$OUTPUT_FILE" 2>&1; then
   fail "focused verification accepted an unapproved Cargo subcommand"
 fi
-grep -q "accepts only cargo build, check, clippy, or test" "$OUTPUT_FILE" \
+grep -q "accepts only cargo build, check, clippy, run, or test" "$OUTPUT_FILE" \
   || fail "focused Cargo subcommand refusal was not reported"
 
 echo "verify-workspace-clean regression passed"

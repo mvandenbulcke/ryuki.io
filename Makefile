@@ -1,9 +1,13 @@
 .PHONY: build test test-unit test-db lint validate verify-clean cache-status clean run-api run-portal compose-up compose-down docker-build release-check db-backup db-restore
 
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+RYUKI_DEV_TARGET_DIR ?= $(abspath $(REPO_ROOT)/../.ryuki-target-ryuki.io)
+RYUKI_LEPTOS_SITE_ROOT ?= $(RYUKI_DEV_TARGET_DIR)/leptos-site
+
 # Build/test/lint targets use the bounded disposable verifier so routine agent
-# and CI-style work never leaves a persistent ./target behind. Long-running
-# development servers remain persistent workflows, but the checked-in rustc
-# wrapper enforces the repository-wide hard target ceiling for every Cargo path.
+# and CI-style work never leaves a persistent target behind. Long-running
+# development servers share the external development target above, and the
+# checked-in rustc wrapper enforces its hard ceiling for every Cargo path.
 
 build:
 	./scripts/verify-workspace-clean.sh -- cargo build --workspace
@@ -51,7 +55,7 @@ lint:
 	./scripts/verify-workspace-clean.sh -- cargo clippy --workspace --all-targets -- -D warnings
 
 validate:
-	cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
+	./scripts/verify-workspace-clean.sh -- cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 	./scripts/no-secret-scan.sh
 
 # Full one-shot verification for CI and coding agents. Uses one temporary,
@@ -60,18 +64,32 @@ verify-clean:
 	./scripts/verify-workspace-clean.sh
 
 cache-status:
-	@du -sh target 2>/dev/null || echo "target: absent"
-	@df -h . | tail -1
+	@echo "development Cargo target: $(RYUKI_DEV_TARGET_DIR)"
+	@if [ -d "$(RYUKI_DEV_TARGET_DIR)" ]; then \
+		du -sh "$(RYUKI_DEV_TARGET_DIR)"; \
+		if du --apparent-size --count-links -sh "$(RYUKI_DEV_TARGET_DIR)" >/dev/null 2>&1; then \
+			du --apparent-size --count-links -sh "$(RYUKI_DEV_TARGET_DIR)" | sed 's/^/apparent: /'; \
+		else \
+			du -A -l -s -h "$(RYUKI_DEV_TARGET_DIR)" | sed 's/^/apparent: /'; \
+		fi; \
+	else \
+		echo "development target: absent"; \
+	fi
+	@df -h "$(REPO_ROOT)/.." | tail -1
 
 clean:
-	cargo clean
+	CARGO_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" cargo clean
 	rm -rf output/
 
 run-api:
-	RYUKI_MIGRATION_MODE=local-auto cargo run --manifest-path sources/ryuki-api/Cargo.toml
+	CARGO_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
+	  RYUKI_MIGRATION_MODE=local-auto \
+	  cargo run --manifest-path sources/ryuki-api/Cargo.toml
 
 run-portal:
-	cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
+	CARGO_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
+	  LEPTOS_SITE_ROOT="$(RYUKI_LEPTOS_SITE_ROOT)" \
+	  cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 
 # Local-dev logical backup of the compose database. Writes a timestamped,
 # custom-format (-Fc) dump under ./backups/ that `db-restore` can replay. This

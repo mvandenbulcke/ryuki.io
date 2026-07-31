@@ -1,0 +1,8 @@
+This tracked regular file intentionally prevents Cargo from creating a
+checkout-local target directory when Cargo is launched outside this repository
+with only --manifest-path and therefore does not discover .cargo/config.toml.
+
+Run Cargo from the repository, use the sanctioned Make targets, or set an
+explicit external CARGO_TARGET_DIR. Persistent development artifacts belong in
+../.ryuki-target-ryuki.io; disposable verification artifacts are managed by
+scripts/verify-workspace-clean.sh.
