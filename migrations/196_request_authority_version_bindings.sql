@@ -240,13 +240,18 @@ BEGIN
     END IF;
 
     spec_mode_text := NEW.spec ->> 'mode';
-    IF spec_mode_text IS DISTINCT FROM CASE NEW.mode
-        WHEN 'OfflineDryRun' THEN 'offline_dry_run'
-        WHEN 'LivePlan' THEN 'live_plan'
-        WHEN 'LiveApply' THEN 'live_apply'
-        WHEN 'LiveDestroy' THEN 'live_destroy'
-        ELSE NULL
-    END THEN
+    -- Keep the SQL CASE grouped inside the PL/pgSQL IF expression.  Without
+    -- these parentheses the PL/pgSQL reader treats the first CASE-arm THEN as
+    -- the end of the IF condition and submits a truncated expression.
+    IF spec_mode_text IS DISTINCT FROM (
+        CASE NEW.mode
+            WHEN 'OfflineDryRun' THEN 'offline_dry_run'
+            WHEN 'LivePlan' THEN 'live_plan'
+            WHEN 'LiveApply' THEN 'live_apply'
+            WHEN 'LiveDestroy' THEN 'live_destroy'
+            ELSE NULL
+        END
+    ) THEN
         RAISE EXCEPTION 'agent job spec mode does not match its row binding'
             USING ERRCODE = '23514';
     END IF;
