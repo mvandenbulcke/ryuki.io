@@ -140,7 +140,7 @@ impl std::fmt::Debug for LivePlanArtifacts {
 use super::{
     exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
     executable::{ApprovedExecutable, ApprovedTool},
-    scrub::{scrub, scrub_output},
+    scrub::{append_go_json_escape_variants, basic_auth_canonical_variants, scrub, scrub_output},
     terraform::{
         apply_env_allowlist, combine_output, credential_components, pin_home_tmpdir_to_workspace,
         validate_offering_slug, validate_var_name, TERRAFORM_INIT_ARGS,
@@ -893,13 +893,13 @@ fn append_backend_secret_value(
         return;
     }
     values.push(value.as_bytes().to_vec());
-    append_go_json_escape_variant(values, value);
+    append_go_json_escape_variants(values, value.as_bytes());
     append_backend_secret_components(values, value, secret_kind);
     let quoted_json = format!("\"{value}\"");
     if let Ok(decoded) = serde_json::from_str::<String>(&quoted_json) {
         if !decoded.is_empty() && decoded.as_bytes() != value.as_bytes() {
             append_backend_secret_components(values, &decoded, secret_kind);
-            append_go_json_escape_variant(values, &decoded);
+            append_go_json_escape_variants(values, decoded.as_bytes());
             values.push(decoded.into_bytes());
         }
     }
@@ -975,18 +975,16 @@ fn append_query_string_components(values: &mut Vec<Vec<u8>>, query: &str) {
             continue;
         }
         values.push(raw_value.as_bytes().to_vec());
-        append_go_json_escape_variant(values, raw_value);
+        append_go_json_escape_variants(values, raw_value.as_bytes());
         let decoded = percent_decode_url_component(raw_value);
         if decoded.as_slice() != raw_value.as_bytes() {
-            if let Ok(decoded_string) = std::str::from_utf8(&decoded) {
-                append_go_json_escape_variant(values, decoded_string);
-            }
+            append_go_json_escape_variants(values, &decoded);
             values.push(decoded);
         }
     }
     for (_, decoded_value) in url::form_urlencoded::parse(query.as_bytes()) {
         if !decoded_value.is_empty() {
-            append_go_json_escape_variant(values, &decoded_value);
+            append_go_json_escape_variants(values, decoded_value.as_bytes());
             values.push(decoded_value.as_bytes().to_vec());
         }
     }
@@ -1004,114 +1002,17 @@ fn append_basic_auth_variants(
     }
     if let Some(username) = username {
         values.push(username.as_bytes().to_vec());
-        append_go_json_escape_variant(values, username);
+        append_go_json_escape_variants(values, username.as_bytes());
     }
     if let Some(password_value) = password_value {
         values.push(password_value.as_bytes().to_vec());
-        append_go_json_escape_variant(values, password_value);
+        append_go_json_escape_variants(values, password_value.as_bytes());
     }
-    let mut combined = String::with_capacity(
-        username.map_or(0, str::len) + password_value.map_or(0, str::len) + 1,
-    );
-    if let Some(username) = username {
-        combined.push_str(username);
-    }
-    combined.push(':');
-    if let Some(password_value) = password_value {
-        combined.push_str(password_value);
-    }
-    values.push(combined.as_bytes().to_vec());
-    values.push(standard_base64(combined.as_bytes()));
-}
-
-fn standard_base64(value: &[u8]) -> Vec<u8> {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = Vec::with_capacity(value.len().div_ceil(3) * 4);
-    for chunk in value.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        encoded.push(ALPHABET[(first >> 2) as usize]);
-        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize]);
-        if chunk.len() > 1 {
-            encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize]);
-        } else {
-            encoded.push(b'=');
-        }
-        if chunk.len() > 2 {
-            encoded.push(ALPHABET[(third & 0x3f) as usize]);
-        } else {
-            encoded.push(b'=');
-        }
-    }
-    encoded
-}
-
-fn append_go_json_escape_variant(values: &mut Vec<Vec<u8>>, value: &str) {
-    use std::fmt::Write as _;
-
-    let mut escaped = String::with_capacity(value.len());
-    let mut changed = false;
-    for character in value.chars() {
-        match character {
-            '"' => {
-                escaped.push_str("\\\"");
-                changed = true;
-            }
-            '\\' => {
-                escaped.push_str("\\\\");
-                changed = true;
-            }
-            '\u{0008}' => {
-                escaped.push_str("\\b");
-                changed = true;
-            }
-            '\u{000c}' => {
-                escaped.push_str("\\f");
-                changed = true;
-            }
-            '\n' => {
-                escaped.push_str("\\n");
-                changed = true;
-            }
-            '\r' => {
-                escaped.push_str("\\r");
-                changed = true;
-            }
-            '\t' => {
-                escaped.push_str("\\t");
-                changed = true;
-            }
-            '<' => {
-                escaped.push_str("\\u003c");
-                changed = true;
-            }
-            '>' => {
-                escaped.push_str("\\u003e");
-                changed = true;
-            }
-            '&' => {
-                escaped.push_str("\\u0026");
-                changed = true;
-            }
-            '\u{2028}' => {
-                escaped.push_str("\\u2028");
-                changed = true;
-            }
-            '\u{2029}' => {
-                escaped.push_str("\\u2029");
-                changed = true;
-            }
-            character if character <= '\u{001f}' => {
-                write!(&mut escaped, "\\u{:04x}", character as u32)
-                    .expect("writing to String cannot fail");
-                changed = true;
-            }
-            _ => escaped.push(character),
-        }
-    }
-    if changed {
-        values.push(escaped.into_bytes());
+    if let Some(variants) = basic_auth_canonical_variants(
+        username.map(str::as_bytes),
+        password_value.map(str::as_bytes),
+    ) {
+        values.extend(variants);
     }
 }
 
@@ -2794,15 +2695,20 @@ fn live_terraform_plan_inner(
     }
 
     // Build secret components for scrubbing.
-    let components = credential_components(creds.material.as_slice());
+    let components = Zeroizing::new(credential_components(creds.material.as_slice()));
 
     // FAIL CLOSED: declared secret vars must pair 1:1 with resolved components
     // BEFORE any workspace or terraform subprocess exists.
-    if let Some(err) = credential_arity_error(plan, &components) {
+    if let Some(err) = credential_arity_error(plan, components.as_slice()) {
         return Err(err);
     }
 
-    let secret_refs = combined_secret_refs(&components, backend_config);
+    let redaction_values = combined_secret_redaction_values(
+        &plan.secret_var_names,
+        components.as_slice(),
+        backend_config,
+    )?;
+    let secret_refs = redaction_values.refs();
     let cred_str = credential_env_string(creds)?;
 
     // Binary availability check — terraform-absent-safe.
@@ -3065,15 +2971,20 @@ fn live_terraform_apply_inner(
     }
 
     // Secret scrubbing components.
-    let components = credential_components(creds.material.as_slice());
+    let components = Zeroizing::new(credential_components(creds.material.as_slice()));
 
     // FAIL CLOSED: declared secret vars must pair 1:1 with resolved components
     // BEFORE any workspace or terraform subprocess exists.
-    if let Some(err) = credential_arity_error(plan, &components) {
+    if let Some(err) = credential_arity_error(plan, components.as_slice()) {
         return Err(err);
     }
 
-    let secret_refs = combined_secret_refs(&components, backend_config);
+    let redaction_values = combined_secret_redaction_values(
+        &plan.secret_var_names,
+        components.as_slice(),
+        backend_config,
+    )?;
+    let secret_refs = redaction_values.refs();
     let cred_str = credential_env_string(creds)?;
 
     // Binary availability check.
@@ -3303,15 +3214,20 @@ fn live_terraform_destroy_inner(
     }
 
     // Secret scrubbing components.
-    let components = credential_components(creds.material.as_slice());
+    let components = Zeroizing::new(credential_components(creds.material.as_slice()));
 
     // FAIL CLOSED: declared secret vars must pair 1:1 with resolved components
     // BEFORE any workspace or terraform subprocess exists.
-    if let Some(err) = credential_arity_error(plan, &components) {
+    if let Some(err) = credential_arity_error(plan, components.as_slice()) {
         return Err(err);
     }
 
-    let secret_refs = combined_secret_refs(&components, backend_config);
+    let redaction_values = combined_secret_redaction_values(
+        &plan.secret_var_names,
+        components.as_slice(),
+        backend_config,
+    )?;
+    let secret_refs = redaction_values.refs();
     let cred_str = credential_env_string(creds)?;
 
     // Binary availability check — terraform-absent-safe.
@@ -3532,27 +3448,111 @@ struct TfStepControl<'a> {
 /// BUG FIXED (historical): earlier code set `TF_VAR_<name> = <whole joined
 /// string>` for EVERY name, so a multi-credential offering got ALL credentials
 /// concatenated into EVERY var. The zip maps each name to ITS OWN value.
-fn secret_env_pairs(secret_names: &[String], cred_str: &str) -> Vec<(String, String)> {
+fn secret_env_pairs(secret_names: &[String], cred_str: &str) -> Vec<(String, Zeroizing<String>)> {
     if secret_names.is_empty() || cred_str.is_empty() {
         return Vec::new();
     }
     let mut pairs = Vec::with_capacity(secret_names.len() * 2);
     for (name, value) in secret_names.iter().zip(cred_str.split(',')) {
-        pairs.push((name.clone(), value.to_string()));
-        pairs.push((format!("TF_VAR_{}", name.to_lowercase()), value.to_string()));
+        pairs.push((name.clone(), Zeroizing::new(value.to_string())));
+        pairs.push((
+            format!("TF_VAR_{}", name.to_lowercase()),
+            Zeroizing::new(value.to_string()),
+        ));
     }
     pairs
 }
 
-fn combined_secret_refs<'a>(
+/// Process-local scrub registry for one live Terraform operation.
+///
+/// `registered` borrows already-owned provider/backend values. `derived`
+/// contains only the two canonical Basic-auth values for the explicitly typed
+/// provider username/password pair and is zeroized when the operation ends.
+/// Deliberately no `Debug`: even redaction values must never enter logs.
+struct SecretRedactionValues<'a> {
+    registered: Vec<&'a [u8]>,
+    derived: Vec<Zeroizing<Vec<u8>>>,
+}
+
+impl SecretRedactionValues<'_> {
+    fn refs(&self) -> Vec<&[u8]> {
+        self.registered
+            .iter()
+            .copied()
+            .chain(self.derived.iter().map(|value| value.as_slice()))
+            .collect()
+    }
+}
+
+fn combined_secret_redaction_values<'a>(
+    provider_names: &[String],
     provider_components: &'a [Vec<u8>],
     backend_config: &'a IsolatedBackendConfig,
-) -> Vec<&'a [u8]> {
-    provider_components
+) -> Result<SecretRedactionValues<'a>, RunnerError> {
+    let registered = provider_components
         .iter()
         .chain(backend_config.redaction_values().iter())
         .map(Vec::as_slice)
-        .collect()
+        .collect();
+    let derived = provider_basic_auth_redaction_values(provider_names, provider_components)?;
+    Ok(SecretRedactionValues {
+        registered,
+        derived,
+    })
+}
+
+fn provider_basic_auth_redaction_values(
+    provider_names: &[String],
+    provider_components: &[Vec<u8>],
+) -> Result<Vec<Zeroizing<Vec<u8>>>, RunnerError> {
+    fn unique_index(names: &[String], wanted: &str) -> Result<Option<usize>, RunnerError> {
+        let mut found = None;
+        for (index, name) in names.iter().enumerate() {
+            if name == wanted && found.replace(index).is_some() {
+                return Err(RunnerError::CredInjection(format!(
+                    "live Terraform provider redaction schema declares {wanted} more than once"
+                )));
+            }
+        }
+        Ok(found)
+    }
+
+    let username_index = unique_index(provider_names, "VSPHERE_USER")?;
+    let password_index = unique_index(provider_names, "VSPHERE_PASSWORD")?;
+    let (Some(username_index), Some(password_index)) = (username_index, password_index) else {
+        if username_index.is_some() || password_index.is_some() {
+            return Err(RunnerError::CredInjection(
+                "live Terraform provider redaction requires VSPHERE_USER and VSPHERE_PASSWORD to be declared together"
+                    .to_string(),
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let username = provider_components.get(username_index).ok_or_else(|| {
+        RunnerError::CredInjection(
+            "live Terraform provider username is missing from the redaction registry".to_string(),
+        )
+    })?;
+    let password_component = provider_components.get(password_index).ok_or_else(|| {
+        RunnerError::CredInjection(
+            "live Terraform provider password is missing from the redaction registry".to_string(),
+        )
+    })?;
+    if username.is_empty() || password_component.is_empty() {
+        return Err(RunnerError::CredInjection(
+            "live Terraform provider Basic-auth redaction requires non-empty typed components"
+                .to_string(),
+        ));
+    }
+
+    let variants = basic_auth_canonical_variants(Some(username), Some(password_component))
+        .ok_or_else(|| {
+            RunnerError::CredInjection(
+                "live Terraform provider Basic-auth redaction could not derive canonical variants"
+                    .to_string(),
+            )
+        })?;
+    Ok(variants.into_iter().map(Zeroizing::new).collect())
 }
 
 /// FAIL-CLOSED credential arity gate: a live run whose offering declares
@@ -3578,9 +3578,9 @@ fn credential_arity_error(plan: &RunPlan, components: &[Vec<u8>]) -> Option<Runn
     )))
 }
 
-fn credential_env_string(creds: &ResolvedCredentials) -> Result<String, RunnerError> {
+fn credential_env_string(creds: &ResolvedCredentials) -> Result<Zeroizing<String>, RunnerError> {
     std::str::from_utf8(creds.material.as_slice())
-        .map(str::to_owned)
+        .map(|value| Zeroizing::new(value.to_owned()))
         .map_err(|_| {
             RunnerError::CredInjection(
                 "live Terraform credential material must be UTF-8 for typed environment injection"
@@ -3648,13 +3648,15 @@ fn run_tf_step(
                 "live Terraform credential env {env_key:?} is not registered in the output redactor; refusing to spawn"
             )));
         }
-        cmd.env(&env_key, value);
+        cmd.env(&env_key, value.as_str());
     }
 
-    let output =
+    let mut output =
         run_command_with_optional_cancellation(cmd, LIVE_RUNNER_TIMEOUT, control.cancellation)?;
 
-    let raw = combine_output(&output.stdout, &output.stderr);
+    let raw = Zeroizing::new(combine_output(&output.stdout, &output.stderr));
+    output.stdout.zeroize();
+    output.stderr.zeroize();
     // Human-readable diagnostic logs are scrubbed and normally truncated to
     // bound evidence size. Raw `terraform show -json` never enters this type;
     // its dedicated zeroizing path commits before redaction.
@@ -3871,7 +3873,9 @@ mod tests {
                 .expect("write execution e2e vars");
         }
 
-        let secret_refs = combined_secret_refs(&[], backend);
+        let redaction_values =
+            combined_secret_redaction_values(&[], &[], backend).expect("empty provider registry");
+        let secret_refs = redaction_values.refs();
         let init = run_tf_step(
             Path::new("terraform"),
             TERRAFORM_INIT_ARGS,
@@ -4465,10 +4469,41 @@ resource "terraform_data" "decoy" {
             .any(|value| value == br"\u003c\u003e\u0026\u2028\u2029"));
 
         let mut mixed_variants = Vec::new();
-        append_go_json_escape_variant(&mut mixed_variants, "p\"\\\n<>&\u{2028}\u{2029}");
+        append_go_json_escape_variants(
+            &mut mixed_variants,
+            "p\"\\\n<>&\u{2028}\u{2029}".as_bytes(),
+        );
         assert!(mixed_variants
             .iter()
             .any(|value| value == br#"p\"\\\n\u003c\u003e\u0026\u2028\u2029"#));
+        assert!(mixed_variants
+            .iter()
+            .any(|value| value == br#"p\"\\\n<>&\u2028\u2029"#));
+
+        let mut invalid_percent_variants = Vec::new();
+        append_query_string_components(
+            &mut invalid_percent_variants,
+            "signature=provider-%FF-canary",
+        );
+        assert!(invalid_percent_variants
+            .iter()
+            .any(|value| value == br"provider-\ufffd-canary"));
+        let invalid_percent_refs: Vec<&[u8]> =
+            invalid_percent_variants.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            scrub(
+                r#"diagnostic=provider-\ufffd-canary status=failed"#,
+                &invalid_percent_refs,
+            ),
+            "diagnostic=[REDACTED] status=failed"
+        );
+        assert_eq!(
+            scrub(
+                "diagnostic=provider-\u{fffd}-canary status=failed",
+                &invalid_percent_refs,
+            ),
+            "diagnostic=[REDACTED] status=failed"
+        );
     }
 
     #[test]
@@ -6028,8 +6063,13 @@ esac
         // TF_VAR_<lowercase> terraform-variable alias, each with ITS OWN value
         // (multi-credential mis-pairing bug guard).
         let names = vec!["VSPHERE_USER".to_string(), "VSPHERE_PASSWORD".to_string()];
+        let pairs = secret_env_pairs(&names, "admin@vsphere.local,hunter2");
+        let projected: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().to_string()))
+            .collect();
         assert_eq!(
-            secret_env_pairs(&names, "admin@vsphere.local,hunter2"),
+            projected,
             vec![
                 (
                     "VSPHERE_USER".to_string(),
@@ -6044,8 +6084,13 @@ esac
             ]
         );
         // A lowercase declared name still gets both forms (verbatim + alias).
+        let lowercase_pairs = secret_env_pairs(&["token".to_string()], "abc123");
+        let lowercase_projected: Vec<(String, String)> = lowercase_pairs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().to_string()))
+            .collect();
         assert_eq!(
-            secret_env_pairs(&["token".to_string()], "abc123"),
+            lowercase_projected,
             vec![
                 ("token".to_string(), "abc123".to_string()),
                 ("TF_VAR_token".to_string(), "abc123".to_string()),
@@ -6054,6 +6099,72 @@ esac
         // No names, or no creds → nothing injected.
         assert!(secret_env_pairs(&[], "abc").is_empty());
         assert!(secret_env_pairs(&["x".to_string()], "").is_empty());
+    }
+
+    #[test]
+    fn provider_basic_auth_redaction_pairs_only_explicit_declared_names() {
+        // Deliberately reorder the components: the typed names, not adjacency
+        // or a Cartesian guess, establish the one approved Basic-auth pair.
+        let names = vec![
+            "VSPHERE_PASSWORD".to_string(),
+            "VSPHERE_SERVER".to_string(),
+            "VSPHERE_USER".to_string(),
+        ];
+        let components = vec![
+            b"typed-pass-canary".to_vec(),
+            b"vcenter.test.invalid".to_vec(),
+            b"typed-user-canary".to_vec(),
+        ];
+        let derived =
+            provider_basic_auth_redaction_values(&names, &components).expect("typed pair");
+        assert_eq!(derived.len(), 2, "canonical expansion stays bounded");
+        assert!(derived
+            .iter()
+            .any(|value| value.as_slice() == b"typed-user-canary:typed-pass-canary"));
+        assert!(derived.iter().any(|value| {
+            value.as_slice() == b"dHlwZWQtdXNlci1jYW5hcnk6dHlwZWQtcGFzcy1jYW5hcnk="
+        }));
+
+        let unrelated_names = vec!["API_USER".to_string(), "API_TOKEN".to_string()];
+        assert!(
+            provider_basic_auth_redaction_values(&unrelated_names, &components[..2])
+                .expect("unrelated schema")
+                .is_empty(),
+            "untyped components must not be combined"
+        );
+    }
+
+    #[test]
+    fn provider_basic_auth_redaction_rejects_ambiguous_schema_without_secret_echo() {
+        let components = vec![
+            b"never-echo-user-canary".to_vec(),
+            b"never-echo-pass-canary".to_vec(),
+        ];
+        let partial = provider_basic_auth_redaction_values(
+            &["VSPHERE_USER".to_string(), "OTHER".to_string()],
+            &components,
+        )
+        .expect_err("partial typed pair must fail closed")
+        .to_string();
+        assert!(partial.contains("declared together"));
+        assert!(!partial.contains("never-echo"));
+
+        let duplicate = provider_basic_auth_redaction_values(
+            &[
+                "VSPHERE_USER".to_string(),
+                "VSPHERE_USER".to_string(),
+                "VSPHERE_PASSWORD".to_string(),
+            ],
+            &[
+                b"never-echo-user-a".to_vec(),
+                b"never-echo-user-b".to_vec(),
+                b"never-echo-pass".to_vec(),
+            ],
+        )
+        .expect_err("duplicate typed name must fail closed")
+        .to_string();
+        assert!(duplicate.contains("more than once"));
+        assert!(!duplicate.contains("never-echo"));
     }
 
     // -----------------------------------------------------------------------
@@ -6205,12 +6316,43 @@ esac
         let ws_probe = super::super::workspace::Workspace::new().expect("ws");
         let probe_dir = ws_probe.path().to_string_lossy().to_string();
         let shim = ws_probe.path().join("fake-tf-env-dump");
-        // The shim dumps its environment per step, emits valid JSON for `show`,
-        // and writes the stub tfplan for the plan step.
+        let provider_user = "user-value-a";
+        let provider_password = "pass-value-b"; // secret-scan-allow: inert unit-test fixture
+        let provider_server = "vcenter<\u{2028}canary";
+        let [_, basic_auth_encoded] = basic_auth_canonical_variants(
+            Some(provider_user.as_bytes()),
+            Some(provider_password.as_bytes()),
+        )
+        .expect("typed Basic-auth fixture");
+        let basic_auth_encoded = String::from_utf8(basic_auth_encoded).expect("Base64 is ASCII");
+        let go_json_default = r"vcenter\u003c\u2028canary";
+        let go_json_no_html = r"vcenter<\u2028canary";
+        let encoded_diagnostic = format!(
+            "basic={basic_auth_encoded} go-default={go_json_default} go-no-html={go_json_no_html}"
+        );
+
+        // The shim dumps its environment per step, emits transformed provider
+        // credentials through the real stdout scrub boundary, emits valid JSON
+        // for `show`, and writes the stub tfplan for the plan step.
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = version ]; then exit 0; fi\nenv > \"{probe_dir}/env-$1\"\nif [ \"$1\" = show ]; then echo '{{\"format_version\":\"1.2\",\"resource_changes\":[]}}'; exit 0; fi\ntouch \"$PWD/tfplan\"\nexit 0\n"
+                r#"#!/bin/sh
+if [ "$1" = version ]; then exit 0; fi
+env > "{probe_dir}/env-$1"
+if [ "$1" = show ]; then
+  echo '{{"format_version":"1.2","resource_changes":[]}}'
+  exit 0
+fi
+case "$1" in
+  plan) printf '%s\n' 'Plan: {encoded_diagnostic}' ;;
+  apply) printf '%s\n' 'Apply complete! {encoded_diagnostic}' ;;
+  destroy) printf '%s\n' 'Destroy complete! {encoded_diagnostic}' ;;
+  *) printf '%s\n' 'diagnostic={encoded_diagnostic}' ;;
+esac
+touch "$PWD/tfplan"
+exit 0
+"#
             ),
         )
         .expect("write shim");
@@ -6233,7 +6375,7 @@ esac
             .collect();
         // Resolved material in declared order: USER, PASSWORD, SERVER.
         let creds = ResolvedCredentials {
-            material: b"user-value-a,pass-value-b,vcenter.test.invalid".to_vec(),
+            material: format!("{provider_user},{provider_password},{provider_server}").into_bytes(),
             descriptor: "test:vsphere".to_string(),
         };
 
@@ -6260,26 +6402,29 @@ esac
             let dump = std::fs::read_to_string(ws_probe.path().join(format!("env-{step}")))
                 .unwrap_or_else(|e| panic!("env dump for {step} must exist: {e}"));
             // Declared provider-native vars, each with ITS OWN value.
-            assert!(dump.contains("VSPHERE_USER=user-value-a"), "{step}: {dump}");
             assert!(
-                dump.contains("VSPHERE_PASSWORD=pass-value-b"), // secret-scan-allow: fixture value, not a credential
+                dump.contains(&format!("VSPHERE_USER={provider_user}")),
                 "{step}: {dump}"
             );
             assert!(
-                dump.contains("VSPHERE_SERVER=vcenter.test.invalid"),
+                dump.contains(&format!("VSPHERE_PASSWORD={provider_password}")), // secret-scan-allow: fixture value, not a credential
+                "{step}: {dump}"
+            );
+            assert!(
+                dump.contains(&format!("VSPHERE_SERVER={provider_server}")),
                 "{step}: {dump}"
             );
             // Terraform-variable aliases for the bundle's `var.vsphere_*` refs.
             assert!(
-                dump.contains("TF_VAR_vsphere_user=user-value-a"),
+                dump.contains(&format!("TF_VAR_vsphere_user={provider_user}")),
                 "{step}: {dump}"
             );
             assert!(
-                dump.contains("TF_VAR_vsphere_password=pass-value-b"), // secret-scan-allow: fixture value, not a credential
+                dump.contains(&format!("TF_VAR_vsphere_password={provider_password}")), // secret-scan-allow: fixture value, not a credential
                 "{step}: {dump}"
             );
             assert!(
-                dump.contains("TF_VAR_vsphere_server=vcenter.test.invalid"),
+                dump.contains(&format!("TF_VAR_vsphere_server={provider_server}")),
                 "{step}: {dump}"
             );
             // The agent-side env var namespace must NOT pass through, and the
@@ -6304,7 +6449,7 @@ esac
         );
 
         // The credential values must be scrubbed from the returned evidence.
-        for value in ["user-value-a", "pass-value-b", "vcenter.test.invalid"] {
+        for value in [provider_user, provider_password, provider_server] {
             assert!(
                 !result.outcome.log.contains(value)
                     && !result.outcome.summary.contains(value)
@@ -6315,6 +6460,24 @@ esac
                 "credential value {value:?} must be scrubbed from evidence"
             );
         }
+        for transformed in [
+            basic_auth_encoded.as_str(),
+            go_json_default,
+            go_json_no_html,
+        ] {
+            assert!(
+                !result.outcome.log.contains(transformed)
+                    && !result.outcome.summary.contains(transformed)
+                    && !applied.log.contains(transformed)
+                    && !applied.summary.contains(transformed)
+                    && !destroyed.log.contains(transformed)
+                    && !destroyed.summary.contains(transformed),
+                "transformed credential {transformed:?} must be scrubbed on every live operation"
+            );
+        }
+        assert!(result.outcome.summary.contains("[REDACTED]"));
+        assert!(applied.log.contains("[REDACTED]"));
+        assert!(destroyed.log.contains("[REDACTED]"));
 
         std::env::remove_var("RYUKI_LIVE_CRED_VSPHERE_USER");
         std::env::remove_var("RYUKI_TEST_PARENT_SECRET");

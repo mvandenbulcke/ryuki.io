@@ -21370,9 +21370,9 @@ async fn requests_list_impl(
 /// the audit/evidence-pack redaction discipline and is the last safety net
 /// before the data leaves the API process.
 ///
-/// For items with `redacted: false` the raw `value` is passed through
-/// unchanged — the runner's pre-scrub (`runner::scrub`) already ensured no
-/// known secret appears in it.
+/// Historical items with `redacted: false` are re-evaluated through the shared
+/// detector before projection. Stage metadata receives the same recursive
+/// treatment because lifecycle reasons are duplicated there.
 ///
 /// The input is the raw JSONB stages value (a JSON array of Stage objects as
 /// serialized by serde from `Vec<ryuki_engine::models::Stage>`). The output
@@ -21398,20 +21398,50 @@ fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
                         .get("redacted")
                         .and_then(|r| r.as_bool())
                         .unwrap_or(false);
-                    if !is_redacted {
+                    let item_key = item
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let item_value = item
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let dynamically_sensitive =
+                        ryuki_engine::evidence_pipeline::should_redact(item_key, item_value);
+                    let supplied_redacted_value_is_sensitive = item
+                        .get("redacted_value")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|candidate| {
+                            ryuki_engine::evidence_pipeline::should_redact("", candidate)
+                        });
+                    if !is_redacted
+                        && !dynamically_sensitive
+                        && !supplied_redacted_value_is_sensitive
+                    {
                         return item.clone();
                     }
-                    // Redacted item: replace `value` with the safe display form.
-                    let safe_value = item
-                        .get("redacted_value")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("***REDACTED***");
+                    // Newly detected or hostile supplied values always collapse
+                    // to the canonical marker. Existing pre-redacted safe
+                    // display text remains compatible.
+                    let safe_value =
+                        if dynamically_sensitive || supplied_redacted_value_is_sensitive {
+                            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+                        } else {
+                            item.get("redacted_value")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+                        };
                     let mut out = item.clone();
                     if let Some(obj) = out.as_object_mut() {
                         obj.insert(
                             "value".to_string(),
                             serde_json::Value::String(safe_value.to_string()),
                         );
+                        obj.insert(
+                            "redacted_value".to_string(),
+                            serde_json::Value::String(safe_value.to_string()),
+                        );
+                        obj.insert("redacted".to_string(), serde_json::Value::Bool(true));
                     }
                     out
                 })
@@ -21422,6 +21452,12 @@ fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
                     "evidence".to_string(),
                     serde_json::Value::Array(sanitized_evidence),
                 );
+                if let Some(metadata) = stage.get("metadata") {
+                    obj.insert(
+                        "metadata".to_string(),
+                        ryuki_engine::evidence_pipeline::redact_json_evidence_value(metadata),
+                    );
+                }
             }
             stage_out
         })
@@ -26027,6 +26063,11 @@ async fn reject_one(
     if approval_role_for(session).as_deref() != Some(role) {
         return Err(ordinary_approval_role_required());
     }
+    // One reason is copied into lifecycle evidence, stage metadata, the
+    // approval ledger, and audit detail. Normalize it once before any of those
+    // persistence boundaries so new rows never retain a replayable credential.
+    let safe_reason = ryuki_engine::evidence_pipeline::redact_sensitive_text("reason", reason);
+    let reason = safe_reason.as_str();
     let actor_principal = authenticated_principal_id(session)?.to_string();
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
@@ -27392,6 +27433,10 @@ async fn requests_approval_quorum(
     Ok(Json(body))
 }
 
+fn redact_approval_decision_reason(reason: Option<String>) -> Option<String> {
+    reason.map(|reason| ryuki_engine::evidence_pipeline::redact_sensitive_text("reason", &reason))
+}
+
 /// GET /api/requests/{id}/approval-decisions — the individual approval-decision
 /// LEDGER for one request: every recorded `request_approval_decisions` row
 /// (approval_epoch, current, role, decision, actor, decided_at, reason), including
@@ -27403,10 +27448,11 @@ async fn requests_approval_quorum(
 /// PlatformAdmin) ALSO holds `audit`, and gating on `approve` would wrongly exclude
 /// the audit-only `Auditor` from an audit ledger. `actor` is already exposed by the
 /// quorum endpoint's approvers list; `reason` is the approver's free-text reject
-/// justification — treat it as AUDIT-VISIBLE free text (any secret/PII redaction is a
-/// write-side concern, out of scope for this read). 404 for an unknown OR out-of-scope
-/// request (no oracle). Empty ledger + `durable:false` with no DB (the dry-run approve
-/// arm writes no ledger), distinct from a durable-but-empty `{decisions:[],durable:true}`.
+/// justification. New writes are redacted before persistence, and this read
+/// repeats the same guard for historical rows. 404 for an unknown OR
+/// out-of-scope request (no oracle). Empty ledger + `durable:false` with no DB
+/// (the dry-run approve arm writes no ledger), distinct from a durable-but-empty
+/// `{decisions:[],durable:true}`.
 async fn requests_approval_decisions(
     AuthExtractor(session): AuthExtractor,
     Path(request_id): Path<String>,
@@ -27473,6 +27519,7 @@ async fn requests_approval_decisions(
     let decisions: Vec<Value> = rows
         .into_iter()
         .map(|r| {
+            let reason = redact_approval_decision_reason(r.reason);
             json!({
                 "approval_epoch": r.approval_epoch,
                 "current": r.approval_epoch == current_approval_epoch,
@@ -27480,7 +27527,7 @@ async fn requests_approval_decisions(
                 "decision": r.decision,
                 "actor": r.actor,
                 "decided_at": r.decided_at.to_rfc3339(),
-                "reason": r.reason,
+                "reason": reason,
             })
         })
         .collect();
@@ -52979,6 +53026,131 @@ mod unit_tests {
         assert_eq!(reject["outcome"], "applied");
     }
 
+    #[tokio::test]
+    async fn requests_reject_cookie_reason_is_absent_from_actual_read_sinks() {
+        if get_db().is_some() {
+            eprintln!("SKIP: cookie-reason read-sink regression requires no-DB mode");
+            return;
+        }
+
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let marker = "SYNTH-REJECT-ENDPOINT-COOKIE-CANARY";
+        let reason = format!("__Host-ryuki_session={marker}");
+        let approver = single_role_session(
+            "approver-cookie-redaction",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let reviewed = reviewed_request_reject_body(&id, reason).await;
+        let Json(response) = requests_reject(Path(id.clone()), AuthExtractor(approver), reviewed)
+            .await
+            .expect("approver may reject a planned request");
+        assert!(!serde_json::to_string(&response).unwrap().contains(marker));
+
+        let Json(request_detail) = requests_get_for_test(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("request detail remains readable");
+        let request_detail_json = serde_json::to_string(&request_detail).unwrap();
+        assert!(!request_detail_json.contains(marker));
+        assert!(
+            request_detail_json.contains(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+
+        let Json(audit_trail) = requests_audit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit trail remains readable");
+        let audit_json = serde_json::to_string(&audit_trail).unwrap();
+        assert!(!audit_json.contains(marker));
+        let reject_entry = audit_trail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["action"] == "request.reject")
+            .unwrap();
+        assert_eq!(
+            reject_entry["detail"]["reason"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+
+        let Json(evidence_pack) =
+            request_evidence_pack(AuthExtractor(AuthSession::static_dry_run()), Path(id))
+                .await
+                .expect("evidence pack remains readable");
+        assert!(!serde_json::to_string(&evidence_pack)
+            .unwrap()
+            .contains(marker));
+    }
+
+    #[tokio::test]
+    async fn evidence_redact_endpoint_rejects_hostile_replacement_cookie_value() {
+        let raw_marker = "SYNTH-ENDPOINT-RAW-COOKIE-CANARY";
+        let replacement_marker = "SYNTH-ENDPOINT-REPLACEMENT-COOKIE-CANARY";
+        let metadata_marker = "SYNTH-ENDPOINT-METADATA-COOKIE-CANARY";
+        let compliance_marker = "SYNTH-ENDPOINT-COMPLIANCE-COOKIE-CANARY";
+        let safe_metadata = "ordinary endpoint metadata";
+        let safe_compliance = "approval policy check passed";
+        let pack = ryuki_engine::models::EvidencePack {
+            id: "ev-hostile-endpoint".to_string(),
+            request_id: "req-hostile-endpoint".to_string(),
+            items: vec![ryuki_engine::models::EvidenceItem {
+                key: "reason".to_string(),
+                value: format!("__Host-ryuki_session={raw_marker}"),
+                redacted_value: Some(format!("ryuki_session={replacement_marker}")),
+                redacted: false,
+                evidence_type: ryuki_engine::models::EvidenceType::ApprovalDecision,
+            }],
+            redacted: false,
+            created_at: "synthetic".to_string(),
+            format: "json".to_string(),
+            compliance_checks: vec![
+                format!("Cookie: ryuki_session={compliance_marker}"),
+                safe_compliance.to_string(),
+            ],
+            metadata: std::collections::HashMap::from([
+                (
+                    "reason".to_string(),
+                    format!("__Host-entra_login_csrf={metadata_marker}"),
+                ),
+                ("summary".to_string(), safe_metadata.to_string()),
+            ]),
+        };
+
+        let Json(redacted) = evidence_redact(Json(EvidenceRedactRequest {
+            pack: serde_json::to_value(pack).unwrap(),
+        }))
+        .await
+        .expect("redaction endpoint accepts the evidence shape");
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains(raw_marker));
+        assert!(!serialized.contains(replacement_marker));
+        assert!(!serialized.contains(metadata_marker));
+        assert!(!serialized.contains(compliance_marker));
+        assert_eq!(
+            redacted["items"][0]["value"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(
+            redacted["items"][0]["redacted_value"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(
+            redacted["metadata"]["reason"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(redacted["metadata"]["summary"], safe_metadata);
+        assert_eq!(
+            redacted["compliance_checks"][0],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(redacted["compliance_checks"][1], safe_compliance);
+    }
+
     #[test]
     fn reject_body_requires_exact_positive_version_on_the_wire() {
         assert!(
@@ -55303,6 +55475,23 @@ mod unit_tests {
     }
 
     // ── approval-decisions ledger read — auth / no-DB / malformed (no global pool) ──
+
+    #[test]
+    fn approval_decision_reason_redaction_preserves_safe_text_and_hides_cookie() {
+        assert_eq!(
+            redact_approval_decision_reason(Some("insufficient change window".to_string()))
+                .as_deref(),
+            Some("insufficient change window")
+        );
+        assert_eq!(
+            redact_approval_decision_reason(Some(
+                "__Host-ryuki_session=SYNTH-HISTORICAL-LEDGER-CANARY".to_string()
+            ))
+            .as_deref(),
+            Some(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(redact_approval_decision_reason(None), None);
+    }
 
     #[tokio::test]
     async fn approval_decisions_requires_audit_permission() {
@@ -70216,8 +70405,8 @@ mod db_lifecycle_tests {
 
     /// GET approval-decisions returns the full ledger (role/decision/actor/decided_at/
     /// reason) in DETERMINISTIC order — decided_at ASC, then BIGSERIAL id ASC as the
-    /// tie-breaker for same-transaction timestamps (codex). reason is NULL for the
-    /// approve and present for the reject; durable:true; unknown request → 404.
+    /// tie-breaker for same-transaction timestamps (codex). Historical raw cookie
+    /// material is redacted on read; durable:true; unknown request → 404.
     #[tokio::test]
     async fn approval_decisions_returns_ledger_ordered_with_reasons() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -70237,7 +70426,8 @@ mod db_lifecycle_tests {
              FROM requests AS r \
              CROSS JOIN (VALUES \
                  ('DatacenterApprover', 'approved', 'alice', NULL::text), \
-                 ('PlatformAdmin', 'rejected', 'bob', 'insufficient change window') \
+                 ('PlatformAdmin', 'rejected', 'bob', \
+                  '__Host-ryuki_session=SYNTH-LEDGER-COOKIE-CANARY') \
              ) AS d(role, decision, actor, reason) \
              WHERE r.id = $1",
         )
@@ -70289,8 +70479,11 @@ mod db_lifecycle_tests {
         assert_eq!(decisions[1]["decision"], serde_json::json!("rejected"));
         assert_eq!(
             decisions[1]["reason"],
-            serde_json::json!("insufficient change window")
+            serde_json::json!(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
         );
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("SYNTH-LEDGER-COOKIE-CANARY"));
         // codex: make the tie-breaker premise EXPLICIT — both rows were inserted in
         // one tx so they share decided_at; the deterministic [approve, reject] order
         // therefore comes from the BIGSERIAL id ASC tie-breaker, not from timestamps.
@@ -74545,6 +74738,49 @@ mod maint_calendar_db_tests {
         assert!(
             sanitized_str.contains("***REDACTED***"),
             "sentinel must appear when redacted_value is absent; got: {sanitized_str}"
+        );
+    }
+
+    #[test]
+    fn sanitize_stages_redacts_historical_unflagged_cookie_evidence_and_metadata() {
+        use ryuki_engine::models::{EvidenceItem, EvidenceType, Stage, StageStatus};
+        use std::collections::HashMap;
+
+        let marker = "SYNTH-HISTORICAL-COOKIE-CANARY";
+        let raw_reason = format!("__Host-ryuki_session={marker}");
+        let stage = Stage {
+            name: "approve".to_string(),
+            status: StageStatus::Failed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "approval-decision".to_string(),
+                value: format!("Rejected by approver: {raw_reason}"),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::ApprovalDecision,
+            }],
+            metadata: HashMap::from([
+                ("approver".to_string(), "approver-principal".to_string()),
+                ("reason".to_string(), raw_reason),
+            ]),
+        };
+
+        let stages_json = serde_json::to_value([stage]).unwrap();
+        let sanitized = sanitize_stages_for_portal(&stages_json);
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+        assert!(!serialized.contains(marker));
+        assert_eq!(
+            sanitized[0]["evidence"][0]["value"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(
+            sanitized[0]["metadata"]["reason"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(
+            sanitized[0]["metadata"]["approver"], "approver-principal",
+            "ordinary attribution must remain available"
         );
     }
 }

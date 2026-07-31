@@ -10,10 +10,16 @@
 //!
 //! # Representation coverage
 //! Providers frequently render values through JSON/HCL, URL, or shell
-//! escaping before writing them. The scrub set therefore includes those
-//! deterministic representations as well as the literal secret. Matches are
+//! escaping before writing them. Go providers also use `encoding/json`, whose
+//! HTML-safe and HTML-disabled modes differ from serde_json and replace invalid
+//! UTF-8 bytes deterministically. The scrub set therefore includes those
+//! bounded representations as well as the literal secret. Typed composites
+//! such as Basic authentication are registered explicitly by the caller; this
+//! module never guesses pairs or recursively expands encodings. Matches are
 //! found against the original output and overlapping ranges are merged before
 //! replacement, so the result is independent of secret ordering.
+
+use zeroize::Zeroizing;
 
 /// Maximum log excerpt stored in `RunOutcome.log`. Outputs longer than this
 /// are truncated with a suffix indicating the truncation.
@@ -43,7 +49,7 @@ pub fn scrub(output: &str, secret_values: &[&[u8]]) -> String {
             continue;
         }
         let mut search_from = 0usize;
-        while let Some(relative_start) = output[search_from..].find(variant) {
+        while let Some(relative_start) = output[search_from..].find(variant.as_str()) {
             let start = search_from + relative_start;
             ranges.push((start, start + variant.len()));
             // Advance by one Unicode scalar rather than by the whole match so
@@ -83,7 +89,7 @@ pub fn scrub(output: &str, secret_values: &[&[u8]]) -> String {
     scrubbed
 }
 
-fn secret_variants(secret_values: &[&[u8]]) -> Vec<String> {
+fn secret_variants(secret_values: &[&[u8]]) -> Vec<Zeroizing<String>> {
     let mut variants = Vec::new();
     for secret in secret_values
         .iter()
@@ -94,36 +100,87 @@ fn secret_variants(secret_values: &[&[u8]]) -> Vec<String> {
         let lower_percent = percent_encode(secret, false, false);
         let upper_form_percent = percent_encode(secret, true, true);
         let lower_form_percent = percent_encode(secret, false, true);
-        variants.push(upper_percent);
-        variants.push(lower_percent);
-        variants.push(upper_form_percent);
-        variants.push(lower_form_percent);
+        variants.push(Zeroizing::new(upper_percent));
+        variants.push(Zeroizing::new(lower_percent));
+        variants.push(Zeroizing::new(upper_form_percent));
+        variants.push(Zeroizing::new(lower_form_percent));
 
-        let Ok(secret_str) = std::str::from_utf8(secret) else {
-            continue;
+        for escape_html in [true, false] {
+            if let Some(go_json) = go_json_escape_variant(secret, escape_html) {
+                variants.push(Zeroizing::new(go_json));
+            }
+        }
+
+        let secret_str = match std::str::from_utf8(secret) {
+            Ok(secret_str) => secret_str,
+            Err(_) => {
+                // `std::process::Output` is converted through
+                // `String::from_utf8_lossy` before this boundary. Register the
+                // same single, bounded representation so malformed provider
+                // bytes cannot survive capture as literal U+FFFD characters.
+                variants.push(Zeroizing::new(String::from_utf8_lossy(secret).into_owned()));
+                continue;
+            }
         };
-        variants.push(secret_str.to_string());
+        variants.push(Zeroizing::new(secret_str.to_string()));
 
-        if let Ok(quoted) = serde_json::to_string(secret_str) {
+        if let Ok(quoted) = serde_json::to_string(secret_str).map(Zeroizing::new) {
             if let Some(inner) = quoted
                 .strip_prefix('"')
                 .and_then(|value| value.strip_suffix('"'))
             {
-                variants.push(inner.to_string());
+                variants.push(Zeroizing::new(inner.to_string()));
             }
         }
 
         let shell_single = secret_str.replace('\'', "'\\''");
-        variants.push(shell_single);
-        variants.push(shell_backslash_escape(secret_str));
-        variants.push(shell_mixed_escape(secret_str));
+        variants.push(Zeroizing::new(shell_single));
+        variants.push(Zeroizing::new(shell_backslash_escape(secret_str)));
+        variants.push(Zeroizing::new(shell_mixed_escape(secret_str)));
     }
 
     variants.retain(|variant| !variant.is_empty());
+    variants.sort_unstable_by(|left, right| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left.as_str().cmp(right.as_str()))
+    });
+    variants.dedup_by(|left, right| left.as_str() == right.as_str());
     variants
-        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    variants.dedup();
-    variants
+}
+
+/// Return the two canonical wire values for one explicitly typed Basic-auth
+/// credential: the raw `username:password` octets and standard padded Base64.
+///
+/// The caller must establish the username/password relationship from trusted
+/// schema metadata. This helper intentionally accepts only one pair and emits
+/// exactly two non-recursive variants, preventing Cartesian or recursive
+/// secret expansion. Empty components retain Basic-auth's defined boundary
+/// forms (`username:` or `:password`); two absent/empty components produce no
+/// value.
+pub(crate) fn basic_auth_canonical_variants(
+    username: Option<&[u8]>,
+    password: Option<&[u8]>, // secret-scan-allow: typed parameter, not a literal credential
+) -> Option<[Vec<u8>; 2]> {
+    let username = username.filter(|value| !value.is_empty());
+    let password = password.filter(|value| !value.is_empty()); // secret-scan-allow: typed value reference
+    if username.is_none() && password.is_none() {
+        return None;
+    }
+
+    let username_len = username.map_or(0, <[u8]>::len);
+    let password_len = password.map_or(0, <[u8]>::len);
+    let mut combined = Vec::with_capacity(username_len + password_len + 1);
+    if let Some(username) = username {
+        combined.extend_from_slice(username);
+    }
+    combined.push(b':');
+    if let Some(password) = password {
+        combined.extend_from_slice(password);
+    }
+    let encoded = standard_base64(&combined);
+    Some([combined, encoded])
 }
 
 fn percent_encode(value: &[u8], uppercase: bool, space_as_plus: bool) -> String {
@@ -143,6 +200,150 @@ fn percent_encode(value: &[u8], uppercase: bool, space_as_plus: bool) -> String 
         }
     }
     encoded
+}
+
+pub(crate) fn standard_base64(value: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = Vec::with_capacity(value.len().div_ceil(3) * 4);
+    for chunk in value.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize]);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize]);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize]);
+        } else {
+            encoded.push(b'=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0x3f) as usize]);
+        } else {
+            encoded.push(b'=');
+        }
+    }
+    encoded
+}
+
+/// Encode the inner string bytes exactly as Go's `encoding/json` does.
+///
+/// Go supports two bounded modes: the default HTML-safe mode and
+/// `Encoder.SetEscapeHTML(false)`. Both modes still escape U+2028/U+2029 and
+/// replace every invalid UTF-8 byte with `\ufffd`. Registering both closes the
+/// mixed-representation case (`<` left literal while U+2028 is escaped)
+/// without guessing encodings or recursively expanding variants.
+fn go_json_escape_variant(value: &[u8], escape_html: bool) -> Option<String> {
+    let mut escaped = String::with_capacity(value.len());
+    let mut changed = false;
+    let mut index = 0usize;
+    while index < value.len() {
+        let byte = value[index];
+        if byte.is_ascii() {
+            index += 1;
+            append_go_json_character(&mut escaped, char::from(byte), escape_html, &mut changed);
+            continue;
+        }
+
+        let remaining = &value[index..];
+        let valid_prefix_len = match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    append_go_json_character(&mut escaped, character, escape_html, &mut changed);
+                }
+                break;
+            }
+            Err(error) => error.valid_up_to(),
+        };
+        if valid_prefix_len > 0 {
+            let valid = std::str::from_utf8(&remaining[..valid_prefix_len])
+                .expect("Utf8Error::valid_up_to identifies a valid prefix");
+            for character in valid.chars() {
+                append_go_json_character(&mut escaped, character, escape_html, &mut changed);
+            }
+            index += valid_prefix_len;
+            continue;
+        }
+
+        // Go's utf8.DecodeRuneInString reports size 1 for malformed input, so
+        // encoding/json emits one replacement escape per invalid byte.
+        escaped.push_str("\\ufffd");
+        changed = true;
+        index += 1;
+    }
+    changed.then_some(escaped)
+}
+
+fn append_go_json_character(
+    escaped: &mut String,
+    character: char,
+    escape_html: bool,
+    changed: &mut bool,
+) {
+    use std::fmt::Write as _;
+
+    match character {
+        '"' => {
+            escaped.push_str("\\\"");
+            *changed = true;
+        }
+        '\\' => {
+            escaped.push_str("\\\\");
+            *changed = true;
+        }
+        '\u{0008}' => {
+            escaped.push_str("\\b");
+            *changed = true;
+        }
+        '\u{000c}' => {
+            escaped.push_str("\\f");
+            *changed = true;
+        }
+        '\n' => {
+            escaped.push_str("\\n");
+            *changed = true;
+        }
+        '\r' => {
+            escaped.push_str("\\r");
+            *changed = true;
+        }
+        '\t' => {
+            escaped.push_str("\\t");
+            *changed = true;
+        }
+        '<' if escape_html => {
+            escaped.push_str("\\u003c");
+            *changed = true;
+        }
+        '>' if escape_html => {
+            escaped.push_str("\\u003e");
+            *changed = true;
+        }
+        '&' if escape_html => {
+            escaped.push_str("\\u0026");
+            *changed = true;
+        }
+        '\u{2028}' => {
+            escaped.push_str("\\u2028");
+            *changed = true;
+        }
+        '\u{2029}' => {
+            escaped.push_str("\\u2029");
+            *changed = true;
+        }
+        character if character <= '\u{001f}' => {
+            write!(escaped, "\\u{:04x}", character as u32).expect("writing to String cannot fail");
+            *changed = true;
+        }
+        _ => escaped.push(character),
+    }
+}
+
+pub(crate) fn append_go_json_escape_variants(values: &mut Vec<Vec<u8>>, value: &[u8]) {
+    for escape_html in [true, false] {
+        if let Some(escaped) = go_json_escape_variant(value, escape_html) {
+            values.push(escaped.into_bytes());
+        }
+    }
 }
 
 fn shell_backslash_escape(value: &str) -> String {
@@ -324,6 +525,89 @@ mod tests {
         assert!(!scrubbed.contains("api+key%2f%2b"));
         assert!(!scrubbed.contains("shell'\\''value\\$part"));
         assert_eq!(scrubbed.matches("[REDACTED]").count(), 5);
+    }
+
+    #[test]
+    fn scrub_redacts_go_json_provider_wire_representation() {
+        let secret = "provider\"\\\n<>&\u{2028}\u{2029}";
+        let output = r#"diagnostic=provider\"\\\n\u003c\u003e\u0026\u2028\u2029 status=failed"#;
+        let scrubbed = scrub(output, &[secret.as_bytes()]);
+        assert_eq!(scrubbed, "diagnostic=[REDACTED] status=failed");
+        assert!(!scrubbed.contains("\\u003c"));
+    }
+
+    #[test]
+    fn scrub_redacts_go_json_no_html_mixed_representation() {
+        let secret = "provider<\u{2028}canary";
+        let output = r#"diagnostic=provider<\u2028canary status=failed"#;
+        let scrubbed = scrub(output, &[secret.as_bytes()]);
+        assert_eq!(scrubbed, "diagnostic=[REDACTED] status=failed");
+        assert!(!scrubbed.contains("provider<\\u2028canary"));
+    }
+
+    #[test]
+    fn scrub_redacts_go_json_invalid_utf8_replacement_representation() {
+        let secret = b"provider-\xff-canary";
+        let output = r#"diagnostic=provider-\ufffd-canary status=failed"#;
+        let scrubbed = scrub(output, &[secret.as_slice()]);
+        assert_eq!(scrubbed, "diagnostic=[REDACTED] status=failed");
+        assert!(!scrubbed.contains("provider-\\ufffd-canary"));
+    }
+
+    #[test]
+    fn scrub_redacts_capture_lossy_invalid_utf8_representation() {
+        let secret = b"provider-\xff-canary";
+        let output = "diagnostic=provider-\u{fffd}-canary status=failed";
+        let scrubbed = scrub(output, &[secret.as_slice()]);
+        assert_eq!(scrubbed, "diagnostic=[REDACTED] status=failed");
+        assert!(!scrubbed.contains("provider-\u{fffd}-canary"));
+    }
+
+    #[test]
+    fn scrub_redacts_explicit_typed_basic_auth_wire_values() {
+        let [combined, encoded] =
+            basic_auth_canonical_variants(Some(b"basic-user-canary"), Some(b"basic-pass-canary"))
+                .expect("typed pair");
+        assert_eq!(encoded, b"YmFzaWMtdXNlci1jYW5hcnk6YmFzaWMtcGFzcy1jYW5hcnk=");
+        let output = format!(
+            "raw={} encoded={}",
+            String::from_utf8_lossy(&combined),
+            String::from_utf8_lossy(&encoded)
+        );
+        let scrubbed = scrub(&output, &[combined.as_slice(), encoded.as_slice()]);
+        assert_eq!(scrubbed, "raw=[REDACTED] encoded=[REDACTED]");
+    }
+
+    #[test]
+    fn scrub_does_not_guess_basic_auth_pairs_or_decode_unregistered_output() {
+        let output = "status=healthy opaque=YmFzaWMtdXNlci1jYW5hcnk6YmFzaWMtcGFzcy1jYW5hcnk=";
+        let scrubbed = scrub(
+            output,
+            &[
+                b"basic-user-canary".as_slice(),
+                b"basic-pass-canary".as_slice(),
+            ],
+        );
+        assert_eq!(
+            scrubbed, output,
+            "only an explicitly typed pair may register a composite"
+        );
+    }
+
+    #[test]
+    fn basic_auth_canonical_variants_have_bounded_boundary_forms() {
+        assert!(basic_auth_canonical_variants(None, None).is_none());
+        assert!(basic_auth_canonical_variants(Some(b""), Some(b"")).is_none());
+
+        let [username_only, username_only_encoded] =
+            basic_auth_canonical_variants(Some(b"basic-user"), None).expect("username boundary");
+        assert_eq!(username_only, b"basic-user:");
+        assert_eq!(username_only_encoded, b"YmFzaWMtdXNlcjo=");
+
+        let [password_only, password_only_encoded] =
+            basic_auth_canonical_variants(None, Some(b"basic-pass")).expect("password boundary");
+        assert_eq!(password_only, b":basic-pass");
+        assert_eq!(password_only_encoded, standard_base64(b":basic-pass"));
     }
 
     #[test]

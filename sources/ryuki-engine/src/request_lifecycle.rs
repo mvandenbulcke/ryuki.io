@@ -378,6 +378,11 @@ pub fn reject_request(request: &Request, approver: &str, reason: &str) -> Result
         ));
     }
 
+    // Rejection reasons are copied into stage evidence and metadata. Remove any
+    // credential material at this source boundary so direct engine callers
+    // cannot persist a replayable cookie before an API read-side guard runs.
+    let reason = crate::evidence_pipeline::redact_sensitive_text("reason", reason);
+
     let mut rejected = request.clone();
     rejected.status = RequestStatus::Rejected;
     rejected.updated_at = Utc::now().to_rfc3339();
@@ -391,7 +396,7 @@ pub fn reject_request(request: &Request, approver: &str, reason: &str) -> Result
     };
     let metadata = HashMap::from([
         ("approver".into(), approver.to_string()),
-        ("reason".into(), reason.to_string()),
+        ("reason".into(), reason),
         ("decision".into(), "rejected".into()),
     ]);
 
@@ -1400,6 +1405,36 @@ mod tests {
         let validation = validate_request(&rejected).unwrap();
         assert!(!validation.passed);
         assert!(reject_request(&rejected, "x", "again").is_err());
+    }
+
+    #[test]
+    fn test_reject_request_redacts_bare_session_cookie_before_stage_storage() {
+        let marker = "SYNTH-REJECTION-COOKIE-CANARY";
+        let reason = format!("__Host-ryuki_session={marker}");
+        let rejected =
+            reject_request(&make_planned_request(), "Datacenter Approver", &reason).unwrap();
+        let approve_stage = rejected
+            .stages
+            .iter()
+            .find(|stage| stage.name == "approve")
+            .unwrap();
+        let decision = approve_stage
+            .evidence
+            .iter()
+            .find(|item| item.key == "approval-decision")
+            .unwrap();
+
+        assert!(!decision.value.contains(marker));
+        assert!(
+            decision
+                .value
+                .contains(crate::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(
+            approve_stage.metadata.get("reason").map(String::as_str),
+            Some(crate::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
+        );
+        assert!(!serde_json::to_string(&rejected).unwrap().contains(marker));
     }
 
     #[test]

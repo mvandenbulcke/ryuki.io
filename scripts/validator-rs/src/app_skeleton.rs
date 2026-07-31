@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use syn::visit::Visit as _;
 
 // The legacy C# API (api/Ryuki.Platform.Api/*) was deleted when the platform
 // was ported to Rust; the API skeleton is now the ryuki-api crate.
@@ -812,6 +813,7 @@ fn validate_portal(
 ) {
     let active_app = strip_rust_comments(app_rs);
     let active_app_without_strings = strip_rust_string_literals(&active_app);
+    let portal_main = inspect_portal_main(main_rs);
     // Favicon ownership stays in App metadata. Accept a self-contained PNG/SVG
     // data URI or the portal's same-origin `/favicon.svg` asset; all three keep
     // the icon inside the application boundary with no third-party fetch.
@@ -877,33 +879,15 @@ fn validate_portal(
         errors,
         "portal Cargo.toml must declare Axum-backed full-stack dependencies behind ssr",
     );
-    // relaxed (config source): the original check pinned the Leptos config load
-    // to `get_configuration(Some("Cargo.toml"))`. The portal team switched to
-    // `get_configuration(None)`, which reads the same `[package.metadata.leptos]`
-    // settings from the environment / compiled-in defaults instead of re-reading
-    // Cargo.toml at runtime. Either form starts the same Axum-backed SSR server,
-    // so we accept both. All other tokens (tokio main, leptos_axum imports,
-    // Router, .leptos_routes, file_and_error_handler(shell), and the
-    // static-dry-run boundary) stay required.
     expect(
-        main_rs.contains(r#"#[cfg(feature = "ssr")]"#)
-            && main_rs.contains("#[tokio::main]")
-            && main_rs.contains(
-                "leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes}",
-            )
-            && main_rs.contains("Router::new()")
-            // relaxed: accept `.leptos_routes_with_context(` — the portal team
-            // upgraded from `.leptos_routes(` to the context-injecting variant so
-            // an upstream HTTP client can be provided to server functions. Both
-            // mount the generated Leptos route list on the Axum router.
-            && (main_rs.contains(".leptos_routes(")
-                || main_rs.contains(".leptos_routes_with_context("))
-            && main_rs.contains("file_and_error_handler(shell)")
-            && (main_rs.contains(r#"get_configuration(Some("Cargo.toml"))"#)
-                || main_rs.contains("get_configuration(None)"))
-            && main_rs.contains("PortalServerBoundary::static_dry_run()"),
+        portal_main.runs_axum_leptos_ssr,
         errors,
         "portal main.rs must run the Axum-backed Leptos SSR server",
+    );
+    expect(
+        portal_main.exposes_health_routes,
+        errors,
+        "portal main.rs must expose exact GET /healthz and /readyz routes on the served router",
     );
     expect(
         lib_rs.contains(r#"#[cfg(feature = "hydrate")]"#)
@@ -2344,6 +2328,969 @@ fn validate_text(path: &str, text: &str, errors: &mut Vec<String>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PortalMainInspection {
+    pub(crate) runs_axum_leptos_ssr: bool,
+    pub(crate) plans_core_platform_reads: bool,
+    pub(crate) exposes_health_routes: bool,
+}
+
+#[derive(Debug)]
+struct RouterBinding {
+    name: String,
+    statement_index: usize,
+    exposes_health_routes: bool,
+}
+
+pub(crate) fn inspect_portal_main(main_rs: &str) -> PortalMainInspection {
+    let Ok(file) = syn::parse_file(main_rs) else {
+        return PortalMainInspection::default();
+    };
+    let matching_mains: Vec<&syn::ItemFn> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(item_fn)
+                if item_fn.sig.ident == "main"
+                    && item_fn.sig.asyncness.is_some()
+                    && item_fn.sig.inputs.is_empty()
+                    && item_fn.sig.constness.is_none()
+                    && item_fn.sig.unsafety.is_none()
+                    && item_fn.sig.abi.is_none()
+                    && item_fn.sig.variadic.is_none()
+                    && item_fn.attrs.len() == 2
+                    && item_fn.attrs.iter().any(attribute_is_cfg_ssr)
+                    && item_fn.attrs.iter().any(attribute_is_tokio_main) =>
+            {
+                Some(item_fn)
+            }
+            _ => None,
+        })
+        .collect();
+    let [main_fn] = matching_mains.as_slice() else {
+        return PortalMainInspection::default();
+    };
+
+    inspect_portal_main_body(&main_fn.block)
+}
+
+fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
+    if block.stmts.iter().any(statement_has_attributes)
+        || block.stmts.iter().any(statement_has_early_exit)
+        || block.stmts.iter().any(|statement| match statement {
+            syn::Stmt::Item(syn::Item::Use(item_use)) => use_tree_contains_rename(&item_use.tree),
+            syn::Stmt::Item(_) | syn::Stmt::Macro(_) => true,
+            _ => false,
+        })
+    {
+        return PortalMainInspection::default();
+    }
+    let imports = collect_block_imports(block);
+    if imports.iter().any(|path| {
+        path.last()
+            .is_some_and(|segment| segment == "get_configuration")
+    }) || !imported(&imports, &["axum", "Router"])
+        || !imported(&imports, &["leptos_axum", "LeptosRoutes"])
+        || !imported(&imports, &["leptos_axum", "generate_route_list"])
+        || !imported(&imports, &["axum", "routing", "get"])
+        || !imported(&imports, &["ryuki_portal_ui", "app", "App"])
+        || !imported(&imports, &["ryuki_portal_ui", "app", "shell"])
+        || !imported(
+            &imports,
+            &["ryuki_portal_ui", "server_boundary", "PortalServerBoundary"],
+        )
+        || !imported(&imports, &["leptos", "prelude", "*"])
+    {
+        return PortalMainInspection::default();
+    }
+
+    let has_legacy_handler = imported(&imports, &["leptos_axum", "file_and_error_handler"]);
+    let has_context_handler = imported(
+        &imports,
+        &["leptos_axum", "file_and_error_handler_with_context"],
+    );
+    if !has_legacy_handler && !has_context_handler {
+        return PortalMainInspection::default();
+    }
+    if block
+        .stmts
+        .iter()
+        .any(|statement| statement_has_unrecognized_main_await(statement, &imports))
+    {
+        return PortalMainInspection::default();
+    }
+
+    let mut generated_routes = BTreeSet::new();
+    let mut current_configurations = BTreeSet::new();
+    let mut current_leptos_options = BTreeSet::new();
+    let mut current_boundaries = BTreeSet::new();
+    let mut local_bindings = Vec::new();
+    let mut routers = Vec::new();
+    let mut listeners = Vec::new();
+    let mut serves = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut core_plans = Vec::new();
+
+    for (statement_index, statement) in block.stmts.iter().enumerate() {
+        match statement {
+            syn::Stmt::Local(local) => {
+                let Some(name) = local_ident(&local.pat) else {
+                    return PortalMainInspection::default();
+                };
+                if [
+                    "App",
+                    "Router",
+                    "PortalServerBoundary",
+                    "file_and_error_handler",
+                    "file_and_error_handler_with_context",
+                    "generate_route_list",
+                    "get",
+                    "get_configuration",
+                    "shell",
+                    "validate_live_provider_auth_posture",
+                ]
+                .contains(&name.as_str())
+                {
+                    return PortalMainInspection::default();
+                }
+                let Some(initializer) = local.init.as_ref().map(|init| init.expr.as_ref()) else {
+                    generated_routes.remove(&name);
+                    current_configurations.remove(&name);
+                    current_leptos_options.remove(&name);
+                    current_boundaries.remove(&name);
+                    local_bindings.push((name, statement_index));
+                    continue;
+                };
+
+                if expression_calls_core_plan(initializer, &current_boundaries) {
+                    core_plans.push(statement_index);
+                }
+                if let Some(router) = inspect_router_initializer(
+                    &name,
+                    statement_index,
+                    initializer,
+                    &imports,
+                    &generated_routes,
+                    &current_leptos_options,
+                    has_legacy_handler,
+                    has_context_handler,
+                ) {
+                    routers.push(router);
+                }
+                if expression_binds_tcp_listener(initializer) {
+                    listeners.push((name.clone(), statement_index));
+                }
+
+                let generates_routes = expression_generates_app_routes(initializer, &imports);
+                let loads_configuration = expression_loads_configuration(initializer);
+                let derives_leptos_options =
+                    expression_derives_leptos_options(initializer, &current_configurations);
+                let creates_boundary = expression_creates_static_boundary(initializer, &imports);
+                generated_routes.remove(&name);
+                current_configurations.remove(&name);
+                current_leptos_options.remove(&name);
+                current_boundaries.remove(&name);
+                if generates_routes {
+                    generated_routes.insert(name.clone());
+                }
+                if loads_configuration {
+                    current_configurations.insert(name.clone());
+                }
+                if derives_leptos_options {
+                    current_leptos_options.insert(name.clone());
+                }
+                if creates_boundary {
+                    current_boundaries.insert(name.clone());
+                    boundaries.push((name.clone(), statement_index));
+                }
+                local_bindings.push((name, statement_index));
+            }
+            syn::Stmt::Expr(expression, _) => {
+                if expression_calls_core_plan(expression, &current_boundaries) {
+                    core_plans.push(statement_index);
+                }
+                if let Some((listener, router)) = expression_serves_router(expression) {
+                    serves.push((listener, router, statement_index));
+                }
+            }
+            syn::Stmt::Item(syn::Item::Use(_)) => {}
+            syn::Stmt::Item(_) | syn::Stmt::Macro(_) => {
+                return PortalMainInspection::default();
+            }
+        }
+    }
+
+    let mut valid_servers = Vec::new();
+    for (listener_name, router_name, serve_index) in serves {
+        let Some(router) = routers.iter().find(|router| {
+            router.name == router_name
+                && router.statement_index < serve_index
+                && binding_is_current(
+                    &local_bindings,
+                    &router.name,
+                    router.statement_index,
+                    serve_index,
+                )
+        }) else {
+            continue;
+        };
+        let Some((_, listener_index)) = listeners.iter().find(|(name, index)| {
+            name == &listener_name
+                && *index < serve_index
+                && binding_is_current(&local_bindings, name, *index, serve_index)
+        }) else {
+            continue;
+        };
+        if *listener_index >= serve_index || !serve_has_success_tail(block, serve_index) {
+            continue;
+        }
+        let has_boundary = boundaries
+            .iter()
+            .any(|(_, index)| *index < router.statement_index);
+        if !has_boundary {
+            continue;
+        }
+
+        valid_servers.push(PortalMainInspection {
+            runs_axum_leptos_ssr: true,
+            plans_core_platform_reads: core_plans
+                .iter()
+                .any(|index| *index < router.statement_index),
+            exposes_health_routes: router.exposes_health_routes,
+        });
+    }
+    match valid_servers.as_slice() {
+        [inspection] => *inspection,
+        _ => PortalMainInspection::default(),
+    }
+}
+
+fn inspect_router_initializer(
+    name: &str,
+    statement_index: usize,
+    initializer: &syn::Expr,
+    imports: &[Vec<String>],
+    generated_routes: &BTreeSet<String>,
+    leptos_options: &BTreeSet<String>,
+    has_legacy_handler: bool,
+    has_context_handler: bool,
+) -> Option<RouterBinding> {
+    let mut methods = Vec::new();
+    let mut cursor = strip_paren_group(initializer);
+    while let syn::Expr::MethodCall(method) = cursor {
+        methods.push(method);
+        cursor = strip_paren_group(&method.receiver);
+    }
+    if !expression_is_router_new(cursor, imports) {
+        return None;
+    }
+    methods.reverse();
+
+    let mut leptos_route_index = None;
+    let mut fallback_index = None;
+    let mut state_index = None;
+    let mut route_options = None;
+    let mut state_options = None;
+    let mut healthz_routes = 0usize;
+    let mut readyz_routes = 0usize;
+    let mut health_routes_are_get = true;
+    for (index, method) in methods.iter().enumerate() {
+        match method.method.to_string().as_str() {
+            "leptos_routes" | "leptos_routes_with_context" => {
+                if leptos_route_index.is_some() {
+                    return None;
+                }
+                route_options =
+                    leptos_route_method_options(method, imports, generated_routes, leptos_options);
+                route_options.as_ref()?;
+                leptos_route_index = Some(index);
+            }
+            "fallback" => {
+                if fallback_index.is_some()
+                    || !fallback_method_is_valid(
+                        method,
+                        imports,
+                        has_legacy_handler,
+                        has_context_handler,
+                    )
+                {
+                    return None;
+                }
+                fallback_index = Some(index);
+            }
+            "with_state" => {
+                if state_index.is_some() || method.args.len() != 1 {
+                    return None;
+                }
+                state_options = method.args.first().and_then(cloned_or_simple_ident);
+                state_index = Some(index);
+            }
+            "route" => {
+                if let Some(path) = method.args.first().and_then(string_literal) {
+                    if path == "/healthz" {
+                        healthz_routes += 1;
+                        health_routes_are_get &= route_method_uses_get(method, imports);
+                    } else if path == "/readyz" {
+                        readyz_routes += 1;
+                        health_routes_are_get &= route_method_uses_get(method, imports);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (Some(leptos_route_index), Some(fallback_index), Some(state_index)) =
+        (leptos_route_index, fallback_index, state_index)
+    else {
+        return None;
+    };
+    if leptos_route_index >= fallback_index
+        || fallback_index >= state_index
+        || route_options != state_options
+    {
+        return None;
+    }
+
+    Some(RouterBinding {
+        name: name.to_string(),
+        statement_index,
+        exposes_health_routes: health_routes_are_get && healthz_routes == 1 && readyz_routes == 1,
+    })
+}
+
+fn leptos_route_method_options(
+    method: &syn::ExprMethodCall,
+    imports: &[Vec<String>],
+    generated_routes: &BTreeSet<String>,
+    leptos_options: &BTreeSet<String>,
+) -> Option<String> {
+    if !imported(imports, &["leptos_axum", "LeptosRoutes"]) {
+        return None;
+    }
+    let expected_arguments = if method.method == "leptos_routes" {
+        3
+    } else if method.method == "leptos_routes_with_context" {
+        4
+    } else {
+        return None;
+    };
+    if method.args.len() != expected_arguments {
+        return None;
+    }
+    let routes_are_generated = method.args.iter().nth(1).is_some_and(|routes| {
+        simple_ident(routes).is_some_and(|name| generated_routes.contains(&name))
+            || expression_generates_app_routes(routes, imports)
+    });
+    if !routes_are_generated {
+        return None;
+    }
+    referenced_simple_ident(method.args.first()?).filter(|name| leptos_options.contains(name))
+}
+
+fn route_method_uses_get(method: &syn::ExprMethodCall, imports: &[Vec<String>]) -> bool {
+    if method.args.len() != 2 {
+        return false;
+    }
+    let Some(handler) = method.args.iter().nth(1).and_then(expression_call) else {
+        return false;
+    };
+    expression_path(&handler.func)
+        .is_some_and(|path| path_is_bound(path, "get", &["axum", "routing", "get"], imports))
+        && handler.args.len() == 1
+}
+
+fn fallback_method_is_valid(
+    method: &syn::ExprMethodCall,
+    imports: &[Vec<String>],
+    has_legacy_handler: bool,
+    has_context_handler: bool,
+) -> bool {
+    let Some(handler) = method.args.first().and_then(expression_call) else {
+        return false;
+    };
+    if method.args.len() != 1 {
+        return false;
+    }
+    let Some(handler_path) = expression_path(&handler.func) else {
+        return false;
+    };
+
+    if has_legacy_handler
+        && path_is_bound(
+            handler_path,
+            "file_and_error_handler",
+            &["leptos_axum", "file_and_error_handler"],
+            imports,
+        )
+    {
+        return handler.args.len() == 1
+            && handler
+                .args
+                .first()
+                .is_some_and(|producer| expression_is_shell(producer, imports));
+    }
+    if has_context_handler
+        && path_is_bound(
+            handler_path,
+            "file_and_error_handler_with_context",
+            &["leptos_axum", "file_and_error_handler_with_context"],
+            imports,
+        )
+    {
+        return handler.args.len() == 2
+            && handler
+                .args
+                .iter()
+                .nth(1)
+                .is_some_and(|producer| expression_is_shell(producer, imports));
+    }
+    false
+}
+
+fn expression_generates_app_routes(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
+    let Some(call) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    let Some(function) = expression_path(&call.func) else {
+        return false;
+    };
+    path_is_bound(
+        function,
+        "generate_route_list",
+        &["leptos_axum", "generate_route_list"],
+        imports,
+    ) && call.args.len() == 1
+        && call
+            .args
+            .first()
+            .is_some_and(|app| expression_is_app(app, imports))
+}
+
+fn expression_is_app(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
+    expression_path(strip_paren_group(expression))
+        .is_some_and(|path| path_is_bound(path, "App", &["ryuki_portal_ui", "app", "App"], imports))
+}
+
+fn expression_is_shell(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
+    expression_path(strip_paren_group(expression)).is_some_and(|path| {
+        path_is_bound(path, "shell", &["ryuki_portal_ui", "app", "shell"], imports)
+    })
+}
+
+fn expression_is_router_new(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
+    let Some(call) = expression_call(expression) else {
+        return false;
+    };
+    let Some(path) = expression_path(&call.func) else {
+        return false;
+    };
+    call.args.is_empty()
+        && ((path_matches(path, &["Router", "new"]) && imported(imports, &["axum", "Router"]))
+            || path_matches(path, &["axum", "Router", "new"]))
+}
+
+fn expression_loads_configuration(expression: &syn::Expr) -> bool {
+    let Some(call) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    if !expression_path(&call.func).is_some_and(|path| path_matches(path, &["get_configuration"]))
+        || call.args.len() != 1
+    {
+        return false;
+    }
+    call.args.first().is_some_and(|argument| {
+        expression_path(argument).is_some_and(|path| path_matches(path, &["None"]))
+            || expression_call(argument).is_some_and(|some| {
+                expression_path(&some.func).is_some_and(|path| path_matches(path, &["Some"]))
+                    && some.args.len() == 1
+                    && some
+                        .args
+                        .first()
+                        .and_then(string_literal)
+                        .is_some_and(|value| value == "Cargo.toml")
+            })
+    })
+}
+
+fn expression_derives_leptos_options(
+    expression: &syn::Expr,
+    configurations: &BTreeSet<String>,
+) -> bool {
+    let syn::Expr::Field(field) = strip_completion_wrappers(expression) else {
+        return false;
+    };
+    matches!(
+        &field.member,
+        syn::Member::Named(member) if member == "leptos_options"
+    ) && simple_ident(&field.base).is_some_and(|name| configurations.contains(&name))
+}
+
+fn expression_creates_static_boundary(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
+    let Some(call) = expression_call(strip_completion_wrappers(expression)) else {
+        return false;
+    };
+    let Some(path) = expression_path(&call.func) else {
+        return false;
+    };
+    call.args.is_empty()
+        && ((path_matches(path, &["PortalServerBoundary", "static_dry_run"])
+            && imported(
+                imports,
+                &["ryuki_portal_ui", "server_boundary", "PortalServerBoundary"],
+            ))
+            || path_matches(
+                path,
+                &[
+                    "ryuki_portal_ui",
+                    "server_boundary",
+                    "PortalServerBoundary",
+                    "static_dry_run",
+                ],
+            ))
+}
+
+fn expression_calls_core_plan(
+    expression: &syn::Expr,
+    current_boundaries: &BTreeSet<String>,
+) -> bool {
+    let expression = strip_completion_wrappers(expression);
+    let syn::Expr::MethodCall(method) = expression else {
+        return false;
+    };
+    method.method == "plan_core_platform_reads"
+        && method.args.is_empty()
+        && simple_ident(&method.receiver).is_some_and(|name| current_boundaries.contains(&name))
+}
+
+fn expression_binds_tcp_listener(expression: &syn::Expr) -> bool {
+    let Some(call) = awaited_call(expression) else {
+        return false;
+    };
+    expression_path(&call.func)
+        .is_some_and(|path| path_matches(path, &["tokio", "net", "TcpListener", "bind"]))
+        && call.args.len() == 1
+}
+
+fn expression_serves_router(expression: &syn::Expr) -> Option<(String, String)> {
+    let call = awaited_call(expression)?;
+    let function = expression_path(&call.func)?;
+    if !path_matches(function, &["axum", "serve"]) || call.args.len() != 2 {
+        return None;
+    }
+    let listener = simple_ident(call.args.first()?)?;
+    let service = strip_paren_group(call.args.iter().nth(1)?);
+    let syn::Expr::MethodCall(into_make_service) = service else {
+        return None;
+    };
+    if into_make_service.method != "into_make_service" || !into_make_service.args.is_empty() {
+        return None;
+    }
+    let router = simple_ident(&into_make_service.receiver)?;
+    Some((listener, router))
+}
+
+fn awaited_call(expression: &syn::Expr) -> Option<&syn::ExprCall> {
+    let expression = strip_paren_group(expression);
+    let expression = match expression {
+        syn::Expr::Try(try_expression) => strip_paren_group(&try_expression.expr),
+        expression => expression,
+    };
+    let syn::Expr::Await(await_expression) = expression else {
+        return None;
+    };
+    expression_call(&await_expression.base)
+}
+
+fn binding_is_current(
+    bindings: &[(String, usize)],
+    name: &str,
+    binding_index: usize,
+    use_index: usize,
+) -> bool {
+    !bindings
+        .iter()
+        .any(|(candidate, index)| candidate == name && *index > binding_index && *index < use_index)
+}
+
+fn serve_has_success_tail(block: &syn::Block, serve_index: usize) -> bool {
+    if serve_index + 2 != block.stmts.len() {
+        return false;
+    }
+    let Some(syn::Stmt::Expr(expression, None)) = block.stmts.last() else {
+        return false;
+    };
+    let Some(ok) = expression_call(expression) else {
+        return false;
+    };
+    if !expression_path(&ok.func).is_some_and(|path| path_matches(path, &["Ok"]))
+        || ok.args.len() != 1
+    {
+        return false;
+    }
+    matches!(
+        ok.args.first().map(strip_paren_group),
+        Some(syn::Expr::Tuple(tuple)) if tuple.elems.is_empty()
+    )
+}
+
+#[derive(Default)]
+struct AttributeDetector {
+    found: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for AttributeDetector {
+    fn visit_attribute(&mut self, _attribute: &'ast syn::Attribute) {
+        self.found = true;
+    }
+}
+
+fn statement_has_attributes(statement: &syn::Stmt) -> bool {
+    let mut detector = AttributeDetector::default();
+    match statement {
+        syn::Stmt::Local(local) => detector.visit_local(local),
+        syn::Stmt::Item(syn::Item::Use(item_use)) => detector.visit_item_use(item_use),
+        syn::Stmt::Expr(expression, _) => detector.visit_expr(expression),
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => return true,
+    }
+    detector.found
+}
+
+#[derive(Default)]
+struct EarlyExitDetector {
+    found: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for EarlyExitDetector {
+    fn visit_expr_return(&mut self, _expression: &'ast syn::ExprReturn) {
+        self.found = true;
+    }
+
+    fn visit_expr_break(&mut self, _expression: &'ast syn::ExprBreak) {
+        self.found = true;
+    }
+
+    fn visit_expr_continue(&mut self, _expression: &'ast syn::ExprContinue) {
+        self.found = true;
+    }
+
+    fn visit_expr_loop(&mut self, _expression: &'ast syn::ExprLoop) {
+        self.found = true;
+    }
+
+    fn visit_expr_while(&mut self, _expression: &'ast syn::ExprWhile) {
+        self.found = true;
+    }
+
+    fn visit_expr_for_loop(&mut self, _expression: &'ast syn::ExprForLoop) {
+        self.found = true;
+    }
+
+    fn visit_expr_yield(&mut self, _expression: &'ast syn::ExprYield) {
+        self.found = true;
+    }
+
+    fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+        let diverges = expression_path(&expression.func).is_some_and(|path| {
+            [
+                &["std", "process", "exit"][..],
+                &["std", "process", "abort"][..],
+                &["process", "exit"][..],
+                &["process", "abort"][..],
+                &["core", "intrinsics", "abort"][..],
+            ]
+            .iter()
+            .any(|candidate| path_matches(path, candidate))
+        });
+        if diverges {
+            self.found = true;
+        } else {
+            syn::visit::visit_expr_call(self, expression);
+        }
+    }
+
+    fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
+        let diverges = expression.mac.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "panic" | "todo" | "unimplemented" | "unreachable"
+            )
+        });
+        if diverges {
+            self.found = true;
+        } else {
+            syn::visit::visit_expr_macro(self, expression);
+        }
+    }
+}
+
+fn statement_has_early_exit(statement: &syn::Stmt) -> bool {
+    let mut detector = EarlyExitDetector::default();
+    match statement {
+        syn::Stmt::Local(local) => detector.visit_local(local),
+        syn::Stmt::Expr(expression, _) => detector.visit_expr(expression),
+        syn::Stmt::Item(syn::Item::Use(_)) => {}
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => return true,
+    }
+    detector.found
+}
+
+#[derive(Default)]
+struct MainFlowAwaitDetector {
+    count: usize,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for MainFlowAwaitDetector {
+    fn visit_expr_await(&mut self, expression: &'ast syn::ExprAwait) {
+        self.count += 1;
+        syn::visit::visit_expr_await(self, expression);
+    }
+
+    fn visit_expr_async(&mut self, _expression: &'ast syn::ExprAsync) {}
+
+    fn visit_expr_closure(&mut self, _expression: &'ast syn::ExprClosure) {}
+}
+
+fn statement_has_unrecognized_main_await(statement: &syn::Stmt, imports: &[Vec<String>]) -> bool {
+    let mut detector = MainFlowAwaitDetector::default();
+    match statement {
+        syn::Stmt::Local(local) => detector.visit_local(local),
+        syn::Stmt::Expr(expression, _) => detector.visit_expr(expression),
+        syn::Stmt::Item(syn::Item::Use(_)) => return false,
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => return true,
+    }
+    if detector.count == 0 {
+        return false;
+    }
+    if detector.count != 1 {
+        return true;
+    }
+    match statement {
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .is_none_or(|init| !expression_binds_tcp_listener(&init.expr)),
+        syn::Stmt::Expr(expression, _) => {
+            expression_serves_router(expression).is_none()
+                && !expression_validates_live_provider_auth(expression, imports)
+        }
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => true,
+    }
+}
+
+fn expression_validates_live_provider_auth(
+    expression: &syn::Expr,
+    imports: &[Vec<String>],
+) -> bool {
+    let Some(call) = awaited_call(expression) else {
+        return false;
+    };
+    expression_path(&call.func).is_some_and(|path| {
+        path_is_bound(
+            path,
+            "validate_live_provider_auth_posture",
+            &[
+                "ryuki_portal_ui",
+                "startup",
+                "validate_live_provider_auth_posture",
+            ],
+            imports,
+        )
+    }) && call.args.len() == 2
+}
+
+fn strip_paren_group(mut expression: &syn::Expr) -> &syn::Expr {
+    loop {
+        expression = match expression {
+            syn::Expr::Paren(paren) => &paren.expr,
+            syn::Expr::Group(group) => &group.expr,
+            _ => return expression,
+        };
+    }
+}
+
+fn strip_completion_wrappers(mut expression: &syn::Expr) -> &syn::Expr {
+    loop {
+        expression = match strip_paren_group(expression) {
+            syn::Expr::Try(try_expression) => &try_expression.expr,
+            syn::Expr::Await(await_expression) => &await_expression.base,
+            expression => return expression,
+        };
+    }
+}
+
+fn expression_call(expression: &syn::Expr) -> Option<&syn::ExprCall> {
+    match strip_paren_group(expression) {
+        syn::Expr::Call(call) => Some(call),
+        _ => None,
+    }
+}
+
+fn expression_path(expression: &syn::Expr) -> Option<&syn::Path> {
+    match strip_paren_group(expression) {
+        syn::Expr::Path(path) => Some(&path.path),
+        _ => None,
+    }
+}
+
+fn local_ident(pattern: &syn::Pat) -> Option<String> {
+    match pattern {
+        syn::Pat::Ident(ident)
+            if ident.by_ref.is_none() && ident.mutability.is_none() && ident.subpat.is_none() =>
+        {
+            Some(ident.ident.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn simple_ident(expression: &syn::Expr) -> Option<String> {
+    let path = expression_path(expression)?;
+    if path.leading_colon.is_none() && path.segments.len() == 1 {
+        path.segments
+            .first()
+            .map(|segment| segment.ident.to_string())
+    } else {
+        None
+    }
+}
+
+fn referenced_simple_ident(expression: &syn::Expr) -> Option<String> {
+    let syn::Expr::Reference(reference) = strip_paren_group(expression) else {
+        return None;
+    };
+    if reference.mutability.is_some() {
+        return None;
+    }
+    simple_ident(&reference.expr)
+}
+
+fn cloned_or_simple_ident(expression: &syn::Expr) -> Option<String> {
+    if let Some(name) = simple_ident(expression) {
+        return Some(name);
+    }
+    let syn::Expr::MethodCall(clone) = strip_paren_group(expression) else {
+        return None;
+    };
+    if clone.method != "clone" || !clone.args.is_empty() {
+        return None;
+    }
+    simple_ident(&clone.receiver)
+}
+
+fn string_literal(expression: &syn::Expr) -> Option<String> {
+    match strip_paren_group(expression) {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(value),
+            ..
+        }) => Some(value.value()),
+        _ => None,
+    }
+}
+
+fn attribute_is_cfg_ssr(attribute: &syn::Attribute) -> bool {
+    let syn::Meta::List(list) = &attribute.meta else {
+        return false;
+    };
+    if !list.path.is_ident("cfg") {
+        return false;
+    }
+    let Ok(syn::Meta::NameValue(feature)) = list.parse_args::<syn::Meta>() else {
+        return false;
+    };
+    feature.path.is_ident("feature")
+        && matches!(
+            feature.value,
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(ref value),
+                ..
+            }) if value.value() == "ssr"
+        )
+}
+
+fn attribute_is_tokio_main(attribute: &syn::Attribute) -> bool {
+    path_matches(attribute.path(), &["tokio", "main"])
+}
+
+fn collect_block_imports(block: &syn::Block) -> Vec<Vec<String>> {
+    let mut imports = Vec::new();
+    for statement in &block.stmts {
+        if let syn::Stmt::Item(syn::Item::Use(item_use)) = statement {
+            collect_use_paths(&item_use.tree, &mut Vec::new(), &mut imports);
+        }
+    }
+    imports
+}
+
+fn collect_use_paths(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    imports: &mut Vec<Vec<String>>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_use_paths(&path.tree, prefix, imports);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let mut path = prefix.clone();
+            path.push(name.ident.to_string());
+            imports.push(path);
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_paths(item, prefix, imports);
+            }
+        }
+        syn::UseTree::Glob(_) => {
+            let mut path = prefix.clone();
+            path.push("*".to_string());
+            imports.push(path);
+        }
+        syn::UseTree::Rename(_) => {}
+    }
+}
+
+fn use_tree_contains_rename(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => use_tree_contains_rename(&path.tree),
+        syn::UseTree::Group(group) => group.items.iter().any(use_tree_contains_rename),
+        syn::UseTree::Rename(_) => true,
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn imported(imports: &[Vec<String>], expected: &[&str]) -> bool {
+    imports.iter().any(|path| {
+        path.len() == expected.len()
+            && path
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual == *expected)
+    })
+}
+
+fn path_is_bound(
+    path: &syn::Path,
+    unqualified: &str,
+    qualified: &[&str],
+    imports: &[Vec<String>],
+) -> bool {
+    path_matches(path, qualified)
+        || (path_matches(path, &[unqualified]) && imported(imports, qualified))
+}
+
+fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == expected.len()
+        && path
+            .segments
+            .iter()
+            .zip(expected)
+            .all(|(segment, expected)| segment.ident == *expected)
+}
+
 fn validate_forbidden_code_tokens(
     label: &str,
     source: &str,
@@ -2963,6 +3910,200 @@ mod tests {
     }
 
     #[test]
+    fn current_context_aware_portal_main_is_structurally_accepted() {
+        let inspection = inspect_portal_main(include_str!("../../../portal/portal-ui/src/main.rs"));
+        assert!(inspection.runs_axum_leptos_ssr);
+        assert!(inspection.plans_core_platform_reads);
+        assert!(inspection.exposes_health_routes);
+    }
+
+    #[test]
+    fn context_aware_leptos_runtime_requires_shell_fallback_and_served_router() {
+        let main_rs = context_aware_ssr_main();
+        for invalid_main in [
+            main_rs.replace(
+                "file_and_error_handler_with_context(|| {}, shell)",
+                "file_and_error_handler_with_context(|| {}, other_shell)",
+            ),
+            main_rs.replace("axum::serve(", "serve_without_axum("),
+            main_rs.replace(
+                "app.into_make_service()",
+                "unrelated_router.into_make_service()",
+            ),
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn conditional_and_early_exit_server_decoys_are_rejected() {
+        let main_rs = context_aware_ssr_main();
+        for invalid_main in [
+            main_rs.replace("#[tokio::main]", "#[tokio::main]\n#[cfg(any())]"),
+            main_rs.replace(
+                "    let routes = generate_route_list(App);",
+                "    #[cfg(any())]\n    let routes = generate_route_list(App);",
+            ),
+            main_rs.replace(
+                "    use leptos::prelude::*;",
+                "    #[cfg(any())]\n    use leptos::prelude::*;",
+            ),
+            main_rs.replace(
+                "    let configuration = get_configuration(None)?;",
+                "    return Ok(());\n    let configuration = get_configuration(None)?;",
+            ),
+            main_rs.replace(
+                "    let configuration = get_configuration(None)?;",
+                "    std::process::exit(0);\n    let configuration = get_configuration(None)?;",
+            ),
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn health_routes_require_get_and_configuration_options_lineage() {
+        let main_rs = context_aware_ssr_main();
+        let non_get_health = main_rs.replace(
+            ".route(\"/healthz\", get(|| async { \"ok\" }))",
+            ".route(\"/healthz\", post(|| async { \"ok\" }))",
+        );
+        let arbitrary_configuration = main_rs.replace(
+            "get_configuration(None)?",
+            "get_configuration(Some(\"arbitrary\"))?",
+        );
+        let caller_options = main_rs.replace(
+            "            &leptos_options,\n            routes,",
+            "            &caller_options,\n            routes,",
+        );
+        for invalid_main in [non_get_health, arbitrary_configuration, caller_options] {
+            assert_ne!(invalid_main, main_rs);
+            let inspection = inspect_portal_main(&invalid_main);
+            assert!(!(inspection.runs_axum_leptos_ssr && inspection.exposes_health_routes));
+        }
+    }
+
+    #[test]
+    fn unrecognized_pending_await_before_server_is_rejected() {
+        let main_rs = context_aware_ssr_main();
+        let invalid_main = main_rs.replace(
+            "    let configuration = get_configuration(None)?;",
+            concat!(
+                "    std::future::pending::<()>().await;\n",
+                "    let configuration = get_configuration(None)?;"
+            ),
+        );
+        assert_ne!(invalid_main, main_rs);
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
+    fn local_get_shadow_cannot_turn_health_routes_into_post_routes() {
+        let main_rs = context_aware_ssr_main();
+        let invalid_main = main_rs
+            .replace(
+                "    let configuration = get_configuration(None)?;",
+                concat!(
+                    "    let handler = || async { \"ok\" };\n",
+                    "    let get = |handler| axum::routing::post(handler);\n",
+                    "    let configuration = get_configuration(None)?;"
+                ),
+            )
+            .replace("get(|| async { \"ok\" })", "get(handler)")
+            .replace("get(|| async { \"ready\" })", "get(handler)");
+        assert_ne!(invalid_main, main_rs);
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
+    fn competing_explicit_configuration_import_is_rejected() {
+        let main_rs = context_aware_ssr_main();
+        let invalid_main = main_rs.replace(
+            "    use leptos::prelude::*;",
+            concat!(
+                "    use leptos::prelude::*;\n",
+                "    use evil::get_configuration;"
+            ),
+        );
+        assert_ne!(invalid_main, main_rs);
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
+    fn raw_string_and_unused_helper_decoys_are_rejected() {
+        let raw_string_decoy = r##"#[cfg(feature = "ssr")]
+#[tokio::main]
+async fn main() {
+    use axum::{routing::get, Router};
+    use leptos::prelude::*;
+    use leptos_axum::{
+        file_and_error_handler_with_context, generate_route_list, LeptosRoutes,
+    };
+    use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    let configuration = get_configuration(None)?;
+    let leptos_options = configuration.leptos_options;
+    let routes = generate_route_list(App);
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary.plan_core_platform_reads()?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let decoy = r#"Router::new()
+        .route("/healthz", get(handler))
+        .route("/readyz", get(handler))
+        .leptos_routes_with_context(&leptos_options, routes, context, shell)
+        .fallback(file_and_error_handler_with_context(context, shell))
+        .with_state(leptos_options);
+        axum::serve(listener, app.into_make_service()).await?;"#;
+}
+"##;
+        assert!(!inspect_portal_main(raw_string_decoy).runs_axum_leptos_ssr);
+
+        let unused_helper_decoy = format!(
+            "{}\n{}",
+            context_aware_ssr_main().replace("async fn main()", "async fn unused_server()"),
+            r#"#[cfg(feature = "ssr")]
+#[tokio::main]
+async fn main() {}"#
+        );
+        assert!(!inspect_portal_main(&unused_helper_decoy).runs_axum_leptos_ssr);
+    }
+
+    #[test]
+    fn lifetime_and_comment_like_literal_cannot_hide_missing_serve() {
+        let invalid_main = context_aware_ssr_main().replace(
+            "    axum::serve(listener, app.into_make_service()).await?;",
+            concat!(
+                "    let marker: &'static str = ",
+                "\"// axum::serve(listener, app.into_make_service()).await?;\";"
+            ),
+        );
+        assert_ne!(invalid_main, context_aware_ssr_main());
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
+    fn leptos_routes_and_fallback_on_disparate_router_chains_are_rejected() {
+        let invalid_main = context_aware_ssr_main()
+            .replace(
+                "    let app = Router::new()",
+                "    let routed = Router::new()",
+            )
+            .replace(
+                "        .with_state(leptos_options);",
+                concat!(
+                    "        .with_state(leptos_options.clone());\n",
+                    "    let app = Router::new()\n",
+                    "        .fallback(file_and_error_handler_with_context(|| {}, shell))\n",
+                    "        .with_state(leptos_options);"
+                ),
+            );
+        assert_ne!(invalid_main, context_aware_ssr_main());
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
     fn root_context_portal_dockerfile_is_accepted() {
         // RED: portal Dockerfile with root-context COPY patterns must not
         // trigger the "retired Trunk index.html" error.
@@ -3049,5 +4190,44 @@ mod tests {
             "Old crate-local non-Trunk Dockerfile should still pass but got: {:?}",
             errors
         );
+    }
+
+    fn context_aware_ssr_main() -> String {
+        r#"#[cfg(feature = "ssr")]
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use axum::{routing::get, Router};
+    use leptos::prelude::*;
+    use leptos_axum::{
+        file_and_error_handler_with_context, generate_route_list, LeptosRoutes,
+    };
+    use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    let configuration = get_configuration(None)?;
+    let leptos_options = configuration.leptos_options;
+    let address = leptos_options.site_addr;
+    let routes = generate_route_list(App);
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary.plan_core_platform_reads()?;
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ready" }))
+        .leptos_routes_with_context(
+            &leptos_options,
+            routes,
+            || {},
+            {
+                let leptos_options = leptos_options.clone();
+                move || shell(leptos_options.clone())
+            },
+        )
+        .fallback(file_and_error_handler_with_context(|| {}, shell))
+        .with_state(leptos_options);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, app.into_make_service()).await?;
+    Ok(())
+}
+"#
+        .to_string()
     }
 }

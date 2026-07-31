@@ -1036,7 +1036,7 @@ fn validate_portal_runtime_text(
     dockerfile: &str,
     errors: &mut Vec<String>,
 ) {
-    let active_main = rust_without_comments(main_rs);
+    let portal_main = crate::app_skeleton::inspect_portal_main(main_rs);
     let active_lib = rust_without_comments(lib_rs);
     let active_lib_code = strip_rust_string_literals(&active_lib);
     let dockerfile_lower = dockerfile.to_ascii_lowercase();
@@ -1077,42 +1077,13 @@ fn validate_portal_runtime_text(
         errors,
         "portal IA runtime cargo-leptos metadata must build SSR server and hydration assets",
     );
-    // relaxed: the real portal main.rs imports axum with the additional
-    // `middleware` item (`use axum::{middleware, routing::get, Router};`) and uses
-    // the context-passing `.leptos_routes_with_context(` variant. Both are valid
-    // leptos_axum patterns; the earlier check pinned the exact import list and the
-    // bare `.leptos_routes(` form, contradicting the working SSR entrypoint. We
-    // still require the axum `routing::get`/`Router` import, a `leptos_routes`
-    // registration, and the rest of the SSR server wiring.
     expect(
-        active_main.contains(r#"#[cfg(feature = "ssr")]"#)
-            && active_main.contains("#[tokio::main]")
-            && active_main.contains("routing::get")
-            && active_main.contains("Router")
-            && active_main.contains(
-                "leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes}",
-            )
-            && active_main.contains("generate_route_list(App)")
-            && active_main.contains("Router::new()")
-            && active_main.contains(".leptos_routes")
-            && active_main.contains("file_and_error_handler(shell)")
-            && active_main.contains("get_configuration(")
-            && active_main.contains("PortalServerBoundary::static_dry_run()")
-            && active_main.contains("plan_core_platform_reads()")
-            && active_main.contains("axum::serve("),
+        portal_main.runs_axum_leptos_ssr && portal_main.plans_core_platform_reads,
         errors,
         "portal IA runtime main.rs must run the Axum-backed Leptos SSR server",
     );
-    // relaxed: the Rust portal loads cargo-leptos metadata via
-    // `get_configuration(None)`, which is the supported modern leptos_axum
-    // pattern (cargo-leptos injects `LEPTOS_*` env vars at build/run time). The
-    // earlier check forbade `get_configuration(None)` and required the
-    // `Some("Cargo.toml")` form, contradicting the real SSR entrypoint, so the
-    // health-route assertion now stands on its own and the configuration-loading
-    // requirement is covered by the `get_configuration(` check above.
     expect(
-        active_main.contains(r#".route("/healthz", get("#)
-            && active_main.contains(r#".route("/readyz", get("#),
+        portal_main.exposes_health_routes,
         errors,
         "portal IA runtime main.rs must expose health routes and load cargo-leptos metadata",
     );
@@ -2768,6 +2739,34 @@ mod tests {
     }
 
     #[test]
+    fn context_aware_leptos_fallback_is_accepted() {
+        let inspection = crate::app_skeleton::inspect_portal_main(&context_aware_ssr_main());
+        assert!(inspection.runs_axum_leptos_ssr);
+        assert!(inspection.plans_core_platform_reads);
+        assert!(inspection.exposes_health_routes);
+
+        let legacy = crate::app_skeleton::inspect_portal_main(&minimal_ssr_main());
+        assert!(legacy.runs_axum_leptos_ssr);
+        assert!(legacy.plans_core_platform_reads);
+        assert!(legacy.exposes_health_routes);
+    }
+
+    #[test]
+    fn context_aware_leptos_runtime_still_requires_fallback_and_axum_serve() {
+        let main_rs = context_aware_ssr_main();
+        for invalid_main in [
+            main_rs.replace(
+                ".fallback(file_and_error_handler_with_context(",
+                ".fallback(other_handler(",
+            ),
+            main_rs.replace("axum::serve(", "serve_without_axum("),
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!crate::app_skeleton::inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
     fn root_context_portal_dockerfile_passes_runtime_check() {
         // RED: root-context portal Dockerfile must not trigger
         // "portal IA runtime Dockerfile must build the full-stack Leptos" error
@@ -2904,19 +2903,66 @@ style-file = "styles.css"
     fn minimal_ssr_main() -> String {
         r#"#[cfg(feature = "ssr")]
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum::{routing::get, Router};
+    use leptos::prelude::*;
     use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
-    use ryuki_portal_ui::app::*;
-    let conf = get_configuration(Some("Cargo.toml")).unwrap();
+    use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    let configuration = get_configuration(Some("Cargo.toml"))?;
+    let leptos_options = configuration.leptos_options;
+    let address = leptos_options.site_addr;
+    let routes = generate_route_list(App);
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary.plan_core_platform_reads()?;
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ok" }))
-        .leptos_routes(&conf, generate_route_list(App), shell)
-        .fallback(file_and_error_handler(shell));
-    PortalServerBoundary::static_dry_run();
-    plan_core_platform_reads();
-    axum::serve(app).await.unwrap();
+        .leptos_routes(&leptos_options, routes, shell)
+        .fallback(file_and_error_handler(shell))
+        .with_state(leptos_options);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, app.into_make_service()).await?;
+    Ok(())
+}
+"#
+        .to_string()
+    }
+
+    fn context_aware_ssr_main() -> String {
+        r#"#[cfg(feature = "ssr")]
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use axum::{routing::get, Router};
+    use leptos::prelude::*;
+    use leptos_axum::{
+        file_and_error_handler_with_context, generate_route_list, LeptosRoutes,
+    };
+    use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    let configuration = get_configuration(None)?;
+    let leptos_options = configuration.leptos_options;
+    let address = leptos_options.site_addr;
+    let routes = generate_route_list(App);
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary.plan_core_platform_reads()?;
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ready" }))
+        .leptos_routes_with_context(
+            &leptos_options,
+            routes,
+            || {},
+            {
+                let leptos_options = leptos_options.clone();
+                move || shell(leptos_options.clone())
+            },
+        )
+        .fallback(file_and_error_handler_with_context(|| {}, shell))
+        .with_state(leptos_options);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, app.into_make_service()).await?;
+    Ok(())
 }
 "#
         .to_string()

@@ -287,8 +287,23 @@ fn validate_cargo_install_pin(
     version: &str,
     errors: &mut Vec<String>,
 ) {
+    if dockerfile_uses_custom_escape_directive(content) {
+        errors.push(format!(
+            "{label}: {package} install must use the default Dockerfile escape character so RUN instructions remain directly analyzable"
+        ));
+        return;
+    }
+    if dockerfile_uses_unsupported_shell_directive(content) {
+        errors.push(format!(
+            "{label}: {package} install cannot be validated with a custom Dockerfile SHELL directive"
+        ));
+        return;
+    }
+
     let package_with_version = format!("{package}@");
     let mut installs: Vec<Vec<String>> = Vec::new();
+    let mut total_install_count = 0usize;
+    let mut unresolved_shell_control_flow = false;
 
     for instruction in logical_dockerfile_instructions(content) {
         let Some(separator) = instruction.find(|character: char| character.is_whitespace()) else {
@@ -298,8 +313,24 @@ fn validate_cargo_install_pin(
         if !keyword.eq_ignore_ascii_case("RUN") {
             continue;
         }
-        for command in docker_run_commands(run.trim()) {
+        let Some(run) = docker_run_command_after_options(run.trim()) else {
+            unresolved_shell_control_flow = true;
+            continue;
+        };
+        let commands = if let Some(arguments) = docker_json_exec_arguments(run) {
+            if json_exec_has_unresolved_cargo_install(&arguments, package) {
+                unresolved_shell_control_flow = true;
+            }
+            vec![arguments]
+        } else {
+            if shell_run_has_unresolved_cargo_install(run, package) {
+                unresolved_shell_control_flow = true;
+            }
+            split_shell_commands(run)
+        };
+        for command in commands {
             for arguments in cargo_install_invocations(&command) {
+                total_install_count += 1;
                 if arguments.iter().any(|argument| {
                     argument == package || argument.starts_with(&package_with_version)
                 }) {
@@ -307,6 +338,20 @@ fn validate_cargo_install_pin(
                 }
             }
         }
+    }
+
+    if unresolved_shell_control_flow {
+        errors.push(format!(
+            "{label}: {package} install must be a directly analyzable command; shell control flow or dynamic command construction around cargo install is not allowed"
+        ));
+        return;
+    }
+
+    if total_install_count != 1 {
+        errors.push(format!(
+            "{label}: must contain exactly one cargo install command total while pinning {package}; found {total_install_count}"
+        ));
+        return;
     }
 
     if installs.len() != 1 {
@@ -375,6 +420,1039 @@ fn is_forbidden_cargo_source_flag(argument: &str) -> bool {
                 .strip_prefix(*flag)
                 .is_some_and(|rest| rest.starts_with('='))
     })
+}
+
+fn dockerfile_uses_custom_escape_directive(content: &str) -> bool {
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(comment) = line.strip_prefix('#') else {
+            return false;
+        };
+        let Some((name, value)) = comment.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("escape") {
+            return value.trim() != "\\";
+        }
+    }
+    false
+}
+
+fn dockerfile_uses_unsupported_shell_directive(content: &str) -> bool {
+    logical_dockerfile_instructions(content)
+        .into_iter()
+        .filter_map(|instruction| {
+            let separator = instruction.find(char::is_whitespace)?;
+            let (keyword, arguments) = instruction.split_at(separator);
+            keyword
+                .eq_ignore_ascii_case("SHELL")
+                .then(|| arguments.trim().to_owned())
+        })
+        .any(|arguments| {
+            serde_json::from_str::<Vec<String>>(&arguments).map_or(true, |arguments| {
+                arguments.len() != 2
+                    || !matches!(arguments[0].as_str(), "/bin/sh" | "sh")
+                    || arguments[1] != "-c"
+            })
+        })
+}
+
+/// Reject target-tool installs embedded in shell grammar that this validator
+/// intentionally does not try to execute or fully parse. Without this guard,
+/// a Dockerfile could keep one valid direct pin while hiding a later
+/// replacement install behind `if`, `case`, a loop, a function, or a
+/// subshell; the direct-command collector would see only the harmless pin.
+fn shell_run_has_unresolved_cargo_install(run: &str, package: &str) -> bool {
+    analyze_shell_install(run, package, 0).unresolved
+}
+
+#[derive(Default)]
+struct ShellInstallAnalysis {
+    has_target_install: bool,
+    unresolved: bool,
+}
+
+struct ShellSyntax {
+    commands: Vec<Vec<ShellSyntaxWord>>,
+    has_control_flow: bool,
+    has_pipeline: bool,
+    has_heredoc: bool,
+}
+
+struct ShellSyntaxWord {
+    value: String,
+    quoted: bool,
+    expanded: bool,
+}
+
+fn analyze_shell_install(run: &str, package: &str, depth: usize) -> ShellInstallAnalysis {
+    if depth > 8 {
+        return ShellInstallAnalysis {
+            has_target_install: true,
+            unresolved: true,
+        };
+    }
+
+    let syntax = shell_syntax(run);
+    if syntax.has_heredoc {
+        return ShellInstallAnalysis {
+            has_target_install: true,
+            unresolved: true,
+        };
+    }
+
+    let package_is_present = syntax
+        .commands
+        .iter()
+        .flatten()
+        .any(|word| shell_syntax_word_is_package(word, package));
+    let constructed_target_install = syntax
+        .commands
+        .iter()
+        .flatten()
+        .any(|word| shell_assignment_constructs_target_install(word, package));
+    let has_install_word = syntax
+        .commands
+        .iter()
+        .flatten()
+        .any(|word| !word.quoted && word.value == "install");
+    let cargo_has_dynamic_argv = syntax.commands.iter().any(|command| {
+        command.iter().enumerate().any(|(index, word)| {
+            !word.expanded
+                && executable_name(&word.value) == "cargo"
+                && command[index + 1..].iter().any(|argument| {
+                    argument.expanded && shell_word_is_positional_parameter(&argument.value)
+                })
+        })
+    });
+    let mut analysis = ShellInstallAnalysis::default();
+
+    for command in &syntax.commands {
+        let (mut command_has_target, positional_expansion) =
+            shell_command_has_target_install(command, package);
+        let directly_embedded_target = command_has_target;
+        let (executable_index, has_unsafe_wrapper) = shell_effective_executable_index(command);
+
+        for script in command
+            .iter()
+            .filter(|word| word.expanded)
+            .flat_map(|word| shell_command_substitution_bodies(&word.value))
+        {
+            let nested = analyze_shell_install(&script, package, depth + 1);
+            command_has_target |= nested.has_target_install;
+            analysis.unresolved |= nested.has_target_install || nested.unresolved;
+        }
+
+        if let Some(script) = shell_env_split_string(command) {
+            let nested = analyze_shell_install(script, package, depth + 1);
+            command_has_target |= nested.has_target_install;
+            analysis.unresolved |= nested.unresolved;
+        }
+
+        if let Some(index) = executable_index {
+            let executable = executable_name(&command[index].value);
+            if command[index].expanded && !command[index].quoted {
+                // Unquoted executable expansion can field-split into an
+                // arbitrary executable, subcommand, and package argv sourced
+                // from ENV/ARG values outside this RUN instruction.
+                command_has_target = true;
+                analysis.unresolved = true;
+            }
+            if directly_embedded_target && executable != "cargo" {
+                let shell_positional_execution = if is_shell_executable(executable) {
+                    shell_syntax_command_string(command, index)
+                        .is_some_and(shell_script_uses_positional_command)
+                } else if executable == "busybox"
+                    && command
+                        .get(index + 1)
+                        .is_some_and(|word| is_shell_executable(executable_name(&word.value)))
+                {
+                    shell_syntax_command_string(command, index + 1)
+                        .is_some_and(shell_script_uses_positional_command)
+                } else {
+                    true
+                };
+                analysis.unresolved |= shell_positional_execution;
+            }
+            if command[index].expanded {
+                if let Some(script_word) = shell_syntax_command_word(command, index) {
+                    if script_word.expanded {
+                        command_has_target = true;
+                        analysis.unresolved = true;
+                    } else {
+                        let nested = analyze_shell_install(&script_word.value, package, depth + 1);
+                        command_has_target |= nested.has_target_install;
+                        analysis.unresolved |= nested.has_target_install || nested.unresolved;
+                    }
+                }
+            } else if is_shell_executable(executable) {
+                if let Some(script_word) = shell_syntax_command_word(command, index) {
+                    if script_word.expanded {
+                        command_has_target = true;
+                        analysis.unresolved = true;
+                    } else {
+                        let nested = analyze_shell_install(&script_word.value, package, depth + 1);
+                        command_has_target |= nested.has_target_install;
+                        analysis.unresolved |= nested.unresolved
+                            || (is_alternate_shell_executable(executable)
+                                && nested.has_target_install);
+                    }
+                } else {
+                    command_has_target = true;
+                    analysis.unresolved = true;
+                }
+            } else if executable == "busybox"
+                && command
+                    .get(index + 1)
+                    .is_some_and(|word| is_shell_executable(executable_name(&word.value)))
+            {
+                if let Some(script_word) = shell_syntax_command_word(command, index + 1) {
+                    if script_word.expanded {
+                        command_has_target = true;
+                        analysis.unresolved = true;
+                    } else {
+                        let nested = analyze_shell_install(&script_word.value, package, depth + 1);
+                        command_has_target |= nested.has_target_install;
+                        analysis.unresolved |= nested.has_target_install || nested.unresolved;
+                    }
+                } else {
+                    command_has_target = true;
+                    analysis.unresolved = true;
+                }
+            } else if executable == "eval" {
+                let script = command[index + 1..]
+                    .iter()
+                    .map(|word| word.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let nested = analyze_shell_install(&script, package, depth + 1);
+                command_has_target |= nested.has_target_install;
+                analysis.unresolved |= nested.has_target_install || nested.unresolved;
+            } else if matches!(executable, "." | "source") {
+                command_has_target = true;
+                analysis.unresolved = true;
+            } else if executable == "xargs" && shell_command_contains_cargo_install(command) {
+                // xargs can obtain the package operand from stdin, so the
+                // target cannot be proven even when it is absent from argv.
+                command_has_target = true;
+                analysis.unresolved = true;
+            }
+        }
+
+        if command_has_target {
+            analysis.has_target_install = true;
+            analysis.unresolved |= positional_expansion || has_unsafe_wrapper;
+        }
+    }
+
+    if syntax.has_pipeline
+        && syntax
+            .commands
+            .iter()
+            .any(|command| shell_command_is_interpreter_sink(command))
+    {
+        analysis.has_target_install = true;
+        analysis.unresolved = true;
+    }
+
+    if package_is_present
+        && syntax.commands.iter().any(|command| {
+            let (index, _) = shell_effective_executable_index(command);
+            index.is_some_and(|index| {
+                command[index].expanded
+                    && command
+                        .get(index + 1)
+                        .is_some_and(|word| word.value == "install" || word.expanded)
+            })
+        })
+    {
+        analysis.has_target_install = true;
+        analysis.unresolved = true;
+    }
+
+    if constructed_target_install
+        && syntax.commands.iter().any(|command| {
+            let (index, _) = shell_effective_executable_index(command);
+            index.is_some_and(|index| command[index].expanded)
+        })
+    {
+        analysis.has_target_install = true;
+        analysis.unresolved = true;
+    }
+
+    if package_is_present && has_install_word && cargo_has_dynamic_argv {
+        analysis.has_target_install = true;
+        analysis.unresolved = true;
+    }
+
+    if analysis.has_target_install && (syntax.has_control_flow || syntax.has_pipeline) {
+        analysis.unresolved = true;
+    }
+    analysis
+}
+
+fn shell_command_has_target_install(command: &[ShellSyntaxWord], package: &str) -> (bool, bool) {
+    for (index, word) in command.iter().enumerate() {
+        if !word.expanded && executable_name(&word.value) == "cargo" {
+            let Some(subcommand_index) = shell_cargo_install_subcommand_index(command, index)
+            else {
+                if command.get(index + 1).is_some_and(|subcommand| {
+                    subcommand.expanded
+                        && (!subcommand.quoted
+                            || command[index + 2..].iter().any(|argument| {
+                                argument.expanded || shell_syntax_word_is_package(argument, package)
+                            }))
+                }) {
+                    return (true, true);
+                }
+                continue;
+            };
+            if command[subcommand_index + 1..]
+                .iter()
+                .any(|argument| is_forbidden_cargo_source_flag(&argument.value))
+            {
+                return (true, false);
+            }
+            let (has_literal_target, has_dynamic_target) =
+                shell_cargo_install_target_operands(&command[subcommand_index + 1..], package);
+            if has_literal_target || has_dynamic_target {
+                return (true, has_dynamic_target);
+            }
+        }
+
+        if word.expanded {
+            let Some(subcommand) = command.get(index + 1) else {
+                continue;
+            };
+            if (subcommand.value == "install" || subcommand.expanded)
+                && command[index + 2..].iter().any(|argument| {
+                    argument.expanded || shell_syntax_word_is_package(argument, package)
+                })
+            {
+                return (true, true);
+            }
+        }
+    }
+    (false, false)
+}
+
+fn shell_command_contains_cargo_install(command: &[ShellSyntaxWord]) -> bool {
+    command.iter().enumerate().any(|(index, word)| {
+        !word.expanded
+            && executable_name(&word.value) == "cargo"
+            && shell_cargo_install_subcommand_index(command, index).is_some()
+    })
+}
+
+fn shell_cargo_install_subcommand_index(
+    command: &[ShellSyntaxWord],
+    cargo_index: usize,
+) -> Option<usize> {
+    let mut index = cargo_index + 1;
+    if command
+        .get(index)
+        .is_some_and(|word| !word.expanded && word.value.starts_with('+'))
+    {
+        index += 1;
+    }
+    loop {
+        let word = command.get(index)?;
+        if word.expanded {
+            return None;
+        }
+        if word.value == "install" {
+            return Some(index);
+        }
+        if cargo_global_option_consumes_value(&word.value) {
+            index += 2;
+            continue;
+        }
+        if word.value.starts_with('-') && word.value != "--" {
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+}
+
+fn cargo_global_option_consumes_value(option: &str) -> bool {
+    matches!(option, "--color" | "--config" | "-Z")
+}
+
+fn shell_cargo_install_target_operands(
+    arguments: &[ShellSyntaxWord],
+    package: &str,
+) -> (bool, bool) {
+    let mut literal_target = false;
+    let mut dynamic_target = false;
+    let mut options = true;
+    let mut index = 0;
+
+    while let Some(argument) = arguments.get(index) {
+        if let Some(consumes_following_operand) =
+            shell_redirection_consumes_following_operand(&argument.value)
+        {
+            index += if consumes_following_operand { 2 } else { 1 };
+            continue;
+        }
+        if options && argument.value == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && cargo_install_option_consumes_value(&argument.value) {
+            index += 2;
+            continue;
+        }
+        if options && argument.value.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        literal_target |= shell_syntax_word_is_package(argument, package);
+        dynamic_target |= argument.expanded;
+        index += 1;
+    }
+    (literal_target, dynamic_target)
+}
+
+fn shell_redirection_consumes_following_operand(word: &str) -> Option<bool> {
+    let redirection = word.trim_start_matches(|character: char| character.is_ascii_digit());
+    if redirection.starts_with(">&") || redirection.starts_with("<&") {
+        return Some(false);
+    }
+    for operator in ["&>>", "&>", "<>", ">>", "<<", ">", "<"] {
+        if let Some(operand) = redirection.strip_prefix(operator) {
+            return Some(operand.is_empty());
+        }
+    }
+    None
+}
+
+fn cargo_install_option_consumes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "--version"
+            | "--root"
+            | "--path"
+            | "--git"
+            | "--branch"
+            | "--tag"
+            | "--rev"
+            | "--registry"
+            | "--index"
+            | "--target"
+            | "--target-dir"
+            | "--bin"
+            | "--example"
+            | "--features"
+            | "--profile"
+            | "--jobs"
+            | "--config"
+            | "--color"
+            | "-j"
+            | "-F"
+            | "-Z"
+    )
+}
+
+fn shell_assignment_constructs_target_install(word: &ShellSyntaxWord, package: &str) -> bool {
+    let Some((_, value)) = word.value.split_once('=') else {
+        return false;
+    };
+    let words: Vec<ShellSyntaxWord> = value
+        .split_whitespace()
+        .map(|value| ShellSyntaxWord {
+            value: value.to_string(),
+            quoted: false,
+            expanded: false,
+        })
+        .collect();
+    shell_command_has_target_install(&words, package).0
+}
+
+fn shell_command_substitution_bodies(value: &str) -> Vec<String> {
+    let characters: Vec<char> = value.chars().collect();
+    let mut bodies = Vec::new();
+    let mut index = 0;
+
+    while index < characters.len() {
+        if characters[index] == '`' {
+            let start = index + 1;
+            index = start;
+            while index < characters.len() && characters[index] != '`' {
+                if characters[index] == '\\' {
+                    index += 1;
+                }
+                index += 1;
+            }
+            if index <= characters.len() {
+                bodies.push(characters[start..index].iter().collect());
+            }
+            index += 1;
+            continue;
+        }
+        if characters[index] != '$'
+            || characters.get(index + 1) != Some(&'(')
+            || characters.get(index + 2) == Some(&'(')
+        {
+            index += 1;
+            continue;
+        }
+
+        let start = index + 2;
+        index = start;
+        let mut depth = 1usize;
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        while index < characters.len() {
+            let character = characters[index];
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if let Some(delimiter) = quote {
+                if character == delimiter {
+                    quote = None;
+                }
+            } else if matches!(character, '\'' | '"') {
+                quote = Some(character);
+            } else if character == '(' {
+                depth += 1;
+            } else if character == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            index += 1;
+        }
+        if depth == 0 {
+            bodies.push(characters[start..index].iter().collect());
+        }
+        index += 1;
+    }
+    bodies
+}
+
+fn shell_command_is_interpreter_sink(command: &[ShellSyntaxWord]) -> bool {
+    let (Some(index), _) = shell_effective_executable_index(command) else {
+        return false;
+    };
+    let executable = executable_name(&command[index].value);
+    is_shell_executable(executable)
+        || executable == "xargs"
+        || matches!(executable, "." | "source")
+        || (executable == "busybox"
+            && command
+                .get(index + 1)
+                .is_some_and(|word| is_shell_executable(executable_name(&word.value))))
+}
+
+fn shell_script_uses_positional_command(script: &str) -> bool {
+    let syntax = shell_syntax(script);
+    syntax.commands.iter().any(|command| {
+        let (Some(index), _) = shell_effective_executable_index(command) else {
+            return false;
+        };
+        command[index].expanded && shell_word_is_positional_parameter(&command[index].value)
+    })
+}
+
+fn shell_word_is_positional_parameter(value: &str) -> bool {
+    let parameter = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| value.strip_prefix('$'))
+        .unwrap_or(value);
+    let parameter = parameter.strip_prefix('!').unwrap_or(parameter);
+    matches!(parameter, "@" | "*")
+        || (!parameter.is_empty() && parameter.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn shell_syntax_word_is_package(word: &ShellSyntaxWord, package: &str) -> bool {
+    let package_with_version = format!("{package}@");
+    word.value == package
+        || word.value.starts_with(&package_with_version)
+        || word
+            .value
+            .split_once('=')
+            .is_some_and(|(_, value)| value == package || value.starts_with(&package_with_version))
+}
+
+fn shell_effective_executable_index(command: &[ShellSyntaxWord]) -> (Option<usize>, bool) {
+    let mut index = 0;
+    let mut has_unsafe_wrapper = false;
+
+    loop {
+        while command
+            .get(index)
+            .is_some_and(|word| is_shell_assignment(&word.value))
+        {
+            index += 1;
+        }
+        let Some(executable) = command.get(index).map(|word| executable_name(&word.value)) else {
+            return (None, has_unsafe_wrapper);
+        };
+        match executable {
+            "command" => {
+                index += 1;
+                while let Some(option) = command.get(index) {
+                    if matches!(option.value.as_str(), "-v" | "-V") {
+                        return (None, has_unsafe_wrapper);
+                    }
+                    if option.value == "--" || option.value == "-p" || option.value.starts_with('-')
+                    {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "env" => {
+                index += 1;
+                let mut options = true;
+                loop {
+                    let Some(argument) = command.get(index) else {
+                        return (None, has_unsafe_wrapper);
+                    };
+                    if is_shell_assignment(&argument.value) {
+                        index += 1;
+                        continue;
+                    }
+                    if options && argument.value == "--" {
+                        options = false;
+                        index += 1;
+                        continue;
+                    }
+                    if options
+                        && matches!(argument.value.as_str(), "-u" | "--unset" | "-C" | "--chdir")
+                    {
+                        index += 2;
+                        continue;
+                    }
+                    if options && argument.value.starts_with('-') {
+                        index += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "exec" => {
+                has_unsafe_wrapper = true;
+                index += 1;
+            }
+            _ => return (Some(index), has_unsafe_wrapper),
+        }
+    }
+}
+
+fn shell_env_split_string(command: &[ShellSyntaxWord]) -> Option<&str> {
+    let mut index = 0;
+    while command
+        .get(index)
+        .is_some_and(|word| is_shell_assignment(&word.value))
+    {
+        index += 1;
+    }
+    if command
+        .get(index)
+        .is_some_and(|word| executable_name(&word.value) == "command")
+    {
+        index += 1;
+        while command
+            .get(index)
+            .is_some_and(|word| word.value.starts_with('-'))
+        {
+            index += 1;
+        }
+    }
+    if !command
+        .get(index)
+        .is_some_and(|word| executable_name(&word.value) == "env")
+    {
+        return None;
+    }
+
+    for (option_index, option) in command.iter().enumerate().skip(index + 1) {
+        if matches!(option.value.as_str(), "-S" | "--split-string") {
+            return command
+                .get(option_index + 1)
+                .map(|word| word.value.as_str());
+        }
+        if let Some(script) = option.value.strip_prefix("--split-string=") {
+            return Some(script);
+        }
+    }
+    None
+}
+
+fn shell_syntax_command_word(
+    command: &[ShellSyntaxWord],
+    shell_index: usize,
+) -> Option<&ShellSyntaxWord> {
+    command
+        .iter()
+        .enumerate()
+        .skip(shell_index + 1)
+        .find(|(_, option)| {
+            option.value.starts_with('-')
+                && !option.value.starts_with("--")
+                && option.value[1..].bytes().any(|byte| byte == b'c')
+        })
+        .and_then(|(index, _)| command.get(index + 1))
+}
+
+fn shell_syntax_command_string(command: &[ShellSyntaxWord], shell_index: usize) -> Option<&str> {
+    shell_syntax_command_word(command, shell_index).map(|word| word.value.as_str())
+}
+
+fn is_shell_executable(executable: &str) -> bool {
+    matches!(
+        executable,
+        "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish"
+    )
+}
+
+fn is_alternate_shell_executable(executable: &str) -> bool {
+    is_shell_executable(executable) && !matches!(executable, "sh" | "bash")
+}
+
+fn append_balanced_shell_expansion(
+    value: &mut String,
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    opening: char,
+    closing: char,
+) {
+    if characters.peek() != Some(&opening) {
+        return;
+    }
+    value.push(characters.next().expect("peeked expansion delimiter"));
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for character in characters.by_ref() {
+        value.push(character);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == opening {
+            depth += 1;
+        } else if character == closing {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+}
+
+fn append_backtick_shell_expansion(
+    value: &mut String,
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) {
+    let mut escaped = false;
+    for character in characters.by_ref() {
+        value.push(character);
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '`' {
+            break;
+        }
+    }
+}
+
+fn shell_syntax(run: &str) -> ShellSyntax {
+    fn push_word(
+        value: &mut String,
+        quoted: &mut bool,
+        expanded: &mut bool,
+        command: &mut Vec<ShellSyntaxWord>,
+    ) {
+        if !value.is_empty() {
+            command.push(ShellSyntaxWord {
+                value: std::mem::take(value),
+                quoted: std::mem::take(quoted),
+                expanded: std::mem::take(expanded),
+            });
+        }
+    }
+
+    fn push_command(
+        value: &mut String,
+        quoted: &mut bool,
+        expanded: &mut bool,
+        command: &mut Vec<ShellSyntaxWord>,
+        commands: &mut Vec<Vec<ShellSyntaxWord>>,
+    ) {
+        push_word(value, quoted, expanded, command);
+        if !command.is_empty() {
+            commands.push(std::mem::take(command));
+        }
+    }
+
+    let mut commands = Vec::new();
+    let mut command = Vec::new();
+    let mut value = String::new();
+    let mut word_quoted = false;
+    let mut word_expanded = false;
+    let mut quote: Option<char> = None;
+    let mut has_control_flow = false;
+    let mut has_pipeline = false;
+    let mut has_heredoc = false;
+    let mut characters = run.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else if delimiter == '"' && character == '\\' {
+                word_quoted = true;
+                if let Some(escaped) = characters.next() {
+                    value.push(escaped);
+                }
+            } else {
+                if delimiter == '"' && matches!(character, '$' | '`') {
+                    word_expanded = true;
+                    if character == '`' {
+                        has_control_flow = true;
+                    }
+                }
+                value.push(character);
+            }
+            continue;
+        }
+
+        match character {
+            '\\' => {
+                word_quoted = true;
+                if let Some(escaped) = characters.next() {
+                    value.push(escaped);
+                }
+            }
+            '\'' | '"' => {
+                word_quoted = true;
+                quote = Some(character);
+            }
+            '$' => {
+                word_expanded = true;
+                value.push(character);
+                if characters.peek() == Some(&'{') {
+                    append_balanced_shell_expansion(&mut value, &mut characters, '{', '}');
+                } else if characters.peek() == Some(&'(') {
+                    has_control_flow = true;
+                    append_balanced_shell_expansion(&mut value, &mut characters, '(', ')');
+                }
+            }
+            '`' => {
+                word_expanded = true;
+                has_control_flow = true;
+                value.push(character);
+                append_backtick_shell_expansion(&mut value, &mut characters);
+            }
+            '<' if characters.peek() == Some(&'<') => {
+                characters.next();
+                has_heredoc = true;
+                value.push_str("<<");
+            }
+            ';' => push_command(
+                &mut value,
+                &mut word_quoted,
+                &mut word_expanded,
+                &mut command,
+                &mut commands,
+            ),
+            '|' => {
+                let logical_or = characters.peek() == Some(&'|');
+                if logical_or {
+                    characters.next();
+                } else {
+                    has_pipeline = true;
+                    if characters.peek() == Some(&'&') {
+                        characters.next();
+                    }
+                }
+                push_command(
+                    &mut value,
+                    &mut word_quoted,
+                    &mut word_expanded,
+                    &mut command,
+                    &mut commands,
+                );
+            }
+            '&' => {
+                let redirects_file_descriptor = (value.ends_with('>') || value.ends_with('<'))
+                    && characters
+                        .peek()
+                        .is_some_and(|next| next.is_ascii_digit() || *next == '-' || *next == '$');
+                let redirects_both_streams = value.is_empty() && characters.peek() == Some(&'>');
+                if redirects_file_descriptor || redirects_both_streams {
+                    value.push('&');
+                    continue;
+                }
+                let logical_and = characters.peek() == Some(&'&');
+                if logical_and {
+                    characters.next();
+                } else {
+                    has_control_flow = true;
+                }
+                push_command(
+                    &mut value,
+                    &mut word_quoted,
+                    &mut word_expanded,
+                    &mut command,
+                    &mut commands,
+                );
+            }
+            '(' | ')' | '{' | '}' => {
+                has_control_flow = true;
+                push_command(
+                    &mut value,
+                    &mut word_quoted,
+                    &mut word_expanded,
+                    &mut command,
+                    &mut commands,
+                );
+            }
+            '#' if value.is_empty() => {
+                for remainder in characters.by_ref() {
+                    if remainder == '\n' {
+                        break;
+                    }
+                }
+                push_command(
+                    &mut value,
+                    &mut word_quoted,
+                    &mut word_expanded,
+                    &mut command,
+                    &mut commands,
+                );
+            }
+            '\n' => push_command(
+                &mut value,
+                &mut word_quoted,
+                &mut word_expanded,
+                &mut command,
+                &mut commands,
+            ),
+            character if character.is_whitespace() => push_word(
+                &mut value,
+                &mut word_quoted,
+                &mut word_expanded,
+                &mut command,
+            ),
+            character => value.push(character),
+        }
+    }
+    push_command(
+        &mut value,
+        &mut word_quoted,
+        &mut word_expanded,
+        &mut command,
+        &mut commands,
+    );
+
+    for word in commands.iter().flatten() {
+        if !word.quoted
+            && (word.value == "!"
+                || matches!(
+                    word.value.as_str(),
+                    "if" | "then"
+                        | "elif"
+                        | "else"
+                        | "fi"
+                        | "case"
+                        | "esac"
+                        | "for"
+                        | "select"
+                        | "while"
+                        | "until"
+                        | "do"
+                        | "done"
+                        | "function"
+                        | "eval"
+                ))
+        {
+            has_control_flow = true;
+        }
+    }
+
+    ShellSyntax {
+        commands,
+        has_control_flow,
+        has_pipeline,
+        has_heredoc,
+    }
+}
+
+fn json_exec_has_unresolved_cargo_install(arguments: &[String], package: &str) -> bool {
+    let words: Vec<ShellSyntaxWord> = arguments
+        .iter()
+        .map(|argument| ShellSyntaxWord {
+            value: argument.clone(),
+            quoted: true,
+            expanded: false,
+        })
+        .collect();
+    if let Some(script) = shell_env_split_string(&words) {
+        let nested = analyze_shell_install(script, package, 0);
+        if nested.unresolved {
+            return true;
+        }
+    }
+    let (Some(index), has_unsafe_wrapper) = shell_effective_executable_index(&words) else {
+        return false;
+    };
+    let executable = executable_name(&words[index].value);
+    let (embedded_target, _) = shell_command_has_target_install(&words, package);
+    if embedded_target && (executable != "cargo" || has_unsafe_wrapper) {
+        return true;
+    }
+    if is_shell_executable(executable) {
+        let Some(script) = shell_syntax_command_string(&words, index) else {
+            return true;
+        };
+        return {
+            let nested = analyze_shell_install(script, package, 0);
+            let (positional_target, _) = shell_command_has_target_install(&words, package);
+            nested.unresolved
+                || (has_unsafe_wrapper && nested.has_target_install)
+                || (is_alternate_shell_executable(executable) && nested.has_target_install)
+                || (positional_target && shell_script_uses_positional_command(script))
+        };
+    }
+    if executable == "busybox"
+        && words
+            .get(index + 1)
+            .is_some_and(|word| is_shell_executable(executable_name(&word.value)))
+    {
+        let Some(script) = shell_syntax_command_string(&words, index + 1) else {
+            return true;
+        };
+        return {
+            let nested = analyze_shell_install(script, package, 0);
+            nested.unresolved || nested.has_target_install
+        };
+    }
+    executable == "xargs" && shell_command_contains_cargo_install(&words)
 }
 
 /// Join Dockerfile line continuations so policy applies to logical RUN
@@ -471,14 +1549,27 @@ fn split_shell_commands(run: &str) -> Vec<Vec<String>> {
     commands
 }
 
-fn docker_run_commands(run: &str) -> Vec<Vec<String>> {
+fn docker_run_command_after_options(mut run: &str) -> Option<&str> {
+    while run.starts_with("--") {
+        let separator = run.find(char::is_whitespace)?;
+        let (option, remainder) = run.split_at(separator);
+        if !["--mount=", "--network=", "--security=", "--device="]
+            .iter()
+            .any(|prefix| option.starts_with(prefix) && option.len() > prefix.len())
+        {
+            return None;
+        }
+        run = remainder.trim_start();
+    }
+    (!run.is_empty()).then_some(run)
+}
+
+fn docker_json_exec_arguments(run: &str) -> Option<Vec<String>> {
     let run = run.trim();
     if run.starts_with('[') {
-        if let Ok(arguments) = serde_json::from_str::<Vec<String>>(run) {
-            return vec![arguments];
-        }
+        return serde_json::from_str::<Vec<String>>(run).ok();
     }
-    split_shell_commands(run)
+    None
 }
 
 fn cargo_install_invocations(command: &[String]) -> Vec<Vec<String>> {
@@ -575,7 +1666,10 @@ fn collect_cargo_install_invocations(
                     break;
                 }
             }
-            "sh" | "bash" => {
+            "exec" => {
+                index += 1;
+            }
+            "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "fish" => {
                 if let Some(script) = shell_command_string(command, index) {
                     for nested in split_shell_commands(script) {
                         collect_cargo_install_invocations(&nested, depth + 1, installs);
@@ -583,17 +1677,48 @@ fn collect_cargo_install_invocations(
                 }
                 return;
             }
-            "cargo" => {
+            "busybox"
                 if command
                     .get(index + 1)
-                    .is_some_and(|token| token == "install")
-                {
-                    installs.push(command[index + 2..].to_vec());
+                    .is_some_and(|argument| is_shell_executable(executable_name(argument))) =>
+            {
+                if let Some(script) = shell_command_string(command, index + 1) {
+                    for nested in split_shell_commands(script) {
+                        collect_cargo_install_invocations(&nested, depth + 1, installs);
+                    }
+                }
+                return;
+            }
+            "cargo" => {
+                if let Some(subcommand_index) = cargo_install_subcommand_index(command, index) {
+                    installs.push(command[subcommand_index + 1..].to_vec());
                 }
                 return;
             }
             _ => return,
         }
+    }
+}
+
+fn cargo_install_subcommand_index(command: &[String], cargo_index: usize) -> Option<usize> {
+    let mut index = cargo_index + 1;
+    if command.get(index).is_some_and(|word| word.starts_with('+')) {
+        index += 1;
+    }
+    loop {
+        let word = command.get(index)?;
+        if word == "install" {
+            return Some(index);
+        }
+        if cargo_global_option_consumes_value(word) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') && word != "--" {
+            index += 1;
+            continue;
+        }
+        return None;
     }
 }
 
@@ -892,6 +2017,353 @@ name = "ryuki-integration-tests"
         assert!(
             errors.is_empty(),
             "wrapped exact install failed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_install_pin_preserves_direct_continued_pins_for_both_build_tools() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let content = format!(
+                "RUN CARGO_NET_OFFLINE=true command cargo install --locked \\\n                 --version={version} {package}\n"
+            );
+            let mut errors = Vec::new();
+            validate_cargo_install_pin(&content, "Dockerfile", package, version, &mut errors);
+            assert!(
+                errors.is_empty(),
+                "valid direct {package} pin was rejected: {errors:?}"
+            );
+
+            let json_exec = format!(
+                "RUN [\"cargo\", \"install\", \"{package}\", \"--version\", \"{version}\", \"--locked\"]\n"
+            );
+            let mut json_errors = Vec::new();
+            validate_cargo_install_pin(
+                &json_exec,
+                "Dockerfile",
+                package,
+                version,
+                &mut json_errors,
+            );
+            assert!(
+                json_errors.is_empty(),
+                "valid JSON-exec {package} pin was rejected: {json_errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_rejects_if_case_and_loop_replacement_installs() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            for replacement in [
+                format!(
+                    "RUN if true; then \\\n                         cargo install {package} --force; fi\n"
+                ),
+                format!(
+                    "RUN tool={package}; case \"$tool\" in *)cargo install \"$tool\" --force ;; esac\n"
+                ),
+                format!(
+                    "RUN for tool in {package}; do cargo install \"$tool\" --force; done\n"
+                ),
+                "RUN if true; then cargo install \"$BUILD_TOOL\" --force; fi\n"
+                    .to_string(),
+                format!(
+                    "RUN cargo_cmd=cargo; tool={package}; if true; then \"$cargo_cmd\" install \"$tool\" --force; fi\n"
+                ),
+            ] {
+                assert_shell_control_flow_replacement_is_rejected(
+                    package,
+                    version,
+                    &replacement,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_rejects_dynamic_positions_without_control_keywords() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            for replacement in [
+                format!("RUN CARGO=cargo; \"$CARGO\" install {package} --force\n"),
+                format!("RUN TOOL={package}; cargo install \"$TOOL\" --force\n"),
+                format!("RUN SUBCOMMAND=install; cargo \"$SUBCOMMAND\" {package} --force\n"),
+                format!(
+                    "RUN SHELL=dash; \"$SHELL\" -c 'cargo install {package} --force'\n"
+                ),
+                format!(
+                    "ENV REINSTALL=\"cargo install {package} --force\"\nRUN $REINSTALL\n"
+                ),
+                format!(
+                    "ENV ARGS=\"install {package} --force\"\nRUN cargo $ARGS\n"
+                ),
+                format!("RUN cmd='cargo install {package} --force'; $cmd\n"),
+                format!("ENV CARGO=cargo\nRUN ${{CARGO}} install {package} --force\n"),
+                format!("RUN $(printf cargo) install {package} --force\n"),
+                format!("RUN `printf cargo` install {package} --force\n"),
+                format!("RUN echo \"$(cargo install {package} --force)\"\n"),
+                format!(
+                    "RUN c() {{ cargo \"$@\"; }}; c install {package} --force\n"
+                ),
+                format!("RUN set -- install {package} --force; cargo \"$@\"\n"),
+                format!(
+                    "RUN CARGO=cargo; SUBCOMMAND=install; TOOL={package}; \"$CARGO\" \"$SUBCOMMAND\" \"$TOOL\" --force\n"
+                ),
+            ] {
+                assert_shell_control_flow_replacement_is_rejected(
+                    package,
+                    version,
+                    &replacement,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_rejects_function_subshell_and_nested_shell_replacements() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            for replacement in [
+                format!(
+                    "RUN install_tool() {{ cargo install {package} --force; }}; install_tool\n"
+                ),
+                format!("RUN (cargo install {package} --force)\n"),
+                format!(
+                    "RUN result=$(cargo install {package} --force)\n"
+                ),
+                format!("RUN ! cargo install {package} --force\n"),
+                format!(
+                    "RUN /bin/sh -c 'if true; then cargo install {package} --force; fi'\n"
+                ),
+                format!(
+                    "RUN [\"/bin/bash\", \"-c\", \"if true; then cargo install {package} --force; fi\"]\n"
+                ),
+            ] {
+                assert_shell_control_flow_replacement_is_rejected(
+                    package,
+                    version,
+                    &replacement,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_rejects_exec_alternate_shell_and_pipeline_wrappers() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let positional_json = format!(
+                "RUN {}\n",
+                serde_json::to_string(&[
+                    "sh",
+                    "-c",
+                    "\"$0\" \"$@\"",
+                    "cargo",
+                    "install",
+                    package,
+                    "--force",
+                ])
+                .expect("serialize positional shell fixture")
+            );
+            for replacement in [
+                format!("RUN exec cargo install {package} --force\n"),
+                format!("RUN /bin/dash -c 'cargo install {package} --force'\n"),
+                format!("RUN busybox sh -c 'cargo install {package} --force'\n"),
+                format!("RUN env -S 'if true; then cargo install {package} --force; fi'\n"),
+                format!("RUN printf '%s\\n' '{package}' | xargs cargo install --force\n"),
+                format!("RUN printf 'cargo install {package} --force\\n' | sh\n"),
+                format!(
+                    "RUN printf '%s\\n' 'cargo install {package} --force' >/tmp/reinstall.sh && sh /tmp/reinstall.sh\n"
+                ),
+                format!(
+                    "RUN printf '%s\\n' 'cargo install {package} --force' >/tmp/reinstall.sh && . /tmp/reinstall.sh\n"
+                ),
+                format!("RUN [\"dash\", \"-c\", \"cargo install {package} --force\"]\n"),
+                format!("RUN timeout 600 cargo install {package} --force\n"),
+                format!(
+                    "RUN find /tmp -name marker -exec cargo install {package} --force \\;\n"
+                ),
+                format!(
+                    "RUN sh -c '\"$0\" \"$@\"' cargo install {package} --force\n"
+                ),
+                format!("RUN sh -c '$1' _ 'cargo install {package} --force'\n"),
+                format!(
+                    "RUN sh -c \"$(printf '%s' 'cargo install {package} --force')\"\n"
+                ),
+                format!(
+                    "RUN [\"timeout\", \"600\", \"cargo\", \"install\", \"{package}\", \"--force\"]\n"
+                ),
+                format!(
+                    "RUN [\"rustup\", \"run\", \"stable\", \"cargo\", \"install\", \"{package}\", \"--force\"]\n"
+                ),
+                positional_json,
+            ] {
+                assert_shell_control_flow_replacement_is_rejected(package, version, &replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_rejects_cargo_global_and_buildkit_replacements() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            for replacement in [
+                format!("RUN cargo +stable install {package} --force\n"),
+                format!("RUN cargo --color=never install {package} --force\n"),
+                format!(
+                    "RUN --mount=type=cache,target=/tmp/cargo-cache cargo install {package} --force\n"
+                ),
+                format!(
+                    "RUN --mount=type=cache,target=/tmp/cargo-cache [\"cargo\", \"install\", \"{package}\", \"--force\"]\n"
+                ),
+                "COPY attacker /tmp/tool\nRUN cargo install --path /tmp/tool --force\n"
+                    .to_string(),
+            ] {
+                assert_replacement_is_rejected(package, version, &replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_rejects_heredocs_and_custom_escape_directives() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let pinned = format!("RUN cargo install {package} --version {version} --locked\n");
+            for content in [
+                format!("{pinned}RUN <<'EOF'\ncargo install {package} --force\nEOF\n"),
+                format!("# escape=`\n{pinned}RUN `\n    cargo install {package} --force\n"),
+                format!("{pinned}SHELL [\"cargo\", \"install\", \"--force\"]\nRUN {package}\n"),
+            ] {
+                let mut errors = Vec::new();
+                validate_cargo_install_pin(&content, "Dockerfile", package, version, &mut errors);
+                assert!(
+                    errors.iter().any(|error| error.contains(package)),
+                    "unsupported Docker framing was accepted for {package}: {content:?}; {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_install_pin_preserves_json_arguments_and_quoted_shell_data() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let json_exec = format!(
+                "RUN [\"cargo\", \"install\", \"{package}\", \"--version\", \"{version}\", \"--locked\", \"--root\", \"/opt/{{tools}}\"]\n"
+            );
+            let mut json_errors = Vec::new();
+            validate_cargo_install_pin(
+                &json_exec,
+                "Dockerfile",
+                package,
+                version,
+                &mut json_errors,
+            );
+            assert!(
+                json_errors.is_empty(),
+                "JSON-exec data was mistaken for shell grammar for {package}: {json_errors:?}"
+            );
+
+            let shell = format!(
+                "RUN cargo install {package} --version {version} --locked\n\
+                 RUN if true; then printf '%s\\n' 'cargo install {package} (documentation only)' | grep -q documentation; fi\n"
+            );
+            let mut shell_errors = Vec::new();
+            validate_cargo_install_pin(&shell, "Dockerfile", package, version, &mut shell_errors);
+            assert!(
+                shell_errors.is_empty(),
+                "quoted shell data was mistaken for an invocation for {package}: {shell_errors:?}"
+            );
+
+            let default_escape = format!(
+                r#"# escape=\
+SHELL ["/bin/sh", "-c"]
+RUN cargo install {package} --version {version} --locked
+"#
+            );
+            let mut default_escape_errors = Vec::new();
+            validate_cargo_install_pin(
+                &default_escape,
+                "Dockerfile",
+                package,
+                version,
+                &mut default_escape_errors,
+            );
+            assert!(
+                default_escape_errors.is_empty(),
+                "default Docker escape directive was rejected for {package}: {default_escape_errors:?}"
+            );
+
+            let expanded_option_values = format!(
+                "RUN cargo install {package} --version {version} --locked --root \"$CARGO_HOME\" --color \"$CARGO_COLOR\" > \"$LOG\" 2> \"$ERROR_LOG\" 3>&1\n"
+            );
+            let mut expanded_option_errors = Vec::new();
+            validate_cargo_install_pin(
+                &expanded_option_values,
+                "Dockerfile",
+                package,
+                version,
+                &mut expanded_option_errors,
+            );
+            assert!(
+                expanded_option_errors.is_empty(),
+                "expanded install-option values or fd redirection were mistaken for a package operand for {package}: {expanded_option_errors:?}"
+            );
+        }
+    }
+
+    fn assert_shell_control_flow_replacement_is_rejected(
+        package: &str,
+        version: &str,
+        replacement: &str,
+    ) {
+        let pinned = format!("RUN cargo install {package} --version {version} --locked\n");
+        let mut errors = Vec::new();
+        validate_cargo_install_pin(
+            &format!("{pinned}{replacement}"),
+            "Dockerfile",
+            package,
+            version,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains(package) && error.contains("shell control flow")
+            }),
+            "shell-control-flow replacement install was accepted for {package}: {replacement:?}; {errors:?}"
+        );
+    }
+
+    fn assert_replacement_is_rejected(package: &str, version: &str, replacement: &str) {
+        let pinned = format!("RUN cargo install {package} --version {version} --locked\n");
+        let mut errors = Vec::new();
+        validate_cargo_install_pin(
+            &format!("{pinned}{replacement}"),
+            "Dockerfile",
+            package,
+            version,
+            &mut errors,
+        );
+        assert!(
+            !errors.is_empty(),
+            "replacement install was accepted for {package}: {replacement:?}"
         );
     }
 

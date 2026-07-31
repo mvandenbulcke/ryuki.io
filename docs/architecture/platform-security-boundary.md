@@ -2472,6 +2472,19 @@ and cannot close those requirements.
   SIEM export uses a transactional outbox and acknowledged consumer checkpoints
   with idempotent delivery, gap/reorder detection, bounded lag, and replay;
   database-only rehashing cannot erase evidence.
+- **SB-AUD-05 — Current-state transition claims.** A derived alert or recovery
+  notification is emitted only after the authoritative source row is re-read
+  and conditionally changed in the same transaction as its event and delivery
+  record. Discovery produces candidate work only. Time-derived liveness uses
+  the database statement clock at the conditional transition, so concurrent or
+  delayed workers cannot publish an obsolete or duplicate state change.
+- **SB-AUD-06 — Typed representation redaction.** Before evidence, audit,
+  outbox, or export persistence, reusable credentials are removed from their
+  registered canonical wire representations, including bounded JSON escaping,
+  schema-declared composite encodings, and cookie header structures. Composite
+  credentials are formed only from an explicit typed schema, derived values are
+  zeroized, and bounded structured inspection fails closed without guessing
+  arbitrary field pairs or decoding attacker-controlled output.
 43. **SB-SC-01 — Immutable privileged build inputs.** Privileged CI actions,
     builder/runtime images, Helm charts, ad-hoc Cargo tools, and deployment
     dependencies are pinned to immutable revisions or digests and updated by a
@@ -2499,6 +2512,16 @@ and cannot close those requirements.
   workflow downloaded it. The trusted release either rebuilds from the admitted
   revision or verifies a digest-bound provenance chain, expected builder,
   materials, subject, and policy before promotion.
+- **SB-SC-07 — Exact signed release reference.** Release admission resolves the
+  full `refs/tags/<release>` object once, requires an annotated signed tag whose
+  embedded name exactly equals the requested release name, and uses that same
+  object ID for signature verification, peeling, and provenance. An abbreviated
+  ref or signed object copied behind another name conveys no release authority.
+- **SB-SC-08 — Analyzable build-tool installation.** A privileged build tool
+  has one directly analyzable immutable installation. Shell control flow,
+  functions, nested interpreters, subshells, command substitution, and dynamic
+  command construction around that install fail admission rather than hiding a
+  later replacement from static validation.
 
 ## Options considered
 

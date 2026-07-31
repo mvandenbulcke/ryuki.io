@@ -173,33 +173,12 @@ impl AuditEntry {
 }
 
 /// Redacts secret-bearing values in an audit `detail` JSON before it is served.
-/// The stored trail is append-only and keeps the real verbatim attribution, but
-/// every READ path (`/api/requests/{id}/audit`, `/api/activity/audit`, and the
-/// evidence pack that embeds the trail) must never surface a secret a user typed
-/// into free-text — e.g. a credential pasted into a reject/cancel reason. Reuses
-/// the engine's pure pattern logic so this stays consistent with the evidence
-/// pipeline's redaction.
+/// Every READ path (`/api/requests/{id}/audit`, `/api/activity/audit`, and the
+/// evidence pack that embeds the trail) must protect both current and historical
+/// rows. The shared bounded engine traversal also recognizes structured header
+/// maps, named entries, and tuples rather than inspecting only direct strings.
 fn redact_detail(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut redacted = serde_json::Map::with_capacity(map.len());
-            for (key, child) in map {
-                match child {
-                    Value::String(text)
-                        if ryuki_engine::evidence_pipeline::should_redact(key, text) =>
-                    {
-                        redacted.insert(key.clone(), Value::String("***REDACTED***".to_string()));
-                    }
-                    other => {
-                        redacted.insert(key.clone(), redact_detail(other));
-                    }
-                }
-            }
-            Value::Object(redacted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(redact_detail).collect()),
-        other => other.clone(),
-    }
+    ryuki_engine::evidence_pipeline::redact_json_evidence_value(value)
 }
 
 /// Cap on the process-local (no-DB / dry-run) audit store so a long-running
@@ -1469,6 +1448,34 @@ mod tests {
         // recursing into nested objects; sibling non-secret values are kept.
         assert_eq!(redacted["nested"]["api_key"], "***REDACTED***");
         assert_eq!(redacted["nested"]["ok"], "fine");
+    }
+
+    #[test]
+    fn redact_detail_scrubs_structured_cookie_header_aggregates() {
+        let named_marker = "SYNTH-AUDIT-NAMED-COOKIE-CANARY";
+        let tuple_marker = "SYNTH-AUDIT-TUPLE-COOKIE-CANARY";
+        let detail = json!({
+            "transport": {
+                "headers": [
+                    {
+                        "name": "Cookie",
+                        "value": format!("session={named_marker}")
+                    },
+                    [
+                        "Set-Cookie",
+                        format!("session={tuple_marker}"),
+                        {"sensitive": true}
+                    ]
+                ]
+            },
+            "note": "ordinary handover text"
+        });
+
+        let redacted = redact_detail(&detail);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains(named_marker));
+        assert!(!serialized.contains(tuple_marker));
+        assert_eq!(redacted["note"], "ordinary handover text");
     }
 
     #[test]

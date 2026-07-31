@@ -47,7 +47,73 @@ const SENSITIVE_VALUE_MARKERS: &[&str] = &["bearer ", "authorization: basic "];
 
 const AUTHORIZATION_LABEL: &str = "authorization";
 const AUTHORIZATION_SCHEMES: &[&str] = &["basic", "bearer"];
+const COOKIE_HEADER_LABELS: &[&str] = &["cookie", "set-cookie", "set_cookie"];
+/// Exact credential-bearing cookie names admitted by the shipped secure and
+/// explicit-loopback runtimes. Cookie names are case-sensitive on the wire, but
+/// evidence matching is case-insensitive because logs and serializers can
+/// normalize their presentation.
+const CREDENTIAL_COOKIE_NAMES: &[&str] = &[
+    "__host-ryuki_session",
+    "ryuki_session",
+    "__host-entra_login_csrf",
+    "entra_login_csrf",
+    "__host-oidc_login_csrf",
+    "oidc_login_csrf",
+];
+const STRUCTURED_HEADER_NAME_FIELDS: &[&str] =
+    &["name", "key", "header", "header_name", "header-name"];
+const STRUCTURED_HEADER_VALUE_FIELDS: &[&str] = &[
+    "value",
+    "values",
+    "header_value",
+    "header-value",
+    "header_values",
+    "header-values",
+];
 const MAX_NESTED_JSON_SECRET_DEPTH: usize = 4;
+const MAX_STRUCTURED_SECRET_BYTES: usize = 256 * 1024;
+const MAX_STRUCTURED_SECRET_NODES: usize = 4_096;
+/// Canonical replacement emitted by every evidence and audit projection.
+pub const REDACTED_EVIDENCE_VALUE: &str = "***REDACTED***";
+
+fn is_cookie_header_name(value: &str) -> bool {
+    COOKIE_HEADER_LABELS
+        .iter()
+        .any(|label| value.eq_ignore_ascii_case(label))
+}
+
+fn is_credential_cookie_name(value: &str) -> bool {
+    CREDENTIAL_COOKIE_NAMES
+        .iter()
+        .any(|name| value.eq_ignore_ascii_case(name))
+}
+
+fn is_sensitive_cookie_name(value: &str) -> bool {
+    is_cookie_header_name(value) || is_credential_cookie_name(value)
+}
+
+fn is_named_field(key: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| key.eq_ignore_ascii_case(name))
+}
+
+fn object_is_cookie_header_entry(entries: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let names_cookie_header = entries.iter().any(|(key, value)| {
+        is_named_field(key, STRUCTURED_HEADER_NAME_FIELDS)
+            && value.as_str().is_some_and(is_sensitive_cookie_name)
+    });
+    let has_header_value = entries
+        .keys()
+        .any(|key| is_named_field(key, STRUCTURED_HEADER_VALUE_FIELDS));
+    names_cookie_header && has_header_value
+}
+
+fn array_is_cookie_header_entry(values: &[serde_json::Value]) -> bool {
+    values.len() >= 2
+        && values
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_sensitive_cookie_name)
+}
 
 fn authorization_scheme_bears_secret(value: &str) -> bool {
     let value_lower = value.trim_start().to_ascii_lowercase();
@@ -61,36 +127,69 @@ fn authorization_scheme_bears_secret(value: &str) -> bool {
     })
 }
 
-/// Recognizes exact `Authorization` fields in valid JSON, including nested
-/// objects and JSON-encoded object strings. Parsing first also covers escaped
-/// key spellings such as `\u0041uthorization` without teaching the fallback a
-/// partial JSON decoder.
-fn structured_authorization_bears_secret(value: &serde_json::Value, depth: usize) -> bool {
-    if depth > MAX_NESTED_JSON_SECRET_DEPTH {
-        return false;
+/// Recognizes exact `Authorization`, `Cookie`, and `Set-Cookie` fields in valid
+/// JSON, including nested objects and JSON-encoded object strings. Parsing
+/// first also covers escaped key spellings such as `\u0043ookie` without
+/// teaching the fallback a partial JSON decoder.
+///
+/// Depth and node budgets bound nested/encoded traversal. Exhaustion is treated
+/// as sensitive so an attacker cannot bypass redaction by hiding a cookie after
+/// an oversized prefix.
+fn structured_header_bears_secret(
+    value: &serde_json::Value,
+    depth: usize,
+    remaining_nodes: &mut usize,
+) -> bool {
+    if depth > MAX_NESTED_JSON_SECRET_DEPTH || *remaining_nodes == 0 {
+        return true;
     }
+    *remaining_nodes -= 1;
 
     match value {
-        serde_json::Value::Object(entries) => entries.iter().any(|(key, value)| {
-            (key.eq_ignore_ascii_case(AUTHORIZATION_LABEL)
-                && value
-                    .as_str()
-                    .is_some_and(authorization_scheme_bears_secret))
-                || structured_authorization_bears_secret(value, depth + 1)
-        }),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| structured_authorization_bears_secret(value, depth + 1)),
-        serde_json::Value::String(encoded) if depth < MAX_NESTED_JSON_SECRET_DEPTH => {
+        serde_json::Value::Object(entries) => {
+            object_is_cookie_header_entry(entries)
+                || entries.iter().any(|(key, value)| {
+                    (key.eq_ignore_ascii_case(AUTHORIZATION_LABEL)
+                        && value
+                            .as_str()
+                            .is_some_and(authorization_scheme_bears_secret))
+                        || is_sensitive_cookie_name(key)
+                        || structured_header_bears_secret(value, depth + 1, remaining_nodes)
+                })
+        }
+        serde_json::Value::Array(values) => {
+            array_is_cookie_header_entry(values)
+                || values
+                    .iter()
+                    .any(|value| structured_header_bears_secret(value, depth + 1, remaining_nodes))
+        }
+        serde_json::Value::String(encoded) => {
+            if header_text_bears_secret(encoded) {
+                return true;
+            }
             let encoded = encoded.trim_start();
-            if !encoded.starts_with('{') && !encoded.starts_with('[') {
+            if depth >= MAX_NESTED_JSON_SECRET_DEPTH
+                || (!encoded.starts_with('{') && !encoded.starts_with('['))
+            {
                 return false;
             }
-            serde_json::from_str::<serde_json::Value>(encoded)
-                .is_ok_and(|nested| structured_authorization_bears_secret(&nested, depth + 1))
+            if encoded.len() > MAX_STRUCTURED_SECRET_BYTES {
+                return true;
+            }
+            serde_json::from_str::<serde_json::Value>(encoded).is_ok_and(|nested| {
+                structured_header_bears_secret(&nested, depth + 1, remaining_nodes)
+            })
         }
         _ => false,
     }
+}
+
+/// Bounded shared detector for parsed structured evidence. API audit/detail
+/// sinks use the same recognizer as string evidence so header maps, named
+/// entries, tuples, and nested JSON cannot diverge between output surfaces.
+pub fn structured_value_bears_secret(value: &serde_json::Value) -> bool {
+    let mut remaining_nodes = MAX_STRUCTURED_SECRET_NODES;
+    structured_header_bears_secret(value, 0, &mut remaining_nodes)
 }
 
 fn trim_assignment_syntax(value: &str) -> &str {
@@ -127,26 +226,75 @@ fn authorization_assignment_bears_secret(value_lower: &str) -> bool {
     false
 }
 
+/// Fallback for header-shaped plaintext or escaped fragments stored under a
+/// generic evidence key. Only exact Cookie/Set-Cookie labels followed by a
+/// field delimiter match, so safe prose such as "cookie policy enabled" is
+/// preserved.
+fn cookie_assignment_bears_secret(value_lower: &str) -> bool {
+    for &label in COOKIE_HEADER_LABELS
+        .iter()
+        .chain(CREDENTIAL_COOKIE_NAMES.iter())
+    {
+        let mut offset = 0;
+        while let Some(relative) = value_lower[offset..].find(label) {
+            let position = offset + relative;
+            let after_label = position + label.len();
+            let is_word_boundary = value_lower[..position]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+
+            if is_word_boundary {
+                let after = trim_assignment_syntax(&value_lower[after_label..]);
+                if after.starts_with(':') || after.starts_with('=') {
+                    return true;
+                }
+            }
+
+            offset = after_label;
+        }
+    }
+    false
+}
+
+fn header_text_bears_secret(value: &str) -> bool {
+    let value_lower = value.to_lowercase();
+    SENSITIVE_VALUE_MARKERS
+        .iter()
+        .any(|marker| value_lower.contains(marker))
+        || authorization_assignment_bears_secret(&value_lower)
+        || cookie_assignment_bears_secret(&value_lower)
+}
+
 /// True if an evidence value looks like it carries a secret: an exact structured
-/// Authorization credential, a robust embedded Authorization assignment, a
+/// Authorization/Cookie header, a robust embedded header assignment, a
 /// standalone auth marker, or a known secret label immediately followed by a
 /// `:`/`=` delimiter. Requiring the delimiter avoids redacting an incidental
 /// prose mention ("the password was rotated"); when in doubt this errs toward
 /// OVER-redaction, which is fail-safe for audit/evidence output.
 fn value_bears_secret(value: &str) -> bool {
-    if serde_json::from_str::<serde_json::Value>(value)
-        .is_ok_and(|structured| structured_authorization_bears_secret(&structured, 0))
+    let structured_candidate = value.trim_start();
+    if structured_candidate.starts_with('{')
+        || structured_candidate.starts_with('[')
+        || structured_candidate.starts_with('"')
     {
-        return true;
-    }
-
-    let value_lower = value.to_lowercase();
-    for marker in SENSITIVE_VALUE_MARKERS {
-        if value_lower.contains(marker) {
+        if value.len() > MAX_STRUCTURED_SECRET_BYTES {
+            return true;
+        }
+        if serde_json::from_str::<serde_json::Value>(value)
+            .is_ok_and(|structured| structured_value_bears_secret(&structured))
+        {
             return true;
         }
     }
-    if authorization_assignment_bears_secret(&value_lower) {
+
+    let value_lower = value.to_lowercase();
+    if SENSITIVE_VALUE_MARKERS
+        .iter()
+        .any(|marker| value_lower.contains(marker))
+        || authorization_assignment_bears_secret(&value_lower)
+        || cookie_assignment_bears_secret(&value_lower)
+    {
         return true;
     }
     for label in SENSITIVE_VALUE_LABELS {
@@ -238,21 +386,34 @@ pub fn collect_evidence(request: &Request) -> Result<EvidencePack, String> {
 
 pub fn redact_evidence(pack: &mut EvidencePack) -> Result<(), String> {
     for item in pack.items.iter_mut() {
-        if should_redact(&item.key, &item.value) {
+        let raw_value_is_sensitive = should_redact(&item.key, &item.value);
+        let supplied_redacted_value_is_sensitive = item
+            .redacted_value
+            .as_deref()
+            .is_some_and(|candidate| should_redact("", candidate));
+        if raw_value_is_sensitive || supplied_redacted_value_is_sensitive {
             item.redacted = true;
-            if item.redacted_value.is_none() {
-                item.redacted_value = Some("***REDACTED***".into());
-            }
+            // A caller-controlled redacted_value is not trusted as a safe
+            // substitute for a newly detected credential.
+            item.redacted_value = Some(REDACTED_EVIDENCE_VALUE.into());
         }
         // For every redacted item (whether just flagged above or pre-marked
         // by the lifecycle), overwrite the raw value with the safe form so
         // the pack — and its digest — never carry a sensitive raw value.
         if item.redacted {
-            item.value = item
+            let safe_value = item
                 .redacted_value
                 .clone()
-                .unwrap_or_else(|| "***REDACTED***".into());
+                .unwrap_or_else(|| REDACTED_EVIDENCE_VALUE.into());
+            item.value = safe_value.clone();
+            item.redacted_value = Some(safe_value);
         }
+    }
+    for (key, value) in &mut pack.metadata {
+        *value = redact_sensitive_text(key, value);
+    }
+    for check in &mut pack.compliance_checks {
+        *check = redact_sensitive_text("", check);
     }
     pack.redacted = true;
     Ok(())
@@ -262,7 +423,19 @@ pub fn redact_evidence(pack: &mut EvidencePack) -> Result<(), String> {
 /// secret-bearing value pattern. Pure and pattern-only (no I/O); shared with the
 /// API's audit-read redaction so the two stay consistent.
 pub fn should_redact(key: &str, value: &str) -> bool {
+    if key_bears_secret(key) {
+        return true;
+    }
+
+    value_bears_secret(value)
+}
+
+fn key_bears_secret(key: &str) -> bool {
     let key_lower = key.to_lowercase();
+
+    if is_sensitive_cookie_name(key.trim()) {
+        return true;
+    }
 
     for pattern in SENSITIVE_KEY_PATTERNS {
         if key_lower.contains(pattern) {
@@ -270,11 +443,77 @@ pub fn should_redact(key: &str, value: &str) -> bool {
         }
     }
 
-    if value_bears_secret(value) {
-        return true;
-    }
-
     false
+}
+
+/// Return a display/persistence-safe representation of one free-text field.
+/// Legitimate text is preserved byte-for-byte; detected credential material is
+/// replaced with the one canonical marker.
+pub fn redact_sensitive_text(key: &str, value: &str) -> String {
+    if should_redact(key, value) {
+        REDACTED_EVIDENCE_VALUE.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Recursively redact parsed JSON evidence using the same bounded header and
+/// value detector as string evidence. This is the shared boundary used by API
+/// audit/detail projection for historical structured rows.
+pub fn redact_json_evidence_value(value: &serde_json::Value) -> serde_json::Value {
+    let mut remaining_nodes = MAX_STRUCTURED_SECRET_NODES;
+    redact_json_evidence_value_inner(value, None, 0, &mut remaining_nodes)
+}
+
+fn redact_json_evidence_value_inner(
+    value: &serde_json::Value,
+    field_key: Option<&str>,
+    depth: usize,
+    remaining_nodes: &mut usize,
+) -> serde_json::Value {
+    if depth > MAX_NESTED_JSON_SECRET_DEPTH || *remaining_nodes == 0 {
+        return serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string());
+    }
+    *remaining_nodes -= 1;
+
+    match value {
+        serde_json::Value::Object(entries) => {
+            if object_is_cookie_header_entry(entries) {
+                return serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string());
+            }
+            let mut redacted = serde_json::Map::with_capacity(entries.len());
+            for (key, child) in entries {
+                let safe_child = if key_bears_secret(key) {
+                    serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string())
+                } else {
+                    redact_json_evidence_value_inner(child, Some(key), depth + 1, remaining_nodes)
+                };
+                redacted.insert(key.clone(), safe_child);
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(values) => {
+            if array_is_cookie_header_entry(values) {
+                return serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string());
+            }
+            serde_json::Value::Array(
+                values
+                    .iter()
+                    .map(|child| {
+                        redact_json_evidence_value_inner(child, None, depth + 1, remaining_nodes)
+                    })
+                    .collect(),
+            )
+        }
+        serde_json::Value::String(text) => {
+            if should_redact(field_key.unwrap_or_default(), text) {
+                serde_json::Value::String(REDACTED_EVIDENCE_VALUE.to_string())
+            } else {
+                value.clone()
+            }
+        }
+        _ => value.clone(),
+    }
 }
 
 pub fn export_evidence(pack: &EvidencePack, format: &str) -> Result<String, String> {
@@ -299,14 +538,25 @@ fn build_safe_export_pack(pack: &EvidencePack) -> serde_json::Value {
         .items
         .iter()
         .map(|item| {
+            let dynamically_redacted = should_redact(&item.key, &item.value);
             let safe_value = safe_export_value(item);
             serde_json::json!({
                 "key": item.key,
                 "value": safe_value,
-                "redacted": item.redacted,
+                "redacted": item.redacted || dynamically_redacted,
                 "evidence_type": item.evidence_type,
             })
         })
+        .collect();
+    let metadata: HashMap<String, String> = pack
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), redact_sensitive_text(key, value)))
+        .collect();
+    let compliance_checks: Vec<String> = pack
+        .compliance_checks
+        .iter()
+        .map(|check| redact_sensitive_text("", check))
         .collect();
 
     serde_json::json!({
@@ -316,8 +566,8 @@ fn build_safe_export_pack(pack: &EvidencePack) -> serde_json::Value {
         "redacted": pack.redacted,
         "created_at": pack.created_at,
         "format": pack.format,
-        "compliance_checks": pack.compliance_checks,
-        "metadata": pack.metadata,
+        "compliance_checks": compliance_checks,
+        "metadata": metadata,
     })
 }
 
@@ -326,10 +576,14 @@ fn build_safe_export_pack(pack: &EvidencePack) -> serde_json::Value {
 /// - If redacted without redacted_value → uses safe marker
 /// - If not redacted → uses original value
 fn safe_export_value(item: &EvidenceItem) -> String {
-    if item.redacted {
+    if should_redact(&item.key, &item.value) {
+        REDACTED_EVIDENCE_VALUE.to_string()
+    } else if item.redacted {
         item.redacted_value
-            .clone()
-            .unwrap_or_else(|| "***REDACTED***".to_string())
+            .as_deref()
+            .filter(|candidate| !should_redact("", candidate))
+            .unwrap_or(REDACTED_EVIDENCE_VALUE)
+            .to_string()
     } else {
         item.value.clone()
     }
@@ -555,6 +809,276 @@ mod tests {
     }
 
     #[test]
+    fn test_should_redact_cookie_evidence_shapes_without_redacting_safe_metadata() {
+        for (key, value) in [
+            ("Cookie", "__Host-ryuki_session=SYNTH-REQUEST-COOKIE"),
+            (
+                "set-cookie",
+                "__Host-ryuki_session=SYNTH-RESPONSE-COOKIE; Secure; HttpOnly",
+            ),
+            (
+                "http_headers",
+                "Cookie: __Host-ryuki_session=SYNTH-PLAINTEXT-REQUEST",
+            ),
+            (
+                "http_headers",
+                "Set-Cookie: __Host-ryuki_session=SYNTH-PLAINTEXT-RESPONSE; Secure",
+            ),
+            (
+                "provider_output",
+                r#"{"headers":{"Cookie":"__Host-ryuki_session=SYNTH-JSON-REQUEST"}}"#,
+            ),
+            (
+                "provider_output",
+                r#"{"headers":[{"name":"Set-Cookie","value":"__Host-ryuki_session=SYNTH-NAMED-RESPONSE"}]}"#,
+            ),
+            (
+                "provider_output",
+                r#"{"headers":[["Cookie","__Host-ryuki_session=SYNTH-TUPLE-REQUEST"]]}"#,
+            ),
+            (
+                "provider_output",
+                r#"{"response":"{\"headers\":{\"Set-Cookie\":\"__Host-ryuki_session=SYNTH-NESTED-RESPONSE\"}}"}"#,
+            ),
+            ("reason", "__Host-ryuki_session=SYNTH-BARE-SECURE-SESSION"),
+            ("reason", "ryuki_session=SYNTH-BARE-LOOPBACK-SESSION"),
+            ("reason", "__Host-entra_login_csrf=SYNTH-BARE-ENTRA-BINDING"),
+            (
+                "reason",
+                "entra_login_csrf=SYNTH-BARE-LOOPBACK-ENTRA-BINDING",
+            ),
+            ("reason", "__Host-oidc_login_csrf=SYNTH-BARE-OIDC-BINDING"),
+            ("reason", "oidc_login_csrf=SYNTH-BARE-LOOPBACK-OIDC-BINDING"),
+        ] {
+            assert!(
+                should_redact(key, value),
+                "cookie-bearing evidence must be redacted for key {key}"
+            );
+        }
+
+        for (key, value) in [
+            (
+                "cookie_policy",
+                "Secure and HttpOnly browser policy enabled",
+            ),
+            ("execution_log", "cookie policy enabled; SameSite is strict"),
+            (
+                "configuration",
+                r#"{"cookie_policy":{"secure":true,"http_only":true}}"#,
+            ),
+            ("summary", "browser compatibility check completed"),
+        ] {
+            assert!(
+                !should_redact(key, value),
+                "non-secret cookie metadata must remain available for key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_and_export_remove_cookie_values_but_preserve_safe_evidence() {
+        let raw_cookie_markers = [
+            "SYNTH-COOKIE-KEY-MARKER",
+            "SYNTH-COOKIE-LINE-MARKER",
+            "SYNTH-SET-COOKIE-JSON-MARKER",
+        ];
+        let safe_summary = "browser policy validation passed";
+        let mut pack = EvidencePack {
+            id: "ev-cookie-redaction".into(),
+            request_id: "req-cookie-redaction".into(),
+            items: vec![
+                EvidenceItem {
+                    key: "Cookie".into(),
+                    value: format!("__Host-ryuki_session={}", raw_cookie_markers[0]),
+                    redacted_value: None,
+                    redacted: false,
+                    evidence_type: EvidenceType::ExecutionLog,
+                },
+                EvidenceItem {
+                    key: "request_headers".into(),
+                    value: format!("Cookie: __Host-ryuki_session={}", raw_cookie_markers[1]),
+                    redacted_value: None,
+                    redacted: false,
+                    evidence_type: EvidenceType::ExecutionLog,
+                },
+                EvidenceItem {
+                    key: "provider_output".into(),
+                    value: format!(
+                        r#"{{"headers":[{{"name":"Set-Cookie","value":"__Host-ryuki_session={}; Secure"}}]}}"#,
+                        raw_cookie_markers[2]
+                    ),
+                    redacted_value: None,
+                    redacted: false,
+                    evidence_type: EvidenceType::ExecutionLog,
+                },
+                EvidenceItem {
+                    key: "summary".into(),
+                    value: safe_summary.into(),
+                    redacted_value: None,
+                    redacted: false,
+                    evidence_type: EvidenceType::Summary,
+                },
+            ],
+            redacted: false,
+            created_at: Utc::now().to_rfc3339(),
+            format: "json".into(),
+            compliance_checks: Vec::new(),
+            metadata: HashMap::new(),
+        };
+
+        redact_evidence(&mut pack).unwrap();
+
+        for item in &pack.items[..raw_cookie_markers.len()] {
+            assert!(item.redacted, "cookie evidence must be marked redacted");
+            assert_eq!(item.value, "***REDACTED***");
+            assert_eq!(item.redacted_value.as_deref(), Some("***REDACTED***"));
+        }
+        assert!(!pack.items[raw_cookie_markers.len()].redacted);
+        assert_eq!(pack.items[raw_cookie_markers.len()].value, safe_summary);
+
+        let serialized_pack = serde_json::to_string(&pack).unwrap();
+        let exported_pack = export_evidence(&pack, "json").unwrap();
+        for marker in raw_cookie_markers {
+            assert!(!serialized_pack.contains(marker));
+            assert!(!exported_pack.contains(marker));
+        }
+        assert!(serialized_pack.contains(safe_summary));
+        assert!(exported_pack.contains(safe_summary));
+    }
+
+    #[test]
+    fn test_hostile_redacted_value_cannot_reintroduce_cookie_credential() {
+        let raw_marker = "SYNTH-RAW-COOKIE-CANARY";
+        let replacement_marker = "SYNTH-HOSTILE-REPLACEMENT-CANARY";
+        let metadata_marker = "SYNTH-METADATA-COOKIE-CANARY";
+        let compliance_marker = "SYNTH-COMPLIANCE-COOKIE-CANARY";
+        let safe_metadata = "ordinary evidence metadata";
+        let safe_compliance = "approval policy check passed";
+        let mut pack = EvidencePack {
+            id: "ev-hostile-redacted-value".into(),
+            request_id: "req-hostile-redacted-value".into(),
+            items: vec![EvidenceItem {
+                key: "reason".into(),
+                value: format!("__Host-ryuki_session={raw_marker}"),
+                redacted_value: Some(format!("ryuki_session={replacement_marker}")),
+                redacted: false,
+                evidence_type: EvidenceType::ApprovalDecision,
+            }],
+            redacted: false,
+            created_at: Utc::now().to_rfc3339(),
+            format: "json".into(),
+            compliance_checks: vec![
+                format!("Cookie: ryuki_session={compliance_marker}"),
+                safe_compliance.into(),
+            ],
+            metadata: HashMap::from([
+                (
+                    "reason".into(),
+                    format!("__Host-entra_login_csrf={metadata_marker}"),
+                ),
+                ("summary".into(), safe_metadata.into()),
+            ]),
+        };
+
+        redact_evidence(&mut pack).unwrap();
+        assert!(pack.items[0].redacted);
+        assert_eq!(pack.items[0].value, REDACTED_EVIDENCE_VALUE);
+        assert_eq!(
+            pack.items[0].redacted_value.as_deref(),
+            Some(REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(
+            pack.metadata.get("reason").map(String::as_str),
+            Some(REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(
+            pack.metadata.get("summary").map(String::as_str),
+            Some(safe_metadata)
+        );
+        assert_eq!(pack.compliance_checks[0], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(pack.compliance_checks[1], safe_compliance);
+
+        let serialized = serde_json::to_string(&pack).unwrap();
+        let exported = export_evidence(&pack, "json").unwrap();
+        for marker in [
+            raw_marker,
+            replacement_marker,
+            metadata_marker,
+            compliance_marker,
+        ] {
+            assert!(!serialized.contains(marker));
+            assert!(!exported.contains(marker));
+        }
+        assert!(serialized.contains(safe_metadata));
+        assert!(serialized.contains(safe_compliance));
+        assert!(exported.contains(safe_metadata));
+        assert!(exported.contains(safe_compliance));
+    }
+
+    #[test]
+    fn test_export_defensively_redacts_historical_metadata_and_compliance_values() {
+        let metadata_marker = "SYNTH-HISTORICAL-METADATA-COOKIE-CANARY";
+        let compliance_marker = "SYNTH-HISTORICAL-COMPLIANCE-COOKIE-CANARY";
+        let safe_metadata = "ordinary historical metadata";
+        let safe_compliance = "change-policy evidence present";
+        let pack = EvidencePack {
+            id: "ev-historical-metadata-export".into(),
+            request_id: "req-historical-metadata-export".into(),
+            items: Vec::new(),
+            redacted: true,
+            created_at: Utc::now().to_rfc3339(),
+            format: "json".into(),
+            compliance_checks: vec![
+                format!("Set-Cookie: oidc_login_csrf={compliance_marker}"),
+                safe_compliance.into(),
+            ],
+            metadata: HashMap::from([
+                (
+                    "reason".into(),
+                    format!("__Host-ryuki_session={metadata_marker}"),
+                ),
+                ("summary".into(), safe_metadata.into()),
+            ]),
+        };
+
+        let exported = export_evidence(&pack, "json").unwrap();
+        assert!(!exported.contains(metadata_marker));
+        assert!(!exported.contains(compliance_marker));
+        assert!(exported.contains(safe_metadata));
+        assert!(exported.contains(safe_compliance));
+        let exported: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(exported["metadata"]["reason"], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(exported["compliance_checks"][0], REDACTED_EVIDENCE_VALUE);
+    }
+
+    #[test]
+    fn test_structured_json_redactor_handles_named_and_tuple_cookie_entries() {
+        let named_marker = "SYNTH-NAMED-COOKIE-CANARY";
+        let tuple_marker = "SYNTH-TUPLE-COOKIE-CANARY";
+        let detail = serde_json::json!({
+            "headers": [
+                {
+                    "name": "Cookie",
+                    "value": format!("session={named_marker}")
+                },
+                [
+                    "Set-Cookie",
+                    format!("session={tuple_marker}"),
+                    {"sensitive": true}
+                ]
+            ],
+            "note": "ordinary audit context"
+        });
+
+        assert!(structured_value_bears_secret(&detail));
+        let redacted = redact_json_evidence_value(&detail);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains(named_marker));
+        assert!(!serialized.contains(tuple_marker));
+        assert_eq!(redacted["note"], "ordinary audit context");
+    }
+
+    #[test]
     fn test_redact_and_export_remove_escaped_structured_authorization() {
         let marker = "SYNTH-STRUCTURED-BASIC-MARKER";
         let mut pack = EvidencePack {
@@ -607,6 +1131,7 @@ mod tests {
         // Symmetry sanity: the previously-working spellings still match.
         assert!(should_redact("yaml", "password: hunter2")); // secret-scan-allow: fake fixture
         assert!(should_redact("env", "SECRET_TOKEN=abc")); // secret-scan-allow: fake fixture
+
         // Quoted-JSON, spaced, and additional label shapes (Codex-hardening).
         assert!(should_redact("json", "{\"password\":\"hunter2\"}")); // secret-scan-allow: fake fixture
         assert!(should_redact("json", "{'token' : 'abc'}")); // secret-scan-allow: fake fixture
@@ -614,6 +1139,7 @@ mod tests {
         assert!(should_redact("dsn", "passwd = hunter2")); // secret-scan-allow: fake fixture
         assert!(should_redact("aws", "aws_secret_access_key=AKIA")); // secret-scan-allow: fake fixture
         assert!(should_redact("hdr", "Authorization: Basic dXNlcjpwYXNz")); // secret-scan-allow: fake fixture
+
         // A benign value that merely contains the word 'password' in prose,
         // without a `:`/`=` delimiter, is NOT a value-pattern hit.
         assert!(
