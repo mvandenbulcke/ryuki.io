@@ -103,6 +103,21 @@ GNUPGHOME="${signer_home}" git -C "${repo}" tag --sign v01.0.2 \
   --message 'signed malformed release tag' "${main_commit}"
 GNUPGHOME="${signer_home}" git -C "${repo}" tag --sign v1.0.2 \
   --message 'signed trusted main release' "${main_commit}"
+valid_tag_object="$(git -C "${repo}" rev-parse refs/tags/v1.0.2)"
+
+# Copying a valid signed tag object behind a different SemVer ref must not let
+# that unsigned release name inherit the original tag's trust.
+git -C "${repo}" update-ref refs/tags/v1.0.3 "${valid_tag_object}"
+
+# A higher-precedence abbreviated ref must not let signature verification
+# inspect one object while release provenance is emitted for another.
+GNUPGHOME="${signer_home}" git -C "${repo}" tag --sign v1.0.4 \
+  --message 'signed trusted main release for ref-shadow regression' "${main_commit}"
+shadow_signed_tag_object="$(git -C "${repo}" rev-parse refs/tags/v1.0.4)"
+git -C "${repo}" tag --delete v1.0.4 >/dev/null
+git -C "${repo}" tag --no-sign --annotate v1.0.4 \
+  --message 'unsigned release tag hidden by abbreviated ref' "${main_commit}"
+git -C "${repo}" update-ref refs/v1.0.4 "${shadow_signed_tag_object}"
 
 run_validator() {
   local release_tag="$1"
@@ -160,6 +175,16 @@ expect_rejected \
   v01.0.2 \
   "${main_commit}" \
   'Release tag must be an exact v-prefixed SemVer'
+expect_rejected \
+  copied-signed-tag-object \
+  v1.0.3 \
+  "${main_commit}" \
+  'Release tag ref name does not match the signed tag name'
+expect_rejected \
+  abbreviated-ref-shadow \
+  v1.0.4 \
+  "${main_commit}" \
+  'Release tag signature is missing or invalid'
 
 valid_output="${work_dir}/valid-main.output"
 : >"${valid_output}"
@@ -170,7 +195,6 @@ if ! run_validator v1.0.2 "${main_commit}" "${valid_output}" \
   exit 1
 fi
 
-valid_tag_object="$(git -C "${repo}" rev-parse refs/tags/v1.0.2)"
 grep -Fxq "commit-sha=${main_commit}" "${valid_output}" || {
   printf 'not ok - valid signed main tag emitted the wrong commit\n' >&2
   exit 1

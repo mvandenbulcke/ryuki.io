@@ -32,7 +32,7 @@ const PROVING_GROUND_VALIDATE_PATH: &str = "deploy/proving-ground/validate.sh";
 const RELEASE_SOURCE_SCRIPT_PATH: &str = "scripts/release/validate-source-v1.sh";
 const RELEASE_NOTES_SCRIPT_PATH: &str = "scripts/release/validate-notes-v1.sh";
 const RELEASE_SOURCE_SCRIPT_SHA256: &str =
-    "fc21af08e27f4073bb6e57370097c61b76770be72eefba6af91898dded08eaea";
+    "011cc7a1fda421f41ee4c22553c631ac21eb42ca0393ea02cdcc09489716e2c2";
 const RELEASE_NOTES_SCRIPT_SHA256: &str =
     "ed8d63bc13b9dd32fd51af864d19be885027ec5a196177d1ca2b57e91faf5849";
 const RELEASE_SOURCE_STEP_V1: &str = "bash scripts/release/validate-source-v1.sh";

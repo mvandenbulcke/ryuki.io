@@ -15,10 +15,35 @@ semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|
   fail "Release event SHA must be a full lowercase commit SHA"
 
 tag_ref="refs/tags/${RELEASE_TAG}"
-git show-ref --verify --quiet "${tag_ref}" || \
+tag_object="$(git show-ref --verify --hash "${tag_ref}")" || \
   fail "Release tag ref is missing from the authenticated checkout"
-[[ "$(git cat-file -t "${tag_ref}")" == "tag" ]] || \
+[[ "${tag_object}" =~ ^[0-9a-f]{40}$ ]] || \
+  fail "Release tag object must have one full lowercase object ID"
+[[ "$(git cat-file -t "${tag_object}")" == "tag" ]] || \
   fail "Release tag must be annotated; lightweight tags are forbidden"
+signed_tag_name="$(
+  git cat-file tag "${tag_object}" |
+    awk '
+      BEGIN { in_header = 1 }
+      in_header && /^$/ { in_header = 0; next }
+      in_header && /^tag / {
+        if (found) {
+          invalid = 1
+          next
+        }
+        found = 1
+        name = substr($0, 5)
+      }
+      END {
+        if (!found || invalid) {
+          exit 1
+        }
+        print name
+      }
+    '
+)" || fail "Release tag object has an invalid signed tag name"
+[[ "${signed_tag_name}" == "${RELEASE_TAG}" ]] || \
+  fail "Release tag ref name does not match the signed tag name"
 
 expected_fingerprint="$(printf '%s' "${RELEASE_SIGNING_FINGERPRINT}" | tr '[:lower:]' '[:upper:]')"
 [[ "${expected_fingerprint}" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] || \
@@ -45,7 +70,7 @@ mapfile -t policy_fingerprints < <(
 gpg --batch --import "${signing_key}" >/dev/null 2>&1 || \
   fail "Release signing public key could not be imported"
 
-verification_status="$(git -c gpg.program=gpg verify-tag --raw "${RELEASE_TAG}" 2>&1)" || {
+verification_status="$(git -c gpg.program=gpg verify-tag --raw "${tag_object}" 2>&1)" || {
   printf '%s\n' "${verification_status}" >&2
   fail "Release tag signature is missing or invalid"
 }
@@ -69,11 +94,8 @@ mapfile -t valid_signers < <(
 [[ " ${valid_signers[0]} " == *" ${expected_fingerprint} "* ]] || \
   fail "Release tag was not signed by the configured release identity"
 
-tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
-tag_object="$(git rev-parse "${tag_ref}")"
+tag_commit="$(git rev-parse "${tag_object}^{commit}")"
 event_commit="$(git rev-parse "${RELEASE_SHA}^{commit}")"
-[[ "${tag_object}" =~ ^[0-9a-f]{40}$ ]] || \
-  fail "Release tag object must have one full lowercase object ID"
 [[ "${tag_commit}" == "${event_commit}" ]] || \
   fail "Release tag commit does not match the event SHA"
 # fetch-depth: 0 populated all authenticated remote branches before checkout
