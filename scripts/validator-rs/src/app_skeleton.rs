@@ -2409,6 +2409,18 @@ pub(crate) fn inspect_portal_main(main_rs: &str) -> PortalMainInspection {
     }) {
         return PortalMainInspection::default();
     }
+    let mut middleware_bindings = file
+        .items
+        .iter()
+        .filter(|item| item_binds_value_name(item, "security_headers_middleware"));
+    let Some(syn::Item::Fn(security_headers_middleware)) = middleware_bindings.next() else {
+        return PortalMainInspection::default();
+    };
+    if middleware_bindings.next().is_some()
+        || !security_headers_middleware_forwards_response(security_headers_middleware)
+    {
+        return PortalMainInspection::default();
+    }
     let matching_mains: Vec<&syn::ItemFn> = file
         .items
         .iter()
@@ -2437,6 +2449,112 @@ pub(crate) fn inspect_portal_main(main_rs: &str) -> PortalMainInspection {
     inspect_portal_main_body(&main_fn.block)
 }
 
+fn security_headers_middleware_forwards_response(function: &syn::ItemFn) -> bool {
+    if function.sig.ident != "security_headers_middleware"
+        || function.attrs.len() != 1
+        || !function.attrs.iter().all(attribute_is_cfg_ssr)
+        || !matches!(&function.vis, syn::Visibility::Inherited)
+        || function.sig.constness.is_some()
+        || function.sig.asyncness.is_none()
+        || function.sig.unsafety.is_some()
+        || function.sig.abi.is_some()
+        || !function.sig.generics.params.is_empty()
+        || function.sig.generics.where_clause.is_some()
+        || function.sig.variadic.is_some()
+        || function.sig.inputs.len() != 2
+        || !matches!(
+            &function.sig.output,
+            syn::ReturnType::Type(_, response_type)
+                if type_path_matches(response_type, &["axum", "response", "Response"])
+        )
+        || function.block.stmts.iter().any(statement_has_attributes)
+    {
+        return false;
+    }
+
+    let mut inputs = function.sig.inputs.iter();
+    let (Some(syn::FnArg::Typed(request)), Some(syn::FnArg::Typed(next))) =
+        (inputs.next(), inputs.next())
+    else {
+        return false;
+    };
+    if !request.attrs.is_empty()
+        || !next.attrs.is_empty()
+        || local_ident(&request.pat).as_deref() != Some("request")
+        || local_ident(&next.pat).as_deref() != Some("next")
+        || !type_path_matches(&request.ty, &["axum", "extract", "Request"])
+        || !type_path_matches(&next.ty, &["axum", "middleware", "Next"])
+    {
+        return false;
+    }
+
+    // Keep the middleware a transparent response wrapper: it must await the
+    // sole downstream request, pass that exact response's headers to the
+    // security-header helper, and return the same response as its tail value.
+    let [syn::Stmt::Local(response), syn::Stmt::Expr(apply_headers, Some(_)), syn::Stmt::Expr(returned, None)] =
+        function.block.stmts.as_slice()
+    else {
+        return false;
+    };
+    let syn::Pat::Ident(response_pattern) = &response.pat else {
+        return false;
+    };
+    if response_pattern.ident != "response"
+        || response_pattern.by_ref.is_some()
+        || response_pattern.mutability.is_none()
+        || response_pattern.subpat.is_some()
+    {
+        return false;
+    }
+    let Some(response_initializer) = response
+        .init
+        .as_ref()
+        .filter(|initializer| initializer.diverge.is_none())
+        .map(|initializer| strip_paren_group(&initializer.expr))
+    else {
+        return false;
+    };
+    let syn::Expr::Await(next_response) = response_initializer else {
+        return false;
+    };
+    let syn::Expr::MethodCall(next_run) = strip_paren_group(&next_response.base) else {
+        return false;
+    };
+    if next_run.method != "run"
+        || next_run.turbofish.is_some()
+        || next_run.args.len() != 1
+        || simple_ident(&next_run.receiver).as_deref() != Some("next")
+        || next_run.args.first().and_then(simple_ident).as_deref() != Some("request")
+    {
+        return false;
+    }
+
+    let Some(apply_headers) = expression_call(apply_headers) else {
+        return false;
+    };
+    let Some(headers_mut) = apply_headers.args.first().map(strip_paren_group) else {
+        return false;
+    };
+    let syn::Expr::MethodCall(headers_mut) = headers_mut else {
+        return false;
+    };
+    expression_path(&apply_headers.func)
+        .is_some_and(|path| path_matches(path, &["apply_security_headers"]))
+        && apply_headers.args.len() == 1
+        && headers_mut.method == "headers_mut"
+        && headers_mut.turbofish.is_none()
+        && headers_mut.args.is_empty()
+        && simple_ident(&headers_mut.receiver).as_deref() == Some("response")
+        && simple_ident(returned).as_deref() == Some("response")
+}
+
+fn type_path_matches(rust_type: &syn::Type, expected: &[&str]) -> bool {
+    let syn::Type::Path(type_path) = rust_type else {
+        return false;
+    };
+    type_path.qself.is_none() && path_matches(&type_path.path, expected)
+}
+
 fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
     if block.stmts.iter().any(statement_has_attributes)
         || block.stmts.iter().any(statement_has_early_exit)
@@ -2459,6 +2577,12 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
     if imports.iter().any(|path| {
         path.last()
             .is_some_and(|segment| segment == "get_configuration")
+    }) || imports.iter().any(|path| {
+        path.last().is_some_and(|segment| segment == "middleware")
+            && !path_matches_segments(path, &["axum", "middleware"])
+    }) || imports.iter().any(|path| {
+        path.last()
+            .is_some_and(|segment| segment == "security_headers_middleware")
     }) || imports.iter().any(|path| {
         path.last()
             .is_some_and(|segment| segment == "provide_context")
@@ -2487,6 +2611,7 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                 )
         })
         || !imported(&imports, &["axum", "Router"])
+        || !imported(&imports, &["axum", "middleware"])
         || !imported(&imports, &["leptos_axum", "LeptosRoutes"])
         || !imported(
             &imports,
@@ -2568,9 +2693,11 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                     "generate_route_list_with_exclusions",
                     "get",
                     "get_configuration",
+                    "middleware",
                     "provide_context",
                     "protect_server_function_routes",
                     "registered_server_function_route_exclusions",
+                    "security_headers_middleware",
                     "shell",
                     "validate_live_provider_auth_posture",
                 ]
@@ -2763,6 +2890,7 @@ fn inspect_router_initializer(
     let mut leptos_route_index = None;
     let mut merge_index = None;
     let mut fallback_index = None;
+    let mut layer_index = None;
     let mut state_index = None;
     let mut route_binding = None;
     let mut fallback_context = None;
@@ -2836,23 +2964,38 @@ fn inspect_router_initializer(
                 }
             }
             "layer" => {
-                if method.args.len() != 1 {
+                if layer_index.is_some()
+                    || !layer_method_uses_security_headers_middleware(method, imports)
+                {
                     return None;
                 }
+                layer_index = Some(index);
             }
             _ => return None,
         }
     }
 
-    let (Some(merge_index), Some(leptos_route_index), Some(fallback_index), Some(state_index)) =
-        (merge_index, leptos_route_index, fallback_index, state_index)
+    let (
+        Some(merge_index),
+        Some(leptos_route_index),
+        Some(fallback_index),
+        Some(layer_index),
+        Some(state_index),
+    ) = (
+        merge_index,
+        leptos_route_index,
+        fallback_index,
+        layer_index,
+        state_index,
+    )
     else {
         return None;
     };
     let route_binding = route_binding?;
     if leptos_route_index >= merge_index
         || merge_index >= fallback_index
-        || fallback_index >= state_index
+        || fallback_index + 1 != layer_index
+        || layer_index + 1 != state_index
         || state_index + 1 != methods.len()
         || Some(route_binding.options) != state_options
         || Some(route_binding.context) != fallback_context
@@ -2865,6 +3008,27 @@ fn inspect_router_initializer(
         statement_index,
         exposes_health_routes: health_routes_are_get && healthz_routes == 1 && readyz_routes == 1,
     })
+}
+
+fn layer_method_uses_security_headers_middleware(
+    method: &syn::ExprMethodCall,
+    imports: &[Vec<String>],
+) -> bool {
+    if method.args.len() != 1 {
+        return false;
+    }
+    let Some(from_fn) = method.args.first().and_then(expression_call) else {
+        return false;
+    };
+    let calls_axum_from_fn = expression_path(&from_fn.func).is_some_and(|path| {
+        (path_matches(path, &["middleware", "from_fn"])
+            && imported(imports, &["axum", "middleware"]))
+            || path_matches(path, &["axum", "middleware", "from_fn"])
+    });
+    calls_axum_from_fn
+        && from_fn.args.len() == 1
+        && from_fn.args.first().and_then(simple_ident).as_deref()
+            == Some("security_headers_middleware")
 }
 
 fn leptos_route_method_binding(
@@ -4681,6 +4845,61 @@ mod tests {
     }
 
     #[test]
+    fn canonical_security_header_layer_and_passthrough_middleware_are_accepted() {
+        let inspection = inspect_portal_main(&context_aware_ssr_main());
+
+        assert!(inspection.runs_axum_leptos_ssr);
+        assert!(inspection.exposes_health_routes);
+    }
+
+    #[test]
+    fn inline_short_circuit_security_header_layer_is_rejected() {
+        let main_rs = context_aware_ssr_main();
+        let invalid_main = main_rs.replace(
+            "        .layer(middleware::from_fn(security_headers_middleware))",
+            concat!(
+                "        .layer(middleware::from_fn(|_request, _next| async {\n",
+                "            axum::response::Response::new(axum::body::Body::empty())\n",
+                "        }))"
+            ),
+        );
+
+        assert_ne!(invalid_main, main_rs);
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
+    fn duplicate_and_misplaced_security_header_layers_are_rejected() {
+        let main_rs = context_aware_ssr_main();
+        let layer = "        .layer(middleware::from_fn(security_headers_middleware))\n";
+        let duplicate_layer = main_rs.replace(layer, &format!("{layer}{layer}"));
+        let misplaced_layer = main_rs.replace(layer, "").replace(
+            "        .merge(server_function_routes)\n",
+            &format!("{layer}        .merge(server_function_routes)\n"),
+        );
+
+        for invalid_main in [duplicate_layer, misplaced_layer] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn named_security_header_middleware_must_await_the_next_service() {
+        let main_rs = context_aware_ssr_main();
+        let invalid_main = main_rs.replace(
+            "    let mut response = next.run(request).await;",
+            concat!(
+                "    let mut response =\n",
+                "        axum::response::Response::new(axum::body::Body::empty());"
+            ),
+        );
+
+        assert_ne!(invalid_main, main_rs);
+        assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+    }
+
+    #[test]
     fn context_aware_leptos_runtime_requires_shell_fallback_and_served_router() {
         let main_rs = context_aware_ssr_main();
         for invalid_main in [
@@ -4917,7 +5136,7 @@ mod tests {
     #[test]
     fn block_scoped_trusted_crate_roots_cannot_be_shadowed() {
         let main_rs = context_aware_ssr_main();
-        let insertion_point = "    use axum::{routing::{any, get}, Router};";
+        let insertion_point = "    use axum::{middleware, routing::{any, get}, Router};";
 
         assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
         for shadow in [
@@ -5324,7 +5543,7 @@ async fn main() {}"#
         r#"#[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum::{routing::{any, get}, Router};
+    use axum::{middleware, routing::{any, get}, Router};
     use leptos::prelude::*;
     use leptos_axum::{
         file_and_error_handler_with_context, generate_route_list_with_exclusions, LeptosRoutes,
@@ -5382,10 +5601,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             move || provide_context(upstream_for_fallback.clone()),
             shell,
         ))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(leptos_options);
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app.into_make_service()).await?;
     Ok(())
+}
+
+#[cfg(feature = "ssr")]
+async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    apply_security_headers(response.headers_mut());
+    response
 }
 "#
         .to_string()
