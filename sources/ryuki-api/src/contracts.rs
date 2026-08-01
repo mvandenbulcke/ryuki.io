@@ -3517,7 +3517,7 @@ fn local_request_created_key_cmp(
 
 fn retain_request_in_memory_with_limits(
     store: &mut Vec<ryuki_engine::models::Request>,
-    request: ryuki_engine::models::Request,
+    mut request: ryuki_engine::models::Request,
     max_records: usize,
     max_bytes: usize,
     max_record_bytes: usize,
@@ -3528,6 +3528,7 @@ fn retain_request_in_memory_with_limits(
     if store.len() >= max_records {
         return Err(InMemoryRequestStoreError::RecordLimit);
     }
+    ryuki_engine::evidence_pipeline::redact_request_stages(&mut request.stages);
     let request_bytes = retained_request_bytes(&request);
     if request_bytes > max_record_bytes {
         return Err(InMemoryRequestStoreError::RecordTooLarge);
@@ -3588,6 +3589,8 @@ fn replace_request_in_memory_with_limits(
         .checked_add(1)
         .filter(|version| *version > 0)
         .ok_or(InMemoryRequestStoreError::ResourceVersionOverflow)?;
+
+    ryuki_engine::evidence_pipeline::redact_request_stages(&mut request.stages);
 
     let request_bytes = retained_request_bytes(&request);
     if request_bytes > max_record_bytes {
@@ -12621,7 +12624,9 @@ mod os_baseline_handler_db_tests {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
         let pool = crate::database::get_db()?;
-        crate::database::run_migrations(pool).await.ok()?;
+        crate::database::run_migrations(pool)
+            .await
+            .expect("configured runbook database migrations must apply");
         Some(pool)
     }
 
@@ -19787,6 +19792,12 @@ async fn apply_transition_audited(
     let actor_principal = authenticated_principal_id(session)?.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
 
+    // This is the common durable stage sink. Redact both the cumulative stage
+    // history and the stage-shaped plan before either JSON value reaches the
+    // requests table; read-side sanitization remains for historical rows.
+    let safe_stages_json = sanitize_stages_for_portal(&artifacts.stages_json);
+    let safe_plan_json = artifacts.plan_json.as_ref().map(sanitize_stages_for_portal);
+
     // The CAS binds status, approval epoch, and the database-owned resource
     // version, so a lifecycle transition can never land against a different
     // approval cycle or a same-status mutation resolved earlier. Rework
@@ -19806,8 +19817,8 @@ async fn apply_transition_audited(
     let maybe_row: Option<DbRequestRow> = sqlx::query_as(&update_sql)
         .bind(to_status)
         .bind(to_stage)
-        .bind(&artifacts.stages_json)
-        .bind(&artifacts.plan_json)
+        .bind(&safe_stages_json)
+        .bind(&safe_plan_json)
         .bind(&artifacts.validation_json)
         .bind(&artifacts.approval_route_json)
         .bind(artifacts.advance_approval_epoch)
@@ -19988,6 +19999,10 @@ async fn commit_transition_side_effects(
     // audit, and decision side effects back together. The no-DB path does not
     // touch this table.
     if let (Some(role), Some(decision)) = (approval_role, approval_decision) {
+        // Keep this final ledger sink independently safe even if a future
+        // caller bypasses the lifecycle handler's earlier normalization.
+        let safe_approval_reason = approval_reason
+            .map(|reason| ryuki_engine::evidence_pipeline::redact_sensitive_text("reason", reason));
         let inserted = sqlx::query(
             "INSERT INTO request_approval_decisions \
                  (request_id, approval_epoch, role, decision, principal_binding_state, \
@@ -20008,7 +20023,7 @@ async fn commit_transition_side_effects(
         .bind(row.approval_epoch)
         .bind(role)
         .bind(decision)
-        .bind(approval_reason)
+        .bind(safe_approval_reason.as_deref())
         .bind(approval_basis_resource_version)
         .bind(actor_principal_id.into_uuid())
         .execute(&mut *tx)
@@ -20259,7 +20274,9 @@ async fn apply_approval_decision_audited(
     let decisions = to_decisions(after);
     let quorum = evaluate_quorum(&decisions, req, req);
 
-    let stages_json = serde_json::to_value(&approved.stages).unwrap_or_else(|_| json!([]));
+    let stages_json = sanitize_stages_for_portal(
+        &serde_json::to_value(&approved.stages).unwrap_or_else(|_| json!([])),
+    );
     let approval_route_json =
         serde_json::to_value(&approved.approval_route).unwrap_or_else(|_| json!([]));
     let planned_db = request_status_to_db(&ryuki_engine::models::RequestStatus::Planned);
@@ -20777,7 +20794,9 @@ async fn requests_create(
         // intake stage(s) the engine just produced. approval_route is '[]' at
         // intake; plan/validation_results stay NULL until those transitions.
         let payload = build_request_payload(&request_type, &body, criticality);
-        let stages_json = serde_json::to_value(&request.stages).unwrap_or_else(|_| json!([]));
+        let stages_json = sanitize_stages_for_portal(
+            &serde_json::to_value(&request.stages).unwrap_or_else(|_| json!([])),
+        );
         let approval_route_json =
             serde_json::to_value(&request.approval_route).unwrap_or_else(|_| json!([]));
         // All three security identities are the same exact opaque principal at
@@ -20887,7 +20906,7 @@ async fn requests_create(
         response.id = request_id;
         response.created_at = row.created_at.to_rfc3339();
         response.updated_at = row.updated_at.to_rfc3339();
-        return Ok(Json(serde_json::to_value(&response).unwrap_or_default()));
+        return Ok(Json(request_for_safe_response(&response)));
     }
 
     // Capacity is reserved before reporting an applied create. A full local
@@ -20914,7 +20933,7 @@ async fn requests_create(
     )
     .await
     .map_err(db_error)?;
-    Ok(Json(serde_json::to_value(&request).unwrap_or_default()))
+    Ok(Json(request_for_safe_response(&request)))
 }
 
 /// Current lifecycle stage name for an in-memory request record: the first
@@ -21404,80 +21423,98 @@ async fn requests_list_impl(
 /// serialized by serde from `Vec<ryuki_engine::models::Stage>`). The output
 /// replaces each evidence item's serialized `value` field with the safe form.
 ///
-/// Non-array or malformed inputs are returned as-is (defensive; the DB should
-/// always store a valid array).
+/// Non-array or malformed inputs are recursively redacted rather than returned
+/// verbatim. Historical corruption must fail closed at this final output
+/// boundary even when it cannot be decoded as the current Stage shape.
 fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = stages.as_array() else {
-        return stages.clone();
+        return ryuki_engine::evidence_pipeline::redact_json_evidence_value(stages);
     };
     let sanitized: Vec<serde_json::Value> = arr
         .iter()
         .map(|stage| {
-            let Some(evidence_arr) = stage.get("evidence").and_then(|e| e.as_array()) else {
-                // No evidence array — pass stage through unchanged.
-                return stage.clone();
-            };
-            let sanitized_evidence: Vec<serde_json::Value> = evidence_arr
-                .iter()
-                .map(|item| {
-                    let is_redacted = item
-                        .get("redacted")
-                        .and_then(|r| r.as_bool())
-                        .unwrap_or(false);
-                    let item_key = item
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let item_value = item
-                        .get("value")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let dynamically_sensitive =
-                        ryuki_engine::evidence_pipeline::should_redact(item_key, item_value);
-                    let supplied_redacted_value_is_sensitive = item
-                        .get("redacted_value")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|candidate| {
-                            ryuki_engine::evidence_pipeline::should_redact("", candidate)
-                        });
-                    if !is_redacted
-                        && !dynamically_sensitive
-                        && !supplied_redacted_value_is_sensitive
-                    {
-                        return item.clone();
-                    }
-                    // Newly detected or hostile supplied values always collapse
-                    // to the canonical marker. Existing pre-redacted safe
-                    // display text remains compatible.
-                    let safe_value =
-                        if dynamically_sensitive || supplied_redacted_value_is_sensitive {
-                            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
-                        } else {
-                            item.get("redacted_value")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
-                        };
-                    let mut out = item.clone();
-                    if let Some(obj) = out.as_object_mut() {
-                        obj.insert(
-                            "value".to_string(),
-                            serde_json::Value::String(safe_value.to_string()),
-                        );
-                        obj.insert(
-                            "redacted_value".to_string(),
-                            serde_json::Value::String(safe_value.to_string()),
-                        );
-                        obj.insert("redacted".to_string(), serde_json::Value::Bool(true));
-                    }
-                    out
-                })
-                .collect();
+            if !stage.is_object() {
+                return ryuki_engine::evidence_pipeline::redact_json_evidence_value(stage);
+            }
             let mut stage_out = stage.clone();
             if let Some(obj) = stage_out.as_object_mut() {
-                obj.insert(
-                    "evidence".to_string(),
-                    serde_json::Value::Array(sanitized_evidence),
-                );
+                if let Some(evidence) = stage.get("evidence") {
+                    let sanitized_evidence = if let Some(evidence_arr) = evidence.as_array() {
+                        serde_json::Value::Array(
+                            evidence_arr
+                                .iter()
+                                .map(|item| {
+                                    if !item.is_object()
+                                        || !item.get("key").is_some_and(serde_json::Value::is_string)
+                                        || !item
+                                            .get("value")
+                                            .is_some_and(serde_json::Value::is_string)
+                                    {
+                                        return ryuki_engine::evidence_pipeline::redact_json_evidence_value(
+                                            item,
+                                        );
+                                    }
+                            let is_redacted = item
+                                .get("redacted")
+                                .and_then(|r| r.as_bool())
+                                .unwrap_or(false);
+                            let item_key = item
+                                .get("key")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            let item_value = item
+                                .get("value")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            let dynamically_sensitive =
+                                ryuki_engine::evidence_pipeline::should_redact(item_key, item_value);
+                            let supplied_redacted_value_is_sensitive = item
+                                .get("redacted_value")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|candidate| {
+                                    ryuki_engine::evidence_pipeline::should_redact("", candidate)
+                                });
+                            if !is_redacted
+                                && !dynamically_sensitive
+                                && !supplied_redacted_value_is_sensitive
+                            {
+                                return item.clone();
+                            }
+                            // Newly detected or hostile supplied values always collapse
+                            // to the canonical marker. Existing pre-redacted safe
+                            // display text remains compatible.
+                            let safe_value = if dynamically_sensitive
+                                || supplied_redacted_value_is_sensitive
+                            {
+                                ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+                            } else {
+                                item.get("redacted_value")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or(
+                                        ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE,
+                                    )
+                            };
+                            let mut out = item.clone();
+                            if let Some(obj) = out.as_object_mut() {
+                                obj.insert(
+                                    "value".to_string(),
+                                    serde_json::Value::String(safe_value.to_string()),
+                                );
+                                obj.insert(
+                                    "redacted_value".to_string(),
+                                    serde_json::Value::String(safe_value.to_string()),
+                                );
+                                obj.insert("redacted".to_string(), serde_json::Value::Bool(true));
+                            }
+                            out
+                        })
+                                .collect(),
+                        )
+                    } else {
+                        ryuki_engine::evidence_pipeline::redact_json_evidence_value(evidence)
+                    };
+                    obj.insert("evidence".to_string(), sanitized_evidence);
+                }
                 if let Some(metadata) = stage.get("metadata") {
                     obj.insert(
                         "metadata".to_string(),
@@ -21489,6 +21526,18 @@ fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(sanitized)
+}
+
+/// Serialize one request for an API mutation/read response while applying the
+/// same stage evidence and metadata redaction used by the detail endpoint.
+fn request_for_safe_response(request: &ryuki_engine::models::Request) -> Value {
+    let mut value = serde_json::to_value(request).unwrap_or_default();
+    if let Some(stages) = value.get("stages").cloned() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("stages".to_string(), sanitize_stages_for_portal(&stages));
+        }
+    }
+    value
 }
 
 /// Drift-guard source for the two human LivePlan approval routes. Both accept
@@ -22871,7 +22920,9 @@ async fn requests_plan(
         )
         .await?;
 
-        return Ok(Json(serde_json::to_value(&stages).unwrap_or_default()));
+        return Ok(Json(sanitize_stages_for_portal(
+            &serde_json::to_value(&stages).unwrap_or_default(),
+        )));
     }
 
     // ── No-DB branch (Task 3 restructure) ───────────────────────────────────
@@ -22948,7 +22999,9 @@ async fn requests_plan(
     )
     .await?;
 
-    Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
+    Ok(Json(sanitize_stages_for_portal(
+        &serde_json::to_value(&stages).unwrap_or_default(),
+    )))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -23082,8 +23135,7 @@ async fn approve_one(
         // no-DB arm below. A PARTIAL approve returns 200 with status still
         // 'planned', so callers MUST read `quorum.quorum_met` rather than assume
         // approval.
-        let mut request_json =
-            serde_json::to_value(db_row_to_request(&row, request_id)).unwrap_or_default();
+        let mut request_json = request_for_safe_response(&db_row_to_request(&row, request_id));
         if let Some(obj) = request_json.as_object_mut() {
             let mut quorum_json = serde_json::to_value(&quorum).unwrap_or_else(|_| json!({}));
             quorum_json["approval_epoch"] = json!(row.approval_epoch);
@@ -23167,7 +23219,7 @@ async fn approve_one(
         1,
         1,
     );
-    let mut approved_json = serde_json::to_value(&approved).unwrap_or_default();
+    let mut approved_json = request_for_safe_response(&approved);
     if let Some(obj) = approved_json.as_object_mut() {
         let mut quorum_json = serde_json::to_value(&quorum).unwrap_or_else(|_| json!({}));
         quorum_json["approval_epoch"] = Value::Null;
@@ -23221,7 +23273,7 @@ async fn requests_lock(
 
         apply_persisted_request_metadata(&mut locked, &updated);
 
-        return Ok(Json(serde_json::to_value(&locked).unwrap_or_default()));
+        return Ok(Json(request_for_safe_response(&locked)));
     }
 
     let mut store = request_store().lock().await;
@@ -23258,7 +23310,7 @@ async fn requests_lock(
     )
     .await?;
 
-    Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
+    Ok(Json(request_for_safe_response(&locked)))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -23329,7 +23381,9 @@ async fn requests_execute(
         // transaction, so a dispatched request always has its job(s) and a
         // job always has a dispatched request.
         let executing = request_lifecycle::begin_execution(&request).map_err(map_engine_error)?;
-        let stages_json = serde_json::to_value(&executing.stages).unwrap_or_else(|_| json!([]));
+        let stages_json = sanitize_stages_for_portal(
+            &serde_json::to_value(&executing.stages).unwrap_or_else(|_| json!([])),
+        );
         let platform = request.site.clone();
 
         let mut tx = pool.begin().await.map_err(db_error)?;
@@ -23485,7 +23539,7 @@ async fn requests_execute(
     )
     .await?;
 
-    Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
+    Ok(Json(request_for_safe_response(&executed)))
 }
 
 /// Result of materializing a request's execution: either today's single job
@@ -26168,7 +26222,7 @@ async fn reject_one(
 
         apply_persisted_request_metadata(&mut rejected, &updated);
 
-        return Ok(serde_json::to_value(&rejected).unwrap_or_default());
+        return Ok(request_for_safe_response(&rejected));
     }
 
     // Separation of duties: the rejecting approver must not be the creator. Read
@@ -26237,7 +26291,7 @@ async fn reject_one(
     .await
     .map_err(db_error)?;
 
-    Ok(serde_json::to_value(&rejected).unwrap_or_default())
+    Ok(request_for_safe_response(&rejected))
 }
 
 /// POST /api/requests/{id}/rework — send a request back to Intake for the
@@ -26329,7 +26383,7 @@ async fn rework_one(
         )
         .await?;
         apply_persisted_request_metadata(&mut reworked, &updated);
-        return Ok(serde_json::to_value(&reworked).unwrap_or_default());
+        return Ok(request_for_safe_response(&reworked));
     }
 
     let mut store = request_store().lock().await;
@@ -26366,7 +26420,7 @@ async fn rework_one(
     )
     .await
     .map_err(db_error)?;
-    Ok(serde_json::to_value(&reworked).unwrap_or_default())
+    Ok(request_for_safe_response(&reworked))
 }
 
 /// POST /api/requests/{id}/fail — mark a request terminally Failed (e.g. an
@@ -26454,7 +26508,7 @@ async fn fail_one(
         )
         .await?;
         apply_persisted_request_metadata(&mut failed, &updated);
-        return Ok(serde_json::to_value(&failed).unwrap_or_default());
+        return Ok(request_for_safe_response(&failed));
     }
 
     let mut store = request_store().lock().await;
@@ -26492,7 +26546,7 @@ async fn fail_one(
     )
     .await
     .map_err(db_error)?;
-    Ok(serde_json::to_value(&failed).unwrap_or_default())
+    Ok(request_for_safe_response(&failed))
 }
 
 /// POST /api/requests/{id}/cancel — withdraw a request before execution begins.
@@ -26573,7 +26627,7 @@ async fn cancel_one(
 
         apply_persisted_request_metadata(&mut cancelled, &updated);
 
-        return Ok(serde_json::to_value(&cancelled).unwrap_or_default());
+        return Ok(request_for_safe_response(&cancelled));
     }
 
     let mut store = request_store().lock().await;
@@ -26621,7 +26675,7 @@ async fn cancel_one(
     .await
     .map_err(db_error)?;
 
-    Ok(serde_json::to_value(&cancelled).unwrap_or_default())
+    Ok(request_for_safe_response(&cancelled))
 }
 
 /// Body for a batch cancel: the request ids and a shared reason.
@@ -41319,20 +41373,35 @@ struct RunbookListQuery {
 }
 
 const RUNBOOK_SITE_AUTHORITY_CHANGED: &str =
-    "runbook site is unknown or inactive; reload and retry";
+    "runbook site is unknown, inactive, or has changed authority; restart the execution";
 
 async fn lock_runbook_active_site(
     conn: &mut sqlx::PgConnection,
     site: &str,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    if crate::repos::site_registry::lock_active(conn, site)
-        .await
-        .map_err(db_error)?
-    {
-        Ok(())
-    } else {
-        Err(status_409(RUNBOOK_SITE_AUTHORITY_CHANGED))
-    }
+    expected_authority_epoch: Option<i64>,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    let authority_epoch: Option<i64> = sqlx::query_scalar(
+        "SELECT authority_epoch FROM site_registry \
+         WHERE unlocode COLLATE \"C\" = $1::text COLLATE \"C\" \
+           AND active = TRUE \
+           AND ($2::bigint IS NULL OR authority_epoch = $2) \
+         FOR SHARE",
+    )
+    .bind(site)
+    .bind(expected_authority_epoch)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    authority_epoch.ok_or_else(|| status_409(RUNBOOK_SITE_AUTHORITY_CHANGED))
+}
+
+fn bound_runbook_site_authority_epoch(
+    execution: &runbook_execution::RunbookExecution,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    execution
+        .site_authority_epoch
+        .filter(|epoch| *epoch > 0)
+        .ok_or_else(|| status_409(RUNBOOK_SITE_AUTHORITY_CHANGED))
 }
 
 async fn runbook_catalog() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -41359,12 +41428,14 @@ async fn runbook_start(
 
     // actor = authenticated caller (from request extensions), never a client
     // body field — the audit trail must name the real principal.
-    let exec = runbook_execution::build_execution(&body.runbook_id, &body.site, &actor)
+    let mut exec = runbook_execution::build_execution(&body.runbook_id, &body.site, &actor)
         .map_err(|e| status_400(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
-    lock_runbook_active_site(&mut tx, &exec.site).await?;
-    crate::repos::runbook_executions::insert(&mut *tx, &exec)
+    let authority_epoch = lock_runbook_active_site(&mut tx, &exec.site, None).await?;
+    runbook_execution::bind_site_authority_epoch(&mut exec, authority_epoch)
+        .map_err(|error| status_409(&error))?;
+    crate::repos::runbook_executions::insert(&mut *tx, &mut exec)
         .await
         .map_err(db_error)?;
     audit::record_audit_tx(
@@ -41378,6 +41449,7 @@ async fn runbook_start(
                 "runbook_id": exec.runbook_id,
                 "execution_id": exec.id,
                 "site": exec.site,
+                "site_authority_epoch": exec.site_authority_epoch,
             }),
         ),
     )
@@ -41425,7 +41497,8 @@ async fn runbook_execute_step(
         runbook_execution::execute_step_pure(&exec, step_order).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
-    lock_runbook_active_site(&mut tx, &updated.site).await?;
+    let authority_epoch = bound_runbook_site_authority_epoch(&updated)?;
+    lock_runbook_active_site(&mut tx, &updated.site, Some(authority_epoch)).await?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -41485,7 +41558,8 @@ async fn runbook_approve(
         runbook_execution::approve_execution_pure(&exec, &actor).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
-    lock_runbook_active_site(&mut tx, &updated.site).await?;
+    let authority_epoch = bound_runbook_site_authority_epoch(&updated)?;
+    lock_runbook_active_site(&mut tx, &updated.site, Some(authority_epoch)).await?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -41532,7 +41606,8 @@ async fn runbook_complete(
     let updated = runbook_execution::complete_execution_pure(&exec).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
-    lock_runbook_active_site(&mut tx, &updated.site).await?;
+    let authority_epoch = bound_runbook_site_authority_epoch(&updated)?;
+    lock_runbook_active_site(&mut tx, &updated.site, Some(authority_epoch)).await?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -57006,6 +57081,49 @@ mod db_lifecycle_tests {
         .expect("seed current-epoch request approval");
     }
 
+    async fn seed_exact_approval_principal(
+        pool: &PgPool,
+        request_id: Uuid,
+        label: &str,
+        roles: &[String],
+    ) -> crate::principal_registry::PrincipalBinding {
+        let subject = format!("{label}-{request_id}");
+        seed_test_principal_binding(pool, "local", &subject, roles)
+            .await
+            .1
+    }
+
+    async fn seed_exact_current_decision(
+        pool: &PgPool,
+        request_id: Uuid,
+        label: &str,
+        role: &str,
+        decision: &str,
+        reason: Option<&str>,
+    ) -> crate::principal_registry::PrincipalBinding {
+        let roles = vec![role.to_string()];
+        let binding = seed_exact_approval_principal(pool, request_id, label, &roles).await;
+        sqlx::query(
+            "INSERT INTO request_approval_decisions \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version, reason) \
+             SELECT id, approval_epoch, $2, $3, 'exact-v1', $4, $5, $6, $7 \
+             FROM requests WHERE id = $1",
+        )
+        .bind(request_id)
+        .bind(role)
+        .bind(decision)
+        .bind(binding.principal_id.into_uuid())
+        .bind(binding.principal_lifecycle_version)
+        .bind(binding.principal_authority_version)
+        .bind(reason)
+        .execute(pool)
+        .await
+        .expect("seed exact current-epoch approval decision");
+        binding
+    }
+
     async fn read_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
         sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
@@ -57155,18 +57273,35 @@ mod db_lifecycle_tests {
             .await
             .expect("seed owner-bound request");
         }
+        // Migration 199 quarantines pre-cutover subject labels and rejects every
+        // new non-opaque request. Recreate that historical row only in this
+        // rollback-safe fixture path, with ordinary trigger enforcement restored
+        // before any production read is exercised.
+        let mut legacy_fixture_tx = pool.begin().await.expect("begin legacy request fixture");
+        sqlx::query("SET LOCAL session_replication_role = 'replica'")
+            .execute(&mut *legacy_fixture_tx)
+            .await
+            .expect("suppress origin triggers for the pre-cutover request fixture");
         sqlx::query(
             "INSERT INTO requests (id, request_type, status, stage, site, environment, \
-             name, cpu, memory_gb, legacy_created_by_label, legacy_requester_label, \
-             legacy_owner_label) \
+             name, cpu, memory_gb, principal_binding_state, legacy_created_by_label, \
+             legacy_requester_label, legacy_owner_label) \
              VALUES ($1, 'server-deployment', 'draft', 'request', 'DEFRA', 'production', \
-                     'owner-legacy', 2, 4, $2, $2, $2)",
+                     'owner-legacy', 2, 4, 'legacy-quarantined', $2, $2, $2)",
         )
         .bind(legacy_id)
         .bind(&alice)
-        .execute(pool)
+        .execute(&mut *legacy_fixture_tx)
         .await
         .expect("seed quarantined legacy request");
+        sqlx::query("SET LOCAL session_replication_role = 'origin'")
+            .execute(&mut *legacy_fixture_tx)
+            .await
+            .expect("restore request trigger enforcement after the pre-cutover fixture");
+        legacy_fixture_tx
+            .commit()
+            .await
+            .expect("commit quarantined legacy request fixture");
 
         let mut requester = request_read_session(&alice, ryuki_engine::auth::APP_ROLE_REQUESTER);
         requester.principal_id = Some(alice_binding.principal_id);
@@ -69331,15 +69466,21 @@ mod db_lifecycle_tests {
     async fn seed_b1b_step_request(
         pool: &PgPool,
         status: &str,
-        requester: &str,
-    ) -> (Uuid, Uuid, String, ReviewedLivePlanSelection) {
+        _requester: &str,
+    ) -> (Uuid, Uuid, String, ReviewedLivePlanSelection, Uuid) {
         let req_id = Uuid::new_v4();
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by, requester) \
-             VALUES ($1, 'server-deployment', 'executing', 'execute', 'DEFRA', 'production', 'first-test-vm', 2, 4, $2, $2)",
+            "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+                  principal_binding_state, created_by_principal_id, requester_principal_id, \
+                  owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'executing', 'execute', 'DEFRA', 'production', \
+                     'first-test-vm', 2, 4, 'exact-v1', $2, $2, $2)",
         )
         .bind(req_id)
-        .bind(requester)
+        .bind(requester_principal_id)
         .execute(pool)
         .await
         .expect("seed executing request");
@@ -69408,7 +69549,13 @@ mod db_lifecycle_tests {
             &plan_digest,
             reviewed_request.request_resource_version,
         );
-        (req_id, step_id, plan_agent_id, reviewed_selection)
+        (
+            req_id,
+            step_id,
+            plan_agent_id,
+            reviewed_selection,
+            requester_principal_id,
+        )
     }
 
     #[tokio::test]
@@ -69421,7 +69568,7 @@ mod db_lifecycle_tests {
         crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
             &rand::random(),
         ));
-        let (req_id, step_id, plan_agent_id, reviewed_selection) =
+        let (req_id, step_id, plan_agent_id, reviewed_selection, _) =
             seed_b1b_step_request(pool, "AwaitingApproval", "orig-requester").await;
 
         let admin = admin_session("step-approver");
@@ -69491,13 +69638,18 @@ mod db_lifecycle_tests {
         crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
             &rand::random(),
         ));
-        let (req_id, _step_id, plan_agent_id, reviewed_selection) =
+        let (req_id, _step_id, plan_agent_id, reviewed_selection, requester_principal_id) =
             seed_b1b_step_request(pool, "AwaitingApproval", "self-approver").await;
 
         // Approver == requester -> 403 (separation of duties).
+        let mut requester = admin_session("self-approver");
+        requester.principal_id = Some(
+            PrincipalId::from_uuid(requester_principal_id)
+                .expect("request fixture principal is non-nil"),
+        );
         let Err((st, _)) = requests_step_approve_live_apply(
             Path((req_id.to_string(), "a".to_string())),
-            AuthExtractor(admin_session("self-approver")),
+            AuthExtractor(requester),
             Json(reviewed_selection),
         )
         .await
@@ -69544,7 +69696,7 @@ mod db_lifecycle_tests {
             &rand::random(),
         ));
         // Step is still Planning (its LivePlan hasn't completed) -> not approvable.
-        let (req_id, _step_id, plan_agent_id, reviewed_selection) =
+        let (req_id, _step_id, plan_agent_id, reviewed_selection, _) =
             seed_b1b_step_request(pool, "Planning", "orig-requester").await;
 
         let Err((st, _)) = requests_step_approve_live_apply(
@@ -69593,6 +69745,9 @@ mod db_lifecycle_tests {
             ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
         ];
+        let (_, binding) =
+            seed_test_principal_binding(pool, "local", "dc-approver-p2", &session.roles).await;
+        session.principal_id = Some(binding.principal_id);
 
         let Ok(Json(created)) = requests_create(
             AuthExtractor(session.clone()),
@@ -69632,7 +69787,8 @@ mod db_lifecycle_tests {
         assert_eq!(count, 1, "exactly one approval decision row for the role");
 
         let (decision, actor): (String, String) = sqlx::query_as(
-            "SELECT decision, actor FROM request_approval_decisions WHERE request_id = $1 AND role = $2",
+            "SELECT decision, actor_principal_id::text AS actor \
+             FROM request_approval_decisions WHERE request_id = $1 AND role = $2",
         )
         .bind(id)
         .bind(role)
@@ -69640,7 +69796,11 @@ mod db_lifecycle_tests {
         .await
         .expect("fetch decision");
         assert_eq!(decision, "approved");
-        assert_eq!(actor, "dc-approver-p2", "actor is the verified principal");
+        assert_eq!(
+            actor,
+            binding.principal_id.to_string(),
+            "actor is the verified opaque principal"
+        );
 
         cleanup_request(pool, id).await;
     }
@@ -69989,11 +70149,18 @@ mod db_lifecycle_tests {
         // scope": seed a GBLON row directly.
         let in_scope = seed_request(pool, "planned", "approve").await;
         let out_id = Uuid::new_v4();
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
-             VALUES ($1, 'server-deployment', 'planned', 'approve', 'GBLON', 'production', 'scope-test', 2, 4, 'requester-db')",
+            "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+                  principal_binding_state, created_by_principal_id, requester_principal_id, \
+                  owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'planned', 'approve', 'GBLON', 'production', \
+                     'scope-test', 2, 4, 'exact-v1', $2, $2, $2)",
         )
         .bind(out_id)
+        .bind(requester_principal_id)
         .execute(pool)
         .await
         .expect("seed GBLON request");
@@ -70114,7 +70281,7 @@ mod db_lifecycle_tests {
             let detail: Value = sqlx::query_scalar(
                 "SELECT detail FROM audit_log \
                  WHERE request_id = $1 AND action = $2 AND outcome = 'applied' \
-                 ORDER BY created_at DESC LIMIT 1",
+                 ORDER BY occurred_at DESC LIMIT 1",
             )
             .bind(id)
             .bind(action)
@@ -70192,16 +70359,23 @@ mod db_lifecycle_tests {
         // stage differs: "plan" vs "approve".
         let seed_with_stage = |stage_name: &'static str| async move {
             let id = Uuid::new_v4();
+            let requester_principal_id =
+                crate::principal_registry::seed_request_fixture_principal(pool).await;
             let stages = format!(
                 r#"[{{"name":"{stage_name}","status":"Pending","started_at":null,"completed_at":null,"evidence":[],"metadata":{{}}}}]"#
             );
             sqlx::query(
-                "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by, stages) \
-                 VALUES ($1, 'server-deployment', 'approved', $2, 'DEFRA', 'production', 'stage-test', 2, 4, 'requester-db', $3::jsonb)",
+                "INSERT INTO requests \
+                     (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+                      stages, principal_binding_state, created_by_principal_id, \
+                      requester_principal_id, owner_principal_id) \
+                 VALUES ($1, 'server-deployment', 'approved', $2, 'DEFRA', 'production', \
+                         'stage-test', 2, 4, $3::jsonb, 'exact-v1', $4, $4, $4)",
             )
             .bind(id)
             .bind(stage_name)
             .bind(&stages)
+            .bind(requester_principal_id)
             .execute(pool)
             .await
             .expect("seed staged request");
@@ -70521,11 +70695,18 @@ mod db_lifecycle_tests {
         };
         let in_scope = seed_request(pool, "planned", "approve").await;
         let out_id = Uuid::new_v4();
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
-             VALUES ($1, 'server-deployment', 'planned', 'approve', 'GBLON', 'production', 'scope-test', 2, 4, 'requester-db')",
+            "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+                  principal_binding_state, created_by_principal_id, requester_principal_id, \
+                  owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'planned', 'approve', 'GBLON', 'production', \
+                     'scope-test', 2, 4, 'exact-v1', $2, $2, $2)",
         )
         .bind(out_id)
+        .bind(requester_principal_id)
         .execute(pool)
         .await
         .expect("seed GBLON request");
@@ -70585,15 +70766,19 @@ mod db_lifecycle_tests {
     async fn seed_planned_empty_route(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
         let approval_route = serde_json::json!([]);
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
             "INSERT INTO requests \
-             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
-              created_by, approval_route) \
+                 (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+                  approval_route, principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', 'planned', 'approve', 'DEFRA', 'production', \
-                     'pending-test', 2, 4, 'requester-db', $2)",
+                     'pending-test', 2, 4, $2, 'exact-v1', $3, $3, $3)",
         )
         .bind(id)
         .bind(&approval_route)
+        .bind(requester_principal_id)
         .execute(pool)
         .await
         .expect("seed planned request with empty approval_route");
@@ -70673,17 +70858,7 @@ mod db_lifecycle_tests {
         let id = seed_planned_empty_route(pool).await;
 
         // Insert a decision row for this request + role → it must be excluded.
-        sqlx::query(
-            "INSERT INTO request_approval_decisions \
-             (request_id, approval_epoch, role, decision, actor) \
-             SELECT id, approval_epoch, $2, 'approved', 'approver-t4' \
-             FROM requests WHERE id = $1",
-        )
-        .bind(id)
-        .bind(role)
-        .execute(pool)
-        .await
-        .expect("seed decision row");
+        seed_exact_current_decision(pool, id, "approver-t4", role, "approved", None).await;
 
         let session = dc_approver_session("approver-t4");
         let Ok(Json(body)) = approvals_pending(AuthExtractor(session)).await else {
@@ -70715,21 +70890,24 @@ mod db_lifecycle_tests {
         };
         let id = seed_planned_empty_route(pool).await;
 
-        sqlx::query(
-            "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
-             SELECT r.id, r.approval_epoch, d.role, d.decision, d.actor \
-             FROM requests AS r \
-             CROSS JOIN (VALUES \
-                 ('DatacenterApprover', 'approved', 'alice'), \
-                 ('PlatformAdmin', 'approved', 'bob') \
-             ) AS d(role, decision, actor) \
-             WHERE r.id = $1",
+        seed_exact_current_decision(
+            pool,
+            id,
+            "alice",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            "approved",
+            None,
         )
-        .bind(id)
-        .execute(pool)
-        .await
-        .expect("seed decisions");
+        .await;
+        seed_exact_current_decision(
+            pool,
+            id,
+            "bob",
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+            "approved",
+            None,
+        )
+        .await;
 
         let session = AuthSession::static_dry_run();
         let q = |rr: usize, ra: usize| ApprovalQuorumQuery {
@@ -70800,23 +70978,38 @@ mod db_lifecycle_tests {
             return;
         };
         let id = seed_planned_empty_route(pool).await;
+        let alice_roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
+        let alice = seed_exact_approval_principal(pool, id, "alice", &alice_roles).await;
+        let bob_roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
+        let bob = seed_exact_approval_principal(pool, id, "bob", &bob_roles).await;
+        let alice_actor = alice.principal_id.to_string();
+        let bob_actor = bob.principal_id.to_string();
         // Two decisions in ONE tx share decided_at (Postgres now() is tx-scoped), so
         // the id tie-breaker decides order: the approve (inserted first → lower id →
         // NULL reason) precedes the reject (present reason). This exercises exactly the
         // deterministic-ordering fix codex required.
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor, reason) \
-             SELECT r.id, r.approval_epoch, d.role, d.decision, d.actor, d.reason \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version, reason) \
+             SELECT r.id, r.approval_epoch, d.role, d.decision, 'exact-v1', \
+                    d.actor_principal_id, d.lifecycle_version, d.authority_version, d.reason \
              FROM requests AS r \
              CROSS JOIN (VALUES \
-                 ('DatacenterApprover', 'approved', 'alice', NULL::text), \
-                 ('PlatformAdmin', 'rejected', 'bob', \
+                 ('DatacenterApprover', 'approved', $2::uuid, $3::bigint, $4::bigint, NULL::text), \
+                 ('PlatformAdmin', 'rejected', $5::uuid, $6::bigint, $7::bigint, \
                   '__Host-ryuki_session=SYNTH-LEDGER-COOKIE-CANARY') \
-             ) AS d(role, decision, actor, reason) \
+             ) AS d(role, decision, actor_principal_id, lifecycle_version, authority_version, reason) \
              WHERE r.id = $1",
         )
         .bind(id)
+        .bind(alice.principal_id.into_uuid())
+        .bind(alice.principal_lifecycle_version)
+        .bind(alice.principal_authority_version)
+        .bind(bob.principal_id.into_uuid())
+        .bind(bob.principal_lifecycle_version)
+        .bind(bob.principal_authority_version)
         .execute(pool)
         .await
         .expect("seed decisions");
@@ -70851,7 +71044,7 @@ mod db_lifecycle_tests {
             serde_json::json!("DatacenterApprover")
         );
         assert_eq!(decisions[0]["decision"], serde_json::json!("approved"));
-        assert_eq!(decisions[0]["actor"], serde_json::json!("alice"));
+        assert_eq!(decisions[0]["actor"], serde_json::json!(alice_actor));
         assert_eq!(
             decisions[0]["reason"],
             serde_json::Value::Null,
@@ -70862,6 +71055,7 @@ mod db_lifecycle_tests {
             "decided_at present as rfc3339"
         );
         assert_eq!(decisions[1]["decision"], serde_json::json!("rejected"));
+        assert_eq!(decisions[1]["actor"], serde_json::json!(bob_actor));
         assert_eq!(
             decisions[1]["reason"],
             serde_json::json!(ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE)
@@ -71011,16 +71205,20 @@ mod db_lifecycle_tests {
 
         async fn try_insert(pool: &PgPool, rt: &str, status: &str) -> Result<Uuid, sqlx::Error> {
             let id = Uuid::new_v4();
+            let requester_principal_id =
+                crate::principal_registry::seed_request_fixture_principal(pool).await;
             sqlx::query(
                 "INSERT INTO requests \
-                 (id, request_type, status, stage, site, environment, name, cpu, \
-                  memory_gb, created_by, approval_route) \
+                     (id, request_type, status, stage, site, environment, name, cpu, \
+                      memory_gb, approval_route, principal_binding_state, \
+                      created_by_principal_id, requester_principal_id, owner_principal_id) \
                  VALUES ($1, $2, $3, 'intake', 'DEFRA', 'production', 'check-test', \
-                         2, 4, 'requester-db', '[]'::jsonb)",
+                         2, 4, '[]'::jsonb, 'exact-v1', $4, $4, $4)",
             )
             .bind(id)
             .bind(rt)
             .bind(status)
+            .bind(requester_principal_id)
             .execute(pool)
             .await?;
             Ok(id)
@@ -71126,6 +71324,41 @@ mod quorum_enforcement_db_tests {
         let pool = crate::database::get_db()?;
         crate::database::run_migrations(pool).await.ok()?;
         Some(pool)
+    }
+
+    async fn seed_quorum_principal_binding(
+        pool: &PgPool,
+        label: &str,
+        roles: &[&str],
+    ) -> crate::principal_registry::PrincipalBinding {
+        let mut roles = roles
+            .iter()
+            .map(|role| (*role).to_string())
+            .collect::<Vec<_>>();
+        roles.sort();
+        roles.dedup();
+        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+        let subject = format!("{label}-{}", Uuid::new_v4().simple());
+        let mut tx = pool.begin().await.expect("begin quorum principal seed");
+        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+            &mut tx,
+            "quorum-test",
+            "https://quorum.test",
+            &subject,
+            &crate::principal_registry::InitialHumanAuthority {
+                authority_digest: &authority_digest,
+                roles: &roles,
+                site_mode: "global",
+                site_scope: &[],
+                environment_mode: "global",
+                environment_scope: &[],
+                created_by: "quorum-test",
+            },
+        )
+        .await
+        .expect("seed exact quorum principal binding");
+        tx.commit().await.expect("commit quorum principal seed");
+        binding
     }
 
     /// A verified approver session with an explicit principal AND approval role,
@@ -71565,13 +71798,23 @@ mod quorum_enforcement_db_tests {
             return;
         };
         let id = seed_planned(pool, "q-legacy-writer").await;
+        let actor = seed_quorum_principal_binding(
+            pool,
+            "legacy-writer",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+        .await;
 
         let epochless = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, role, decision, actor) \
-             VALUES ($1, 'DatacenterApprover', 'approved', 'old-replica')",
+                 (request_id, role, decision, principal_binding_state, actor_principal_id, \
+                  actor_principal_lifecycle_version, actor_principal_authority_version) \
+             VALUES ($1, 'DatacenterApprover', 'approved', 'exact-v1', $2, $3, $4)",
         )
         .bind(id)
+        .bind(actor.principal_id.into_uuid())
+        .bind(actor.principal_lifecycle_version)
+        .bind(actor.principal_authority_version)
         .execute(pool)
         .await;
         assert!(epochless.is_err(), "epochless legacy writes must fail");
@@ -71579,11 +71822,16 @@ mod quorum_enforcement_db_tests {
         let current_epoch = read_row(pool, id).await.approval_epoch;
         let stale = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
-             VALUES ($1, $2, 'DatacenterApprover', 'approved', 'stale-writer')",
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
+             VALUES ($1, $2, 'DatacenterApprover', 'approved', 'exact-v1', $3, $4, $5)",
         )
         .bind(id)
         .bind(current_epoch + 1)
+        .bind(actor.principal_id.into_uuid())
+        .bind(actor.principal_lifecycle_version)
+        .bind(actor.principal_authority_version)
         .execute(pool)
         .await;
         assert!(stale.is_err(), "non-current explicit epochs must fail");
@@ -71716,6 +71964,8 @@ mod quorum_enforcement_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
         let mut tx = pool.begin().await.expect("begin resource-version test");
         sqlx::query("SET LOCAL ryuki.force_request_runtime_contract = 'runtime-v1'")
             .execute(&mut *tx)
@@ -71726,13 +71976,15 @@ mod quorum_enforcement_db_tests {
         let inserted_version: i64 = sqlx::query_scalar(
             "INSERT INTO requests \
                  (id, request_type, status, stage, site, environment, name, cpu, \
-                  memory_gb, created_by, requester, owner, resource_version) \
+                  memory_gb, principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id, resource_version) \
              VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', \
-                     'production', 'resource-version-fixture', 2, 4, \
-                     'version-maker', 'version-maker', 'version-maker', 99) \
+                     'production', 'resource-version-fixture', 2, 4, 'exact-v1', \
+                     $2, $2, $2, 99) \
              RETURNING resource_version",
         )
         .bind(id)
+        .bind(requester_principal_id)
         .fetch_one(&mut *tx)
         .await
         .expect("database normalizes a caller-selected insert version");
@@ -71882,15 +72134,32 @@ mod quorum_enforcement_db_tests {
         let other_name = format!("immutable-other-{}", Uuid::new_v4());
         let original_request = seed_planned(pool, &original_name).await;
         let other_request = seed_planned(pool, &other_name).await;
+        let actor = seed_quorum_principal_binding(
+            pool,
+            "immutable-test",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+        .await;
+        let replacement_actor = seed_quorum_principal_binding(
+            pool,
+            "immutable-replacement",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+        .await;
 
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor, decided_at) \
-             SELECT id, approval_epoch, 'DatacenterApprover', 'approved', 'immutable-test', \
-                    TIMESTAMPTZ '2000-01-01 00:00:00+00' \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version, decided_at) \
+             SELECT id, approval_epoch, 'DatacenterApprover', 'approved', 'exact-v1', \
+                    $2, $3, $4, TIMESTAMPTZ '2000-01-01 00:00:00+00' \
              FROM requests WHERE id = $1",
         )
         .bind(original_request)
+        .bind(actor.principal_id.into_uuid())
+        .bind(actor.principal_lifecycle_version)
+        .bind(actor.principal_authority_version)
         .execute(pool)
         .await
         .expect("seed immutable approval decision");
@@ -71926,12 +72195,13 @@ mod quorum_enforcement_db_tests {
 
         let rewrite = sqlx::query(
             "UPDATE request_approval_decisions \
-             SET decision = 'rejected', actor = 'replacement-actor', \
+             SET decision = 'rejected', actor_principal_id = $2, \
                  decided_at = TIMESTAMPTZ '2000-01-01 00:00:00+00', \
                  reason = 'rewritten evidence' \
              WHERE request_id = $1 AND role = 'DatacenterApprover'",
         )
         .bind(original_request)
+        .bind(replacement_actor.principal_id.into_uuid())
         .execute(pool)
         .await
         .expect_err("decision, actor, time, and reason are immutable evidence");
@@ -71939,7 +72209,8 @@ mod quorum_enforcement_db_tests {
             .to_string()
             .contains("approval decision evidence is immutable"));
         let preserved: (String, String, Option<String>) = sqlx::query_as(
-            "SELECT decision, actor, reason FROM request_approval_decisions \
+            "SELECT decision, actor_principal_id::text AS actor, reason \
+             FROM request_approval_decisions \
              WHERE request_id = $1 AND role = 'DatacenterApprover'",
         )
         .bind(original_request)
@@ -71948,7 +72219,7 @@ mod quorum_enforcement_db_tests {
         .expect("read preserved approval evidence");
         assert_eq!(
             preserved,
-            ("approved".into(), "immutable-test".into(), None)
+            ("approved".into(), actor.principal_id.to_string(), None)
         );
 
         let hard_delete =
@@ -71989,6 +72260,18 @@ mod quorum_enforcement_db_tests {
             return;
         };
         let id = seed_planned_with_required_roles(pool, "database-quorum-guard", 2).await;
+        let replacement_requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
+        let actor = seed_quorum_principal_binding(
+            pool,
+            "database-quorum-first-actor",
+            &[
+                "InventedApprover",
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+                ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+            ],
+        )
+        .await;
 
         let lowered_policy =
             sqlx::query("UPDATE requests SET required_approval_roles = 1 WHERE id = $1")
@@ -72002,25 +72285,32 @@ mod quorum_enforcement_db_tests {
         assert_eq!(read_row(pool, id).await.required_approval_roles, 2);
 
         let rewritten_maker = sqlx::query(
-            "UPDATE requests SET created_by = 'replacement-maker', \
-                                 requester = 'replacement-maker' \
+            "UPDATE requests SET created_by_principal_id = $2, \
+                                 requester_principal_id = $2 \
              WHERE id = $1",
         )
         .bind(id)
+        .bind(replacement_requester_principal_id)
         .execute(pool)
         .await
         .expect_err("request maker identity is immutable before and after review");
         assert!(rewritten_maker
             .to_string()
-            .contains("request maker identity is immutable"));
+            .contains("request principal ownership is immutable"));
 
         let invented_role = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
-             SELECT id, approval_epoch, 'InventedApprover', 'approved', 'invented-actor' \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
+             SELECT id, approval_epoch, 'InventedApprover', 'approved', 'exact-v1', \
+                    $2, $3, $4 \
              FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(actor.principal_id.into_uuid())
+        .bind(actor.principal_lifecycle_version)
+        .bind(actor.principal_authority_version)
         .execute(pool)
         .await
         .expect_err("the durable ledger accepts only server-owned approval roles");
@@ -72030,12 +72320,17 @@ mod quorum_enforcement_db_tests {
 
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
              SELECT id, approval_epoch, 'DatacenterApprover', 'approved', \
-                    'database-quorum-first-actor' \
+                    'exact-v1', $2, $3, $4 \
              FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(actor.principal_id.into_uuid())
+        .bind(actor.principal_lifecycle_version)
+        .bind(actor.principal_authority_version)
         .execute(pool)
         .await
         .expect("seed one canonical current-epoch decision");
@@ -72054,12 +72349,17 @@ mod quorum_enforcement_db_tests {
 
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
              SELECT id, approval_epoch, 'PlatformAdmin', 'approved', \
-                    'database-quorum-first-actor' \
+                    'exact-v1', $2, $3, $4 \
              FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(actor.principal_id.into_uuid())
+        .bind(actor.principal_lifecycle_version)
+        .bind(actor.principal_authority_version)
         .execute(pool)
         .await
         .expect("seed a second canonical role held by the same actor");
@@ -72096,6 +72396,20 @@ mod quorum_enforcement_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
+        let datacenter_actor = seed_quorum_principal_binding(
+            pool,
+            "runtime-dc-checker",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+        .await;
+        let platform_actor = seed_quorum_principal_binding(
+            pool,
+            "runtime-platform-checker",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+        )
+        .await;
         let mut tx = pool.begin().await.expect("begin request contract test");
         sqlx::query("SET LOCAL ryuki.force_request_runtime_contract = 'runtime-v1'")
             .execute(&mut *tx)
@@ -72110,12 +72424,14 @@ mod quorum_enforcement_db_tests {
         let forged_insert = sqlx::query(
             "INSERT INTO requests \
                  (id, request_type, status, stage, site, environment, name, cpu, \
-                  memory_gb, created_by, requester, owner) \
+                  memory_gb, principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', 'approved', 'approve', 'DEFRA', \
-                     'production', 'forged-approved-insert', 2, 4, \
-                     'runtime-maker', 'runtime-maker', 'runtime-maker')",
+                     'production', 'forged-approved-insert', 2, 4, 'exact-v1', \
+                     $2, $2, $2)",
         )
         .bind(forged_id)
+        .bind(requester_principal_id)
         .execute(&mut *tx)
         .await
         .expect_err("a runtime writer cannot insert a request after intake");
@@ -72135,12 +72451,14 @@ mod quorum_enforcement_db_tests {
         sqlx::query(
             "INSERT INTO requests \
                  (id, request_type, status, stage, site, environment, name, cpu, \
-                  memory_gb, created_by, requester, owner) \
+                  memory_gb, principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', \
-                     'production', 'runtime-contract-positive', 2, 4, \
-                     'runtime-maker', 'runtime-maker', 'runtime-maker')",
+                     'production', 'runtime-contract-positive', 2, 4, 'exact-v1', \
+                     $2, $2, $2)",
         )
         .bind(id)
+        .bind(requester_principal_id)
         .execute(&mut *tx)
         .await
         .expect("the canonical application insert remains valid");
@@ -72212,21 +72530,31 @@ mod quorum_enforcement_db_tests {
 
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
              SELECT id, approval_epoch, 'DatacenterApprover', 'approved', \
-                    'runtime-dc-checker' FROM requests WHERE id = $1",
+                    'exact-v1', $2, $3, $4 FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(datacenter_actor.principal_id.into_uuid())
+        .bind(datacenter_actor.principal_lifecycle_version)
+        .bind(datacenter_actor.principal_authority_version)
         .execute(&mut *tx)
         .await
         .expect("first canonical planned approval");
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
              SELECT id, approval_epoch, 'PlatformAdmin', 'approved', \
-                    'runtime-platform-checker' FROM requests WHERE id = $1",
+                    'exact-v1', $2, $3, $4 FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(platform_actor.principal_id.into_uuid())
+        .bind(platform_actor.principal_lifecycle_version)
+        .bind(platform_actor.principal_authority_version)
         .execute(&mut *tx)
         .await
         .expect("second canonical planned approval");
@@ -72282,6 +72610,20 @@ mod quorum_enforcement_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
+        let datacenter_actor = seed_quorum_principal_binding(
+            pool,
+            "decision-ordering-dc",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+        .await;
+        let platform_actor = seed_quorum_principal_binding(
+            pool,
+            "decision-ordering-platform",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+        )
+        .await;
         let mut tx = pool.begin().await.expect("begin decision ordering test");
         sqlx::query("SET LOCAL ryuki.force_request_runtime_contract = 'runtime-v1'")
             .execute(&mut *tx)
@@ -72292,12 +72634,14 @@ mod quorum_enforcement_db_tests {
         sqlx::query(
             "INSERT INTO requests \
                  (id, request_type, status, stage, site, environment, name, cpu, \
-                  memory_gb, created_by, requester, owner) \
+                  memory_gb, principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', \
-                     'production', 'decision-ordering-contract', 2, 4, \
-                     'decision-maker', 'decision-maker', 'decision-maker')",
+                     'production', 'decision-ordering-contract', 2, 4, 'exact-v1', \
+                     $2, $2, $2)",
         )
         .bind(id)
+        .bind(requester_principal_id)
         .execute(&mut *tx)
         .await
         .expect("seed canonical intake request");
@@ -72308,11 +72652,16 @@ mod quorum_enforcement_db_tests {
             .expect("savepoint early approval");
         let early_approval = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
              SELECT id, approval_epoch, 'DatacenterApprover', 'approved', \
-                    'early-checker' FROM requests WHERE id = $1",
+                    'exact-v1', $2, $3, $4 FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(datacenter_actor.principal_id.into_uuid())
+        .bind(datacenter_actor.principal_lifecycle_version)
+        .bind(datacenter_actor.principal_authority_version)
         .execute(&mut *tx)
         .await
         .expect_err("approved evidence cannot precede Planned");
@@ -72345,12 +72694,17 @@ mod quorum_enforcement_db_tests {
             .expect("savepoint early rejection");
         let early_rejection = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor, reason) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version, reason) \
              SELECT id, approval_epoch, 'DatacenterApprover', 'rejected', \
-                    'rejecting-checker', 'insufficient evidence' \
+                    'exact-v1', $2, $3, $4, 'insufficient evidence' \
              FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(datacenter_actor.principal_id.into_uuid())
+        .bind(datacenter_actor.principal_lifecycle_version)
+        .bind(datacenter_actor.principal_authority_version)
         .execute(&mut *tx)
         .await
         .expect_err("rejected evidence follows the Planned -> Rejected update");
@@ -72403,12 +72757,17 @@ mod quorum_enforcement_db_tests {
             .expect("application-compatible rejection update lands first");
         sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor, reason) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version, reason) \
              SELECT id, approval_epoch, 'DatacenterApprover', 'rejected', \
-                    'rejecting-checker', 'insufficient evidence' \
+                    'exact-v1', $2, $3, $4, 'insufficient evidence' \
              FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(datacenter_actor.principal_id.into_uuid())
+        .bind(datacenter_actor.principal_lifecycle_version)
+        .bind(datacenter_actor.principal_authority_version)
         .execute(&mut *tx)
         .await
         .expect("rejection evidence follows the status update in the same transaction");
@@ -72423,11 +72782,16 @@ mod quorum_enforcement_db_tests {
             .expect("savepoint late approval");
         let late_approval = sqlx::query(
             "INSERT INTO request_approval_decisions \
-                 (request_id, approval_epoch, role, decision, actor) \
+                 (request_id, approval_epoch, role, decision, principal_binding_state, \
+                  actor_principal_id, actor_principal_lifecycle_version, \
+                  actor_principal_authority_version) \
              SELECT id, approval_epoch, 'PlatformAdmin', 'approved', \
-                    'late-checker' FROM requests WHERE id = $1",
+                    'exact-v1', $2, $3, $4 FROM requests WHERE id = $1",
         )
         .bind(id)
+        .bind(platform_actor.principal_id.into_uuid())
+        .bind(platform_actor.principal_lifecycle_version)
+        .bind(platform_actor.principal_authority_version)
         .execute(&mut *tx)
         .await
         .expect_err("approved evidence is accepted only while Planned");
@@ -73060,11 +73424,18 @@ mod quorum_enforcement_db_tests {
             .await
             .expect("re-running migration 118 must be a no-op");
         // The column + CHECK constraint still exist and enforce the 1..=10 range.
+        let requester_principal_id =
+            crate::principal_registry::seed_request_fixture_principal(pool).await;
         let bad = sqlx::query(
-            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, required_approval_roles) \
-             VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', 'production', 'q-mig', 1, 1, 0)",
+            "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+                  required_approval_roles, principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', 'production', \
+                     'q-mig', 1, 1, 0, 'exact-v1', $2, $2, $2)",
         )
         .bind(Uuid::new_v4())
+        .bind(requester_principal_id)
         .execute(pool)
         .await;
         assert!(
@@ -75167,6 +75538,27 @@ mod maint_calendar_db_tests {
             sanitized[0]["metadata"]["approver"], "approver-principal",
             "ordinary attribution must remain available"
         );
+    }
+
+    #[test]
+    fn sanitize_stages_redacts_metadata_even_without_an_evidence_array() {
+        let marker = "SYNTH-STAGE-METADATA-ONLY-CANARY";
+        let stages = json!([{
+            "name": "legacy-stage",
+            "metadata": {
+                "reason": format!("PHPSESSID={marker}"),
+                "note": "ordinary stage context"
+            }
+        }]);
+
+        let sanitized = sanitize_stages_for_portal(&stages);
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+        assert!(!serialized.contains(marker));
+        assert_eq!(
+            sanitized[0]["metadata"]["reason"],
+            ryuki_engine::evidence_pipeline::REDACTED_EVIDENCE_VALUE
+        );
+        assert_eq!(sanitized[0]["metadata"]["note"], "ordinary stage context");
     }
 }
 
@@ -81698,7 +82090,7 @@ mod noise_remediation_db_tests {
             "the unrelated site's trigger must regain visibility after bounded repair"
         );
 
-        site_registry_deactivate(
+        let _ = site_registry_deactivate(
             AuthExtractor(verified_noise_admin(&[])),
             Path(site_b.clone()),
         )
@@ -88815,7 +89207,7 @@ mod patch_waves_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        patch_validate(
+        let _ = patch_validate(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
@@ -88888,7 +89280,7 @@ mod patch_waves_db_tests {
         .await
         .expect("seed unresolved legacy wave");
 
-        patch_validate(
+        let _ = patch_validate(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
@@ -89004,7 +89396,7 @@ mod patch_waves_db_tests {
             panic!("patch_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
-        patch_validate(
+        let _ = patch_validate(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
@@ -91449,7 +91841,7 @@ mod backup_restore_db_tests {
             .await
             .expect("restore source CI scope for cleanup");
 
-        backup_restore_approve(
+        let _ = backup_restore_approve(
             Extension(approver_session("source-restored-checker")),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
@@ -91515,7 +91907,7 @@ mod backup_restore_db_tests {
             .execute(pool)
             .await
             .expect("reactivate source point for positive control");
-        backup_restore_execute(
+        let _ = backup_restore_execute(
             AuthExtractor(approver_session("restored-source-executor")),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
@@ -92372,7 +92764,7 @@ mod backup_restore_db_tests {
         );
 
         set_restore_site_active(pool, &site, true).await;
-        backup_restore_approve(
+        let _ = backup_restore_approve(
             Extension(approver_session("active-site-approver")),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
@@ -98779,6 +99171,19 @@ mod runbook_executions_db_tests {
         )
         .await
         .expect("durable active custom site must not depend on a process-cache entry");
+        let bound_epoch = custom_active["site_authority_epoch"]
+            .as_i64()
+            .expect("created runbook returns its durable site authority epoch");
+        let canonical_epoch: i64 =
+            sqlx::query_scalar("SELECT authority_epoch FROM site_registry WHERE unlocode = $1")
+                .bind(&unknown_site)
+                .fetch_one(pool)
+                .await
+                .expect("read canonical custom-site epoch");
+        assert_eq!(
+            bound_epoch, canonical_epoch,
+            "runbook creation must bind the exact locked canonical-site epoch"
+        );
         cleanup(
             pool,
             custom_active["id"]
@@ -98828,14 +99233,14 @@ mod runbook_executions_db_tests {
             "certificate-renewal",
             "DEFRA",
         );
-        let fixtures = [
+        let mut fixtures = [
             approval.clone(),
             step.clone(),
             complete.clone(),
             fail.clone(),
             rollback.clone(),
         ];
-        for fixture in &fixtures {
+        for fixture in &mut fixtures {
             crate::repos::runbook_executions::insert(pool, fixture)
                 .await
                 .expect("insert active-site transition fixture");
@@ -98959,6 +99364,33 @@ mod runbook_executions_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let trigger_modes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT tgname::text, tgenabled::text FROM pg_catalog.pg_trigger \
+             WHERE tgrelid IN ( \
+                 'public.site_registry'::regclass, \
+                 'public.runbook_executions'::regclass \
+             ) \
+               AND tgname = ANY($1) \
+             ORDER BY tgname",
+        )
+        .bind(vec![
+            "runbook_executions_active_site_authority".to_string(),
+            "trg_site_registry_authority_epoch".to_string(),
+        ])
+        .fetch_all(pool)
+        .await
+        .expect("read runbook/site authority trigger modes");
+        assert_eq!(
+            trigger_modes,
+            vec![
+                (
+                    "runbook_executions_active_site_authority".into(),
+                    "A".into(),
+                ),
+                ("trg_site_registry_authority_epoch".into(), "A".into()),
+            ],
+            "both epoch-minting and runbook enforcement triggers must be ALWAYS enabled"
+        );
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let site = format!("R11-{}", &suffix[..12]).to_ascii_uppercase();
         sqlx::query(
@@ -98978,7 +99410,7 @@ mod runbook_executions_db_tests {
             "DEFRA",
         );
         aliased.site = lowercase_alias.clone();
-        let alias_repository_error = crate::repos::runbook_executions::insert(pool, &aliased)
+        let alias_repository_error = crate::repos::runbook_executions::insert(pool, &mut aliased)
             .await
             .expect_err("case-folded site aliases must not acquire repository authority");
         assert!(
@@ -98987,11 +99419,22 @@ mod runbook_executions_db_tests {
                 .contains("current active canonical site"),
             "unexpected lowercase-alias repository rejection: {alias_repository_error}"
         );
+        let site_authority_epoch: i64 =
+            sqlx::query_scalar("SELECT authority_epoch FROM site_registry WHERE unlocode = $1")
+                .bind(&site)
+                .fetch_one(pool)
+                .await
+                .expect("read temporary site's authority epoch");
+        ryuki_engine::runbook_execution::bind_site_authority_epoch(
+            &mut aliased,
+            site_authority_epoch,
+        )
+        .expect("bind alias fixture to the real epoch");
         let alias_raw_error = sqlx::query(
             "INSERT INTO runbook_executions \
              (id, runbook_id, status, site, started_by, execution_json, \
-              invariant_state, invariant_reason) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'Verified', NULL)",
+              invariant_state, invariant_reason, site_authority_epoch) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'Verified', NULL, $7)",
         )
         .bind(&aliased.id)
         .bind(&aliased.runbook_id)
@@ -99001,20 +99444,21 @@ mod runbook_executions_db_tests {
         .bind(&lowercase_alias)
         .bind(&aliased.started_by)
         .bind(serde_json::to_value(&aliased).unwrap())
+        .bind(site_authority_epoch)
         .execute(pool)
         .await
         .expect_err("database trigger must reject a lowercase alias of an active site");
         assert!(
             alias_raw_error
                 .to_string()
-                .contains("current active canonical site"),
+                .contains("exact current active site authority epoch"),
             "unexpected lowercase-alias direct-writer rejection: {alias_raw_error}"
         );
 
         let mut exec = make_exec(&suffix, "certificate-renewal", "DEFRA");
         exec.site = site.clone();
         let id = exec.id.clone();
-        crate::repos::runbook_executions::insert(pool, &exec)
+        crate::repos::runbook_executions::insert(pool, &mut exec)
             .await
             .expect("insert execution while temporary site is active");
         sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
@@ -99029,7 +99473,7 @@ mod runbook_executions_db_tests {
             "DEFRA",
         );
         rejected_insert.site = site.clone();
-        let insert_error = crate::repos::runbook_executions::insert(pool, &rejected_insert)
+        let insert_error = crate::repos::runbook_executions::insert(pool, &mut rejected_insert)
             .await
             .expect_err("repository insert must reject an unknown site");
         assert!(
@@ -99085,7 +99529,7 @@ mod runbook_executions_db_tests {
         assert!(
             raw_error
                 .to_string()
-                .contains("current active canonical site"),
+                .contains("exact current active site authority epoch"),
             "unexpected direct-writer rejection: {raw_error}"
         );
 
@@ -99100,6 +99544,224 @@ mod runbook_executions_db_tests {
         cleanup(pool, &id).await;
     }
 
+    #[test]
+    fn runbook_site_authority_epoch_migration_is_non_reusable_and_always_enforced() {
+        let migration = include_str!("../../../migrations/211_runbook_site_authority_epoch.sql");
+        assert!(migration.contains("site_registry_authority_epoch_seq"));
+        assert!(migration.contains("NO CYCLE"));
+        assert!(!migration.contains("OWNED BY public.site_registry.authority_epoch"));
+        assert!(migration.contains("NEW.authority_epoch := pg_catalog.nextval"));
+        assert!(migration.contains("NEW.active IS DISTINCT FROM OLD.active"));
+        assert!(migration.contains("NEW.unlocode COLLATE \"C\" IS DISTINCT FROM OLD.unlocode"));
+        assert!(migration.contains("legacy-site-authority-epoch-unbound-restart-required"));
+        assert!(migration.contains("registry.authority_epoch = NEW.site_authority_epoch"));
+        assert!(migration.contains("ENABLE ALWAYS TRIGGER trg_site_registry_authority_epoch"));
+        assert!(
+            migration.contains("ENABLE ALWAYS TRIGGER runbook_executions_active_site_authority")
+        );
+        assert!(migration
+            .contains("BEFORE INSERT OR UPDATE OF status, execution_json, site_authority_epoch"));
+        assert!(migration.contains(
+            "REVOKE ALL ON SEQUENCE public.site_registry_authority_epoch_seq FROM PUBLIC"
+        ));
+    }
+
+    #[tokio::test]
+    async fn deactivate_reactivate_does_not_revive_runbook_execution_authority() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("R11EPOCH{}", &suffix[..8]).to_ascii_uppercase();
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', 'Runbook epoch test', 'Test', 'ZZ', 'Etc/UTC', TRUE)",
+        )
+        .bind(&site)
+        .execute(pool)
+        .await
+        .expect("insert reactivation test site");
+
+        let mut exec = make_exec(&suffix, "certificate-renewal", &site);
+        let id = exec.id.clone();
+        crate::repos::runbook_executions::insert(pool, &mut exec)
+            .await
+            .expect("bind execution to initial site epoch");
+        let original_epoch = exec.site_authority_epoch.expect("bound site epoch");
+
+        crate::repos::site_registry::set_active(pool, &site, false)
+            .await
+            .expect("deactivate epoch test site");
+        crate::repos::site_registry::set_active(pool, &site, true)
+            .await
+            .expect("reactivate epoch test site");
+        let reactivated_epoch: i64 =
+            sqlx::query_scalar("SELECT authority_epoch FROM site_registry WHERE unlocode = $1")
+                .bind(&site)
+                .fetch_one(pool)
+                .await
+                .expect("read reactivated epoch");
+        assert_ne!(
+            reactivated_epoch, original_epoch,
+            "reactivation must mint a new site authority epoch"
+        );
+
+        let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
+        let actor = bind_test_principal(
+            &mut session,
+            &format!("runbook-reactivation-checker-{suffix}"),
+        );
+        let handler =
+            super::runbook_approve(super::Path(id.clone()), super::Extension(session)).await;
+        assert!(matches!(
+            handler,
+            Err((axum::http::StatusCode::CONFLICT, _))
+        ));
+
+        let (persisted, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("read stale-epoch execution")
+            .expect("stale-epoch execution remains readable");
+        let updated =
+            ryuki_engine::runbook_execution::approve_execution_pure(&persisted, &actor.to_string())
+                .expect("construct otherwise-valid approval");
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin stale-epoch repository write");
+        let applied =
+            crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
+                .await
+                .expect("repository denial is value-free");
+        tx.rollback().await.expect("rollback denied transition");
+        assert!(!applied, "repository must reject a pre-reactivation epoch");
+
+        let raw_error = sqlx::query(
+            "UPDATE runbook_executions SET status = $2, execution_json = $3 WHERE id = $1",
+        )
+        .bind(&id)
+        .bind(crate::repos::runbook_executions::status_str(
+            &updated.status,
+        ))
+        .bind(serde_json::to_value(&updated).unwrap())
+        .execute(pool)
+        .await
+        .expect_err("ALWAYS trigger must reject a pre-reactivation epoch");
+        assert!(
+            raw_error
+                .to_string()
+                .contains("exact current active site authority epoch"),
+            "unexpected direct-writer epoch rejection: {raw_error}"
+        );
+
+        cleanup(pool, &id).await;
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&site)
+            .execute(pool)
+            .await
+            .expect("clean reactivation test site");
+    }
+
+    #[tokio::test]
+    async fn delete_recreate_same_site_code_does_not_revive_runbook_execution_authority() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("R11LIFE{}", &suffix[..8]).to_ascii_uppercase();
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', 'Runbook lifetime test', 'Test', 'ZZ', 'Etc/UTC', TRUE)",
+        )
+        .bind(&site)
+        .execute(pool)
+        .await
+        .expect("insert original site lifetime");
+
+        let mut exec = make_exec(&suffix, "certificate-renewal", &site);
+        let id = exec.id.clone();
+        crate::repos::runbook_executions::insert(pool, &mut exec)
+            .await
+            .expect("bind execution to original site lifetime");
+        let original_epoch = exec.site_authority_epoch.expect("bound site epoch");
+
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&site)
+            .execute(pool)
+            .await
+            .expect("delete original site lifetime");
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', 'Runbook lifetime test', 'Test', 'ZZ', 'Etc/UTC', TRUE)",
+        )
+        .bind(&site)
+        .execute(pool)
+        .await
+        .expect("recreate same canonical site code");
+        let recreated_epoch: i64 =
+            sqlx::query_scalar("SELECT authority_epoch FROM site_registry WHERE unlocode = $1")
+                .bind(&site)
+                .fetch_one(pool)
+                .await
+                .expect("read recreated site epoch");
+        assert_ne!(
+            recreated_epoch, original_epoch,
+            "site recreation must never reuse the deleted lifetime's epoch"
+        );
+
+        let (persisted, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("read old-lifetime execution")
+            .expect("old-lifetime execution remains readable");
+        let updated = ryuki_engine::runbook_execution::approve_execution_pure(
+            &persisted,
+            "recreated.site.checker",
+        )
+        .expect("construct otherwise-valid approval");
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin recreated-site repository write");
+        let applied =
+            crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
+                .await
+                .expect("repository denial is value-free");
+        tx.rollback().await.expect("rollback denied transition");
+        assert!(!applied, "repository must reject the deleted site lifetime");
+
+        let raw_error = sqlx::query(
+            "UPDATE runbook_executions SET status = $2, execution_json = $3 WHERE id = $1",
+        )
+        .bind(&id)
+        .bind(crate::repos::runbook_executions::status_str(
+            &updated.status,
+        ))
+        .bind(serde_json::to_value(&updated).unwrap())
+        .execute(pool)
+        .await
+        .expect_err("ALWAYS trigger must reject the deleted site lifetime");
+        assert!(
+            raw_error
+                .to_string()
+                .contains("exact current active site authority epoch"),
+            "unexpected recreated-site direct-writer rejection: {raw_error}"
+        );
+
+        cleanup(pool, &id).await;
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&site)
+            .execute(pool)
+            .await
+            .expect("clean recreated site fixture");
+    }
+
     #[tokio::test]
     async fn forward_transition_serializes_with_concurrent_site_deactivation() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -99108,9 +99770,9 @@ mod runbook_executions_db_tests {
             return;
         };
         let suffix = uuid::Uuid::new_v4().to_string();
-        let draft = make_exec(&suffix, "certificate-renewal", "DEFRA");
+        let mut draft = make_exec(&suffix, "certificate-renewal", "DEFRA");
         let id = draft.id.clone();
-        crate::repos::runbook_executions::insert(pool, &draft)
+        crate::repos::runbook_executions::insert(pool, &mut draft)
             .await
             .expect("insert transition/deactivation fixture");
         let (persisted, version) = crate::repos::runbook_executions::get(pool, &id)
@@ -99206,7 +99868,7 @@ mod runbook_executions_db_tests {
         let mut exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
         exec.started_by = initiator_principal.to_string();
         let id = exec.id.clone();
-        crate::repos::runbook_executions::insert(pool, &exec)
+        crate::repos::runbook_executions::insert(pool, &mut exec)
             .await
             .expect("insert maker/checker fixture");
 
@@ -99251,13 +99913,13 @@ mod runbook_executions_db_tests {
         };
         let suffix = uuid::Uuid::new_v4().to_string();
         let draft = make_exec(&suffix, "patch-windows-server", "DEFRA");
-        let exec = ryuki_engine::runbook_execution::approve_execution_pure(
+        let mut exec = ryuki_engine::runbook_execution::approve_execution_pure(
             &draft,
             "different.starting.approver",
         )
         .expect("approve fixture");
         let id = exec.id.clone();
-        crate::repos::runbook_executions::insert(pool, &exec)
+        crate::repos::runbook_executions::insert(pool, &mut exec)
             .await
             .expect("insert approved execution");
         let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
@@ -99360,11 +100022,11 @@ mod runbook_executions_db_tests {
         };
         let suffix = uuid::Uuid::new_v4().to_string();
         let draft = make_exec(&suffix, "patch-windows-server", "DEFRA");
-        let approved =
+        let mut approved =
             ryuki_engine::runbook_execution::approve_execution_pure(&draft, "fixture.approver")
                 .expect("approve fixture");
         let id = approved.id.clone();
-        crate::repos::runbook_executions::insert(pool, &approved)
+        crate::repos::runbook_executions::insert(pool, &mut approved)
             .await
             .expect("insert approved execution");
         let actor = format!("dbtest-runbook-audit-failure-{}", uuid::Uuid::new_v4());
@@ -99439,7 +100101,7 @@ mod runbook_executions_db_tests {
         let _ = crate::database::run_migrations(pool).await; // tolerate drift
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let active = make_exec(&suffix, "restart-service", "DEFRA"); // built non-terminal
+        let mut active = make_exec(&suffix, "restart-service", "DEFRA"); // built non-terminal
         let active_id = active.id.clone();
         let done_ready = make_exec(&format!("{suffix}-done"), "restart-service", "DEFRA");
         let done_step_1 =
@@ -99448,13 +100110,13 @@ mod runbook_executions_db_tests {
             ryuki_engine::runbook_execution::execute_step_pure(&done_step_1, 2).unwrap();
         let done_step_3 =
             ryuki_engine::runbook_execution::execute_step_pure(&done_step_2, 3).unwrap();
-        let done = ryuki_engine::runbook_execution::complete_execution_pure(&done_step_3)
+        let mut done = ryuki_engine::runbook_execution::complete_execution_pure(&done_step_3)
             .expect("all required steps permit terminal fixture");
         let done_id = done.id.clone();
-        crate::repos::runbook_executions::insert(pool, &active)
+        crate::repos::runbook_executions::insert(pool, &mut active)
             .await
             .expect("insert active");
-        crate::repos::runbook_executions::insert(pool, &done)
+        crate::repos::runbook_executions::insert(pool, &mut done)
             .await
             .expect("insert completed");
 
@@ -99486,11 +100148,11 @@ mod runbook_executions_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
+        let mut exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
         let id = exec.id.clone();
 
         // 1. Insert (start)
-        crate::repos::runbook_executions::insert(pool, &exec)
+        crate::repos::runbook_executions::insert(pool, &mut exec)
             .await
             .expect("insert must succeed");
 
@@ -99610,10 +100272,10 @@ mod runbook_executions_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let exec = make_exec(&suffix, "patch-windows-server", "GBLON");
+        let mut exec = make_exec(&suffix, "patch-windows-server", "GBLON");
         let id = exec.id.clone();
 
-        crate::repos::runbook_executions::insert(pool, &exec)
+        crate::repos::runbook_executions::insert(pool, &mut exec)
             .await
             .expect("insert must succeed");
 
@@ -99682,9 +100344,10 @@ mod runbook_executions_db_tests {
         let step_1 = ryuki_engine::runbook_execution::execute_step_pure(&approved, 1).unwrap();
         let step_2 = ryuki_engine::runbook_execution::execute_step_pure(&step_1, 2).unwrap();
         let step_3 = ryuki_engine::runbook_execution::execute_step_pure(&step_2, 3).unwrap();
-        let terminal = ryuki_engine::runbook_execution::complete_execution_pure(&step_3).unwrap();
+        let mut terminal =
+            ryuki_engine::runbook_execution::complete_execution_pure(&step_3).unwrap();
 
-        crate::repos::runbook_executions::insert(pool, &terminal)
+        crate::repos::runbook_executions::insert(pool, &mut terminal)
             .await
             .expect("insert valid terminal fixture");
 
@@ -99716,9 +100379,9 @@ mod runbook_executions_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
+        let mut exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
         let id = exec.id.clone();
-        crate::repos::runbook_executions::insert(pool, &exec)
+        crate::repos::runbook_executions::insert(pool, &mut exec)
             .await
             .expect("insert must succeed");
 
@@ -99842,15 +100505,15 @@ mod runbook_executions_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let exec1 = make_exec(&format!("{suffix}-a"), "restart-service", "DEFRA");
-        let exec2 = make_exec(&format!("{suffix}-b"), "certificate-renewal", "DEFRA");
+        let mut exec1 = make_exec(&format!("{suffix}-a"), "restart-service", "DEFRA");
+        let mut exec2 = make_exec(&format!("{suffix}-b"), "certificate-renewal", "DEFRA");
         let id1 = exec1.id.clone();
         let id2 = exec2.id.clone();
 
-        crate::repos::runbook_executions::insert(pool, &exec1)
+        crate::repos::runbook_executions::insert(pool, &mut exec1)
             .await
             .expect("insert exec1 must succeed");
-        crate::repos::runbook_executions::insert(pool, &exec2)
+        crate::repos::runbook_executions::insert(pool, &mut exec2)
             .await
             .expect("insert exec2 must succeed");
 
@@ -99888,15 +100551,15 @@ mod runbook_executions_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let exec1 = make_exec(&format!("{suffix}-a"), "restart-service", "GBLON");
-        let exec2 = make_exec(&format!("{suffix}-b"), "certificate-renewal", "GBLON");
+        let mut exec1 = make_exec(&format!("{suffix}-a"), "restart-service", "GBLON");
+        let mut exec2 = make_exec(&format!("{suffix}-b"), "certificate-renewal", "GBLON");
         let id1 = exec1.id.clone();
         let id2 = exec2.id.clone();
 
-        crate::repos::runbook_executions::insert(pool, &exec1)
+        crate::repos::runbook_executions::insert(pool, &mut exec1)
             .await
             .expect("insert exec1 must succeed");
-        crate::repos::runbook_executions::insert(pool, &exec2)
+        crate::repos::runbook_executions::insert(pool, &mut exec2)
             .await
             .expect("insert exec2 must succeed");
 

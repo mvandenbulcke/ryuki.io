@@ -10818,15 +10818,19 @@ mod tests {
             state_key: Some(format!("request-test-{}", Uuid::new_v4().simple())),
             mode: ryuki_protocol::JobMode::OfflineDryRun,
         };
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
             "INSERT INTO requests \
-                 (id, request_type, site, environment, name, status, stage, stages) \
+                 (id, request_type, site, environment, name, status, stage, stages, \
+                  principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
              VALUES \
                  ($1, 'server-deployment', $2, 'test', 'agent-job-test', \
-                  'locked', 'lock', '[]'::jsonb)",
+                  'locked', 'lock', '[]'::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(spec.request_id)
         .bind(platform)
+        .bind(principal_id)
         .execute(pool)
         .await
         .expect("seed request bound to pending agent job");
@@ -14036,15 +14040,19 @@ mod tests {
             seed_live_site_execution_authority(pool, platform).await;
         }
         let request_id = Uuid::new_v4();
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
             "INSERT INTO requests \
-                 (id, request_type, site, environment, name, status, stage, stages) \
+                 (id, request_type, site, environment, name, status, stage, stages, \
+                  principal_binding_state, created_by_principal_id, \
+                  requester_principal_id, owner_principal_id) \
              VALUES \
                  ($1, 'server-deployment', $2, 'test', 'agent-job-test', \
-                  'locked', 'lock', '[]'::jsonb)",
+                  'locked', 'lock', '[]'::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(request_id)
         .bind(platform)
+        .bind(principal_id)
         .execute(pool)
         .await
         .expect("seed request bound to agent-job fixture");
@@ -14354,13 +14362,17 @@ mod tests {
             "started_at": null, "completed_at": null,
             "evidence": [], "metadata": {}
         }]);
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'dead-letter-backlink-test', \
-             'executing', 'execute', $2::jsonb)",
+             'executing', 'execute', $2::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(req_id)
         .bind(&stages)
+        .bind(principal_id)
         .execute(&pool)
         .await
         .expect("insert executing request");
@@ -18489,13 +18501,18 @@ mod tests {
     /// grant directly must seed the request first.
     async fn seed_active_request(pool: &PgPool, request_id: Uuid, platform: &str) {
         seed_live_site_execution_authority(pool, platform).await;
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', $2, 'prod', 'live-apply-test', 'locked', 'lock', '[]'::jsonb) \
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', $2, 'prod', 'live-apply-test', 'locked', 'lock', \
+                     '[]'::jsonb, 'exact-v1', $3, $3, $3) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(request_id)
         .bind(platform)
+        .bind(principal_id)
         .execute(pool)
         .await
         .expect("seed active request for live-apply minting");
@@ -18880,12 +18897,17 @@ mod tests {
 
         // A LiveApply grant may only be minted for a real, ACTIVE request — the
         // concluded-status gate in create_live_apply_job loads requests.status.
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', $2, 'prod', 's5a2-live-apply', 'locked', 'lock', '[]'::jsonb)",
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', $2, 'prod', 's5a2-live-apply', 'locked', 'lock', \
+                     '[]'::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(request_id)
         .bind(&platform)
+        .bind(principal_id)
         .execute(&pool)
         .await
         .expect("seed active request for live-apply minting");
@@ -19222,11 +19244,16 @@ mod tests {
 
         let cp_key = ensure_test_cp_key();
         let request_id = Uuid::new_v4();
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 's5a2-concluded', 'retired', 'retire', '[]'::jsonb)",
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 's5a2-concluded', 'retired', 'retire', \
+                     '[]'::jsonb, 'exact-v1', $2, $2, $2)",
         )
         .bind(request_id)
+        .bind(principal_id)
         .execute(&pool)
         .await
         .expect("seed retired request");
@@ -20502,12 +20529,17 @@ mod tests {
         let platform = format!("b1b-plt-{}", &Uuid::new_v4().to_string()[..8]);
         let digest = proto_sha256(b"step-approved-plan");
 
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', $2, 'prod', 'b1b-step-live', 'executing', 'execute', '[]'::jsonb)",
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', $2, 'prod', 'b1b-step-live', 'executing', 'execute', \
+                     '[]'::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(request_id)
         .bind(&platform)
+        .bind(principal_id)
         .execute(&pool)
         .await
         .expect("seed executing request");
@@ -21751,12 +21783,17 @@ mod tests {
             "started_at": null, "completed_at": null,
             "evidence": [], "metadata": {}
         }]);
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'backlink-test', 'executing', 'execute', $2::jsonb)",
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'backlink-test', 'executing', 'execute', \
+                     $2::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(req_id)
         .bind(&stages)
+        .bind(principal_id)
         .execute(&pool)
         .await
         .expect("insert executing request");
@@ -21860,12 +21897,17 @@ mod tests {
         let req_id = Uuid::new_v4();
         // An OBJECT, not a Vec<Stage> array → serde_json::from_value::<Vec<Stage>> fails.
         let corrupt = serde_json::json!({"legacy_shape": true, "stages": ["x"]});
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'backlink-corrupt', 'executing', 'execute', $2::jsonb)",
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'backlink-corrupt', 'executing', \
+                     'execute', $2::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(req_id)
         .bind(&corrupt)
+        .bind(principal_id)
         .execute(&pool)
         .await
         .expect("insert executing request with unparseable stages");
@@ -21920,12 +21962,17 @@ mod tests {
             "started_at": null, "completed_at": null,
             "evidence": [], "metadata": {}
         }]);
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
-            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'step-2b-test', 'executing', 'execute', $2::jsonb)",
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages, \
+                                   principal_binding_state, created_by_principal_id, \
+                                   requester_principal_id, owner_principal_id) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'step-2b-test', 'executing', 'execute', \
+                     $2::jsonb, 'exact-v1', $3, $3, $3)",
         )
         .bind(id)
         .bind(&stages)
+        .bind(principal_id)
         .execute(pool)
         .await
         .expect("insert executing request");
@@ -24089,14 +24136,17 @@ mod tests {
     /// ('executing') permit requeue; concluded ones ('cancelled'/'failed') do not.
     async fn seed_request_row(pool: &PgPool, status: &str) -> Uuid {
         let id = Uuid::new_v4();
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
             "INSERT INTO requests (id, request_type, status, stage, site, environment, \
-             name, cpu, memory_gb, created_by) \
+             name, cpu, memory_gb, principal_binding_state, created_by_principal_id, \
+             requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', $2, 'execute', 'DEFRA', 'production', \
-             'dlq-test', 2, 4, 'requester')",
+             'dlq-test', 2, 4, 'exact-v1', $3, $3, $3)",
         )
         .bind(id)
         .bind(status)
+        .bind(principal_id)
         .execute(pool)
         .await
         .expect("seed request row");
@@ -26484,15 +26534,18 @@ mod tests {
 
     async fn seed_request_for_scope(pool: &PgPool, site: &str, environment: &str) -> Uuid {
         let id = Uuid::new_v4();
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query(
             "INSERT INTO requests (id, request_type, status, stage, site, environment, \
-             name, cpu, memory_gb, created_by) \
+             name, cpu, memory_gb, principal_binding_state, created_by_principal_id, \
+             requester_principal_id, owner_principal_id) \
              VALUES ($1, 'server-deployment', 'executing', 'execute', $2, $3, \
-             'scope-test', 2, 4, 'test-user')",
+             'scope-test', 2, 4, 'exact-v1', $4, $4, $4)",
         )
         .bind(id)
         .bind(site)
         .bind(environment)
+        .bind(principal_id)
         .execute(pool)
         .await
         .expect("seed request for scope");

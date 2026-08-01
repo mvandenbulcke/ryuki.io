@@ -604,8 +604,9 @@ pub struct ExecutionView {
 /// pure dry-run engine logic, no provider/live call). Runnable kinds today:
 /// `health_probe` (read-only liveness), `synthetic_health_run` (records simulated
 /// probe results), `maintain_review_scan` (flags Operational requests due for
-/// review via domain events), `connection_health_sweep` (appends a dry-run
-/// health-check row per integration connection), and `restore_overdue_scan`
+/// review via domain events), `connection_health_sweep` (appends either an
+/// admitted static stub or a fail-closed blocked observation per integration
+/// connection), and `restore_overdue_scan`
 /// (enqueues a deduped shift_queue item per overdue/never-tested system). Every
 /// write happens on `tx`, so a failure rolls back within the schedule's
 /// savepoint.
@@ -850,43 +851,68 @@ async fn run_job(
         }
         "connection_health_sweep" => {
             // Safe-internal dry-run (#19): list EVERY integration connection
-            // (there is no `enabled` column — probe them all), run the PURE
-            // `test_connection_stub` (no live provider call, no live credential
-            // resolver), append a connection_health_checks history row, AND
-            // refresh each connection's last_test_* — all on `tx`, so a failure
-            // rolls back with this schedule's savepoint. `credential_status` is a
-            // DETERMINISTIC STUB value derived from legacy reference presence;
-            // typed references remain explicitly unverified because this job
-            // owns no fingerprint authority. The live resolver is never called
-            // here, keeping the sweep stub-only. `detail` is kept
-            // aggregate-only (a count) — never per-connection ids — because it is
-            // surfaced via /api/ops/scheduler/executions.
+            // (there is no `enabled` column), but run the pure URL-shape stub
+            // only when both process and connection explicitly select local
+            // static dry-run. Live/production rows receive a closed, value-free
+            // `blocked/not-attempted` observation; neither a resolver nor a
+            // provider call runs. History and last_test_* remain atomic with the
+            // schedule savepoint. Detail is aggregate-only — never connection ids.
             let connections =
                 crate::repos::integration_connections::list_all_connections(&mut **tx).await?;
             let tested_at = chrono::Utc::now().to_rfc3339();
+            let auth_mode = crate::config_store::auth_mode_or_default();
+            let mut static_stubbed = 0_usize;
+            let mut blocked = 0_usize;
             for conn in &connections {
-                let result = ryuki_engine::integration_connections::test_connection_stub(conn);
-                // Deterministic stub verdict: the stub only inspects ref presence
-                // (it never resolves the secret), so mirror that here.
-                let credential_status = match &conn.credential_source {
-                    // This scheduler never receives the dedicated fingerprint
-                    // verifier, so a typed row can be structurally present but
-                    // cannot be called admitted or healthy here.
-                    ryuki_engine::integration_connections::CredentialSource::SecretProviderRef => {
-                        "ref-unverified"
-                    }
-                    _ if conn.credential_ref.is_empty() => "ref-missing",
-                    _ => "ref-present",
-                };
+                let (endpoint_status, credential_status, message) =
+                    if crate::integration::local_static_dry_run_allowed(
+                        &auth_mode,
+                        &conn.execution_mode,
+                    ) {
+                        match ryuki_engine::integration_connections::test_connection_stub(conn) {
+                            Ok(result) => {
+                                static_stubbed += 1;
+                                // Deterministic stub verdict: the stub only inspects
+                                // reference presence and never resolves material.
+                                let credential_status = match &conn.credential_source {
+                                    // This scheduler owns no fingerprint verifier, so
+                                    // a typed row cannot be called admitted or healthy.
+                                    ryuki_engine::integration_connections::CredentialSource::SecretProviderRef => {
+                                        "ref-unverified"
+                                    }
+                                    _ if conn.credential_ref.is_empty() => "ref-missing",
+                                    _ => "ref-present",
+                                };
+                                (result.status, credential_status, result.message)
+                            }
+                            Err(_) => {
+                                blocked += 1;
+                                (
+                                    "blocked".to_string(),
+                                    "not-attempted",
+                                    "UNAVAILABLE: static reachability stub is restricted to explicit local dry-run; no live provider call made."
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    } else {
+                        blocked += 1;
+                        (
+                            "blocked".to_string(),
+                            "not-attempted",
+                            "UNAVAILABLE: static reachability stub is restricted to explicit local dry-run; no live provider call made."
+                                .to_string(),
+                        )
+                    };
                 crate::repos::integration_connections::insert_health_check(
                     &mut **tx,
                     &conn.id,
-                    &result.status,
+                    &endpoint_status,
                     credential_status,
-                    &result.message,
+                    &message,
                 )
                 .await?;
-                let combined = format!("{};creds={}", result.status, credential_status);
+                let combined = format!("{endpoint_status};creds={credential_status}");
                 crate::repos::integration_connections::update_last_test(
                     &mut **tx, &conn.id, &tested_at, &combined,
                 )
@@ -894,7 +920,12 @@ async fn run_job(
             }
             Ok((
                 "succeeded".to_string(),
-                Some(format!("probed {} connection(s)", connections.len())),
+                Some(format!(
+                    "evaluated {} connection(s); static-stubbed {}; blocked {}",
+                    connections.len(),
+                    static_stubbed,
+                    blocked
+                )),
             ))
         }
         "restore_overdue_scan_v2" => {
@@ -3228,15 +3259,19 @@ mod db_tests {
     /// returning its generated id. `review_at` is raw SQL (e.g. `NULL` or
     /// `NOW() + INTERVAL '30 days'`) so a test can plant a due / not-due row.
     async fn seed_maintain_request(pool: &PgPool, status: &str, review_at_sql: &str) -> String {
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         let sql = format!(
             "INSERT INTO requests \
-             (request_type, status, stage, site, environment, name, created_by, next_maintain_review_at) \
+             (request_type, status, stage, site, environment, name, \
+              principal_binding_state, created_by_principal_id, requester_principal_id, \
+              owner_principal_id, next_maintain_review_at) \
              VALUES ('server-deployment', $1, 'operational', 'GBLON', 'production', \
-                     'maintain-test', 'system', {review_at_sql}) \
+                     'maintain-test', 'exact-v1', $2, $2, $2, {review_at_sql}) \
              RETURNING id::text"
         );
         sqlx::query_scalar(&sql)
             .bind(status)
+            .bind(principal_id)
             .fetch_one(pool)
             .await
             .expect("seed maintain request")
@@ -3556,6 +3591,15 @@ mod db_tests {
     /// returning its id. `created_at`/`updated_at` have no DB default, so they are
     /// supplied explicitly.
     async fn seed_connection(pool: &PgPool, id: &str, credential_ref: &str) {
+        seed_connection_with_mode(pool, id, credential_ref, "static-dry-run").await;
+    }
+
+    async fn seed_connection_with_mode(
+        pool: &PgPool,
+        id: &str,
+        credential_ref: &str,
+        execution_mode: &str,
+    ) {
         sqlx::query("DELETE FROM integration_connections WHERE id = $1")
             .bind(id)
             .execute(pool)
@@ -3564,12 +3608,13 @@ mod db_tests {
         sqlx::query(
             "INSERT INTO integration_connections \
              (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
-              created_by, created_at, updated_at) \
+              execution_mode, created_by, created_at, updated_at) \
              VALUES ($1, 'vmware', 'sweep-test', 'https://vcenter.example.test', 'env-var', \
-                     $2, 'system', NOW()::text, NOW()::text)",
+                     $2, $3, 'system', NOW()::text, NOW()::text)",
         )
         .bind(id)
         .bind(credential_ref)
+        .bind(execution_mode)
         .execute(pool)
         .await
         .expect("seed integration connection");
@@ -3664,16 +3709,18 @@ mod db_tests {
             .ok();
     }
 
-    /// Test 1: three connections (two with a credential_ref, one WITHOUT) + a
+    /// Test 1: four connections (two static rows with a credential_ref, one
+    /// static row WITHOUT, and one Live row) + a
     /// guaranteed-due sweep. One tick → each gains a fresh connection_health_checks
     /// row AND its last_test_at/last_test_result are updated. Verifies BOTH stub
-    /// branches (ref-present→reachable-stub, ref-missing→unreachable), the EXACT
+    /// branches (ref-present→reachable-stub, ref-missing→unreachable), Live
+    /// refusal (blocked/not-attempted), the EXACT
     /// row column values, the exact `<status>;creds=<verdict>` last_test_result
     /// format the portal parses, that the persisted message is secret-free (never
-    /// contains the credential_ref), and that the execution detail is EXACTLY
-    /// `probed <N> connection(s)` with a bare count token (no per-connection leak).
+    /// contains the credential_ref), and that execution detail honestly
+    /// partitions static stubs from blocked rows without per-connection data.
     #[tokio::test]
-    async fn connection_sweep_probes_all_and_updates_freshness() {
+    async fn connection_sweep_stubs_static_and_blocks_live() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -3682,14 +3729,17 @@ mod db_tests {
         let id_a = "ic-sweep-test-aaaa0001";
         let id_b = "ic-sweep-test-bbbb0002";
         let id_c = "ic-sweep-test-cccc0001"; // empty credential_ref → ref-missing
+        let id_d = "ic-sweep-test-live0004";
         seed_connection(pool, id_a, "API_KEY_A").await;
         seed_connection(pool, id_b, "API_KEY_B").await;
         seed_connection(pool, id_c, "").await;
+        seed_connection_with_mode(pool, id_d, "API_KEY_LIVE", "live").await;
         let sched_id = seed_due_sweep_schedule(pool).await;
 
         let before_a = health_check_count(pool, id_a).await;
         let before_b = health_check_count(pool, id_b).await;
         let before_c = health_check_count(pool, id_c).await;
+        let before_d = health_check_count(pool, id_d).await;
 
         let ran = tick_once(pool).await.unwrap();
         assert!(ran >= 1, "at least the planted sweep schedule ran");
@@ -3709,6 +3759,11 @@ mod db_tests {
             health_check_count(pool, id_c).await,
             before_c + 1,
             "connection C (no ref) gained one health-check row"
+        );
+        assert_eq!(
+            health_check_count(pool, id_d).await,
+            before_d + 1,
+            "Live connection gained one fail-closed health observation"
         );
 
         // ref-present branch (A): the swept row stores the exact stub verdict and
@@ -3737,12 +3792,26 @@ mod db_tests {
             "C message is the exact stub output"
         );
 
+        let (ep_d, cred_d, msg_d) = latest_health_check(pool, id_d).await;
+        assert_eq!(ep_d, "blocked", "Live endpoint_status must fail closed");
+        assert_eq!(
+            cred_d, "not-attempted",
+            "Live credentials must not be resolved by the static sweep"
+        );
+        assert_eq!(
+            msg_d,
+            "UNAVAILABLE: static reachability stub is restricted to explicit local dry-run; no live provider call made.",
+            "Live rows must not inherit a reachable-stub projection"
+        );
+        assert!(!msg_d.contains("API_KEY_LIVE"));
+
         // last_test_* refreshed with the EXACT `<status>;creds=<verdict>` format the
         // portal integrations table parses (mirrors the on-demand probe).
         let expect = [
             (id_a, "reachable-stub;creds=ref-present"),
             (id_b, "reachable-stub;creds=ref-present"),
             (id_c, "unreachable;creds=ref-missing"),
+            (id_d, "blocked;creds=not-attempted"),
         ];
         for (id, want) in expect {
             let (at, result): (Option<String>, Option<String>) = sqlx::query_as(
@@ -3760,8 +3829,8 @@ mod db_tests {
             );
         }
 
-        // Aggregate-only detail contract: EXACTLY "probed <N> connection(s)" with a
-        // bare number — no connection ids can leak via /api/ops/scheduler/executions.
+        // Aggregate-only detail contract reports evaluated, stubbed, and blocked
+        // counts without claiming that a Live row was probed or exposing ids.
         let detail: Option<String> = sqlx::query_scalar(
             "SELECT detail FROM job_executions \
              WHERE schedule_id = $1 AND job_kind = 'connection_health_sweep' \
@@ -3773,17 +3842,28 @@ mod db_tests {
         .await
         .unwrap();
         let detail = detail.unwrap_or_default();
-        let count_token = detail
-            .strip_prefix("probed ")
-            .and_then(|s| s.strip_suffix(" connection(s)"));
+        let counts = detail
+            .strip_prefix("evaluated ")
+            .and_then(|rest| rest.split_once(" connection(s); static-stubbed "))
+            .and_then(|(evaluated, rest)| {
+                let (stubbed, blocked) = rest.split_once("; blocked ")?;
+                Some((
+                    evaluated.parse::<usize>().ok()?,
+                    stubbed.parse::<usize>().ok()?,
+                    blocked.parse::<usize>().ok()?,
+                ))
+            });
         assert!(
-            count_token.is_some_and(|n| n.parse::<u64>().is_ok()),
-            "detail must be exactly 'probed <N> connection(s)': {detail:?}"
+            counts.is_some_and(|(evaluated, stubbed, blocked)| {
+                evaluated == stubbed + blocked && blocked >= 1
+            }),
+            "detail must honestly partition evaluated rows into static stubs and blocked rows: {detail:?}"
         );
 
         cleanup_connection(pool, id_a).await;
         cleanup_connection(pool, id_b).await;
         cleanup_connection(pool, id_c).await;
+        cleanup_connection(pool, id_d).await;
         sqlx::query("DELETE FROM schedules WHERE id = $1")
             .bind(&sched_id)
             .execute(pool)
@@ -3981,11 +4061,11 @@ mod db_tests {
         .bind(metadata)
         .bind(if canonical { "Verified" } else { "Quarantined" })
         .bind((!canonical).then_some("test-invalid-restore-authority"))
-        .bind(
-            canonical
-                .then_some("2000-01-01T00:00:00Z")
-                .unwrap_or("rp-1"),
-        )
+        .bind(if canonical {
+            "2000-01-01T00:00:00Z"
+        } else {
+            "rp-1"
+        })
         .bind(source_authority.map(|authority| authority.0))
         .bind(source_authority.map(|authority| authority.1))
         .bind(if canonical {
@@ -5597,11 +5677,11 @@ mod db_tests {
         .bind(metadata)
         .bind(if canonical { "Verified" } else { "Quarantined" })
         .bind((!canonical).then_some("test-invalid-restore-authority"))
-        .bind(
-            canonical
-                .then_some("2000-01-01T00:00:00Z")
-                .unwrap_or("rp-1"),
-        )
+        .bind(if canonical {
+            "2000-01-01T00:00:00Z"
+        } else {
+            "rp-1"
+        })
         .bind(source_authority.map(|authority| authority.0))
         .bind(source_authority.map(|authority| authority.1))
         .bind(if canonical {
@@ -9247,17 +9327,21 @@ mod db_tests {
     const DRIFT_SCAN_SEED_ID: &str = "d71f7c1c-0031-4d31-8c31-d71f7c1c0031";
 
     /// Seed an 'operational' request, mirroring seed_maintain_request's NOT NULL
-    /// columns (request_type, status, stage, site, environment, name, created_by).
+    /// columns and migration-199 exact opaque-principal bindings.
     async fn seed_operational_request(pool: &PgPool, site: &str, environment: &str) -> String {
+        let principal_id = crate::principal_registry::seed_request_fixture_principal(pool).await;
         sqlx::query_scalar(
             "INSERT INTO requests \
-             (request_type, status, stage, site, environment, name, created_by) \
+             (request_type, status, stage, site, environment, name, \
+              principal_binding_state, created_by_principal_id, requester_principal_id, \
+              owner_principal_id) \
              VALUES ('server-deployment', 'operational', 'operational', $1, $2, \
-                     'drift-recheck-test', 'system') \
+                     'drift-recheck-test', 'exact-v1', $3, $3, $3) \
              RETURNING id::text",
         )
         .bind(site)
         .bind(environment)
+        .bind(principal_id)
         .fetch_one(pool)
         .await
         .expect("seed operational request")

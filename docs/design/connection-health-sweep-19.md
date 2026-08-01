@@ -4,9 +4,10 @@ Status: design. Reuses the #40 durable-scheduler SAFE-INTERNAL-WRITE recipe
 (it is #40 applied to integration connections instead of synthetic checks).
 
 ## Goal
-On-demand connection health exists: a test-connection handler runs
-`test_connection_stub(&conn)` (a DRY-RUN stub — no live provider call) and records
-a `connection_health_checks` row; `integration_health_history` reads the series.
+On-demand connection health exists: a test-connection handler may run
+`test_connection_stub(&conn)` only for an explicitly admitted local
+`static-dry-run` connection (no live provider call); live/production requests
+fail closed. `integration_health_history` reads the durable series.
 There is no PROACTIVE sweep, so the health history only has data when an operator
 manually tests a connection. Add a scheduled `connection_health_sweep` that probes
 every enabled connection on a cadence and records each result, so the health
@@ -32,17 +33,16 @@ schedulable but NOT read_only.
 
 ## API `run_job` arm `"connection_health_sweep"` (ALL on the tick tx)
 1. List ALL integration connections (review fix: `integration_connections` has NO
-   `enabled` column — do not invent a filter; probe every connection).
-2. For each, run `test_connection_stub(&conn)` (pure dry-run) and insert a
-   `connection_health_checks` row via a tx-aware repo fn (mirror the on-demand
-   probe's INSERT, executor-generic so it runs on `&mut *tx`). credential_status:
-   use a DETERMINISTIC STUB value (review fix — do NOT call the live
-   `resolve_credentials`; the safety argument is stub-only), e.g. the same
-   ref-presence verdict the stub implies.
+   `enabled` column — do not invent a filter; evaluate every connection).
+2. For each local static-dry-run row, run `test_connection_stub(&conn)` and
+   insert its deterministic result via a tx-aware repo fn. For every `live` row
+   or non-development process posture, insert a value-free
+   `blocked/not-attempted` observation instead. Never call a credential resolver
+   or provider from this sweep.
 3. Also UPDATE the connection's `last_test_at` / `last_test_result` in the SAME tx
    (review fix) — mirror the on-demand probe so the integrations list shows the
    scheduled freshness (the portal table reads those columns).
-4. `detail` aggregate-only: `"probed N connection(s)"`.
+4. `detail` aggregate-only: evaluated, static-stubbed, and blocked counts.
 A DB error rolls back within the schedule's savepoint (existing tick semantics).
 
 ## Migration 120
@@ -58,10 +58,12 @@ of connections. A retention/pruning policy for `connection_health_checks` is a
 follow-up if connection cardinality ever grows to hundreds.
 
 ## Tests (new *_db_tests, serialized, cleanup)
-1. Seed 2 connections and a guaranteed-due connection_health_sweep schedule; tick
-   once → each connection gains a new connection_health_checks row AND its
-   last_test_at/last_test_result are updated; detail matches exactly
-   `probed <N> connection(s)`, no per-connection id leak.
+1. Seed three static-dry-run connections (including a missing-reference case),
+   one Live connection, and a guaranteed-due connection_health_sweep schedule;
+   tick once → each connection gains a new connection_health_checks row AND its
+   last_test_at/last_test_result are updated. Static rows receive only stub
+   verdicts, the Live row receives `blocked/not-attempted`, and aggregate detail
+   reports exact evaluated/static-stubbed/blocked counts with no connection id.
 2. A second tick adds another row per connection (time series grows — no dedup),
    proving it is not a one-shot.
 3. Engine job_is_schedulable matrix (connection_health_sweep schedulable, not

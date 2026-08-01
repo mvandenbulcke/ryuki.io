@@ -39,6 +39,11 @@ pub struct RunbookExecution {
     pub runbook_id: String,
     pub status: ExecutionStatus,
     pub site: String,
+    /// Exact durable site-registry authority epoch captured when this
+    /// execution is persisted. Pure dry-run projections remain unbound until
+    /// the durable repository admits them against the canonical site row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_authority_epoch: Option<i64>,
     pub started_by: String,
     pub steps_results: Vec<StepResult>,
 }
@@ -80,6 +85,7 @@ fn seed_data() -> ExecutionStore {
             runbook_id: "patch-windows-server".into(),
             status: ExecutionStatus::Draft,
             site: "DEFRA".into(),
+            site_authority_epoch: None,
             started_by: "alice.engineer".into(),
             steps_results: vec![pending_step(1), pending_step(2), pending_step(3)],
         },
@@ -88,6 +94,7 @@ fn seed_data() -> ExecutionStore {
             runbook_id: "restart-service".into(),
             status: ExecutionStatus::Approved,
             site: "GBLON".into(),
+            site_authority_epoch: None,
             started_by: "bob.engineer".into(),
             steps_results: vec![pending_step(1), pending_step(2), pending_step(3)],
         },
@@ -96,6 +103,7 @@ fn seed_data() -> ExecutionStore {
             runbook_id: "certificate-renewal".into(),
             status: ExecutionStatus::Completed,
             site: "DEBER".into(),
+            site_authority_epoch: None,
             started_by: "carla.engineer".into(),
             steps_results: vec![completed_step(1), completed_step(2), completed_step(3)],
         },
@@ -300,6 +308,13 @@ fn is_terminal(status: &ExecutionStatus) -> bool {
 /// and timestamp shapes must agree; and Completed means every required step is
 /// actually complete.
 pub fn validate_execution_invariants(exec: &RunbookExecution) -> Result<(), String> {
+    if exec.site_authority_epoch.is_some_and(|epoch| epoch <= 0) {
+        return Err(format!(
+            "Execution '{}' carries an invalid site authority epoch",
+            exec.id
+        ));
+    }
+
     let runbook = find_runbook(&exec.runbook_id)
         .ok_or_else(|| format!("Runbook '{}' not found", exec.runbook_id))?;
     let expected_orders: Vec<u32> = runbook.steps.iter().map(|step| step.order).collect();
@@ -455,6 +470,7 @@ pub fn build_execution(
         runbook_id: runbook.id.clone(),
         status: initial_status,
         site,
+        site_authority_epoch: None,
         started_by: started_by.into(),
         steps_results: runbook
             .steps
@@ -462,6 +478,29 @@ pub fn build_execution(
             .map(|step| pending_step(step.order))
             .collect(),
     })
+}
+
+/// Attach the server-observed durable site authority to a newly constructed
+/// execution. An execution can be bound once (or idempotently rebound to the
+/// same value); callers cannot retarget it to a different site generation.
+pub fn bind_site_authority_epoch(
+    exec: &mut RunbookExecution,
+    authority_epoch: i64,
+) -> Result<(), String> {
+    if authority_epoch <= 0 {
+        return Err("site authority epoch must be positive".into());
+    }
+    if exec
+        .site_authority_epoch
+        .is_some_and(|bound| bound != authority_epoch)
+    {
+        return Err(format!(
+            "Execution '{}' is already bound to a different site authority epoch",
+            exec.id
+        ));
+    }
+    exec.site_authority_epoch = Some(authority_epoch);
+    validate_execution_invariants(exec)
 }
 
 /// Pure transition: approve an execution. Returns `Err` if the current status
@@ -828,6 +867,21 @@ mod tests {
             .expect("a catalog runbook that explicitly needs no approval stays executable");
         assert_eq!(running.status, ExecutionStatus::Running);
         assert_eq!(ready.status, ExecutionStatus::Approved);
+    }
+
+    #[test]
+    fn durable_site_authority_binding_is_positive_and_immutable() {
+        let mut execution = build_execution("restart-service", "DEFRA", "test.engineer").unwrap();
+        assert_eq!(execution.site_authority_epoch, None);
+        assert!(bind_site_authority_epoch(&mut execution, 0).is_err());
+        bind_site_authority_epoch(&mut execution, 41).expect("bind positive canonical epoch");
+        bind_site_authority_epoch(&mut execution, 41).expect("same binding is idempotent");
+        assert_eq!(execution.site_authority_epoch, Some(41));
+        assert!(
+            bind_site_authority_epoch(&mut execution, 42).is_err(),
+            "an existing execution cannot be rebound to a newer site lifetime"
+        );
+        assert_eq!(execution.site_authority_epoch, Some(41));
     }
 
     #[test]

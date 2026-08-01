@@ -427,3 +427,28 @@ pub(crate) async fn reconcile_authority_digest_tx(
     }
     Ok(true)
 }
+
+/// Create one active opaque principal for database fixtures that insert a
+/// request directly. Production request creation obtains this identity from
+/// the authenticated principal registry path; raw SQL fixtures must model the
+/// same foreign-key and lifecycle contract explicitly.
+#[cfg(test)]
+pub(crate) async fn seed_request_fixture_principal(pool: &sqlx::PgPool) -> Uuid {
+    let principal_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO principals ( \
+             principal_id, principal_kind, lifecycle_state, role_allowlist, \
+             site_authority_mode, site_scope, environment_authority_mode, \
+             environment_scope, created_by \
+         ) VALUES ( \
+             $1, 'system', 'active', ARRAY['PlatformAdmin']::TEXT[], \
+             'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], \
+             'request-fixture' \
+         )",
+    )
+    .bind(principal_id)
+    .execute(pool)
+    .await
+    .expect("seed active request fixture principal");
+    principal_id
+}

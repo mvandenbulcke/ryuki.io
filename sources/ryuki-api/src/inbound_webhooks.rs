@@ -1621,7 +1621,7 @@ mod inbound_webhook_db_tests {
             "delivery-reassignment-new",
             &body,
         );
-        webhook_receive_with_pool(
+        let _accepted = webhook_receive_with_pool(
             conn_id.clone(),
             headers_for_delivery(Some(&new_signature), timestamp, "delivery-reassignment-new"),
             body,

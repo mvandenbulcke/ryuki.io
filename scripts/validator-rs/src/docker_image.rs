@@ -428,7 +428,7 @@ fn step_has_exact_env(step: &YamlValue, expected: &[(&str, &str)]) -> bool {
         .is_some_and(|env| {
             env.len() == expected.len()
                 && expected.iter().all(|(key, value)| {
-                    env.get(&YamlValue::String((*key).to_string()))
+                    env.get(YamlValue::String((*key).to_string()))
                         .and_then(YamlValue::as_str)
                         == Some(*value)
                 })
@@ -440,7 +440,7 @@ fn yaml_mapping_has_exact_keys(value: &YamlValue, expected: &[&str]) -> bool {
         mapping.len() == expected.len()
             && expected
                 .iter()
-                .all(|key| mapping.contains_key(&YamlValue::String((*key).to_string())))
+                .all(|key| mapping.contains_key(YamlValue::String((*key).to_string())))
     })
 }
 

@@ -651,6 +651,12 @@ migration.
 
 - Control-plane integrations may resolve a handle in process only for the
   immediate approved outbound call. The value is not persisted or returned.
+- Database-encrypted inline integration credentials and inline webhook secrets
+  are local static-dry-run/test compatibility only. An authenticated production
+  posture or a `live` connection cannot create, rotate, resolve, or health-check
+  through that custody path; live adoption requires the admitted typed
+  `SecretRef` provider boundary. The URL-shape `test_connection_stub` refuses
+  `live` connections and is never evidence of live provider reachability.
 - Live provider credentials should resolve on the assigned agent using that
   agent's workload identity. When central brokerage is unavoidable, delivery is
   one-time, encrypted to the agent, job-bound, and short-lived; the control plane
@@ -2664,6 +2670,13 @@ from the active trace ledger.
   with authority intersection and complete audit.
 - Route request, runbook, software, access-review, and emergency decisions
   through shared maker/checker, quorum, audit, and idempotency primitives.
+- Bind each persisted runbook execution to a server-minted, non-reusable
+  canonical-site authority epoch. Every forward transition must lock and match
+  the exact still-active epoch; deactivation/reactivation and deletion/
+  recreation of the same site code must not revive stale execution authority.
+  Legacy executions without creation-time epoch evidence remain readable but
+  quarantined, and only protective failure or rollback may bypass current-site
+  liveness for an already-bound execution.
 - Commit decision, transition, outbox, and audit atomically; invalidate approvals
   after rework or any material change.
 - Add monotonic audit sequencing per deployment/trust-domain/applicable-tenant

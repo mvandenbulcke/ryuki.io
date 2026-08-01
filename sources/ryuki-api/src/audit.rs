@@ -1479,6 +1479,35 @@ mod tests {
     }
 
     #[test]
+    fn redact_detail_scrubs_structured_authorization_header_aggregates() {
+        let named_marker = "SYNTH-AUDIT-NAMED-BASIC-CANARY";
+        let tuple_marker = "SYNTH-AUDIT-TUPLE-BASIC-CANARY";
+        let detail = json!({
+            "transport": {
+                "headers": [
+                    {
+                        "header_name": "Authorization",
+                        "header_values": [format!("Basic {named_marker}")]
+                    },
+                    [
+                        "authorization",
+                        format!("Basic {tuple_marker}")
+                    ]
+                ]
+            },
+            "note": "ordinary handover text"
+        });
+
+        let redacted = redact_detail(&detail);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains(named_marker));
+        assert!(!serialized.contains(tuple_marker));
+        assert_eq!(redacted["transport"]["headers"][0], "***REDACTED***");
+        assert_eq!(redacted["transport"]["headers"][1], "***REDACTED***");
+        assert_eq!(redacted["note"], "ordinary handover text");
+    }
+
+    #[test]
     fn audit_entry_to_json_redacts_detail_reason() {
         let entry = AuditEntry {
             reservation_id: uuid::Uuid::new_v4(),

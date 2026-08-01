@@ -227,6 +227,8 @@ pub enum CredError {
     SecretScopeMismatch,
     #[error("legacy Vault credential references are allowed only in explicit local dry-run")]
     LegacyVaultReferenceDenied,
+    #[error("inline integration and webhook credential custody is allowed only in explicit local static dry-run")]
+    InlineCredentialCustodyDenied,
     #[error("typed secret reference generation changed during resolution")]
     SecretReferenceGenerationChanged,
 }
@@ -1118,12 +1120,19 @@ impl ApiIntegrationCredentialResolver {
     }
 }
 
-/// The mock secret resolver is a local dry-run compatibility feature, not a
-/// degraded production mode. Both the process posture and the connection must
-/// independently opt into dry-run behavior.
-fn mock_secret_resolver_allowed(auth_mode: &AuthMode, execution_mode: &ExecutionMode) -> bool {
+/// Local inline-secret custody and synthetic adapters are compatibility
+/// features, not degraded production modes. Both the admitted process posture
+/// and the individual connection must independently opt into static dry-run.
+pub(crate) fn local_static_dry_run_allowed(
+    auth_mode: &AuthMode,
+    execution_mode: &ExecutionMode,
+) -> bool {
     matches!(auth_mode, AuthMode::MockDryRun | AuthMode::StaticDryRun)
         && matches!(execution_mode, ExecutionMode::StaticDryRun)
+}
+
+fn mock_secret_resolver_allowed(auth_mode: &AuthMode, execution_mode: &ExecutionMode) -> bool {
+    local_static_dry_run_allowed(auth_mode, execution_mode)
 }
 
 fn canonical_namespaced_identity(value: &str, prefix: &str) -> bool {
@@ -1556,6 +1565,9 @@ async fn resolve_credentials(
             })
         }
         CredentialSource::DbEncrypted => {
+            if !matches!(&conn.execution_mode, ExecutionMode::StaticDryRun) {
+                return Err(CredError::InlineCredentialCustodyDenied);
+            }
             let pool = pool.ok_or_else(|| CredError::Db("no database pool available".into()))?;
             // FIX-2: scope the secret lookup to THIS connection's id — prevents
             // connection A from resolving connection B's secret by supplying B's
@@ -2013,6 +2025,13 @@ fn integration_500(msg: &str) -> (axum::http::StatusCode, axum::Json<Value>) {
     )
 }
 
+fn integration_503(msg: &str) -> (axum::http::StatusCode, axum::Json<Value>) {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(json!({"error": msg})),
+    )
+}
+
 fn verify_secret_reference_for_write(
     secret_ref: &SecretRef,
 ) -> Result<(), (axum::http::StatusCode, axum::Json<Value>)> {
@@ -2220,6 +2239,21 @@ pub async fn integration_create(
 
     let source =
         CredentialSource::parse(&body.credential_source).map_err(|e| integration_400(&e))?;
+    if !body.inline_secret.is_empty() && source != CredentialSource::DbEncrypted {
+        return Err(integration_400(
+            "inline_secret is accepted only for db-encrypted credential source",
+        ));
+    }
+    if source == CredentialSource::DbEncrypted
+        && !local_static_dry_run_allowed(
+            &crate::config_store::auth_mode_or_default(),
+            &ExecutionMode::StaticDryRun,
+        )
+    {
+        return Err(integration_503(
+            "db-encrypted credentials are unavailable outside explicit local static dry-run",
+        ));
+    }
     let (credential_secret_ref, credential_secret_ref_generation) = match &source {
         CredentialSource::SecretProviderRef => {
             if !body.credential_ref.is_empty()
@@ -2713,6 +2747,22 @@ pub async fn integration_update(
             row.try_into_connection_with_secret_ref().map_err(db_err)?;
         let prior_secret_ref_generation = secret_ref_generation;
 
+        if !body.inline_secret.is_empty() {
+            if conn.credential_source != CredentialSource::DbEncrypted {
+                return Err(integration_400(
+                    "inline_secret is accepted only for db-encrypted credential source",
+                ));
+            }
+            if !local_static_dry_run_allowed(
+                &crate::config_store::auth_mode_or_default(),
+                &conn.execution_mode,
+            ) {
+                return Err(integration_503(
+                    "db-encrypted credentials are unavailable outside explicit local static dry-run",
+                ));
+            }
+        }
+
         let webhook_authority_changed = body
             .vendor_type
             .as_ref()
@@ -3044,6 +3094,15 @@ pub async fn set_webhook_secret(
     connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
     let conn = row.try_into_connection().map_err(db_err)?;
 
+    if !local_static_dry_run_allowed(
+        &crate::config_store::auth_mode_or_default(),
+        &conn.execution_mode,
+    ) {
+        return Err(integration_503(
+            "inline webhook secrets are unavailable outside explicit local static dry-run",
+        ));
+    }
+
     if body.webhook_secret.trim().is_empty() {
         return Err(integration_400("webhook_secret must not be empty"));
     }
@@ -3238,8 +3297,8 @@ pub(crate) async fn webhook_secret_material_was_used(
 /// OR when the ref points at a row that no longer exists — both are treated as
 /// "unconfigured" so the caller fails closed (401) rather than erroring. Uses the same
 /// anti-row-swap scoping as `resolve_credentials`' FIX-2: the secret lookup is scoped
-/// to `(id, connection_id)`, so a foreign ref can never resolve another connection's
-/// secret.
+/// to `(id, connection_id, generation)`, so a foreign or stale-generation ref can
+/// never resolve another authority's secret.
 pub(crate) async fn resolve_webhook_authority(
     connection: &mut sqlx::PgConnection,
     connection_id: &str,
@@ -3247,26 +3306,37 @@ pub(crate) async fn resolve_webhook_authority(
     // Always acquire the connection lock before the credential lock. Rotation
     // and deletion use that same ordering, which makes the authority snapshot
     // both atomic and deadlock-safe.
-    let authority: Option<(String, Option<String>, Option<String>, i64)> = sqlx::query_as(
-        "SELECT vendor_type, site_scope, webhook_secret_ref, webhook_secret_generation \
+    let authority: Option<(String, Option<String>, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT vendor_type, site_scope, execution_mode, webhook_secret_ref, webhook_secret_generation \
          FROM integration_connections WHERE id = $1 FOR SHARE",
     )
     .bind(connection_id)
     .fetch_optional(&mut *connection)
     .await
     .map_err(|error| CredError::Db(error.to_string()))?;
-    let Some((vendor_type, site_scope, Some(secret_ref), generation)) = authority else {
+    let Some((vendor_type, site_scope, execution_mode, Some(secret_ref), generation)) = authority
+    else {
         return Ok(None);
     };
+    let execution_mode = ExecutionMode::parse(&execution_mode)
+        .map_err(|_| CredError::InlineCredentialCustodyDenied)?;
+    if !local_static_dry_run_allowed(
+        &crate::config_store::auth_mode_or_default(),
+        &execution_mode,
+    ) {
+        return Err(CredError::InlineCredentialCustodyDenied);
+    }
     if generation <= 0 {
         return Ok(None);
     }
     let secret_row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT ciphertext, nonce FROM integration_secrets \
-         WHERE id = $1 AND connection_id = $2 FOR SHARE",
+         WHERE id = $1 AND connection_id = $2 \
+           AND webhook_secret_generation = $3 FOR SHARE",
     )
     .bind(&secret_ref)
     .bind(connection_id)
+    .bind(generation)
     .fetch_optional(&mut *connection)
     .await
     .map_err(|error| CredError::Db(error.to_string()))?;
@@ -3432,6 +3502,19 @@ pub async fn integration_test(
     // #2: guard BEFORE resolve_credentials — a scoped admin must never trigger
     // resolution/decryption of another site's credentials (finding #3).
     connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+    if !local_static_dry_run_allowed(
+        &crate::config_store::auth_mode_or_default(),
+        &conn.execution_mode,
+    ) {
+        return Err(integration_503(
+            "live provider health probing is unavailable; static reachability stubs are restricted to explicit local dry-run",
+        ));
+    }
+    let test_result: TestResult = test_connection_stub(&conn).map_err(|_| {
+        integration_503(
+            "live provider health probing is unavailable; static reachability stubs are restricted to explicit local dry-run",
+        )
+    })?;
     // Attempt credential resolution — the ResolvedCredentials is dropped immediately
     // after use and zeroized. Never included in the response.
     // Externally managed connections resolve through the adapter selected by
@@ -3547,9 +3630,6 @@ pub async fn integration_test(
         }
         Err(_) => ("error", "credential resolution failed".to_string()),
     };
-
-    // Run the generic stub (no live vendor call).
-    let test_result: TestResult = test_connection_stub(&conn);
 
     // #58: record ONE durable, hash-chained connection-usage audit row for this
     // credential resolution BEFORE any best-effort telemetry write. This is the
@@ -4650,6 +4730,19 @@ pub mod integration_db_tests {
             "resolved plaintext must match what was provisioned"
         );
 
+        sqlx::query("UPDATE integration_connections SET execution_mode = 'live' WHERE id = $1")
+            .bind(&conn_id)
+            .execute(&pool)
+            .await
+            .expect("mark webhook fixture live");
+        let live_error = resolve_webhook_secret(&pool, &conn_id)
+            .await
+            .expect_err("inline webhook custody must not resolve for a Live connection");
+        assert!(matches!(
+            live_error,
+            CredError::InlineCredentialCustodyDenied
+        ));
+
         cleanup_connection(&pool, &conn_id).await;
     }
 
@@ -4826,6 +4919,72 @@ pub mod integration_db_tests {
             "fresh plaintext must remain eligible"
         );
         history_tx.rollback().await.expect("release history check");
+
+        cleanup_connection(&pool, &conn_id).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_webhook_authority_rejects_secret_generation_mismatch() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+
+        let conn_id = format!("ic-webhook-generation-mismatch-{}", uuid::Uuid::new_v4());
+        let secret_id = format!("is-wh-{}", uuid::Uuid::new_v4());
+        let now = now_iso();
+
+        // The normal API activates a binding only through migration 207's
+        // generation transition trigger. A pre-existing/corrupt INSERT can still
+        // carry a reference before the FK-owned secret row exists, so resolution
+        // must independently require the secret row's generation to match.
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              webhook_secret_ref, webhook_secret_generation, status, readiness, \
+              execution_mode, created_by, created_at, updated_at) \
+             VALUES ($1, 'servicenow', 'webhook-generation-mismatch', 'https://x.example', \
+                     'vault', 'p', $2, 1, 'configured', 'configured', 'static-dry-run', \
+                     'sys', $3, $3)",
+        )
+        .bind(&conn_id)
+        .bind(&secret_id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert mismatched webhook connection");
+
+        let plaintext = rand::random::<[u8; 32]>();
+        let (ciphertext, nonce, key_id) = encrypt_secret(&conn_id, &plaintext).unwrap();
+        sqlx::query(
+            "INSERT INTO integration_secrets \
+             (id, connection_id, ciphertext, nonce, key_id, webhook_secret_generation, \
+              created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,2,$6,$6)",
+        )
+        .bind(&secret_id)
+        .bind(&conn_id)
+        .bind(&ciphertext)
+        .bind(&nonce)
+        .bind(&key_id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert mismatched webhook generation");
+
+        let mut tx = pool.begin().await.expect("begin authority mismatch check");
+        let authority = resolve_webhook_authority(&mut tx, &conn_id)
+            .await
+            .expect("generation mismatch must fail closed without a database error");
+        assert!(
+            authority.is_none(),
+            "a secret row from a different generation must never authorize the connection"
+        );
+        tx.rollback()
+            .await
+            .expect("release mismatch authority lock");
 
         cleanup_connection(&pool, &conn_id).await;
     }
@@ -8282,6 +8441,31 @@ mod unit_tests {
 
     #[test]
     fn development_secret_selection_is_limited_to_explicit_dry_run() {
+        assert!(local_static_dry_run_allowed(
+            &AuthMode::MockDryRun,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(local_static_dry_run_allowed(
+            &AuthMode::StaticDryRun,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(!local_static_dry_run_allowed(
+            &AuthMode::EntraId,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(!local_static_dry_run_allowed(
+            &AuthMode::Local,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(!local_static_dry_run_allowed(
+            &AuthMode::MockDryRun,
+            &ExecutionMode::Live
+        ));
+        assert!(!local_static_dry_run_allowed(
+            &AuthMode::StaticDryRun,
+            &ExecutionMode::Live
+        ));
+
         assert!(mock_secret_resolver_allowed(
             &AuthMode::MockDryRun,
             &ExecutionMode::StaticDryRun
@@ -8570,6 +8754,20 @@ mod unit_tests {
                 .to_string(),
             "vault resolver unavailable: required configuration is missing"
         );
+    }
+
+    #[tokio::test]
+    async fn live_db_encrypted_credential_resolution_fails_before_database_access() {
+        let mut conn = persisted_connection_row("db-encrypted")
+            .try_into_connection()
+            .expect("valid db-encrypted fixture");
+        conn.execution_mode = ExecutionMode::Live;
+
+        let result = resolve_credentials(&conn, None, None).await;
+        assert!(matches!(
+            result,
+            Err(CredError::InlineCredentialCustodyDenied)
+        ));
     }
 
     // -----------------------------------------------------------------------

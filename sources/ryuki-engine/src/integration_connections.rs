@@ -266,34 +266,62 @@ pub fn delete_connection_returning(id: &str) -> Option<IntegrationConnection> {
     Some(store.remove(idx))
 }
 
+/// A static reachability stub cannot establish live provider health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTestStubError {
+    LiveExecutionDenied,
+}
+
+impl std::fmt::Display for ConnectionTestStubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LiveExecutionDenied => {
+                write!(
+                    f,
+                    "connection test stub requires static-dry-run execution mode"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConnectionTestStubError {}
+
 /// Generic test stub: validate that credentials appear resolvable and the
-/// endpoint URL is structurally valid. Does NOT make live vendor calls.
-pub fn test_connection_stub(conn: &IntegrationConnection) -> TestResult {
+/// endpoint URL is structurally valid. Does NOT make live vendor calls and
+/// refuses every connection that is not explicitly `StaticDryRun`.
+pub fn test_connection_stub(
+    conn: &IntegrationConnection,
+) -> Result<TestResult, ConnectionTestStubError> {
+    if !matches!(&conn.execution_mode, ExecutionMode::StaticDryRun) {
+        return Err(ConnectionTestStubError::LiveExecutionDenied);
+    }
+
     // Basic URL shape check (must be http:// or https://).
     let url_ok =
         conn.endpoint_url.starts_with("http://") || conn.endpoint_url.starts_with("https://");
     let cred_ref_present = conn.credential_source == CredentialSource::SecretProviderRef
         || !conn.credential_ref.is_empty();
     if url_ok && cred_ref_present {
-        TestResult {
+        Ok(TestResult {
             status: "reachable-stub".to_string(),
             message: format!(
                 "DRY-RUN: endpoint URL shape valid; credential_source={} ref present. No live call made.",
                 conn.credential_source.as_str()
             ),
             resolved_at: now_iso(),
-        }
+        })
     } else {
         let reason = if !url_ok {
             "endpoint_url must start with http:// or https://"
         } else {
             "credential_ref is empty"
         };
-        TestResult {
+        Ok(TestResult {
             status: "unreachable".to_string(),
             message: format!("DRY-RUN: validation failed — {}", reason),
             resolved_at: now_iso(),
-        }
+        })
     }
 }
 
@@ -479,7 +507,7 @@ mod unit_tests {
             created_at: "2026-06-14T00:00:00+00:00".to_string(),
             updated_at: "2026-06-14T00:00:00+00:00".to_string(),
         };
-        let result = test_connection_stub(&conn);
+        let result = test_connection_stub(&conn).expect("static dry-run stub is admitted");
         assert_eq!(result.status, "reachable-stub");
         // The message must NOT contain any secret material.
         assert!(
@@ -508,12 +536,41 @@ mod unit_tests {
             created_at: "2026-06-14T00:00:00+00:00".to_string(),
             updated_at: "2026-06-14T00:00:00+00:00".to_string(),
         };
-        let result = test_connection_stub(&conn);
+        let result = test_connection_stub(&conn).expect("static dry-run stub is admitted");
         assert_eq!(result.status, "unreachable");
         assert!(
             result.message.contains("http"),
             "message should explain URL requirement: {}",
             result.message
+        );
+    }
+
+    #[test]
+    fn test_connection_stub_rejects_live_execution() {
+        let conn = IntegrationConnection {
+            id: "ic-test-live-00000003".to_string(),
+            vendor_type: "vmware".to_string(),
+            name: "Live".to_string(),
+            endpoint_url: "https://vcenter.example.com".to_string(),
+            site_scope: None,
+            credential_source: CredentialSource::SecretProviderRef,
+            credential_ref: String::new(),
+            status: "configured".to_string(),
+            readiness: "blocked".to_string(),
+            execution_mode: ExecutionMode::Live,
+            last_test_at: None,
+            last_test_result: None,
+            created_by: "test".to_string(),
+            created_at: "2026-06-14T00:00:00+00:00".to_string(),
+            updated_at: "2026-06-14T00:00:00+00:00".to_string(),
+        };
+
+        assert!(
+            matches!(
+                test_connection_stub(&conn),
+                Err(ConnectionTestStubError::LiveExecutionDenied)
+            ),
+            "a URL-shape stub must never be projected as live reachability"
         );
     }
 }

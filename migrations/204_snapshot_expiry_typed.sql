@@ -10,7 +10,6 @@
 -- it cannot enter the stale work index or become visible to the new binary.
 
 SET LOCAL lock_timeout = '30s';
-SET LOCAL TIME ZONE 'UTC';
 LOCK TABLE snapshots IN ACCESS EXCLUSIVE MODE;
 
 ALTER TABLE snapshots

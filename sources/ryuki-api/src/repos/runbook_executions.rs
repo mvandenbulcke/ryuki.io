@@ -18,7 +18,8 @@ use sqlx::PgPool;
 /// row's system version (the xid that last wrote it) — selected as text so the
 /// caller can carry it as an optimistic-lock token (see `transition`).
 pub const COLUMNS: &str =
-    "id, status, execution_json::text AS execution_json, xmin::text AS row_version";
+    "id, status, site_authority_epoch, execution_json::text AS execution_json, \
+     xmin::text AS row_version";
 
 // ─── Row struct ──────────────────────────────────────────────────────────────
 
@@ -29,6 +30,9 @@ pub const COLUMNS: &str =
 pub struct RunbookExecutionRow {
     pub id: String,
     pub status: String,
+    /// Exact site-registry generation captured when the execution was created.
+    /// NULL identifies quarantined pre-epoch history.
+    pub site_authority_epoch: Option<i64>,
     /// Raw JSON text from JSONB::text cast — the full `RunbookExecution`.
     pub execution_json: Option<String>,
     /// `xmin::text` — the row version at read time (optimistic-lock token).
@@ -58,6 +62,10 @@ impl RunbookExecutionRow {
 
         // Override the id with the DB-authoritative value.
         entity.id = self.id;
+        // The scalar binding is authoritative even if a legacy/corrupt JSON
+        // projection omitted it. The database trigger keeps new Verified rows
+        // byte-for-value equivalent at write time.
+        entity.site_authority_epoch = self.site_authority_epoch;
 
         Ok(entity)
     }
@@ -92,26 +100,34 @@ fn decode_status(s: &str) -> Result<ExecutionStatus, String> {
 /// without inserting a row.
 pub async fn insert(
     executor: impl sqlx::PgExecutor<'_>,
-    exec: &RunbookExecution,
+    exec: &mut RunbookExecution,
 ) -> Result<(), sqlx::Error> {
     ryuki_engine::runbook_execution::validate_execution_invariants(exec).map_err(|error| {
         sqlx::Error::Protocol(format!("runbook execution invariant violation: {error}"))
     })?;
-    let execution_json = serde_json::to_value(exec).map_err(|e| {
+    let execution_json = serde_json::to_value(&*exec).map_err(|e| {
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
 
-    let result = sqlx::query(
+    let bound_epoch: Option<i64> = sqlx::query_scalar(
         "WITH active_site AS ( \
-             SELECT unlocode FROM site_registry \
+             SELECT unlocode, authority_epoch FROM site_registry \
              WHERE unlocode COLLATE \"C\" = $4::text COLLATE \"C\" AND active = TRUE \
              FOR SHARE \
          ) \
          INSERT INTO runbook_executions \
          (id, runbook_id, status, site, started_by, execution_json, \
-          invariant_state, invariant_reason) \
-         SELECT $1, $2, $3, active_site.unlocode, $5, $6, 'Verified', NULL \
-         FROM active_site",
+          invariant_state, invariant_reason, site_authority_epoch) \
+         SELECT $1, $2, $3, active_site.unlocode, $5, \
+                jsonb_set( \
+                    $6, \
+                    '{site_authority_epoch}', \
+                    to_jsonb(active_site.authority_epoch), \
+                    TRUE \
+                ), \
+                'Verified', NULL, active_site.authority_epoch \
+         FROM active_site \
+         RETURNING site_authority_epoch",
     )
     .bind(&exec.id)
     .bind(&exec.runbook_id)
@@ -119,14 +135,17 @@ pub async fn insert(
     .bind(&exec.site)
     .bind(&exec.started_by)
     .bind(execution_json)
-    .execute(executor)
+    .fetch_optional(executor)
     .await?;
 
-    if result.rows_affected() != 1 {
+    let Some(bound_epoch) = bound_epoch else {
         return Err(sqlx::Error::Protocol(
             "runbook execution requires a current active canonical site".into(),
         ));
-    }
+    };
+    // Creation authority is server-derived. Ignore any pre-binding carried by
+    // the caller and return the exact value that the INSERT persisted.
+    exec.site_authority_epoch = Some(bound_epoch);
 
     Ok(())
 }
@@ -179,9 +198,10 @@ pub async fn list(
 /// NOT been written since it was read — guarded on the `xmin` row version
 /// (`expected_version`, the token returned by `get`). Returns `Ok(false)` when
 /// the row is absent, was modified concurrently, or a forward transition's
-/// exact site is no longer active (caller → 409), and `Ok(true)` on success.
-/// The active-site row is held `FOR SHARE` until the caller-owned transaction
-/// ends, so a concurrent deactivation cannot race an admitted transition.
+/// exact captured site authority epoch is no longer active (caller → 409), and
+/// `Ok(true)` on success. The active-site row is held `FOR SHARE` until the
+/// caller-owned transaction ends, so a concurrent deactivation or rename
+/// cannot race an admitted transition.
 /// Protective terminalization to Failed or RolledBack remains available after
 /// deactivation so operators can stop or unwind work safely.
 ///
@@ -205,11 +225,19 @@ pub async fn transition(
     let execution_json = serde_json::to_value(updated).map_err(|e| {
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
+    let Some(site_authority_epoch) = updated.site_authority_epoch else {
+        return Ok(false);
+    };
+    if site_authority_epoch <= 0 {
+        return Ok(false);
+    }
 
     let res = sqlx::query(
         "WITH active_site AS ( \
-             SELECT unlocode FROM site_registry \
-             WHERE unlocode COLLATE \"C\" = $5::text COLLATE \"C\" AND active = TRUE \
+             SELECT unlocode, authority_epoch FROM site_registry \
+             WHERE unlocode COLLATE \"C\" = $5::text COLLATE \"C\" \
+               AND active = TRUE \
+               AND authority_epoch = $6 \
              FOR SHARE \
          ) \
          UPDATE runbook_executions AS execution SET \
@@ -220,6 +248,7 @@ pub async fn transition(
            AND execution.xmin = $4::xid \
            AND execution.invariant_state = 'Verified' \
            AND execution.site COLLATE \"C\" = $5::text COLLATE \"C\" \
+           AND execution.site_authority_epoch = $6 \
            AND ( \
                $2 IN ('failed', 'rolled-back') \
                OR EXISTS ( \
@@ -233,6 +262,7 @@ pub async fn transition(
     .bind(execution_json)
     .bind(expected_version)
     .bind(&updated.site)
+    .bind(site_authority_epoch)
     .execute(&mut *executor)
     .await?;
 

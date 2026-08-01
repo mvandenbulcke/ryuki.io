@@ -58,7 +58,7 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 2,
-    "content_digest": "sha256:83e0d8999dcf14b66bb0ba6953fb96b4ffec99d52042a0daf73f32d8f06836cc",
+    "content_digest": "sha256:c43e79ec4430d423910b594a764ddad45de44dbba8431296ac60b32a495bfb6c",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {
@@ -72,21 +72,21 @@
     "artifact_kind": "control-plane-topology",
     "document_id": "control-plane-topology:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:8e122da6785113dfae276f1b555e1ce3de97d58001c30cde126eec0a01eaee19",
+    "content_digest": "sha256:3c47bcbfe8afbbb34686faccc756d689d3c6135228f97b7ccd1c90a637d28cd3",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "egress_policy_ref": {
     "artifact_kind": "egress-policy",
     "document_id": "egress-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:8e122da6785113dfae276f1b555e1ce3de97d58001c30cde126eec0a01eaee19",
+    "content_digest": "sha256:3c47bcbfe8afbbb34686faccc756d689d3c6135228f97b7ccd1c90a637d28cd3",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "retention_policy_ref": {
     "artifact_kind": "retention-policy",
     "document_id": "retention-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:8e122da6785113dfae276f1b555e1ce3de97d58001c30cde126eec0a01eaee19",
+    "content_digest": "sha256:3c47bcbfe8afbbb34686faccc756d689d3c6135228f97b7ccd1c90a637d28cd3",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "production_acceptance_receipt_ref": null,

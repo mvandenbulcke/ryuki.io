@@ -51,9 +51,9 @@ const SENSITIVE_VALUE_MARKERS: &[&str] = &["bearer ", "authorization: basic "];
 const AUTHORIZATION_LABEL: &str = "authorization";
 const AUTHORIZATION_SCHEMES: &[&str] = &["basic", "bearer"];
 const COOKIE_HEADER_LABELS: &[&str] = &["cookie", "set-cookie", "set_cookie"];
-/// Exact credential-bearing cookie names admitted by the shipped secure and
-/// explicit-loopback runtimes. Cookie names are case-sensitive on the wire, but
-/// evidence matching is case-insensitive because logs and serializers can
+/// Exact credential-bearing cookie names used by the shipped runtimes or by
+/// common application frameworks. Cookie names are case-sensitive on the wire,
+/// but evidence matching is case-insensitive because logs and serializers can
 /// normalize their presentation.
 const CREDENTIAL_COOKIE_NAMES: &[&str] = &[
     "__host-ryuki_session",
@@ -62,6 +62,19 @@ const CREDENTIAL_COOKIE_NAMES: &[&str] = &[
     "entra_login_csrf",
     "__host-oidc_login_csrf",
     "oidc_login_csrf",
+    // Common framework session-cookie names can arrive in provider/audit text
+    // without an enclosing Cookie header. Keep these exact (the assignment
+    // parser still requires a field boundary plus ':'/'=') so generic evidence
+    // catches credentials without treating ordinary session prose as secret.
+    "session",
+    "sessionid",
+    "session_id",
+    "jsessionid",
+    "phpsessid",
+    "asp.net_sessionid",
+    "connect.sid",
+    "laravel_session",
+    "_session_id",
 ];
 const STRUCTURED_HEADER_NAME_FIELDS: &[&str] =
     &["name", "key", "header", "header_name", "header-name"];
@@ -870,30 +883,47 @@ pub fn collect_evidence(request: &Request) -> Result<EvidencePack, String> {
     Ok(pack)
 }
 
+fn redact_evidence_item(item: &mut EvidenceItem) {
+    let raw_value_is_sensitive = should_redact(&item.key, &item.value);
+    let supplied_redacted_value_is_sensitive = item
+        .redacted_value
+        .as_deref()
+        .is_some_and(|candidate| should_redact("", candidate));
+    if raw_value_is_sensitive || supplied_redacted_value_is_sensitive {
+        item.redacted = true;
+        // A caller-controlled redacted_value is not trusted as a safe
+        // substitute for a newly detected credential.
+        item.redacted_value = Some(REDACTED_EVIDENCE_VALUE.into());
+    }
+    // For every redacted item (whether just flagged above or pre-marked by the
+    // lifecycle), overwrite the raw value with the safe form so persistence
+    // and digests never carry the sensitive raw value.
+    if item.redacted {
+        let safe_value = item
+            .redacted_value
+            .clone()
+            .unwrap_or_else(|| REDACTED_EVIDENCE_VALUE.into());
+        item.value = safe_value.clone();
+        item.redacted_value = Some(safe_value);
+    }
+}
+
+/// Redact the evidence and metadata attached to request stages before a stage
+/// collection crosses an in-memory or durable persistence boundary.
+pub fn redact_request_stages(stages: &mut [Stage]) {
+    for stage in stages {
+        for item in &mut stage.evidence {
+            redact_evidence_item(item);
+        }
+        for (key, value) in &mut stage.metadata {
+            *value = redact_sensitive_text(key, value);
+        }
+    }
+}
+
 pub fn redact_evidence(pack: &mut EvidencePack) -> Result<(), String> {
     for item in pack.items.iter_mut() {
-        let raw_value_is_sensitive = should_redact(&item.key, &item.value);
-        let supplied_redacted_value_is_sensitive = item
-            .redacted_value
-            .as_deref()
-            .is_some_and(|candidate| should_redact("", candidate));
-        if raw_value_is_sensitive || supplied_redacted_value_is_sensitive {
-            item.redacted = true;
-            // A caller-controlled redacted_value is not trusted as a safe
-            // substitute for a newly detected credential.
-            item.redacted_value = Some(REDACTED_EVIDENCE_VALUE.into());
-        }
-        // For every redacted item (whether just flagged above or pre-marked
-        // by the lifecycle), overwrite the raw value with the safe form so
-        // the pack — and its digest — never carry a sensitive raw value.
-        if item.redacted {
-            let safe_value = item
-                .redacted_value
-                .clone()
-                .unwrap_or_else(|| REDACTED_EVIDENCE_VALUE.into());
-            item.value = safe_value.clone();
-            item.redacted_value = Some(safe_value);
-        }
+        redact_evidence_item(item);
     }
     for (key, value) in &mut pack.metadata {
         *value = redact_sensitive_text(key, value);
@@ -1393,6 +1423,11 @@ mod tests {
             ),
             ("reason", "__Host-oidc_login_csrf=SYNTH-BARE-OIDC-BINDING"),
             ("reason", "oidc_login_csrf=SYNTH-BARE-LOOPBACK-OIDC-BINDING"),
+            ("reason", "JSESSIONID=SYNTH-BARE-JAVA-SESSION"),
+            ("reason", "PHPSESSID=SYNTH-BARE-PHP-SESSION"),
+            ("reason", "ASP.NET_SessionId=SYNTH-BARE-DOTNET-SESSION"),
+            ("reason", "connect.sid=SYNTH-BARE-EXPRESS-SESSION"),
+            ("reason", "session_id=SYNTH-BARE-GENERIC-SESSION"),
         ] {
             assert!(
                 should_redact(key, value),
@@ -1414,6 +1449,8 @@ mod tests {
                 "configuration",
                 r#"nested={\"\\u0043ookiePolicy\":\"ordinary metadata\"}"#,
             ),
+            ("summary", "session policy enabled"),
+            ("summary", "sessionidletimeout=30"),
             ("summary", "browser compatibility check completed"),
         ] {
             assert!(
@@ -1561,6 +1598,50 @@ mod tests {
         assert!(serialized.contains(safe_compliance));
         assert!(exported.contains(safe_metadata));
         assert!(exported.contains(safe_compliance));
+    }
+
+    #[test]
+    fn test_request_stage_redaction_canonicalizes_evidence_and_metadata_before_storage() {
+        let raw_marker = "SYNTH-STAGE-RAW-SESSION-CANARY";
+        let replacement_marker = "SYNTH-STAGE-REPLACEMENT-CANARY";
+        let metadata_marker = "SYNTH-STAGE-METADATA-SESSION-CANARY";
+        let mut stages = vec![Stage {
+            name: "approve".into(),
+            status: StageStatus::Failed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "approval-decision".into(),
+                value: format!("JSESSIONID={raw_marker}"),
+                redacted_value: Some(format!("session_id={replacement_marker}")),
+                redacted: false,
+                evidence_type: EvidenceType::ApprovalDecision,
+            }],
+            metadata: HashMap::from([
+                ("reason".into(), format!("connect.sid={metadata_marker}")),
+                ("decision".into(), "rejected".into()),
+            ]),
+        }];
+
+        redact_request_stages(&mut stages);
+
+        let serialized = serde_json::to_string(&stages).unwrap();
+        for marker in [raw_marker, replacement_marker, metadata_marker] {
+            assert!(!serialized.contains(marker));
+        }
+        assert_eq!(stages[0].evidence[0].value, REDACTED_EVIDENCE_VALUE);
+        assert_eq!(
+            stages[0].evidence[0].redacted_value.as_deref(),
+            Some(REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(
+            stages[0].metadata.get("reason").map(String::as_str),
+            Some(REDACTED_EVIDENCE_VALUE)
+        );
+        assert_eq!(
+            stages[0].metadata.get("decision").map(String::as_str),
+            Some("rejected")
+        );
     }
 
     #[test]
