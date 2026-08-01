@@ -10,12 +10,33 @@
 //! mode baked in.
 
 use serde::Deserialize;
+use serde_yaml::Value as YamlValue;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 const API_EXECUTION_MODE_ENV: &str = "RYUKI_API_EXECUTION_MODE=static-dry-run";
 const PORTAL_EXECUTION_MODE_ENV: &str = "RYUKI_PORTAL_EXECUTION_MODE=static-dry-run";
+const PORTAL_RUNTIME_STAGE: &str = "runtime";
+const PORTAL_BUILD_STAGE: &str = "build";
+const PORTAL_RUNTIME_IMAGE: &str =
+    "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818";
+const PORTAL_RUNTIME_WORKDIR: &str = "/app";
+const PORTAL_RUNTIME_USER: &str = "10001:10001";
+const PORTAL_RUNTIME_PORT: &str = "8080";
+const PORTAL_RUNTIME_BINARY: &str = "/app/ryuki-portal-ui";
+const PORTAL_RUNTIME_BINARY_COPY: &str = "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui";
+const PORTAL_RUNTIME_SITE_COPY: &str =
+    "COPY --from=build --chown=10001:10001 /app/target/site /app/site";
+const PORTAL_RUNTIME_ENVIRONMENT: &[(&str, &str)] = &[
+    ("LEPTOS_SITE_ROOT", "/app/site"),
+    ("LEPTOS_SITE_ADDR", "0.0.0.0:8080"),
+    ("RYUKI_PORTAL_PUBLIC_ORIGIN", "http://127.0.0.1:8080"),
+    ("RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK", "true"),
+    ("RYUKI_PORTAL_EXECUTION_MODE", "static-dry-run"),
+];
+const PORTAL_DOCKERFILE_PATH: &str = "portal/portal-ui/Dockerfile";
+const RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 const CARGO_CHEF_VERSION: &str = "0.1.77";
 const CARGO_LEPTOS_VERSION: &str = "0.3.7";
 const BASE_CARGO_PATH: &str = "/usr/local/cargo/bin/cargo";
@@ -58,6 +79,8 @@ struct Context {
     #[serde(default)]
     portal_dockerfile: String,
     #[serde(default)]
+    release_workflow: String,
+    #[serde(default)]
     validator_dockerfile: String,
 }
 
@@ -77,6 +100,7 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
     }
 
     errors.extend(validate_api_dockerfile(&context.api_dockerfile, &members));
+    validate_portal_release_binding(&context.release_workflow, &mut errors);
     errors.extend(validate_portal_dockerfile(
         &context.portal_dockerfile,
         &members,
@@ -138,12 +162,294 @@ fn validate_portal_dockerfile(content: &str, members: &[String]) -> Vec<String> 
         CARGO_LEPTOS_VERSION,
         &mut errors,
     );
-    if !content.contains(PORTAL_EXECUTION_MODE_ENV) {
+    validate_published_portal_runtime(content, label, &mut errors);
+    errors
+}
+
+/// Bind the pushed portal digest to the one stage whose runtime configuration
+/// the Dockerfile validator proves. Without an explicit target, BuildKit
+/// publishes the final stage, so appending a later stage can silently detach
+/// the release image from the reviewed `runtime` stage.
+fn validate_portal_release_binding(content: &str, errors: &mut Vec<String>) {
+    if content.trim().is_empty() {
         errors.push(format!(
-            "{label}: must bake {PORTAL_EXECUTION_MODE_ENV} so a fresh image cannot execute live changes"
+            "{RELEASE_WORKFLOW_PATH}: file is missing or empty; cannot bind the published portal image to stage {PORTAL_RUNTIME_STAGE:?}"
+        ));
+        return;
+    }
+
+    let workflow: YamlValue = match serde_yaml::from_str(content) {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            errors.push(format!(
+                "{RELEASE_WORKFLOW_PATH}: invalid workflow YAML: {error}"
+            ));
+            return;
+        }
+    };
+    let Some(steps) = workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get("images"))
+        .and_then(|images| images.get("steps"))
+        .and_then(YamlValue::as_sequence)
+    else {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: images job must contain one id=portal build-and-push step"
+        ));
+        return;
+    };
+
+    let portal_publishers: Vec<&YamlValue> = steps
+        .iter()
+        .filter(|step| {
+            let uses_build_push = step
+                .get("uses")
+                .and_then(YamlValue::as_str)
+                .is_some_and(|uses| uses.starts_with("docker/build-push-action@"));
+            let uses_portal_dockerfile = step
+                .get("with")
+                .and_then(|settings| settings.get("file"))
+                .and_then(YamlValue::as_str)
+                .is_some_and(|file| file.trim_start_matches("./") == PORTAL_DOCKERFILE_PATH);
+            uses_build_push && uses_portal_dockerfile
+        })
+        .collect();
+    if portal_publishers.len() != 1 {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: images job must contain exactly one docker/build-push-action publisher for {PORTAL_DOCKERFILE_PATH}; found {}",
+            portal_publishers.len()
+        ));
+        return;
+    }
+
+    let step = portal_publishers[0];
+    let has_portal_id = step.get("id").and_then(YamlValue::as_str) == Some("portal");
+    let uses_build_push = step
+        .get("uses")
+        .and_then(YamlValue::as_str)
+        .is_some_and(|uses| uses.starts_with("docker/build-push-action@"));
+    let settings = step.get("with");
+    let context = settings
+        .and_then(|settings| settings.get("context"))
+        .and_then(YamlValue::as_str);
+    let dockerfile = settings
+        .and_then(|settings| settings.get("file"))
+        .and_then(YamlValue::as_str);
+    let target = settings
+        .and_then(|settings| settings.get("target"))
+        .and_then(YamlValue::as_str);
+    let pushes = settings
+        .and_then(|settings| settings.get("push"))
+        .and_then(YamlValue::as_bool)
+        == Some(true);
+
+    if !has_portal_id
+        || !uses_build_push
+        || context != Some(".")
+        || dockerfile != Some(PORTAL_DOCKERFILE_PATH)
+        || target != Some(PORTAL_RUNTIME_STAGE)
+        || !pushes
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: id=portal must use docker/build-push-action with repository context '.', file {PORTAL_DOCKERFILE_PATH}, push true, and target {PORTAL_RUNTIME_STAGE}"
         ));
     }
-    errors
+}
+
+/// Prove the reviewed contract inside the exact stage selected by the release
+/// workflow. Matching text in a builder, comment, or unselected later stage is
+/// not evidence about the image whose digest is pushed.
+fn validate_published_portal_runtime(content: &str, label: &str, errors: &mut Vec<String>) {
+    #[derive(Default)]
+    struct RuntimeState {
+        base: Option<String>,
+        workdir: Option<String>,
+        environment: HashMap<String, String>,
+        environment_invalid: bool,
+        copies: Vec<String>,
+        user: Option<String>,
+        exposes: Vec<String>,
+        command: Option<Vec<String>>,
+        forbidden_control: Vec<String>,
+        artifact_copy_seen: bool,
+        mutation_after_artifact_copy: Vec<String>,
+    }
+
+    let mut in_runtime = false;
+    let mut runtime_stage_count = 0usize;
+    let mut build_stage_count = 0usize;
+    let mut runtime = RuntimeState::default();
+
+    for instruction in logical_dockerfile_instructions(content) {
+        let Some(separator) = instruction.find(char::is_whitespace) else {
+            continue;
+        };
+        let (keyword, arguments) = instruction.split_at(separator);
+        let arguments = arguments.trim();
+
+        if keyword.eq_ignore_ascii_case("FROM") {
+            let parsed = docker_from_base_and_alias(arguments);
+            let alias = parsed.as_ref().and_then(|(_, alias)| alias.as_deref());
+            if alias == Some(PORTAL_BUILD_STAGE) {
+                build_stage_count += 1;
+            }
+            in_runtime = alias == Some(PORTAL_RUNTIME_STAGE);
+            if in_runtime {
+                runtime_stage_count += 1;
+                runtime = RuntimeState::default();
+                runtime.base = parsed.map(|(base, _)| base);
+            }
+            continue;
+        }
+
+        if !in_runtime {
+            continue;
+        }
+
+        if keyword.eq_ignore_ascii_case("WORKDIR") {
+            runtime.workdir = Some(arguments.to_string());
+        } else if keyword.eq_ignore_ascii_case("ENV") {
+            let Some(assignments) = docker_env_assignments(arguments) else {
+                runtime.environment_invalid = true;
+                continue;
+            };
+            for (key, value) in assignments {
+                runtime.environment.insert(key, value);
+            }
+        } else if keyword.eq_ignore_ascii_case("COPY") {
+            let reviewed_copy = instruction == PORTAL_RUNTIME_BINARY_COPY
+                || instruction == PORTAL_RUNTIME_SITE_COPY;
+            if runtime.artifact_copy_seen && !reviewed_copy {
+                runtime
+                    .mutation_after_artifact_copy
+                    .push(instruction.clone());
+            }
+            runtime.artifact_copy_seen = true;
+            runtime.copies.push(instruction);
+        } else if keyword.eq_ignore_ascii_case("USER") {
+            runtime.user = Some(arguments.to_string());
+        } else if keyword.eq_ignore_ascii_case("EXPOSE") {
+            runtime.exposes.push(arguments.to_string());
+        } else if keyword.eq_ignore_ascii_case("CMD") {
+            runtime.command = docker_json_exec_arguments(arguments);
+        } else if keyword.eq_ignore_ascii_case("RUN") || keyword.eq_ignore_ascii_case("ADD") {
+            if runtime.artifact_copy_seen {
+                runtime
+                    .mutation_after_artifact_copy
+                    .push(instruction.clone());
+            }
+            if keyword.eq_ignore_ascii_case("ADD") {
+                runtime.forbidden_control.push("ADD".to_string());
+            }
+        } else if ["ENTRYPOINT", "VOLUME", "SHELL", "HEALTHCHECK"]
+            .iter()
+            .any(|forbidden| keyword.eq_ignore_ascii_case(forbidden))
+        {
+            runtime.forbidden_control.push(keyword.to_ascii_uppercase());
+        }
+    }
+
+    if runtime_stage_count != 1 {
+        errors.push(format!(
+            "{label}: must declare exactly one stage named {PORTAL_RUNTIME_STAGE:?}; found {runtime_stage_count}"
+        ));
+        return;
+    }
+    if build_stage_count != 1 {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must copy from one unambiguous stage named {PORTAL_BUILD_STAGE:?}; found {build_stage_count}"
+        ));
+    }
+    if runtime.base.as_deref() != Some(PORTAL_RUNTIME_IMAGE) {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must use exact reviewed base {PORTAL_RUNTIME_IMAGE}"
+        ));
+    }
+    if runtime.workdir.as_deref() != Some(PORTAL_RUNTIME_WORKDIR) {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must end with WORKDIR {PORTAL_RUNTIME_WORKDIR}"
+        ));
+    }
+    let environment_is_exact = !runtime.environment_invalid
+        && runtime.environment.len() == PORTAL_RUNTIME_ENVIRONMENT.len()
+        && PORTAL_RUNTIME_ENVIRONMENT
+            .iter()
+            .all(|(key, value)| runtime.environment.get(*key).map(String::as_str) == Some(*value));
+    if !environment_is_exact {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must declare only the exact reviewed environment, including {PORTAL_EXECUTION_MODE_ENV}, LEPTOS_SITE_ROOT=/app/site, and LEPTOS_SITE_ADDR=0.0.0.0:8080"
+        ));
+    }
+    let copies_are_exact = runtime.copies.len() == 2
+        && runtime.copies[0] == PORTAL_RUNTIME_BINARY_COPY
+        && runtime.copies[1] == PORTAL_RUNTIME_SITE_COPY;
+    if !copies_are_exact {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must contain only the exact reviewed binary and site COPY instructions from the unique {PORTAL_BUILD_STAGE:?} stage"
+        ));
+    }
+    if !runtime.mutation_after_artifact_copy.is_empty() {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must not mutate runtime artifacts after their reviewed COPY instructions; found {:?}",
+            runtime.mutation_after_artifact_copy
+        ));
+    }
+    if runtime.user.as_deref() != Some(PORTAL_RUNTIME_USER) {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must end with USER {PORTAL_RUNTIME_USER}"
+        ));
+    }
+    let exposes_only_port = runtime.exposes.len() == 1
+        && runtime.exposes.first().map(String::as_str) == Some(PORTAL_RUNTIME_PORT);
+    if !exposes_only_port {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must expose only port {PORTAL_RUNTIME_PORT}"
+        ));
+    }
+    let command_is_exact = runtime
+        .command
+        .as_deref()
+        .is_some_and(|command| command.len() == 1 && command[0] == PORTAL_RUNTIME_BINARY);
+    if !command_is_exact {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must end with exact JSON CMD [\"{PORTAL_RUNTIME_BINARY}\"]"
+        ));
+    }
+    if !runtime.forbidden_control.is_empty() {
+        errors.push(format!(
+            "{label}: published stage {PORTAL_RUNTIME_STAGE:?} must not add control instructions that can replace or mask the reviewed runtime contract; found {:?}",
+            runtime.forbidden_control
+        ));
+    }
+}
+
+/// Parse the two Docker ENV forms used by the reviewed contract. Quoted or
+/// interpolated values are deliberately rejected because the release
+/// invariant requires literal, reviewable values.
+fn docker_env_assignments(arguments: &str) -> Option<Vec<(String, String)>> {
+    let fields: Vec<&str> = arguments.split_whitespace().collect();
+    let first = fields.first()?;
+    if first.contains('=') {
+        return fields
+            .into_iter()
+            .map(|field| {
+                let (key, value) = field.split_once('=')?;
+                (!key.is_empty() && docker_env_value_is_literal(value))
+                    .then(|| (key.to_string(), value.to_string()))
+            })
+            .collect();
+    }
+
+    let (key, value) = arguments.split_once(char::is_whitespace)?;
+    let value = value.trim();
+    (!key.is_empty() && !value.is_empty() && docker_env_value_is_literal(value))
+        .then(|| vec![(key.to_string(), value.to_string())])
+}
+
+fn docker_env_value_is_literal(value: &str) -> bool {
+    !value
+        .chars()
+        .any(|character| matches!(character, '$' | '"' | '\'' | '\\'))
 }
 
 /// Assert the Dockerfile's COPY set covers the workspace manifests, every
@@ -1035,6 +1341,35 @@ name = "ryuki-integration-tests"
         format!("{runs}ENV {BUILD_ENVIRONMENT}\nWORKDIR /app\nUSER {BUILD_USER}\n")
     }
 
+    fn portal_release_workflow(target: Option<&str>) -> String {
+        let target = target
+            .map(|target| format!("          target: {target}\n"))
+            .unwrap_or_default();
+        format!(
+            "jobs:\n  images:\n    steps:\n      - id: portal\n        uses: docker/build-push-action@0123456789012345678901234567890123456789\n        with:\n          context: .\n          file: portal/portal-ui/Dockerfile\n{target}          push: true\n"
+        )
+    }
+
+    fn canonical_portal_runtime_stage() -> String {
+        format!(concat!(
+            "FROM {PORTAL_RUNTIME_IMAGE} AS {PORTAL_RUNTIME_STAGE}\n",
+            "WORKDIR {PORTAL_RUNTIME_WORKDIR}\n",
+            "ENV LEPTOS_SITE_ROOT=/app/site LEPTOS_SITE_ADDR=0.0.0.0:8080 RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\n",
+            "{PORTAL_RUNTIME_BINARY_COPY}\n",
+            "{PORTAL_RUNTIME_SITE_COPY}\n",
+            "USER {PORTAL_RUNTIME_USER}\n",
+            "EXPOSE {PORTAL_RUNTIME_PORT}\n",
+            "CMD [\"{PORTAL_RUNTIME_BINARY}\"]\n",
+        ))
+    }
+
+    fn canonical_portal_runtime_with_builder() -> String {
+        format!(
+            "FROM rust:1.96-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n{}",
+            canonical_portal_runtime_stage()
+        )
+    }
+
     fn canonical_lifecycle_fixture(
         package: &str,
         version: &str,
@@ -1231,7 +1566,7 @@ name = "ryuki-integration-tests"
     #[test]
     fn portal_dockerfile_requires_dry_run_env() {
         let dockerfile = format!(
-            "FROM rust:1.88-bookworm AS build\n{}RUN cargo leptos build --release -p ryuki-portal-ui\n",
+            "FROM rust:1.88-bookworm AS build\n{}RUN cargo leptos build --release -p ryuki-portal-ui\nFROM debian:bookworm-slim AS runtime\n",
             full_copy_set()
         );
         let errors = validate_portal_dockerfile(&dockerfile, &members());
@@ -1242,11 +1577,167 @@ name = "ryuki-integration-tests"
     }
 
     #[test]
+    fn portal_runtime_rejects_execution_mode_decoy_in_build_stage() {
+        let dockerfile = concat!(
+            "FROM rust:1.96-bookworm AS build\n",
+            "ENV RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\n",
+            "FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime\n",
+            "CMD [\"/app/ryuki-portal-ui\"]\n",
+        );
+        let mut errors = Vec::new();
+        validate_published_portal_runtime(dockerfile, "portal-ui Dockerfile", &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(PORTAL_EXECUTION_MODE_ENV)),
+            "a builder-stage text decoy must not satisfy runtime policy: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn portal_runtime_rejects_later_execution_mode_override_in_same_stage() {
+        let dockerfile = format!(
+            "{}ENV RYUKI_PORTAL_EXECUTION_MODE=live\n",
+            canonical_portal_runtime_with_builder()
+        );
+        let mut errors = Vec::new();
+        validate_published_portal_runtime(&dockerfile, "portal-ui Dockerfile", &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(PORTAL_EXECUTION_MODE_ENV)),
+            "the final effective runtime assignment must be authoritative: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn portal_runtime_rejects_later_user_and_command_overrides() {
+        for unsafe_override in ["USER 0:0\n", "CMD [\"/bin/sh\"]\n"] {
+            let dockerfile = format!(
+                "{}{unsafe_override}",
+                canonical_portal_runtime_with_builder()
+            );
+            let mut errors = Vec::new();
+            validate_published_portal_runtime(&dockerfile, "portal-ui Dockerfile", &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "later runtime override was accepted: {unsafe_override:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn portal_runtime_rejects_artifact_overwrites_after_reviewed_copies() {
+        for unsafe_mutation in [
+            "RUN printf exploit > /app/ryuki-portal-ui\n",
+            "COPY --from=build /tmp/exploit /app/ryuki-portal-ui\n",
+            "ADD exploit /app/site/index.html\n",
+        ] {
+            let dockerfile = format!(
+                "{}{unsafe_mutation}",
+                canonical_portal_runtime_with_builder()
+            );
+            let mut errors = Vec::new();
+            validate_published_portal_runtime(&dockerfile, "portal-ui Dockerfile", &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("must not mutate runtime artifacts")),
+                "later runtime artifact mutation was accepted: {unsafe_mutation:?}; {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn portal_runtime_rejects_duplicate_runtime_aliases() {
+        let dockerfile = format!(
+            "{}FROM {PORTAL_RUNTIME_IMAGE} AS {PORTAL_RUNTIME_STAGE}\n",
+            canonical_portal_runtime_with_builder()
+        );
+        let mut errors = Vec::new();
+        validate_published_portal_runtime(&dockerfile, "portal-ui Dockerfile", &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("exactly one stage named")),
+            "duplicate runtime alias was accepted: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn portal_release_binding_rejects_missing_or_changed_runtime_target() {
+        for target in [None, Some("post-runtime")] {
+            let mut errors = Vec::new();
+            validate_portal_release_binding(&portal_release_workflow(target), &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "release target {target:?} must not detach publication from runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn portal_release_binding_rejects_additional_portal_publisher() {
+        let mut workflow = portal_release_workflow(Some(PORTAL_RUNTIME_STAGE));
+        workflow.push_str(
+            "      - id: portal-escape\n        uses: docker/build-push-action@0123456789012345678901234567890123456789\n        with:\n          context: .\n          file: ./portal/portal-ui/Dockerfile\n          target: post-runtime\n          push: true\n",
+        );
+        let mut errors = Vec::new();
+        validate_portal_release_binding(&workflow, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("exactly one docker/build-push-action publisher")),
+            "an additional portal publisher bypassed the selected target: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn checked_in_portal_release_targets_reviewed_runtime() {
+        let mut errors = Vec::new();
+        validate_portal_release_binding(
+            include_str!("../../../.github/workflows/release.yml"),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "checked-in portal release binding is invalid: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn portal_release_target_keeps_appended_stage_out_of_published_image() {
+        let dockerfile = format!(
+            concat!(
+                "{}",
+                "FROM runtime AS post-runtime\n",
+                "USER 0:0\n",
+                "ENV RYUKI_PORTAL_EXECUTION_MODE=live\n",
+                "COPY --from=build /tmp/exploit /app/ryuki-portal-ui\n",
+                "COPY --from=build /tmp/exploit-site /app/site\n",
+                "CMD [\"/bin/sh\"]\n",
+            ),
+            canonical_portal_runtime_with_builder()
+        );
+        let mut errors = Vec::new();
+        validate_portal_release_binding(
+            &portal_release_workflow(Some(PORTAL_RUNTIME_STAGE)),
+            &mut errors,
+        );
+        validate_published_portal_runtime(&dockerfile, "portal-ui Dockerfile", &mut errors);
+        assert!(
+            errors.is_empty(),
+            "an appended stage is not published when release target is exactly runtime: {errors:?}"
+        );
+    }
+
+    #[test]
     fn complete_portal_dockerfile_passes() {
         let setup = canonical_root_setup_fixture("cargo-leptos", CARGO_LEPTOS_VERSION);
         let dockerfile = format!(
-            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\nRUN [\"/usr/local/cargo/bin/rustup\", \"target\", \"add\", \"wasm32-unknown-unknown\"]\nRUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n{setup}{}RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\", \"-p\", \"ryuki-portal-ui\"]\nFROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\nENV RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\nCOPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\nCOPY --from=build /app/target/site /app/site\n",
-            full_copy_set()
+            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\nRUN [\"/usr/local/cargo/bin/rustup\", \"target\", \"add\", \"wasm32-unknown-unknown\"]\nRUN [\"/usr/local/cargo/bin/cargo\", \"install\", \"cargo-leptos\", \"--version\", \"0.3.7\", \"--locked\", \"--root\", \"/opt/ryuki-tools/cargo-leptos-0.3.7\"]\n{setup}{}RUN [\"/opt/ryuki-tools/cargo-leptos-0.3.7/bin/cargo-leptos\", \"build\", \"--release\", \"-p\", \"ryuki-portal-ui\"]\n{}",
+            full_copy_set(),
+            canonical_portal_runtime_stage(),
         );
         let errors = validate_portal_dockerfile(&dockerfile, &members());
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
@@ -1518,15 +2009,21 @@ name = "ryuki-integration-tests"
             full_copy_set()
         );
         let errors = validate_portal_dockerfile(&dockerfile, &members());
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("rust:1.96-bookworm")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("debian:bookworm-slim")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("cargo-leptos") && error.contains("0.3.7")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("rust:1.96-bookworm"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("debian:bookworm-slim"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("cargo-leptos") && error.contains("0.3.7"))
+        );
     }
 
     #[test]

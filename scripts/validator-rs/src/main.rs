@@ -1756,7 +1756,7 @@ fn run() -> Result<ExitCode, String> {
                 _ => {
                     return Err(format!(
                         "check-yaml-duplicates is not supported for {slice}"
-                    ))
+                    ));
                 }
             };
             print_json(&ErrorsOutput { errors })
@@ -1771,7 +1771,7 @@ fn run() -> Result<ExitCode, String> {
                 _ => {
                     return Err(format!(
                         "check-build-sheet-source-inputs is not supported for {slice}"
-                    ))
+                    ));
                 }
             };
             print_json(&ErrorsOutput { errors })
@@ -1786,7 +1786,7 @@ fn run() -> Result<ExitCode, String> {
                 _ => {
                     return Err(format!(
                         "check-source-inventory is not supported for {slice}"
-                    ))
+                    ));
                 }
             };
             print_json(&ErrorsOutput { errors })
@@ -1801,7 +1801,7 @@ fn run() -> Result<ExitCode, String> {
                 _ => {
                     return Err(format!(
                         "check-source-literals is not supported for {slice}"
-                    ))
+                    ));
                 }
             };
             print_json(&ErrorsOutput { errors })
@@ -4267,6 +4267,12 @@ fn build_slice_context(
                     serde_json::Value::String(raw),
                 );
             }
+            if let Ok(raw) = fs::read_to_string(root.join(".github/workflows/release.yml")) {
+                map.insert(
+                    "release_workflow".to_string(),
+                    serde_json::Value::String(raw),
+                );
+            }
             if let Ok(raw) = fs::read_to_string(root.join("deploy/ci/Dockerfile.validator")) {
                 map.insert(
                     "validator_dockerfile".to_string(),
@@ -4549,9 +4555,11 @@ mod tests {
             &mut errors,
         );
 
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("API endpoint coverage path is unsafe")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("API endpoint coverage path is unsafe"))
+        );
     }
 
     #[test]

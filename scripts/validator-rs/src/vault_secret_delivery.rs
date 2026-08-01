@@ -669,12 +669,8 @@ fn exact_transformed_key(document: &Value, key: &str) -> bool {
         .and_then(|template| template.get("text"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let authenticated_tls = format!("sslmode=verify-full&sslrootcert={CNPG_CA_FILE_PATH}");
     templates.len() == 1
-        && text.contains(&authenticated_tls)
-        && !text.contains("sslmode=require")
-        && text.contains("regexMatch")
-        && text.contains("fail")
+        && is_canonical_database_url_template(text)
         && document
             .pointer("/spec/destination/transformation/excludeRaw")
             .and_then(Value::as_bool)
@@ -683,6 +679,173 @@ fn exact_transformed_key(document: &Value, key: &str) -> bool {
             .pointer("/spec/destination/transformation/excludes")
             .and_then(Value::as_array)
             .is_some_and(|excludes| excludes.len() == 1 && excludes[0].as_str() == Some(".*"))
+}
+
+/// Parses the security-relevant subset of the VSO Go template before comparing
+/// it with the one admitted URL-construction program. Whitespace within actions
+/// is insignificant, but trim markers, action order, arguments, regexes, and the
+/// final URL are exact. This prevents an otherwise-valid template from hiding a
+/// second output command or weakening a delimiter guard while retaining the
+/// substrings checked by the previous validator.
+fn is_canonical_database_url_template(text: &str) -> bool {
+    let expected_prefix: &[&[&str]] = &[
+        &[
+            "$username",
+            ":=",
+            "toString",
+            "(",
+            "get",
+            ".Secrets",
+            "\"username\"",
+            ")",
+        ],
+        &[
+            "$password",
+            ":=",
+            "toString",
+            "(",
+            "get",
+            ".Secrets",
+            "\"password\"",
+            ")",
+        ],
+        &[
+            "if",
+            "not",
+            "(",
+            "regexMatch",
+            "\"^[A-Za-z0-9._~-]+$\"",
+            "$username",
+            ")",
+        ],
+        &["fail", "\"Vault database username is not URL-safe\""],
+        &["end"],
+        &[
+            "if",
+            "not",
+            "(",
+            "regexMatch",
+            "\"^[A-Za-z0-9._~-]+$\"",
+            "$password",
+            ")",
+        ],
+        &["fail", "\"Vault database password is not URL-safe\""],
+        &["end"],
+    ];
+    let expected_url = format!(
+        "\"postgresql://%s:%s@%s/ryuki_platform?sslmode=verify-full&sslrootcert={CNPG_CA_FILE_PATH}\""
+    );
+    let expected_final = [
+        "printf",
+        expected_url.as_str(),
+        "$username",
+        "$password",
+        "(",
+        "get",
+        ".Annotations",
+        "\"ryuki.io/postgres-host\"",
+        ")",
+    ];
+    let Some(actual) = parse_trimmed_template_actions(text) else {
+        return false;
+    };
+
+    actual.len() == expected_prefix.len() + 1
+        && actual
+            .iter()
+            .zip(expected_prefix)
+            .all(|(actual, expected)| {
+                actual
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+            })
+        && actual.last().is_some_and(|actual| {
+            actual
+                .iter()
+                .map(String::as_str)
+                .eq(expected_final.iter().copied())
+        })
+}
+
+fn parse_trimmed_template_actions(text: &str) -> Option<Vec<Vec<String>>> {
+    let mut actions = Vec::new();
+    let mut remaining = text;
+    loop {
+        remaining = remaining.trim_start_matches(is_template_whitespace);
+        if remaining.is_empty() {
+            return Some(actions);
+        }
+
+        let action = remaining.strip_prefix("{{-")?;
+        if !action.chars().next().is_some_and(is_template_whitespace) {
+            return None;
+        }
+        let end = action.find("-}}")?;
+        if !action[..end]
+            .chars()
+            .next_back()
+            .is_some_and(is_template_whitespace)
+        {
+            return None;
+        }
+        actions.push(tokenize_template_action(&action[..end])?);
+        remaining = &action[end + 3..];
+    }
+}
+
+fn is_template_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
+fn tokenize_template_action(action: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < action.len() {
+        let current = action[offset..].chars().next()?;
+        if is_template_whitespace(current) {
+            offset += current.len_utf8();
+            continue;
+        }
+
+        if matches!(current, '(' | ')') {
+            tokens.push(current.to_string());
+            offset += current.len_utf8();
+            continue;
+        }
+
+        let start = offset;
+        if current == '"' {
+            offset += current.len_utf8();
+            let mut escaped = false;
+            let mut terminated = false;
+            while offset < action.len() {
+                let character = action[offset..].chars().next()?;
+                offset += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    terminated = true;
+                    break;
+                }
+            }
+            if !terminated {
+                return None;
+            }
+        } else {
+            while offset < action.len() {
+                let character = action[offset..].chars().next()?;
+                if is_template_whitespace(character) || matches!(character, '(' | ')' | '"') {
+                    break;
+                }
+                offset += character.len_utf8();
+            }
+        }
+        tokens.push(action[start..offset].to_owned());
+    }
+    Some(tokens)
 }
 
 fn exact_restart_target(document: &Value, kind: &str, name: &str) -> bool {
@@ -2627,6 +2790,23 @@ mod tests {
         })
     }
 
+    fn transformed_template_text<'a>(document: &'a Value, key: &str) -> &'a str {
+        let pointer = format!("/spec/destination/transformation/templates/{key}/text");
+        document
+            .pointer(&pointer)
+            .and_then(Value::as_str)
+            .expect("database URL template text")
+    }
+
+    fn with_transformed_template_text(document: &Value, key: &str, text: &str) -> Value {
+        let mut changed = document.clone();
+        let pointer = format!("/spec/destination/transformation/templates/{key}/text");
+        *changed
+            .pointer_mut(&pointer)
+            .expect("database URL template") = Value::String(text.to_owned());
+        changed
+    }
+
     #[test]
     fn current_reference_manifests_keep_secret_delivery_guardrails() {
         let mut errors = Vec::new();
@@ -2675,6 +2855,21 @@ mod tests {
             .expect("runtime database delivery");
         assert!(exact_transformed_key(runtime, "RYUKI_DATABASE_URL"));
 
+        let migration_raw =
+            fs::read_to_string(root.join(MIGRATION_VSO_MANIFEST_PATH)).expect("migration VSO YAML");
+        let migration_documents = parse_yaml_documents(&migration_raw, MIGRATION_VSO_MANIFEST_PATH)
+            .expect("migration VSO parse");
+        let migration = migration_documents
+            .iter()
+            .find(|document| {
+                document.get("kind").and_then(Value::as_str) == Some("VaultDynamicSecret")
+            })
+            .expect("migration database delivery");
+        assert!(exact_transformed_key(
+            migration,
+            "RYUKI_MIGRATION_DATABASE_URL"
+        ));
+
         for replacement in [
             "sslmode=require",
             "sslmode=verify-full",
@@ -2700,6 +2895,113 @@ mod tests {
     }
 
     #[test]
+    fn transformed_database_url_template_accepts_action_whitespace_only() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join(VSO_MANIFEST_PATH)).expect("base VSO YAML");
+        let documents = parse_yaml_documents(&raw, VSO_MANIFEST_PATH).expect("base VSO parse");
+        let runtime = named_document(&documents, "VaultDynamicSecret", "ryuki-platform-api-db")
+            .expect("runtime database delivery");
+        let text = transformed_template_text(runtime, "RYUKI_DATABASE_URL").replacen(
+            "{{- $username := toString",
+            "{{-\n$username   :=\n  toString",
+            1,
+        );
+        let whitespace_only = with_transformed_template_text(runtime, "RYUKI_DATABASE_URL", &text);
+
+        assert!(exact_transformed_key(
+            &whitespace_only,
+            "RYUKI_DATABASE_URL"
+        ));
+    }
+
+    #[test]
+    fn transformed_database_url_template_rejects_structural_and_delimiter_bypasses() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join(VSO_MANIFEST_PATH)).expect("base VSO YAML");
+        let documents = parse_yaml_documents(&raw, VSO_MANIFEST_PATH).expect("base VSO parse");
+        let runtime = named_document(&documents, "VaultDynamicSecret", "ryuki-platform-api-db")
+            .expect("runtime database delivery");
+        let canonical = transformed_template_text(runtime, "RYUKI_DATABASE_URL");
+        let bypasses = [
+            (
+                "extra printf command",
+                format!(
+                    "{canonical}\n{}",
+                    r#"{{- printf "postgresql://alternate.invalid" -}}"#
+                ),
+            ),
+            (
+                "literal alternate URL output",
+                format!("{canonical}\npostgresql://alternate.invalid"),
+            ),
+            (
+                "non-trimmable literal whitespace output",
+                format!("{canonical}\u{a0}"),
+            ),
+            (
+                "alternate URL authority",
+                canonical.replace(
+                    "postgresql://%s:%s@%s/ryuki_platform?",
+                    "postgresql://attacker.invalid/%s:%s@%s?",
+                ),
+            ),
+            (
+                "duplicate TLS query parameter",
+                canonical.replace(
+                    "sslrootcert=/var/run/secrets/ryuki/cnpg/ca.crt",
+                    "sslrootcert=/var/run/secrets/ryuki/cnpg/ca.crt&sslmode=verify-full",
+                ),
+            ),
+            (
+                "userinfo delimiter accepted by username regex",
+                canonical.replace(
+                    r#"regexMatch "^[A-Za-z0-9._~-]+$" $username"#,
+                    r#"regexMatch "^[A-Za-z0-9._~@:-]+$" $username"#,
+                ),
+            ),
+            (
+                "query delimiters accepted by password regex",
+                canonical.replace(
+                    r#"regexMatch "^[A-Za-z0-9._~-]+$" $password"#,
+                    r#"regexMatch "^[A-Za-z0-9._~?&=-]+$" $password"#,
+                ),
+            ),
+            (
+                "untrusted host source",
+                canonical.replace(
+                    r#"(get .Annotations "ryuki.io/postgres-host")"#,
+                    r#"(get .Secrets "host")"#,
+                ),
+            ),
+            (
+                "extra non-output command",
+                canonical.replacen(
+                    r#"{{- $username := toString (get .Secrets "username") -}}"#,
+                    concat!(
+                        r#"{{- $ignored := printf "postgresql://alternate.invalid" -}}"#,
+                        "\n",
+                        r#"{{- $username := toString (get .Secrets "username") -}}"#
+                    ),
+                    1,
+                ),
+            ),
+            (
+                "action without output trim markers",
+                canonical.replacen("{{- $username", "{{ $username", 1),
+            ),
+        ];
+
+        for (description, text) in bypasses {
+            assert_ne!(text, canonical, "test mutation must change the template");
+            let invalid = with_transformed_template_text(runtime, "RYUKI_DATABASE_URL", &text);
+            assert!(
+                !exact_transformed_key(&invalid, "RYUKI_DATABASE_URL"),
+                "validator accepted {description}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_rule_details() {
         let mut catalog = catalog();
         let rules = catalog
@@ -2714,9 +3016,11 @@ mod tests {
 
         validate_catalog_value(&catalog, &mut errors);
 
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("rule details must be unique")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("rule details must be unique"))
+        );
     }
 
     #[test]
@@ -2787,8 +3091,10 @@ app.MapGet("/api/platform/vault-secret-delivery-contract", () => Results.Json(ne
             &mut errors,
         );
 
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("prohibited literal value")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("prohibited literal value"))
+        );
     }
 }

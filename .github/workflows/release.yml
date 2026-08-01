@@ -262,6 +262,7 @@ jobs:
         with:
           context: .
           file: portal/portal-ui/Dockerfile
+          target: runtime
           push: true
           provenance: mode=max
           sbom: true
