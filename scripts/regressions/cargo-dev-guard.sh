@@ -83,6 +83,20 @@ PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$STATUS_TARGET" \
   || fail "status rejected an absent dedicated target"
 [[ ! -e "$STATUS_TARGET" ]] || fail "status created an absent Cargo target"
 
+if PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$TARGET" \
+  RYUKI_DEV_TEST_FILE_LIMIT_KIB=64 "$LAUNCHER" run-api > "$OUTPUT" 2>&1; then
+  fail "development launcher accepted the test file limit outside test mode"
+fi
+grep -q 'reserved for regression tests' "$OUTPUT" \
+  || fail "production test file-limit refusal was not reported"
+if PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$TARGET" \
+  RYUKI_DEV_TEST_MODE=1 RYUKI_DEV_TEST_FILE_LIMIT_KIB=8388608 \
+  "$LAUNCHER" run-api > "$OUTPUT" 2>&1; then
+  fail "development launcher accepted a non-stricter test file limit"
+fi
+grep -q 'must be stricter than 8388608 KiB' "$OUTPUT" \
+  || fail "weakened development file-limit refusal was not reported"
+
 UNMARKED_PARENT="$WORK_DIR/unmarked"
 UNMARKED_TARGET="$UNMARKED_PARENT/.ryuki-target-ryuki.io"
 mkdir -p "$UNMARKED_TARGET"
@@ -103,6 +117,7 @@ PATH="$FAKE_BIN:$PATH" \
   CARGO_TARGET_DIR="$ROOT_DIR" \
   CARGO_BUILD_TARGET_DIR="$ROOT_DIR" \
   CARGO_BUILD_BUILD_DIR="$ROOT_DIR" \
+  CARGO_BUILD_JOBS=999 \
   RUSTC_WRAPPER= \
   RUSTC_WORKSPACE_WRAPPER="$WORK_DIR/hostile-workspace-wrapper" \
   CARGO_BUILD_RUSTC_WRAPPER="$WORK_DIR/hostile-config-wrapper" \
@@ -133,6 +148,14 @@ grep -Fxq 'RYUKI_CARGO_MIN_FREE_GIB=30' "$CAPTURE" \
   || fail "Cargo free-space floor was not pinned"
 grep -Fxq 'RYUKI_CARGO_GUARD_INTERVAL_SECONDS=2' "$CAPTURE" \
   || fail "Cargo guard interval was not pinned"
+grep -Fxq 'CARGO_BUILD_JOBS=1' "$CAPTURE" \
+  || fail "Cargo build jobs were not pinned to one"
+soft_file_limit="$(sed -n 's/^FILE_SIZE_SOFT_KIB=//p' "$CAPTURE")"
+hard_file_limit="$(sed -n 's/^FILE_SIZE_HARD_KIB=//p' "$CAPTURE")"
+[[ "$soft_file_limit" =~ ^[1-9][0-9]*$ && "$soft_file_limit" -le 8388608 ]] \
+  || fail "Cargo command did not inherit the 8 GiB soft file-size ceiling"
+[[ "$hard_file_limit" =~ ^[1-9][0-9]*$ && "$hard_file_limit" -le 8388608 ]] \
+  || fail "Cargo command could raise its hard file-size ceiling"
 grep -Fxq 'FD9=closed' "$CAPTURE" \
   || fail "fake Cargo inherited serialization descriptor 9"
 grep -Fxq 'ARG=run' "$CAPTURE" || fail "run-api did not invoke Cargo run"
@@ -191,8 +214,8 @@ fi
 wait_for_file "$PID_FILE" || fail "target grower did not publish its pid"
 grower_pid="$(sed -n '1p' "$PID_FILE")"
 wait_for_exit "$grower_pid" || fail "target grower survived the disk ceiling"
-grep -q 'stopping Cargo command before it can exhaust the disk' "$OUTPUT" \
-  || fail "runtime target growth stop was not reported"
+grep -Eq 'stopping Cargo command before it can exhaust the disk|[Ff]ilesize limit exceeded|File size limit exceeded' \
+  "$OUTPUT" || fail "runtime target growth stop was not reported"
 rm -f "$TARGET/guard-growth.bin" "$READY" "$PID_FILE"
 
 PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$TARGET" \
@@ -245,6 +268,23 @@ LAUNCHER_PID=""
 wait_for_exit "$hold_pid" || fail "Cargo survived disk supervisor SIGKILL"
 grep -q 'stopping Cargo command after its disk supervisor exited' "$OUTPUT" \
   || fail "supervisor SIGKILL recovery was not reported"
+
+if PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$TARGET" \
+  RYUKI_LEPTOS_SITE_ROOT="$SITE_ROOT" RYUKI_DEV_TEST_CAPTURE="$CAPTURE" \
+  RYUKI_DEV_TEST_MODE=1 RYUKI_DEV_TEST_FILE_LIMIT_KIB=64 \
+  RYUKI_DEV_TEST_BEHAVIOR=file-limit \
+  RYUKI_DEV_TEST_FILE_PATH="$TARGET/file-limit.bin" \
+  "$LAUNCHER" run-api > "$OUTPUT" 2>&1; then
+  fail "fake Cargo created a file beyond the test RLIMIT_FSIZE"
+fi
+grep -Fxq 'FILE_SIZE_SOFT_KIB=64' "$CAPTURE" \
+  || fail "test-only soft file-size limit was not inherited"
+grep -Fxq 'FILE_SIZE_HARD_KIB=64' "$CAPTURE" \
+  || fail "test-only hard file-size limit was not inherited"
+[[ -f "$TARGET/file-limit.bin" ]] \
+  || fail "file-size regression did not attempt the oversized file"
+[[ "$(wc -c < "$TARGET/file-limit.bin")" -le 65536 ]] \
+  || fail "fake Cargo exceeded the test file-size ceiling"
 
 PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$TARGET" \
   RYUKI_LEPTOS_SITE_ROOT="$SITE_ROOT" RYUKI_DEV_TEST_CAPTURE="$CAPTURE" \

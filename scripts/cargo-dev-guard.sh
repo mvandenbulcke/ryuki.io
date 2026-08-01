@@ -14,6 +14,12 @@ REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object 
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 WATCH_INTERVAL_SECONDS=2
+# Bash `ulimit -f` uses 1024-byte blocks. No supervised development command
+# may create one regular file larger than 8 GiB.
+HARD_MAX_FILE_KIB=8388608
+HARD_CARGO_BUILD_JOBS=1
+DEV_TEST_MODE="${RYUKI_DEV_TEST_MODE:-0}"
+DEV_TEST_FILE_LIMIT_KIB="${RYUKI_DEV_TEST_FILE_LIMIT_KIB:-}"
 TARGET_INPUT="${RYUKI_DEV_TARGET_DIR:-$ROOT_PARENT/.ryuki-target-ryuki.io}"
 SITE_INPUT="${RYUKI_LEPTOS_SITE_ROOT:-$TARGET_INPUT/leptos-site}"
 DEV_SUPERVISOR_PID=""
@@ -25,6 +31,24 @@ fail() {
   printf 'error: %s\n' "$1" >&2
   exit 64
 }
+
+case "$DEV_TEST_MODE" in
+  0|1) ;;
+  *) fail "RYUKI_DEV_TEST_MODE must be 0 or 1" ;;
+esac
+FILE_LIMIT_KIB="$HARD_MAX_FILE_KIB"
+if [[ -n "$DEV_TEST_FILE_LIMIT_KIB" && "$DEV_TEST_MODE" != "1" ]]; then
+  fail "RYUKI_DEV_TEST_FILE_LIMIT_KIB is reserved for regression tests"
+fi
+if [[ -n "$DEV_TEST_FILE_LIMIT_KIB" ]]; then
+  [[ "$DEV_TEST_FILE_LIMIT_KIB" =~ ^[1-9][0-9]*$ ]] \
+    || fail "RYUKI_DEV_TEST_FILE_LIMIT_KIB must be a positive integer"
+  (( ${#DEV_TEST_FILE_LIMIT_KIB} <= 9 )) \
+    || fail "RYUKI_DEV_TEST_FILE_LIMIT_KIB is outside the supported integer range"
+  (( DEV_TEST_FILE_LIMIT_KIB < HARD_MAX_FILE_KIB )) \
+    || fail "RYUKI_DEV_TEST_FILE_LIMIT_KIB must be stricter than ${HARD_MAX_FILE_KIB} KiB"
+  FILE_LIMIT_KIB="$DEV_TEST_FILE_LIMIT_KIB"
+fi
 
 canonical_destination() {
   local input="$1"
@@ -125,10 +149,12 @@ sanitize_cargo_environment() {
   unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
   unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
   unset CARGO_BUILD_INCREMENTAL
+  unset CARGO_BUILD_JOBS
   unset CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL
   unset RYUKI_CARGO_GUARD_TEST_MODE RYUKI_CARGO_GUARD_TEST_MAX_KIB
   unset RYUKI_CARGO_MAX_TARGET_GIB RYUKI_CARGO_MIN_FREE_GIB
   unset RYUKI_CARGO_GUARD_INTERVAL_SECONDS
+  unset RYUKI_DEV_TEST_MODE RYUKI_DEV_TEST_FILE_LIMIT_KIB
 
   export CARGO_TARGET_DIR="$TARGET_DIR"
   export CARGO_BUILD_BUILD_DIR="$BUILD_DIR"
@@ -136,9 +162,28 @@ sanitize_cargo_environment() {
   export RUSTC_WORKSPACE_WRAPPER=""
   export CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=""
   export CARGO_INCREMENTAL=0
+  export CARGO_BUILD_JOBS="$HARD_CARGO_BUILD_JOBS"
   export RYUKI_CARGO_MAX_TARGET_GIB="$HARD_MAX_TARGET_GIB"
   export RYUKI_CARGO_MIN_FREE_GIB="$HARD_MIN_FREE_GIB"
   export RYUKI_CARGO_GUARD_INTERVAL_SECONDS="$WATCH_INTERVAL_SECONDS"
+}
+
+apply_file_size_limit() {
+  local limit_kib="$FILE_LIMIT_KIB"
+  local current_soft current_hard observed
+
+  current_soft="$(ulimit -S -f)" || return 75
+  current_hard="$(ulimit -H -f)" || return 75
+  if [[ "$current_soft" =~ ^[0-9]+$ ]] && (( current_soft < limit_kib )); then
+    limit_kib="$current_soft"
+  fi
+  if [[ "$current_hard" =~ ^[0-9]+$ ]] && (( current_hard < limit_kib )); then
+    limit_kib="$current_hard"
+  fi
+  ulimit -S -f "$limit_kib" || return 75
+  ulimit -H -f "$limit_kib" || return 75
+  observed="$(ulimit -S -f)" || return 75
+  [[ "$observed" =~ ^[0-9]+$ && "$observed" -le "$FILE_LIMIT_KIB" ]] || return 75
 }
 
 if du --apparent-size --count-links -s -k /dev/null >/dev/null 2>&1; then
@@ -344,6 +389,11 @@ supervise_command() {
       sleep 0.05
     done
     (( released == 1 )) || exit 75
+    if ! apply_file_size_limit; then
+      printf 'error: unable to enforce the %s KiB file-size limit\n' \
+        "$FILE_LIMIT_KIB" >&2
+      exit 75
+    fi
     set +e
     "$@"
     command_status=$?

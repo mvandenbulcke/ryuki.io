@@ -138,6 +138,7 @@ chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
   printf '%s\n' '  printf "CARGO_TARGET_DIR=%s\n" "${CARGO_TARGET_DIR-}"'
   printf '%s\n' '  printf "CARGO_BUILD_TARGET_DIR=%s\n" "${CARGO_BUILD_TARGET_DIR-}"'
   printf '%s\n' '  printf "CARGO_BUILD_BUILD_DIR=%s\n" "${CARGO_BUILD_BUILD_DIR-}"'
+  printf '%s\n' '  printf "CARGO_BUILD_JOBS=%s\n" "${CARGO_BUILD_JOBS-}"'
   printf '%s\n' '  printf "RUSTC_WRAPPER=%s\n" "${RUSTC_WRAPPER-}"'
   printf '%s\n' '  printf "RUSTC_WORKSPACE_WRAPPER=%s\n" "${RUSTC_WORKSPACE_WRAPPER-}"'
   printf '%s\n' '  printf "CARGO_BUILD_RUSTC_WRAPPER=%s\n" "${CARGO_BUILD_RUSTC_WRAPPER-}"'
@@ -156,8 +157,13 @@ chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
   printf '%s\n' '  printf "RYUKI_CARGO_MAX_TARGET_GIB=%s\n" "${RYUKI_CARGO_MAX_TARGET_GIB-}"'
   printf '%s\n' '  printf "RYUKI_CARGO_MIN_FREE_GIB=%s\n" "${RYUKI_CARGO_MIN_FREE_GIB-}"'
   printf '%s\n' '  printf "RYUKI_CARGO_GUARD_INTERVAL_SECONDS=%s\n" "${RYUKI_CARGO_GUARD_INTERVAL_SECONDS-}"'
+  printf '%s\n' '  printf "FILE_SIZE_SOFT_KIB=%s\n" "$(ulimit -S -f)"'
+  printf '%s\n' '  printf "FILE_SIZE_HARD_KIB=%s\n" "$(ulimit -H -f)"'
   printf '%s\n' '  if [[ -e /dev/fd/9 || -e /proc/self/fd/9 ]]; then printf "FD9=open\n"; else printf "FD9=closed\n"; fi'
   printf '%s\n' '} > "$RYUKI_VERIFY_TEST_CARGO_ENV"'
+  printf '%s\n' 'if [[ "${RYUKI_VERIFY_TEST_FILE_LIMIT_ATTEMPT:-0}" == "1" ]]; then'
+  printf '%s\n' '  dd if=/dev/zero of="$CARGO_TARGET_DIR/file-limit.bin" bs=1024 count=128 2>/dev/null'
+  printf '%s\n' 'fi'
 } > "$FAKE_CARGO"
 chmod 700 "$FAKE_CARGO"
 
@@ -257,6 +263,23 @@ grep -q "RYUKI_VERIFY_TEST_MAX_KIB must not exceed the configured verification t
   "$OUTPUT_FILE" \
   || fail "inflated test-only target ceiling refusal was not reported"
 
+if RYUKI_VERIFY_TEST_FILE_LIMIT_KIB=64 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
+  fail "verification accepted the test file limit outside test mode"
+fi
+grep -q "RYUKI_VERIFY_TEST_FILE_LIMIT_KIB is reserved for regression tests" \
+  "$OUTPUT_FILE" \
+  || fail "production test file-limit refusal was not reported"
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
+  RYUKI_VERIFY_TEST_FILE_LIMIT_KIB=8388608 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
+  fail "verification accepted a non-stricter test file limit"
+fi
+grep -q "RYUKI_VERIFY_TEST_FILE_LIMIT_KIB must be stricter than 8388608 KiB" \
+  "$OUTPUT_FILE" \
+  || fail "weakened verification file-limit refusal was not reported"
+
 UNSAFE_STATE_BASE="${FIXTURE_ROOT}/unsafe-state"
 mkdir -p "$UNSAFE_STATE_BASE"
 if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$UNSAFE_STATE_BASE" \
@@ -298,6 +321,7 @@ PATH="${FAKE_BIN}:$PATH" \
   CARGO_TARGET_DIR="$hostile_target" \
   CARGO_BUILD_TARGET_DIR="${hostile_target}-config" \
   CARGO_BUILD_BUILD_DIR="${hostile_target}-build-dir" \
+  CARGO_BUILD_JOBS=999 \
   RUSTC_WRAPPER="${WORK_DIR}/hostile-rustc-wrapper" \
   RUSTC_WORKSPACE_WRAPPER="${WORK_DIR}/hostile-workspace-wrapper" \
   CARGO_BUILD_RUSTC_WRAPPER="${WORK_DIR}/hostile-config-wrapper" \
@@ -345,6 +369,14 @@ grep -Fxq 'RYUKI_CARGO_MIN_FREE_GIB=30' "$CARGO_ENV_CAPTURE" \
   || fail "focused verification did not pin the rustc free-space floor"
 grep -Fxq 'RYUKI_CARGO_GUARD_INTERVAL_SECONDS=2' "$CARGO_ENV_CAPTURE" \
   || fail "focused verification did not pin the rustc watcher interval"
+grep -Fxq 'CARGO_BUILD_JOBS=1' "$CARGO_ENV_CAPTURE" \
+  || fail "focused verification did not pin Cargo build jobs to one"
+soft_file_limit="$(sed -n 's/^FILE_SIZE_SOFT_KIB=//p' "$CARGO_ENV_CAPTURE")"
+hard_file_limit="$(sed -n 's/^FILE_SIZE_HARD_KIB=//p' "$CARGO_ENV_CAPTURE")"
+[[ "$soft_file_limit" =~ ^[1-9][0-9]*$ && "$soft_file_limit" -le 8388608 ]] \
+  || fail "focused Cargo command did not inherit the 8 GiB soft file-size ceiling"
+[[ "$hard_file_limit" =~ ^[1-9][0-9]*$ && "$hard_file_limit" -le 8388608 ]] \
+  || fail "focused Cargo command could raise its hard file-size ceiling"
 grep -Fxq 'FD9=closed' "$CARGO_ENV_CAPTURE" \
   || fail "focused Cargo command inherited repository lock descriptor 9"
 for pinned in CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do
@@ -354,6 +386,23 @@ done
 [[ ! -e "$hostile_target" && ! -e "${hostile_target}-config" \
   && ! -e "${hostile_target}-build-dir" ]] \
   || fail "focused verification wrote to an inherited Cargo target"
+
+if PATH="${FAKE_BIN}:$PATH" TMPDIR="$TMP_A" \
+  RYUKI_VERIFY_STATE_BASE="$STATE_BASE" RYUKI_VERIFY_TEST_MODE=1 \
+  RYUKI_VERIFY_KEEP_TARGET=0 RYUKI_VERIFY_TEST_FILE_LIMIT_KIB=64 \
+  RYUKI_VERIFY_TEST_CARGO_ENV="$CARGO_ENV_CAPTURE" \
+  RYUKI_VERIFY_TEST_FILE_LIMIT_ATTEMPT=1 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" -- cargo check \
+  > "$OUTPUT_FILE" 2>&1; then
+  fail "fake Cargo created a file beyond the test RLIMIT_FSIZE"
+fi
+grep -Fxq 'FILE_SIZE_SOFT_KIB=64' "$CARGO_ENV_CAPTURE" \
+  || fail "test-only soft file-size limit was not inherited"
+grep -Fxq 'FILE_SIZE_HARD_KIB=64' "$CARGO_ENV_CAPTURE" \
+  || fail "test-only hard file-size limit was not inherited"
+limited_target="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$CARGO_ENV_CAPTURE")"
+[[ -n "$limited_target" && ! -e "$limited_target" ]] \
+  || fail "file-size failure cleanup left its disposable Cargo target"
 
 TMPDIR="$TMP_A" \
   RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
@@ -538,6 +587,17 @@ grep -q "forbids overriding CARGO_TARGET_DIR" "$OUTPUT_FILE" \
   || fail "focused target override refusal was not reported"
 [[ ! -e "$unmanaged_target" ]] \
   || fail "focused target override created an unmanaged target"
+
+for jobs_override in --jobs=99 -j99; do
+  if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+    RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \
+    "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+    -- cargo test "$jobs_override" > "$OUTPUT_FILE" 2>&1; then
+    fail "focused verification accepted Cargo job override ${jobs_override}"
+  fi
+  grep -q "forbids overriding the pinned Cargo job count" "$OUTPUT_FILE" \
+    || fail "focused Cargo job override refusal was not reported"
+done
 
 if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_KEEP_TARGET=0 \

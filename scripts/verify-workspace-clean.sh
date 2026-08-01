@@ -17,8 +17,14 @@ RUSTC_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_WATCH_INTERVAL_SECONDS=2
+# Bash `ulimit -f` uses 1024-byte blocks. Cap every supervised command at an
+# 8 GiB regular file so a single malformed artifact cannot consume the disk
+# between watcher samples.
+HARD_MAX_FILE_KIB=8388608
+HARD_CARGO_BUILD_JOBS=1
 TEST_MODE="${RYUKI_VERIFY_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_VERIFY_TEST_MAX_KIB:-}"
+TEST_FILE_LIMIT_KIB="${RYUKI_VERIFY_TEST_FILE_LIMIT_KIB:-}"
 STATE_BASE_INPUT="${RYUKI_VERIFY_STATE_BASE:-/tmp}"
 if [[ ! -f "$RUSTC_GUARD" || -L "$RUSTC_GUARD" || ! -x "$RUSTC_GUARD" ]]; then
   echo "error: repository Cargo rustc guard is missing or unsafe: ${RUSTC_GUARD}" >&2
@@ -64,14 +70,17 @@ unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
 unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
 unset CARGO_BUILD_INCREMENTAL
+unset CARGO_BUILD_JOBS
 unset CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL
 unset RYUKI_CARGO_GUARD_TEST_MODE RYUKI_CARGO_GUARD_TEST_MAX_KIB
 unset RYUKI_CARGO_MAX_TARGET_GIB RYUKI_CARGO_MIN_FREE_GIB
 unset RYUKI_CARGO_GUARD_INTERVAL_SECONDS
+unset RYUKI_VERIFY_TEST_FILE_LIMIT_KIB
 export CARGO_TARGET_DIR="${VERIFY_DIR}/target"
 export CARGO_BUILD_BUILD_DIR="${CARGO_TARGET_DIR}/build-cache"
 export RUSTC_WRAPPER="$RUSTC_GUARD"
 export CARGO_INCREMENTAL=0
+export CARGO_BUILD_JOBS="$HARD_CARGO_BUILD_JOBS"
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_TEST_DEBUG=0
 export RYUKI_CARGO_MAX_TARGET_GIB="$MAX_TARGET_GIB"
@@ -133,6 +142,20 @@ if [[ -n "$TEST_MAX_KIB" ]]; then
     echo "error: RYUKI_VERIFY_TEST_MAX_KIB must not exceed the configured verification target ceiling" >&2
     exit 64
   fi
+fi
+
+FILE_LIMIT_KIB="$HARD_MAX_FILE_KIB"
+if [[ -n "$TEST_FILE_LIMIT_KIB" && "$TEST_MODE" != "1" ]]; then
+  echo "error: RYUKI_VERIFY_TEST_FILE_LIMIT_KIB is reserved for regression tests" >&2
+  exit 64
+fi
+if [[ -n "$TEST_FILE_LIMIT_KIB" ]]; then
+  require_positive_integer RYUKI_VERIFY_TEST_FILE_LIMIT_KIB "$TEST_FILE_LIMIT_KIB"
+  if (( TEST_FILE_LIMIT_KIB >= HARD_MAX_FILE_KIB )); then
+    echo "error: RYUKI_VERIFY_TEST_FILE_LIMIT_KIB must be stricter than ${HARD_MAX_FILE_KIB} KiB" >&2
+    exit 64
+  fi
+  FILE_LIMIT_KIB="$TEST_FILE_LIMIT_KIB"
 fi
 
 if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
@@ -701,6 +724,26 @@ supervisor_signal() {
   exit "$status"
 }
 
+apply_file_size_limit() {
+  local limit_kib="$FILE_LIMIT_KIB"
+  local current_soft current_hard observed
+
+  current_soft="$(ulimit -S -f)" || return 75
+  current_hard="$(ulimit -H -f)" || return 75
+  if [[ "$current_soft" =~ ^[0-9]+$ ]] && (( current_soft < limit_kib )); then
+    limit_kib="$current_soft"
+  fi
+  if [[ "$current_hard" =~ ^[0-9]+$ ]] && (( current_hard < limit_kib )); then
+    limit_kib="$current_hard"
+  fi
+  ulimit -S -f "$limit_kib" || return 75
+  # Lowering the inherited hard limit in this command subshell prevents a
+  # child process from raising the soft limit again.
+  ulimit -H -f "$limit_kib" || return 75
+  observed="$(ulimit -S -f)" || return 75
+  [[ "$observed" =~ ^[0-9]+$ && "$observed" -le "$FILE_LIMIT_KIB" ]] || return 75
+}
+
 run_gate_command() {
   local wrapper_pid="$1"
   local label="$2"
@@ -749,6 +792,10 @@ run_gate_command() {
       sleep 0.05
     done
     (( released == 1 )) || exit 75
+    if ! apply_file_size_limit; then
+      echo "error: unable to enforce the ${FILE_LIMIT_KIB} KiB file-size limit" >&2
+      exit 75
+    fi
     set +e
     "$@"
     command_status=$?
@@ -889,6 +936,11 @@ validate_focused_cargo_command() {
     fi
     if [[ "$argument" == "--config" || "$argument" == --config=* ]]; then
       echo "error: focused verification forbids Cargo --config overrides" >&2
+      return 64
+    fi
+    if [[ "$argument" == "-j" || "$argument" == -j* \
+      || "$argument" == "--jobs" || "$argument" == --jobs=* ]]; then
+      echo "error: focused verification forbids overriding the pinned Cargo job count" >&2
       return 64
     fi
   done

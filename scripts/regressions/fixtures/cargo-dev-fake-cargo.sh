@@ -7,6 +7,7 @@ set -Eeuo pipefail
   printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR-}"
   printf 'CARGO_BUILD_TARGET_DIR=%s\n' "${CARGO_BUILD_TARGET_DIR-}"
   printf 'CARGO_BUILD_BUILD_DIR=%s\n' "${CARGO_BUILD_BUILD_DIR-}"
+  printf 'CARGO_BUILD_JOBS=%s\n' "${CARGO_BUILD_JOBS-}"
   printf 'RUSTC_WRAPPER=%s\n' "${RUSTC_WRAPPER-}"
   printf 'RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WORKSPACE_WRAPPER-}"
   printf 'CARGO_BUILD_RUSTC_WRAPPER=%s\n' "${CARGO_BUILD_RUSTC_WRAPPER-}"
@@ -18,6 +19,8 @@ set -Eeuo pipefail
   printf 'RYUKI_CARGO_MIN_FREE_GIB=%s\n' "${RYUKI_CARGO_MIN_FREE_GIB-}"
   printf 'RYUKI_CARGO_GUARD_INTERVAL_SECONDS=%s\n' \
     "${RYUKI_CARGO_GUARD_INTERVAL_SECONDS-}"
+  printf 'FILE_SIZE_SOFT_KIB=%s\n' "$(ulimit -S -f)"
+  printf 'FILE_SIZE_HARD_KIB=%s\n' "$(ulimit -H -f)"
   if [[ -e /dev/fd/9 || -e /proc/self/fd/9 ]]; then
     printf 'FD9=open\n'
   else
@@ -59,6 +62,10 @@ case "${RYUKI_DEV_TEST_BEHAVIOR:-capture}" in
     touch "$RYUKI_DEV_TEST_READY"
     trap 'exit 0' HUP INT TERM
     while :; do sleep 1; done
+    ;;
+  file-limit)
+    : "${RYUKI_DEV_TEST_FILE_PATH:?missing file-limit path}"
+    dd if=/dev/zero of="$RYUKI_DEV_TEST_FILE_PATH" bs=1024 count=128 2>/dev/null
     ;;
   clean-target)
     rm -rf -- "$CARGO_TARGET_DIR"
