@@ -3,7 +3,11 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 GUARD="$ROOT_DIR/scripts/cargo-rustc-disk-guard.sh"
+GIT_COMMON_DIR_RAW="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir)"
+GIT_COMMON_DIR="$(cd "$GIT_COMMON_DIR_RAW" && pwd -P)"
+REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object --stdin)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-cargo-guard.XXXXXX")"
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 TARGET="$TEST_ROOT/target"
 OUT_DIR="$TARGET/debug/deps"
 export CARGO_TARGET_DIR="$TARGET"
@@ -26,9 +30,36 @@ SYMLINK_OUT_DIR="$SYMLINK_TARGET/debug/deps"
 DU_FAILURE_BIN="$TEST_ROOT/du-failure-bin"
 DU_TRANSIENT_BIN="$TEST_ROOT/du-transient-bin"
 DU_TRANSIENT_MARKER="$TEST_ROOT/du-transient-failed-once"
+OUTER_VERIFY_DIR="$TEST_ROOT/run.1.1.1"
+OUTER_TARGET="$OUTER_VERIFY_DIR/target"
+OUTER_OUT_DIR="$OUTER_TARGET/debug/deps"
+OUTER_CONTROL="$OUTER_VERIFY_DIR/.ryuki-verify-command-owner"
+OUTER_READY="$TEST_ROOT/outer-ready"
+OUTER_COMPILER_PID="$TEST_ROOT/outer-compiler.pid"
+OUTER_FD_STATE="$TEST_ROOT/outer-fd9"
+OUTER_TERM="$TEST_ROOT/outer-term"
+FAKE_OUTER_RUSTC="$TEST_ROOT/fake-outer-rustc"
+SIGNAL_READY="$TEST_ROOT/signal-ready"
+SIGNAL_COMPILER_PID="$TEST_ROOT/signal-compiler.pid"
+FAKE_SIGNAL_RUSTC="$TEST_ROOT/fake-signal-rustc"
 REAL_DU="$(command -v du)"
 
 cleanup() {
+  if [[ -n "${OUTER_WRAPPER_PID:-}" ]] \
+    && kill -0 -- "-$OUTER_WRAPPER_PID" 2>/dev/null; then
+    kill -KILL -- "-$OUTER_WRAPPER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${SIGNAL_WRAPPER_PID:-}" ]] \
+    && kill -0 "$SIGNAL_WRAPPER_PID" 2>/dev/null; then
+    kill -KILL "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
+  fi
+  if [[ -f "$SIGNAL_COMPILER_PID" ]]; then
+    signal_compiler_pid="$(sed -n '1p' "$SIGNAL_COMPILER_PID")"
+    if [[ "$signal_compiler_pid" =~ ^[1-9][0-9]*$ ]] \
+      && kill -0 "$signal_compiler_pid" 2>/dev/null; then
+      kill -KILL "$signal_compiler_pid" 2>/dev/null || true
+    fi
+  fi
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT INT TERM
@@ -44,6 +75,166 @@ printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf started > %q\nsleep 10\n
 printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ndd if=/dev/zero of=%q bs=1024 count=128 status=none\nprintf finished > %q\n' \
   "$TARGET/fast-oversized.bin" "$FAST_GROWER_FINISHED" > "$FAKE_FAST_GROWER"
 chmod +x "$FAKE_GROWER" "$FAKE_PEER" "$FAKE_FAST_GROWER"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\nif [[ -e /dev/fd/9 || -e /proc/self/fd/9 ]]; then printf open > %q; else printf closed > %q; fi\ntrap '\''printf term > %q; exit 0'\'' HUP INT TERM\ntouch %q\nwhile :; do sleep 1; done\n' \
+  "$OUTER_COMPILER_PID" "$OUTER_FD_STATE" "$OUTER_FD_STATE" \
+  "$OUTER_TERM" "$OUTER_READY" > "$FAKE_OUTER_RUSTC"
+chmod +x "$FAKE_OUTER_RUSTC"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\ntrap "" HUP INT TERM\ntouch %q\nwhile :; do sleep 1; done\n' \
+  "$SIGNAL_COMPILER_PID" "$SIGNAL_READY" > "$FAKE_SIGNAL_RUSTC"
+chmod +x "$FAKE_SIGNAL_RUSTC"
+
+# A verifier-owned rustc wrapper must inherit the durable command process
+# group instead of creating the standalone nested compiler PG. This also
+# verifies that the compiler child cannot inherit the verifier's lock fd 9.
+mkdir -p "$OUTER_OUT_DIR"
+printf '%s\n' \
+  'version=1' \
+  "repository_id=$REPOSITORY_ID" \
+  'run_id=1.1.1' \
+  "workspace=$ROOT_DIR" \
+  'keep_target=0' > "$OUTER_VERIFY_DIR/.ryuki-verify-owner"
+set -m
+(
+  exec 9>"$TEST_ROOT/outer-lock"
+  while [[ ! -f "$OUTER_CONTROL" ]]; do sleep 0.01; done
+  CARGO_TARGET_DIR="$OUTER_TARGET" \
+    CARGO_BUILD_JOBS=1 \
+    RYUKI_CARGO_OUTER_CONTROL_FILE="$OUTER_CONTROL" \
+    RYUKI_CARGO_GUARD_TEST_MODE=1 \
+    RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+    RYUKI_CARGO_MIN_FREE_GIB=30 \
+    RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+    "$GUARD" "$FAKE_OUTER_RUSTC" --out-dir "$OUTER_OUT_DIR"
+) 2>"$TEST_ROOT/outer-supervision.log" &
+OUTER_WRAPPER_PID=$!
+set +m
+printf '%s\n' \
+  'version=1' \
+  "repository_id=$REPOSITORY_ID" \
+  'run_id=1.1.1' \
+  "supervisor_pid=$$" \
+  "command_pid=$OUTER_WRAPPER_PID" \
+  "command_pgid=$OUTER_WRAPPER_PID" > "$OUTER_CONTROL.next"
+mv "$OUTER_CONTROL.next" "$OUTER_CONTROL"
+for _ in {1..100}; do
+  [[ -f "$OUTER_READY" ]] && break
+  sleep 0.05
+done
+[[ -f "$OUTER_READY" ]] || {
+  echo "error: outer-supervised compiler did not start" >&2
+  sed 's/^/  | /' "$TEST_ROOT/outer-supervision.log" >&2 || true
+  exit 1
+}
+[[ "$(<"$OUTER_FD_STATE")" == "closed" ]] || {
+  echo "error: outer-supervised compiler inherited fd 9" >&2
+  exit 1
+}
+kill -TERM -- "-$OUTER_WRAPPER_PID"
+wait "$OUTER_WRAPPER_PID" 2>/dev/null || true
+for _ in {1..100}; do
+  [[ -f "$OUTER_TERM" ]] && break
+  sleep 0.05
+done
+[[ -f "$OUTER_TERM" ]] || {
+  echo "error: outer-supervised compiler escaped the durable root process group" >&2
+  exit 1
+}
+OUTER_WRAPPER_PID=""
+
+if CARGO_TARGET_DIR="$TARGET" \
+  CARGO_BUILD_JOBS=1 \
+  RYUKI_CARGO_OUTER_CONTROL_FILE="$TEST_ROOT/forged-control" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" \
+  2>"$TEST_ROOT/invalid-outer-supervision.log"; then
+  echo "error: forged outer supervision bypassed the standalone guard" >&2
+  exit 1
+fi
+grep -q "invalid outer supervisor ownership" \
+  "$TEST_ROOT/invalid-outer-supervision.log"
+
+FORGED_VERIFY_DIR="$TEST_ROOT/run.2.2.2"
+FORGED_TARGET="$FORGED_VERIFY_DIR/target"
+FORGED_OUT_DIR="$FORGED_TARGET/debug/deps"
+FORGED_CONTROL="$FORGED_VERIFY_DIR/.ryuki-verify-command-owner"
+mkdir -p "$FORGED_OUT_DIR"
+printf '%s\n' \
+  'version=1' \
+  'repository_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+  'run_id=2.2.2' \
+  "workspace=$ROOT_DIR" \
+  'keep_target=0' > "$FORGED_VERIFY_DIR/.ryuki-verify-owner"
+printf '%s\n' \
+  'version=1' \
+  'repository_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+  'run_id=2.2.2' \
+  "supervisor_pid=$$" \
+  "command_pid=$$" \
+  "command_pgid=$$" > "$FORGED_CONTROL"
+if CARGO_TARGET_DIR="$FORGED_TARGET" \
+  CARGO_BUILD_JOBS=1 \
+  RYUKI_CARGO_OUTER_CONTROL_FILE="$FORGED_CONTROL" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$FORGED_OUT_DIR" \
+  2>"$TEST_ROOT/forged-repository-id.log"; then
+  echo "error: forged repository identity bypassed outer supervision" >&2
+  exit 1
+fi
+grep -q "invalid outer supervisor ownership" \
+  "$TEST_ROOT/forged-repository-id.log"
+
+# Repeated cleanup signals must not interrupt the TERM-to-KILL deadline. The
+# compiler ignores catchable signals, so the wrapper must force it down within
+# the same bounded two-second cleanup window used by the outer verifier.
+set +e
+RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_SIGNAL_RUSTC" --out-dir "$OUT_DIR" \
+  2>"$TEST_ROOT/signal-cleanup.log" &
+SIGNAL_WRAPPER_PID=$!
+set -e
+for _ in {1..100}; do
+  [[ -f "$SIGNAL_READY" ]] && break
+  sleep 0.05
+done
+[[ -f "$SIGNAL_READY" ]] || {
+  echo "error: signal-cleanup compiler did not start" >&2
+  exit 1
+}
+kill -TERM "$SIGNAL_WRAPPER_PID"
+kill -INT "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
+kill -HUP "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
+set +e
+wait "$SIGNAL_WRAPPER_PID"
+signal_wrapper_status=$?
+set -e
+[[ "$signal_wrapper_status" -eq 129 || "$signal_wrapper_status" -eq 130 \
+  || "$signal_wrapper_status" -eq 143 ]] || {
+  echo "error: interrupted cleanup returned status $signal_wrapper_status" >&2
+  exit 1
+}
+signal_compiler_pid="$(sed -n '1p' "$SIGNAL_COMPILER_PID")"
+[[ "$signal_compiler_pid" =~ ^[1-9][0-9]*$ ]] || {
+  echo "error: signal-cleanup compiler published an invalid pid" >&2
+  exit 1
+}
+for _ in {1..50}; do
+  kill -0 "$signal_compiler_pid" 2>/dev/null || break
+  sleep 0.05
+done
+kill -0 "$signal_compiler_pid" 2>/dev/null && {
+  echo "error: repeated signals interrupted compiler cleanup deadline" >&2
+  exit 1
+}
+SIGNAL_WRAPPER_PID=""
 
 if RYUKI_CARGO_MAX_TARGET_GIB=25 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/max-target.log"; then

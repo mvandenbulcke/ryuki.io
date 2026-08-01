@@ -745,10 +745,12 @@ rm -f "$FAKE_BIN/du" "$DU_FAILURE_COUNT" "$DU_FAILURE_PID_FILE" \
 
 cp "$DETACHED_CARGO_FIXTURE" "$FAKE_CARGO"
 chmod 700 "$FAKE_CARGO"
+set +e
 PATH="${FAKE_BIN}:$PATH" \
   TMPDIR="$TMP_A" \
   RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   RYUKI_VERIFY_TEST_MODE=1 \
+  RYUKI_VERIFY_TEST_REGROUPED_PGID_FILE="$DETACHED_PID_FILE" \
   RYUKI_VERIFY_KEEP_TARGET=0 \
   RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=1 \
   RYUKI_VERIFY_TEST_DETACHED_PID="$DETACHED_PID_FILE" \
@@ -756,8 +758,11 @@ PATH="${FAKE_BIN}:$PATH" \
   RYUKI_VERIFY_TEST_DETACHED_ATTEMPTED="$DETACHED_ATTEMPTED_FILE" \
   RYUKI_VERIFY_TEST_DETACHED_TARGET="$DETACHED_TARGET_CAPTURE" \
   "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" -- cargo check \
-  > "$OUTPUT_FILE" 2>&1 \
-  || fail "focused verification failed while stopping a detached command descendant"
+  > "$OUTPUT_FILE" 2>&1
+detached_status=$?
+set -e
+[[ "$detached_status" -eq 75 ]] \
+  || fail "focused verification accepted a regrouped command descendant"
 wait_for_file "$DETACHED_PID_FILE" \
   || fail "detached command fixture did not publish its descendant pid"
 detached_pid="$(sed -n '1p' "$DETACHED_PID_FILE")"
@@ -774,8 +779,7 @@ esac
   || fail "detached command descendant recreated the disposable Cargo target"
 [[ ! -e "$DETACHED_ATTEMPTED_FILE" ]] \
   || fail "detached command descendant survived long enough to attempt target recreation"
-grep -q "stopping surviving focused verification descendants after command exit" \
-  "$OUTPUT_FILE" \
-  || fail "detached command descendant cleanup was not reported"
+grep -q "supervised descendant changed process group" "$OUTPUT_FILE" \
+  || fail "regrouped command descendant rejection was not reported"
 
 echo "verify-workspace-clean regression passed"

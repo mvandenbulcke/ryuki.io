@@ -22,9 +22,11 @@ HARD_MAX_WATCH_INTERVAL_SECONDS=2
 # between watcher samples.
 HARD_MAX_FILE_KIB=8388608
 HARD_CARGO_BUILD_JOBS=1
+HARD_STOP_PHASE_ATTEMPTS=10
 TEST_MODE="${RYUKI_VERIFY_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_VERIFY_TEST_MAX_KIB:-}"
 TEST_FILE_LIMIT_KIB="${RYUKI_VERIFY_TEST_FILE_LIMIT_KIB:-}"
+TEST_REGROUPED_PGID_FILE="${RYUKI_VERIFY_TEST_REGROUPED_PGID_FILE:-}"
 STATE_BASE_INPUT="${RYUKI_VERIFY_STATE_BASE:-/tmp}"
 if [[ ! -f "$RUSTC_GUARD" || -L "$RUSTC_GUARD" || ! -x "$RUSTC_GUARD" ]]; then
   echo "error: repository Cargo rustc guard is missing or unsafe: ${RUSTC_GUARD}" >&2
@@ -46,8 +48,8 @@ ACTIVE_GATE_PID=""
 SUPERVISED_COMMAND_PID=""
 SUPERVISED_COMMAND_PGID=""
 GATE_SUPERVISOR_ACTUAL_PID=""
-FROZEN_PROCESS_PIDS=()
 FROZEN_ROOT_PGID=""
+REGROUPED_PROCESS_PGIDS=()
 RETAIN_CURRENT_TARGET=0
 WRAPPER_PID="$$"
 VERIFY_NAMESPACE="${STATE_BASE_ROOT}/ryuki-verify-$(id -u)"
@@ -77,6 +79,7 @@ unset CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL
 unset RYUKI_CARGO_GUARD_TEST_MODE RYUKI_CARGO_GUARD_TEST_MAX_KIB
 unset RYUKI_CARGO_MAX_TARGET_GIB RYUKI_CARGO_MIN_FREE_GIB
 unset RYUKI_CARGO_GUARD_INTERVAL_SECONDS
+unset RYUKI_CARGO_OUTER_CONTROL_FILE
 unset RYUKI_VERIFY_TEST_FILE_LIMIT_KIB
 export CARGO_TARGET_DIR="${VERIFY_DIR}/target"
 export CARGO_BUILD_BUILD_DIR="${CARGO_TARGET_DIR}/build-cache"
@@ -149,6 +152,10 @@ fi
 FILE_LIMIT_KIB="$HARD_MAX_FILE_KIB"
 if [[ -n "$TEST_FILE_LIMIT_KIB" && "$TEST_MODE" != "1" ]]; then
   echo "error: RYUKI_VERIFY_TEST_FILE_LIMIT_KIB is reserved for regression tests" >&2
+  exit 64
+fi
+if [[ -n "$TEST_REGROUPED_PGID_FILE" && "$TEST_MODE" != "1" ]]; then
+  echo "error: RYUKI_VERIFY_TEST_REGROUPED_PGID_FILE is reserved for regression tests" >&2
   exit 64
 fi
 if [[ -n "$TEST_FILE_LIMIT_KIB" ]]; then
@@ -334,41 +341,82 @@ verify_gate_control_contents() {
     "command_pgid=$command_pgid"
 }
 
-verify_gate_control_value() {
-  local control_file="$1"
-  local wanted="$2"
-  local key value found=0
-  while IFS='=' read -r key value; do
-    if [[ "$key" == "$wanted" ]]; then
-      (( found == 0 )) || return 1
-      printf '%s\n' "$value"
-      found=1
-    fi
-  done < "$control_file"
-  (( found == 1 ))
+safe_process_id() {
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  (( 10#$pid > 1 ))
 }
 
-valid_verify_gate_control() {
+VERIFY_CONTROL_SUPERVISOR_PID=""
+VERIFY_CONTROL_COMMAND_PID=""
+VERIFY_CONTROL_COMMAND_PGID=""
+
+load_verify_gate_control() {
   local control_file="$1"
   local run_id="$2"
   local expected_supervisor_pid="${3:-}"
-  local supervisor_pid command_pid command_pgid expected actual
+  local key value version="" repository_id="" parsed_run_id=""
+  local seen_version=0 seen_repository_id=0 seen_run_id=0
+  local seen_supervisor_pid=0 seen_command_pid=0 seen_command_pgid=0
 
   [[ -f "$control_file" && ! -L "$control_file" && -O "$control_file" ]] || return 1
-  supervisor_pid="$(verify_gate_control_value "$control_file" supervisor_pid)" || \
-    return 1
-  command_pid="$(verify_gate_control_value "$control_file" command_pid)" || return 1
-  command_pgid="$(verify_gate_control_value "$control_file" command_pgid)" || return 1
-  [[ "$supervisor_pid" =~ ^[1-9][0-9]{0,9}$ \
-    && "$command_pid" =~ ^[1-9][0-9]{0,9}$ \
-    && "$command_pgid" =~ ^[1-9][0-9]{0,9}$ \
-    && "$command_pid" == "$command_pgid" ]] || return 1
+
+  VERIFY_CONTROL_SUPERVISOR_PID=""
+  VERIFY_CONTROL_COMMAND_PID=""
+  VERIFY_CONTROL_COMMAND_PGID=""
+  # Parse the owned control exactly once. Reopening after validation would
+  # create an avoidable validation/use race even inside the private namespace.
+  while IFS='=' read -r key value; do
+    case "$key" in
+      version)
+        (( seen_version == 0 )) || return 1
+        seen_version=1
+        version="$value"
+        ;;
+      repository_id)
+        (( seen_repository_id == 0 )) || return 1
+        seen_repository_id=1
+        repository_id="$value"
+        ;;
+      run_id)
+        (( seen_run_id == 0 )) || return 1
+        seen_run_id=1
+        parsed_run_id="$value"
+        ;;
+      supervisor_pid)
+        (( seen_supervisor_pid == 0 )) || return 1
+        seen_supervisor_pid=1
+        VERIFY_CONTROL_SUPERVISOR_PID="$value"
+        ;;
+      command_pid)
+        (( seen_command_pid == 0 )) || return 1
+        seen_command_pid=1
+        VERIFY_CONTROL_COMMAND_PID="$value"
+        ;;
+      command_pgid)
+        (( seen_command_pgid == 0 )) || return 1
+        seen_command_pgid=1
+        VERIFY_CONTROL_COMMAND_PGID="$value"
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$control_file"
+
+  (( seen_version == 1 && seen_repository_id == 1 && seen_run_id == 1 \
+    && seen_supervisor_pid == 1 && seen_command_pid == 1 \
+    && seen_command_pgid == 1 )) || return 1
+  [[ "$version" == "1" && "$repository_id" == "$REPOSITORY_ID" \
+    && "$parsed_run_id" == "$run_id" ]] || return 1
+  safe_process_id "$VERIFY_CONTROL_SUPERVISOR_PID" || return 1
+  safe_process_id "$VERIFY_CONTROL_COMMAND_PID" || return 1
+  safe_process_id "$VERIFY_CONTROL_COMMAND_PGID" || return 1
+  [[ "$VERIFY_CONTROL_COMMAND_PID" == "$VERIFY_CONTROL_COMMAND_PGID" ]] || return 1
   [[ -z "$expected_supervisor_pid" \
-    || "$supervisor_pid" == "$expected_supervisor_pid" ]] || return 1
-  expected="$(verify_gate_control_contents "$run_id" "$supervisor_pid" \
-    "$command_pid" "$command_pgid")"
-  actual="$(<"$control_file")" || return 1
-  [[ "$actual" == "$expected" ]]
+    || "$VERIFY_CONTROL_SUPERVISOR_PID" == "$expected_supervisor_pid" ]] || return 1
+}
+
+valid_verify_gate_control() {
+  load_verify_gate_control "$@"
 }
 
 publish_verify_gate_control() {
@@ -428,14 +476,14 @@ recover_verify_gate_control() {
     fi
     return 0
   fi
-  valid_verify_gate_control "$control_file" "$run_id" \
+  load_verify_gate_control "$control_file" "$run_id" \
     "$expected_supervisor_pid" || {
     echo "error: refusing malformed verification command ownership control" >&2
     return 75
   }
-  supervisor_pid="$(verify_gate_control_value "$control_file" supervisor_pid)"
-  command_pid="$(verify_gate_control_value "$control_file" command_pid)"
-  command_pgid="$(verify_gate_control_value "$control_file" command_pgid)"
+  supervisor_pid="$VERIFY_CONTROL_SUPERVISOR_PID"
+  command_pid="$VERIFY_CONTROL_COMMAND_PID"
+  command_pgid="$VERIFY_CONTROL_COMMAND_PGID"
 
   if [[ -z "$expected_supervisor_pid" ]]; then
     if kill -0 "$supervisor_pid" 2>/dev/null || process_group_alive "$command_pgid"; then
@@ -586,27 +634,44 @@ disk_guard() {
 
 collect_process_tree() {
   local pid="$1"
-  local child
+  local child children="" status=0
+
+  safe_process_id "$pid" || return 75
+  if children="$(pgrep -P "$pid" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  # pgrep(1) returns 1 for an authoritative empty child set. Any larger
+  # status means process inspection itself failed, so callers must not claim
+  # that a partial tree is complete.
+  (( status <= 1 )) || return 75
   while IFS= read -r child; do
-    [[ -n "$child" ]] && collect_process_tree "$child"
-  done < <(pgrep -P "$pid" 2>/dev/null || true)
+    [[ -n "$child" ]] || continue
+    safe_process_id "$child" || return 75
+    collect_process_tree "$child" || return $?
+  done <<< "$children"
   printf '%s\n' "$pid"
 }
 
 terminate_process_tree() {
   local root_pid="$1"
-  local pid attempt alive
+  local original_root_pid="$1"
+  local pid attempt alive snapshot extra collection_status=0
   local tree_pids=()
 
+  safe_process_id "$root_pid" || return 75
+  snapshot="$(collect_process_tree "$root_pid")" || return $?
   while IFS= read -r pid; do
     [[ -n "$pid" ]] && tree_pids+=("$pid")
-  done < <(collect_process_tree "$root_pid")
+  done <<< "$snapshot"
 
   for pid in "${tree_pids[@]}"; do
+    safe_process_id "$pid" || return 75
     kill -TERM "$pid" 2>/dev/null || true
   done
 
-  for attempt in {1..20}; do
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
     alive=0
     for pid in "${tree_pids[@]}"; do
       if kill -0 "$pid" 2>/dev/null; then
@@ -621,132 +686,178 @@ terminate_process_tree() {
   # Capture any descendants created during graceful shutdown before forcing
   # the original tree down. Duplicates are harmless.
   for root_pid in "${tree_pids[@]}"; do
+    if ! extra="$(collect_process_tree "$root_pid")"; then
+      collection_status=75
+      continue
+    fi
     while IFS= read -r pid; do
       [[ -n "$pid" ]] && tree_pids+=("$pid")
-    done < <(collect_process_tree "$root_pid")
+    done <<< "$extra"
   done
   for pid in "${tree_pids[@]}"; do
+    safe_process_id "$pid" || return 75
     kill -KILL "$pid" 2>/dev/null || true
   done
+  wait "$original_root_pid" 2>/dev/null || true
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
+    alive=0
+    for pid in "${tree_pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    (( alive == 0 )) && return "$collection_status"
+    pause_without_verify_lock 0.1
+  done
+  return 75
 }
 
 process_group_alive() {
   local pgid="${1:-}"
-  [[ -n "$pgid" ]] || return 1
+  safe_process_id "$pgid" || return 1
   kill -0 -- "-$pgid" 2>/dev/null
 }
 
-is_direct_child() {
-  local parent_pid="$1" child_pid="$2" candidate output status=0
-  if output="$(pgrep -P "$parent_pid" 2>/dev/null)"; then
-    status=0
-  else
-    status=$?
+record_regrouped_process_group() {
+  local pgid="$1" recorded
+  safe_process_id "$pgid" || return 75
+  [[ "$pgid" != "${SUPERVISED_COMMAND_PGID:-}" ]] || return 75
+  for recorded in "${REGROUPED_PROCESS_PGIDS[@]-}"; do
+    [[ -n "$recorded" ]] || continue
+    [[ "$recorded" == "$pgid" ]] && return 0
+  done
+  REGROUPED_PROCESS_PGIDS+=("$pgid")
+  # Start fail-closed shutdown without SIGSTOP; an untrappable supervisor
+  # death must not leave a regrouped descendant suspended forever.
+  kill -TERM -- "-$pgid" 2>/dev/null || process_group_alive "$pgid" || return 0
+}
+
+reject_regrouped_descendants() {
+  local root_pid="${SUPERVISED_COMMAND_PID:-}"
+  local root_pgid="${SUPERVISED_COMMAND_PGID:-}"
+  local snapshot pid ppid pgid known changed mismatch=0 index round
+  local pids=() ppids=() pgids=()
+
+  safe_process_id "$root_pid" || return 75
+  safe_process_id "$root_pgid" || return 75
+  if [[ "$TEST_MODE" == "1" ]]; then
+    if [[ -n "$TEST_REGROUPED_PGID_FILE" \
+      && -f "$TEST_REGROUPED_PGID_FILE" ]]; then
+      read -r pgid < "$TEST_REGROUPED_PGID_FILE" || return 75
+      if safe_process_id "$pgid" && [[ "$pgid" != "$root_pgid" ]] \
+        && process_group_alive "$pgid"; then
+        record_regrouped_process_group "$pgid" || return $?
+        echo "error: supervised descendant changed process group: ${pgid}" >&2
+        return 75
+      fi
+    fi
+    return 0
   fi
-  # Exit 1 is an authoritative empty child set. Higher statuses mean process
-  # inspection is unavailable (for example in a restricted macOS sandbox),
-  # in which case the validated ownership control and process group remain the
-  # fail-closed identity boundary.
-  (( status <= 1 )) || return 2
-  while IFS= read -r candidate; do
-    [[ "$candidate" == "$child_pid" ]] && return 0
-  done <<< "$output"
-  return 1
+
+  snapshot="$(/bin/ps -axo pid=,ppid=,pgid= 2>/dev/null)" || return 75
+  while read -r pid ppid pgid; do
+    [[ -z "$pid" ]] && continue
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$ppid" =~ ^[0-9]+$ \
+      && "$pgid" =~ ^[1-9][0-9]*$ ]] || return 75
+    pids+=("$pid")
+    ppids+=("$ppid")
+    pgids+=("$pgid")
+  done <<< "$snapshot"
+  known=" $root_pid "
+  for ((round = 0; round <= ${#pids[@]}; round++)); do
+    changed=0
+    for index in "${!pids[@]}"; do
+      [[ "$known" == *" ${pids[$index]} "* ]] && continue
+      [[ "$known" == *" ${ppids[$index]} "* ]] || continue
+      known+="${pids[$index]} "
+      changed=1
+      if [[ "${pgids[$index]}" != "$root_pgid" ]]; then
+        record_regrouped_process_group "${pgids[$index]}" || return $?
+        mismatch=1
+      fi
+    done
+    (( changed == 1 )) || break
+  done
+  if (( mismatch == 1 )); then
+    echo "error: supervised descendant changed process group" >&2
+    return 75
+  fi
+  # Portable Bash cannot atomically bind every same-user PID start identity or
+  # catch a descendant that detaches and exits between process-table samples.
+  # The supported Cargo/rustc contract is therefore one durable root group;
+  # every regrouping that is observed is rejected and terminated fail closed.
+}
+
+terminate_regrouped_process_groups() {
+  local pgid attempt status=0
+  [[ -n "${REGROUPED_PROCESS_PGIDS[*]-}" ]] || return 0
+  for pgid in "${REGROUPED_PROCESS_PGIDS[@]}"; do
+    safe_process_id "$pgid" || { status=75; continue; }
+    process_group_alive "$pgid" || continue
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
+      process_group_alive "$pgid" || break
+      pause_without_verify_lock 0.1
+    done
+    process_group_alive "$pgid" && kill -KILL -- "-$pgid" 2>/dev/null || true
+    for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
+      process_group_alive "$pgid" || break
+      pause_without_verify_lock 0.1
+    done
+    process_group_alive "$pgid" && status=75
+  done
+  (( status == 0 )) && REGROUPED_PROCESS_PGIDS=()
+  return "$status"
 }
 
 resume_frozen_process_tree() {
-  local pid current_snapshot child_status=0 root_safe=0 status=0
+  local pgid="${FROZEN_ROOT_PGID:-}"
 
-  if [[ -z "$FROZEN_ROOT_PGID" && ${#FROZEN_PROCESS_PIDS[@]} -eq 0 ]]; then
+  [[ -n "$pgid" ]] || return 0
+  safe_process_id "$pgid" || return 75
+  if kill -CONT -- "-$pgid" 2>/dev/null; then
+    FROZEN_ROOT_PGID=""
     return 0
   fi
-  valid_verify_gate_control "$VERIFY_GATE_CONTROL_FILE" "$RUN_ID" \
-    "$GATE_SUPERVISOR_ACTUAL_PID" || status=75
-  if (( status == 0 )); then
-    is_direct_child "$GATE_SUPERVISOR_ACTUAL_PID" \
-      "$SUPERVISED_COMMAND_PID" || child_status=$?
-    (( child_status != 1 )) || status=75
-    (( status != 0 )) || root_safe=1
+  if process_group_alive "$pgid"; then
+    # Retain the recorded identity so cleanup can retry or kill it. Never
+    # discard live frozen ownership merely because thawing failed.
+    return 75
   fi
-  if (( status == 0 )); then
-    current_snapshot="$(collect_process_tree "$SUPERVISED_COMMAND_PID" | sort -n -u)"
-    for pid in "${FROZEN_PROCESS_PIDS[@]}"; do
-      [[ "$pid" != "$SUPERVISED_COMMAND_PID" ]] || continue
-      printf '%s\n' "$current_snapshot" | grep -Fxq "$pid" || continue
-      kill -0 "$pid" 2>/dev/null || continue
-      kill -CONT "$pid" 2>/dev/null || status=75
-    done
-  fi
-  if (( root_safe == 1 )) && [[ -n "$FROZEN_ROOT_PGID" ]]; then
-    kill -CONT -- "-$FROZEN_ROOT_PGID" 2>/dev/null || status=75
-  fi
-  FROZEN_PROCESS_PIDS=()
   FROZEN_ROOT_PGID=""
-  return "$status"
 }
 
 freeze_supervised_process_tree() {
   local pid="${SUPERVISED_COMMAND_PID:-}"
   local pgid="${SUPERVISED_COMMAND_PGID:-}"
-  local snapshot next_snapshot child child_status=0 round stable=0
 
-  FROZEN_PROCESS_PIDS=()
-  FROZEN_ROOT_PGID=""
-  [[ "$pid" =~ ^[1-9][0-9]*$ && "$pgid" =~ ^[1-9][0-9]*$ \
-    && "$pid" == "$pgid" ]] || return 75
+  [[ -z "$FROZEN_ROOT_PGID" ]] || return 75
+  safe_process_id "$pid" || return 75
+  safe_process_id "$pgid" || return 75
+  [[ "$pid" == "$pgid" ]] || return 75
   valid_verify_gate_control "$VERIFY_GATE_CONTROL_FILE" "$RUN_ID" \
     "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
-  is_direct_child "$GATE_SUPERVISOR_ACTUAL_PID" "$pid" || child_status=$?
-  (( child_status != 1 )) || return 75
-  kill -0 "$pid" 2>/dev/null || return 75
-  process_group_alive "$pgid" || return 75
-  FROZEN_ROOT_PGID="$pgid"
+  # The group may disappear normally between the loop's liveness test and
+  # this function. That means there is nothing to freeze; the command's wait
+  # path and post-gate guard still determine its result.
+  process_group_alive "$pgid" || return 0
   if ! kill -STOP -- "-$pgid" 2>/dev/null; then
     if ! process_group_alive "$pgid"; then
-      FROZEN_ROOT_PGID=""
       return 0
     fi
     return 75
   fi
-  kill -0 "$pid" 2>/dev/null || {
-    resume_frozen_process_tree || true
-    return 75
-  }
-
-  for round in {1..8}; do
-    snapshot="$(collect_process_tree "$pid" | sort -n -u)"
-    [[ -n "$snapshot" ]] || {
-      resume_frozen_process_tree || true
-      return 75
-    }
-    while IFS= read -r child; do
-      [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
-      kill -0 "$child" 2>/dev/null || continue
-      if ! kill -STOP "$child" 2>/dev/null; then
-        if kill -0 "$child" 2>/dev/null; then
-          resume_frozen_process_tree || true
-          return 75
-        fi
-        continue
-      fi
-      kill -0 "$child" 2>/dev/null || continue
-      FROZEN_PROCESS_PIDS+=("$child")
-    done <<< "$snapshot"
-    next_snapshot="$(collect_process_tree "$pid" | sort -n -u)"
-    if [[ "$snapshot" == "$next_snapshot" ]]; then
-      stable=1
-      break
-    fi
-  done
-  if (( stable == 0 )); then
-    resume_frozen_process_tree || true
-    return 75
-  fi
+  # The successful stop pins the group identity until this supervisor thaws
+  # it. The rustc wrapper is required to keep compiler/linker descendants in
+  # this group while outer supervision is active.
+  FROZEN_ROOT_PGID="$pgid"
 }
 
 disk_guard_while_frozen() {
   local guard_status=0 resume_status=0
 
+  reject_regrouped_descendants || return $?
   freeze_supervised_process_tree || return $?
   disk_guard 0 || guard_status=$?
   resume_frozen_process_tree || resume_status=$?
@@ -758,15 +869,16 @@ terminate_process_group() {
   local pgid="$1"
   local attempt
 
+  safe_process_id "$pgid" || return 75
   process_group_alive "$pgid" || return 0
   kill -TERM -- "-$pgid" 2>/dev/null || true
-  for attempt in {1..20}; do
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
     process_group_alive "$pgid" || return 0
     pause_without_verify_lock 0.1
   done
 
   kill -KILL -- "-$pgid" 2>/dev/null || true
-  for attempt in {1..20}; do
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
     process_group_alive "$pgid" || return 0
     pause_without_verify_lock 0.1
   done
@@ -777,6 +889,7 @@ stop_active_gate() {
   local pid="${ACTIVE_GATE_PID:-}"
   local recovery_status=0
   [[ -n "$pid" ]] || return 0
+  safe_process_id "$pid" || return 75
 
   if kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null || true
@@ -784,14 +897,16 @@ stop_active_gate() {
   wait "$pid" 2>/dev/null || true
   recover_verify_gate_control "$VERIFY_DIR" "$RUN_ID" "$pid" || \
     recovery_status=$?
-  ACTIVE_GATE_PID=""
+  (( recovery_status == 0 )) && ACTIVE_GATE_PID=""
   return "$recovery_status"
 }
 
 handle_signal() {
   local status="$1"
+  local cleanup_status=0
   trap '' HUP INT TERM
-  stop_active_gate
+  stop_active_gate || cleanup_status=$?
+  (( cleanup_status == 0 )) || status="$cleanup_status"
   exit "$status"
 }
 
@@ -821,26 +936,48 @@ mkdir -p "$CARGO_TARGET_DIR"
 supervisor_stop_command() {
   local pid="${SUPERVISED_COMMAND_PID:-}"
   local pgid="${SUPERVISED_COMMAND_PGID:-}"
-  local status=0
+  local regroup_status=0 tree_status=0 group_status=0 thaw_status=0 status=0
 
   [[ -n "$pid" || -n "$pgid" ]] || return 0
+  [[ -z "$pid" ]] || safe_process_id "$pid" || return 75
+  [[ -z "$pgid" ]] || safe_process_id "$pgid" || return 75
+  [[ -z "$pid" || -z "$pgid" || "$pid" == "$pgid" ]] || return 75
+  # A stopped group cannot run a TERM handler. Thaw recorded ownership first,
+  # then capture the live ancestry before killing the durable root group so a
+  # child that deliberately moved to another process group is still stopped.
+  resume_frozen_process_tree || thaw_status=$?
+  terminate_regrouped_process_groups || regroup_status=$?
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    terminate_process_tree "$pid" || tree_status=$?
+  fi
   if [[ -n "$pgid" ]] && process_group_alive "$pgid"; then
-    terminate_process_group "$pgid" || status=$?
-  elif [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    terminate_process_tree "$pid"
+    terminate_process_group "$pgid" || group_status=$?
   fi
   [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
-  SUPERVISED_COMMAND_PID=""
-  SUPERVISED_COMMAND_PGID=""
+  (( thaw_status == 0 )) || status="$thaw_status"
+  (( regroup_status == 0 )) || status="$regroup_status"
+  (( tree_status == 0 )) || status="$tree_status"
+  (( group_status == 0 )) || status="$group_status"
+  if (( status != 0 )); then
+    echo "error: verification cleanup failed (thaw=${thaw_status}, regroup=${regroup_status}, tree=${tree_status}, group=${group_status})" >&2
+  fi
+  if (( status == 0 )); then
+    SUPERVISED_COMMAND_PID=""
+    SUPERVISED_COMMAND_PGID=""
+  fi
   return "$status"
 }
 
 supervisor_signal() {
   local status="$1"
+  local stop_status=0 clear_status=0
   trap '' HUP INT TERM
-  supervisor_stop_command || true
-  [[ -z "$GATE_SUPERVISOR_ACTUAL_PID" ]] || \
-    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+  supervisor_stop_command || stop_status=$?
+  if (( stop_status == 0 )) && [[ -n "$GATE_SUPERVISOR_ACTUAL_PID" ]]; then
+    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || clear_status=$?
+  fi
+  (( stop_status == 0 )) || status="$stop_status"
+  (( clear_status == 0 )) || status="$clear_status"
   exit "$status"
 }
 
@@ -868,6 +1005,7 @@ run_gate_command() {
   local wrapper_pid="$1"
   local label="$2"
   local command_pid command_pgid command_status command_wait_status guard_status
+  local regroup_status
   local command_status_file command_status_tmp stop_status
   local release_attempt released supervisor_pid_probe
   shift 2
@@ -912,6 +1050,10 @@ run_gate_command() {
       sleep 0.05
     done
     (( released == 1 )) || exit 75
+    # Cargo propagates this private, target-local ownership record to rustc.
+    # The rustc guard validates it before inheriting this process group, which
+    # keeps the durable root PGID as the only compiler/linker boundary.
+    export RYUKI_CARGO_OUTER_CONTROL_FILE="$VERIFY_GATE_CONTROL_FILE"
     if ! apply_file_size_limit; then
       echo "error: unable to enforce the ${FILE_LIMIT_KIB} KiB file-size limit" >&2
       exit 75
@@ -926,21 +1068,26 @@ run_gate_command() {
   command_pid=$!
   command_pgid="$command_pid"
   set +m
+  safe_process_id "$command_pid" || return 75
   SUPERVISED_COMMAND_PID="$command_pid"
   SUPERVISED_COMMAND_PGID="$command_pgid"
   if ! publish_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" \
     "$command_pid" "$command_pgid" || ! publish_verify_gate_release; then
-    supervisor_stop_command || true
-    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+    stop_status=0
+    supervisor_stop_command || stop_status=$?
+    (( stop_status == 0 )) || return "$stop_status"
+    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
     return 75
   fi
   while process_group_alive "$command_pgid"; do
     [[ ! -f "$command_status_file" ]] || break
     if ! kill -0 "$wrapper_pid" 2>/dev/null; then
       echo "error: stopping ${label}: verification wrapper no longer exists" >&2
-      supervisor_stop_command
+      stop_status=0
+      supervisor_stop_command || stop_status=$?
+      (( stop_status == 0 )) || return "$stop_status"
       run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
-      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
       return 75
     fi
 
@@ -948,9 +1095,11 @@ run_gate_command() {
     [[ ! -f "$command_status_file" ]] || break
     if ! kill -0 "$wrapper_pid" 2>/dev/null; then
       echo "error: stopping ${label}: verification wrapper no longer exists" >&2
-      supervisor_stop_command
+      stop_status=0
+      supervisor_stop_command || stop_status=$?
+      (( stop_status == 0 )) || return "$stop_status"
       run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
-      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
       return 75
     fi
     if disk_guard_while_frozen; then
@@ -958,12 +1107,28 @@ run_gate_command() {
     else
       guard_status=$?
       echo "error: stopping ${label} before it can exhaust the disk" >&2
-      supervisor_stop_command
+      stop_status=0
+      supervisor_stop_command || stop_status=$?
+      (( stop_status == 0 )) || return "$stop_status"
       run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
-      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
       return "$guard_status"
     fi
   done
+
+  regroup_status=0
+  if process_group_alive "$command_pgid"; then
+    reject_regrouped_descendants || regroup_status=$?
+  fi
+  if (( regroup_status != 0 )); then
+    echo "error: stopping ${label}: descendant process-group invariant failed" >&2
+    stop_status=0
+    supervisor_stop_command || stop_status=$?
+    (( stop_status == 0 )) || return "$stop_status"
+    run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
+    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
+    return "$regroup_status"
+  fi
 
   if wait "$command_pid"; then
     command_wait_status=0

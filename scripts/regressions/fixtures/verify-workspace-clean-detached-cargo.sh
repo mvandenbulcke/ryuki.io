@@ -7,6 +7,7 @@ set -Eeuo pipefail
 : "${RYUKI_VERIFY_TEST_DETACHED_TARGET:?missing target capture path}"
 
 printf '%s\n' "$CARGO_TARGET_DIR" > "$RYUKI_VERIFY_TEST_DETACHED_TARGET"
+set -m
 (
   trap '' HUP
   trap 'exit 0' INT TERM
@@ -22,10 +23,12 @@ printf '%s\n' "$CARGO_TARGET_DIR" > "$RYUKI_VERIFY_TEST_DETACHED_TARGET"
   done
 ) &
 descendant_pid=$!
+set +m
 printf '%s\n' "$descendant_pid" > "$RYUKI_VERIFY_TEST_DETACHED_PID"
 
 for _ in {1..200}; do
-  [[ -e "$RYUKI_VERIFY_TEST_DETACHED_READY" ]] && exit 0
+  [[ -e "$RYUKI_VERIFY_TEST_DETACHED_READY" ]] && break
   sleep 0.01
 done
-exit 75
+[[ -e "$RYUKI_VERIFY_TEST_DETACHED_READY" ]] || exit 75
+wait "$descendant_pid"

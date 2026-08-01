@@ -16,10 +16,14 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DEFAULT_TARGET_DIR="$(cd "$ROOT_DIR/.." && pwd -P)/.ryuki-target-ryuki.io"
+GIT_COMMON_DIR_RAW="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir)"
+GIT_COMMON_DIR="$(cd "$GIT_COMMON_DIR_RAW" && pwd -P)"
+REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object --stdin)"
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_CHECK_INTERVAL_SECONDS=2
 MEASUREMENT_MAX_ATTEMPTS=3
+HARD_STOP_PHASE_ATTEMPTS=10
 HARD_MAX_TARGET_KIB=$((HARD_MAX_TARGET_GIB * 1024 * 1024))
 MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-24}"
 MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
@@ -309,6 +313,124 @@ if [[ -n "$TEST_MAX_KIB" ]]; then
   max_target_kib="$TEST_MAX_KIB"
 fi
 
+OUTER_SUPERVISED=0
+
+validate_outer_supervision() {
+  local control_file="${RYUKI_CARGO_OUTER_CONTROL_FILE:-}"
+  local expected_control expected_run_dir sentinel key value test_tmp
+  local version="" repository_id="" run_id="" supervisor_pid=""
+  local command_pid="" command_pgid=""
+  local sentinel_version="" sentinel_repository_id="" sentinel_run_id=""
+  local sentinel_workspace="" sentinel_keep_target=""
+  local wrapper_pid="$$" command_ppid="" ancestor="" depth
+  local group_probe=0
+
+  [[ -n "$control_file" ]] || return 1
+  expected_control="$(dirname "$target_root")/.ryuki-verify-command-owner"
+  [[ "$control_file" == "$expected_control" \
+    && -f "$control_file" && ! -L "$control_file" && -O "$control_file" ]] \
+    || return 75
+  while IFS='=' read -r key value; do
+    case "$key" in
+      version) [[ -z "$version" ]] || return 75; version="$value" ;;
+      repository_id) [[ -z "$repository_id" ]] || return 75; repository_id="$value" ;;
+      run_id) [[ -z "$run_id" ]] || return 75; run_id="$value" ;;
+      supervisor_pid) [[ -z "$supervisor_pid" ]] || return 75; supervisor_pid="$value" ;;
+      command_pid) [[ -z "$command_pid" ]] || return 75; command_pid="$value" ;;
+      command_pgid) [[ -z "$command_pgid" ]] || return 75; command_pgid="$value" ;;
+      *) return 75 ;;
+    esac
+  done < "$control_file"
+  [[ "$version" == "1" && "$repository_id" == "$REPOSITORY_ID" \
+    && "$run_id" =~ ^[1-9][0-9]*\.[0-9]+\.[0-9]+$ \
+    && "$supervisor_pid" =~ ^[1-9][0-9]*$ \
+    && "$command_pid" =~ ^[1-9][0-9]*$ \
+    && "$command_pgid" == "$command_pid" \
+    && "${CARGO_BUILD_JOBS:-}" == "1" ]] || return 75
+  (( 10#$supervisor_pid > 1 && 10#$command_pid > 1 )) || return 75
+
+  expected_run_dir="$(dirname "$target_root")"
+  [[ "$(basename "$target_root")" == "target" \
+    && "$(basename "$expected_run_dir")" == "run.${run_id}" ]] || return 75
+  if [[ "$TEST_MODE" == "1" ]]; then
+    test_tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || return 75
+    case "$expected_run_dir" in
+      "$test_tmp"/ryuki-cargo-guard.*/*) ;;
+      *) return 75 ;;
+    esac
+  else
+    test_tmp="$(cd /tmp && pwd -P)" || return 75
+    [[ "$expected_run_dir" == \
+      "$test_tmp/ryuki-verify-$(id -u)/$REPOSITORY_ID/run.${run_id}" ]] \
+      || return 75
+  fi
+
+  sentinel="$(dirname "$target_root")/.ryuki-verify-owner"
+  [[ -f "$sentinel" && ! -L "$sentinel" && -O "$sentinel" ]] || return 75
+  while IFS='=' read -r key value; do
+    case "$key" in
+      version) [[ -z "$sentinel_version" ]] || return 75; sentinel_version="$value" ;;
+      repository_id) [[ -z "$sentinel_repository_id" ]] || return 75; sentinel_repository_id="$value" ;;
+      run_id) [[ -z "$sentinel_run_id" ]] || return 75; sentinel_run_id="$value" ;;
+      workspace) [[ -z "$sentinel_workspace" ]] || return 75; sentinel_workspace="$value" ;;
+      keep_target) [[ -z "$sentinel_keep_target" && "$value" =~ ^[01]$ ]] \
+        || return 75; sentinel_keep_target="$value" ;;
+      *) return 75 ;;
+    esac
+  done < "$sentinel"
+  [[ "$sentinel_version" == "1" \
+    && "$sentinel_repository_id" == "$REPOSITORY_ID" \
+    && "$sentinel_run_id" == "$run_id" \
+    && "$sentinel_workspace" == "$ROOT_DIR" \
+    && -n "$sentinel_keep_target" ]] || return 75
+  kill -0 "$supervisor_pid" 2>/dev/null || return 75
+  kill -0 -- "-$command_pgid" 2>/dev/null || return 75
+
+  # SIGWINCH is ignored by default by non-interactive Cargo/rustc processes.
+  # Trapping it here and signaling the recorded group proves this wrapper is
+  # itself a member without relying on ps(1), which can be unavailable inside
+  # a restricted macOS execution sandbox.
+  trap 'group_probe=1' WINCH
+  kill -WINCH -- "-$command_pgid" 2>/dev/null || { trap - WINCH; return 75; }
+  for depth in {1..10}; do
+    (( group_probe == 1 )) && break
+    sleep 0.01
+  done
+  trap - WINCH
+  (( group_probe == 1 )) || return 75
+
+  # Where ps is available, additionally prove the command leader is the
+  # supervisor's child and the wrapper descends from that leader. The signed
+  # control/sentinel and group-membership proof remain authoritative on hosts
+  # that deny process-table inspection.
+  command_ppid="$(/bin/ps -o ppid= -p "$command_pid" 2>/dev/null \
+    | awk 'NF == 1 { print $1 }')" || command_ppid=""
+  if [[ -n "$command_ppid" ]]; then
+    [[ "$command_ppid" =~ ^[1-9][0-9]*$ \
+      && "$command_ppid" == "$supervisor_pid" ]] || return 75
+
+    ancestor="$wrapper_pid"
+    if [[ "$ancestor" != "$command_pid" ]]; then
+      for ((depth = 0; depth < 64; depth++)); do
+        ancestor="$(/bin/ps -o ppid= -p "$ancestor" 2>/dev/null \
+          | awk 'NF == 1 { print $1 }')" || return 75
+        [[ "$ancestor" =~ ^[1-9][0-9]*$ ]] || return 75
+        [[ "$ancestor" == "$command_pid" ]] && break
+        [[ "$ancestor" != "1" ]] || return 75
+      done
+      [[ "$ancestor" == "$command_pid" ]] || return 75
+    fi
+  fi
+  OUTER_SUPERVISED=1
+}
+
+if [[ -n "${RYUKI_CARGO_OUTER_CONTROL_FILE:-}" ]]; then
+  if ! validate_outer_supervision; then
+    echo "error: Cargo compilation refused: invalid outer supervisor ownership" >&2
+    exit 75
+  fi
+fi
+
 trip_guard() {
   local temporary="${trip_file}.$$.$RANDOM"
   printf 'tripped\n' > "$temporary"
@@ -327,6 +449,7 @@ guard_check() (
 
   release_guard_lock() {
     local published_token=""
+    trap '' HUP INT TERM
     if [[ -L "$lock_path" ]]; then
       published_token="$(readlink "$lock_path" 2>/dev/null || true)"
     fi
@@ -409,7 +532,7 @@ guard_check() (
     sleep 0.1
   done
   (( lock_acquired == 1 )) || return 75
-  trap release_guard_lock EXIT INT TERM
+  trap release_guard_lock EXIT HUP INT TERM
 
   target_kib=""
   target_kib="$(measure_tree_kib "$target_root")" || target_kib=""
@@ -439,41 +562,90 @@ guard_check() (
 compiler_pid=""
 compiler_pgid=""
 
+safe_process_group_id() {
+  local pgid="${1:-}"
+  [[ "$pgid" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$pgid > 1 ))
+}
+
+compiler_process_group_alive() {
+  local pgid="${1:-}"
+  safe_process_group_id "$pgid" || return 1
+  kill -0 -- "-$pgid" 2>/dev/null
+}
+
 stop_compiler_tree() {
   local pid="${compiler_pid:-}"
   local pgid="${compiler_pgid:-}"
-  local attempt
+  local attempt status=0
   [[ -n "$pid" ]] || return 0
 
-  if [[ -n "$pgid" ]]; then
+  if safe_process_group_id "$pgid"; then
     kill -TERM -- "-$pgid" 2>/dev/null || true
   else
     kill -TERM "$pid" 2>/dev/null || true
   fi
-  for attempt in {1..20}; do
-    if [[ -n "$pgid" ]]; then
-      kill -0 -- "-$pgid" 2>/dev/null || break
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
+    if safe_process_group_id "$pgid"; then
+      compiler_process_group_alive "$pgid" || break
     else
       kill -0 "$pid" 2>/dev/null || break
     fi
     sleep 0.1
   done
-  if [[ -n "$pgid" ]] && kill -0 -- "-$pgid" 2>/dev/null; then
+  if safe_process_group_id "$pgid" && compiler_process_group_alive "$pgid"; then
     kill -KILL -- "-$pgid" 2>/dev/null || true
   elif kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
   fi
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
+    if safe_process_group_id "$pgid"; then
+      compiler_process_group_alive "$pgid" || break
+    else
+      kill -0 "$pid" 2>/dev/null || break
+    fi
+    sleep 0.1
+  done
+  if safe_process_group_id "$pgid" && compiler_process_group_alive "$pgid"; then
+    status=75
+  elif [[ -z "$pgid" ]] && kill -0 "$pid" 2>/dev/null; then
+    status=75
+  fi
   wait "$pid" 2>/dev/null || true
-  compiler_pid=""
-  compiler_pgid=""
+  if (( status == 0 )); then
+    compiler_pid=""
+    compiler_pgid=""
+  fi
+  return "$status"
+}
+
+compiler_exit_cleanup() {
+  local status=$?
+  local cleanup_status=0
+  trap - EXIT
+  trap '' HUP INT TERM
+  stop_compiler_tree || cleanup_status=$?
+  (( cleanup_status == 0 )) || status="$cleanup_status"
+  exit "$status"
 }
 
 handle_signal() {
   local status="$1"
-  trap - INT TERM
+  trap '' HUP INT TERM
   stop_compiler_tree
   exit "$status"
 }
+
+# The outer verifier already performs frozen aggregate checks and owns a
+# durable process group recorded on disk. Inheriting that group prevents the
+# rustc wrapper from creating an unrecorded compiler/linker PG that could
+# survive supervisor recovery. The strict control/sentinel validation above
+# prevents a caller from selecting this mode with an arbitrary environment
+# flag.
+if (( OUTER_SUPERVISED == 1 )); then
+  exec 9>&-
+  exec "$@"
+fi
 
 if ! guard_check 1; then
   echo "error: Cargo compilation refused by the repository disk guard" >&2
@@ -484,24 +656,33 @@ fi
 # Monitor mode gives this one compiler and every inherited linker/descendant a
 # dedicated process group. Turning monitor mode off immediately preserves the
 # wrapper's normal non-interactive behavior while retaining group ownership.
+trap compiler_exit_cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 129' HUP
 set -m
-"$@" &
+(
+  trap - EXIT HUP INT TERM
+  exec 9>&-
+  exec "$@"
+) &
 compiler_pid=$!
 compiler_pgid="$compiler_pid"
 set +m
-trap 'handle_signal 130' INT
-trap 'handle_signal 143' TERM
 
 next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
-while kill -0 -- "-$compiler_pgid" 2>/dev/null; do
+while compiler_process_group_alive "$compiler_pgid"; do
   # Poll child completion separately from the relatively expensive aggregate
   # size check so short compiler probes do not inherit a multi-second delay.
   sleep 0.2
-  kill -0 -- "-$compiler_pgid" 2>/dev/null || break
+  compiler_process_group_alive "$compiler_pgid" || break
   if (( SECONDS < next_guard_check )); then
     continue
   fi
   next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
+  # Standalone mode never SIGSTOPs a compiler: an untrappable wrapper death
+  # must not be able to orphan a suspended compiler. Strict bounded retries
+  # tolerate transient atomic-renames while RLIMIT_FSIZE bounds one artifact.
   if guard_check 0; then
     continue
   fi
@@ -517,7 +698,7 @@ else
 fi
 compiler_pid=""
 compiler_pgid=""
-trap - INT TERM
+trap - EXIT HUP INT TERM
 if ! guard_check 1; then
   echo "error: Cargo compiler output crossed the repository disk ceiling" >&2
   exit 75
