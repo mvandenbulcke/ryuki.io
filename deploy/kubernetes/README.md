@@ -46,6 +46,16 @@ checked-in placeholder digests prove only the repository policy shape; adopted
 registry resolution, signature verification, and the running image ID remain
 deployment evidence.
 
+Tag releases perform one deterministic `release-image-final-render` after both
+image publishers return their immutable digests. The render replaces the two
+reserved image fixtures and the API digest-derived suspended migration identity,
+then `validate-release-image-render kubernetes-manifest` compares the rendered images to
+the exact publisher outputs before the bytes are sealed and attached to the
+GitHub release as `ryuki-release-kubernetes.yaml`. This is repository-local
+artifact binding only: an operator must still read back the adopted GitOps
+render, registry provenance and resolution, admission result, and running image
+IDs.
+
 The manifest validator is deliberately not a Kubernetes admission controller.
 It rejects executable migration `final-render` documents: repository snapshots
 cannot fence ConfigMap deletion/recreation, atomically consume an attempt, or

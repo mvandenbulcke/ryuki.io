@@ -1,3 +1,39 @@
-# kubernetes-manifest contract — static stub for COVERAGE_TSV registration
 slice: kubernetes-manifest
 status: active
+contractVersion: 2
+releaseImageRender:
+  script: scripts/release/render-kubernetes-images-v1.sh
+  sourceMode: checked-in-source-template
+  finalMode: release-image-final-render
+  deterministicInputOrder:
+    - deploy/kubernetes/base/namespace.yaml
+    - deploy/kubernetes/base/serviceaccounts.yaml
+    - deploy/kubernetes/base/configmap.yaml
+    - deploy/kubernetes/base/deployments.yaml
+    - deploy/kubernetes/base/services.yaml
+    - deploy/kubernetes/base/ingress.yaml
+    - deploy/kubernetes/base/networkpolicies.yaml
+    - deploy/kubernetes/operations/migration-job.yaml
+    - deploy/kubernetes/vault/workload-auth.yaml
+  imageInputs:
+    platformApiDigest: images.steps.api.outputs.digest
+    portalDigest: images.steps.portal.outputs.digest
+  validator:
+    command: validate-release-image-render kubernetes-manifest
+    runsAfterImagePublication: true
+    exactPublishedDigestMatchRequired: true
+    reservedRegistryRejected: registry.example.invalid
+    missingDigestRejected: true
+    mutableTagRejected: true
+    zeroDigestRejected: true
+    sourceTemplateSentinelRejected: true
+  releaseAsset: ryuki-release-kubernetes.yaml
+repositoryLocalEvidence:
+  - deterministic-render-script
+  - immutable-publisher-output-wiring
+  - post-publication-final-render-validation
+  - sealed-render-release-asset-handoff
+trustedAccessResiduals:
+  - adopted-registry-provenance-and-digest-resolution
+  - cluster-admission-controller-readback
+  - running-workload-image-id-readback

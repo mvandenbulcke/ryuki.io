@@ -31,10 +31,13 @@ const PROVING_GROUND_COMPOSE_PATH: &str = "deploy/proving-ground/compose.yaml";
 const PROVING_GROUND_VALIDATE_PATH: &str = "deploy/proving-ground/validate.sh";
 const RELEASE_SOURCE_SCRIPT_PATH: &str = "scripts/release/validate-source-v1.sh";
 const RELEASE_NOTES_SCRIPT_PATH: &str = "scripts/release/validate-notes-v1.sh";
+const RELEASE_RENDER_SCRIPT_PATH: &str = "scripts/release/render-kubernetes-images-v1.sh";
 const RELEASE_SOURCE_SCRIPT_SHA256: &str =
     "011cc7a1fda421f41ee4c22553c631ac21eb42ca0393ea02cdcc09489716e2c2";
 const RELEASE_NOTES_SCRIPT_SHA256: &str =
     "ed8d63bc13b9dd32fd51af864d19be885027ec5a196177d1ca2b57e91faf5849";
+const RELEASE_RENDER_SCRIPT_SHA256: &str =
+    "1477beaf93f4e4cc0d68dcb77846677c8b3b1e3c3b5fb1e893424142953d869b";
 const RELEASE_SOURCE_STEP_V1: &str = "bash scripts/release/validate-source-v1.sh";
 const RELEASE_NOTES_STEP_V1: &str = "bash scripts/release/validate-notes-v1.sh";
 const RELEASE_TAG_REVALIDATION_V1: &str = r#"set -euo pipefail
@@ -59,8 +62,18 @@ remote_tag_object="$(
 [[ "${remote_tag_object}" == "${EXPECTED_TAG_OBJECT}" ]] || \
   fail "Release tag moved after provenance validation"
 [[ -n "${RELEASE_NOTES_B64}" ]] || fail "Validated release notes are missing"
+[[ "${KUBERNETES_RENDER_SHA256}" =~ ^[0-9a-f]{64}$ ]] || \
+  fail "Validated Kubernetes render digest is malformed"
+[[ -n "${KUBERNETES_RENDER_B64}" ]] || \
+  fail "Validated Kubernetes render is missing"
 printf '%s' "${RELEASE_NOTES_B64}" | base64 --decode > release-notes.md || \
   fail "Validated release notes are not canonical base64"
+printf '%s' "${KUBERNETES_RENDER_B64}" | base64 --decode \
+  > ryuki-release-kubernetes.yaml || \
+  fail "Validated Kubernetes render is not canonical base64"
+actual_render_sha256="$(sha256sum ryuki-release-kubernetes.yaml | awk '{print $1}')"
+[[ "${actual_render_sha256}" == "${KUBERNETES_RENDER_SHA256}" ]] || \
+  fail "Validated Kubernetes render changed across the job handoff"
 note_bytes="$(LC_ALL=C wc -c < release-notes.md | tr -d '[:space:]')"
 [[ "${note_bytes}" =~ ^[0-9]+$ && "${note_bytes}" -le 131072 ]] || \
   fail "Validated release notes exceed the 128 KiB handoff limit"
@@ -79,6 +92,7 @@ first_heading="$(awk 'NF { print; exit }' release-notes.md)"
 gh release create "${TAG}" \
   --title "${TAG}" \
   --notes-file release-body.md \
+  "ryuki-release-kubernetes.yaml#Ryuki release Kubernetes render" \
   --verify-tag"####;
 const PAGES_EVENT_VALIDATION_V1: &str = r#"set -euo pipefail
 fail() {
@@ -146,6 +160,7 @@ const REQUIRED_WORKFLOW_TERMS: &[&str] = &[
     "release-source:",
     RELEASE_SOURCE_STEP_V1,
     RELEASE_NOTES_STEP_V1,
+    RELEASE_RENDER_SCRIPT_PATH,
     "RELEASE_SIGNING_PUBLIC_KEY_B64",
     "RELEASE_SIGNING_FINGERPRINT",
     "--verify-tag",
@@ -276,6 +291,12 @@ fn validate_release_workflow(root: &Path, errors: &mut Vec<String>) {
         root,
         RELEASE_NOTES_SCRIPT_PATH,
         RELEASE_NOTES_SCRIPT_SHA256,
+        errors,
+    );
+    validate_versioned_release_script(
+        root,
+        RELEASE_RENDER_SCRIPT_PATH,
+        RELEASE_RENDER_SCRIPT_SHA256,
         errors,
     );
     let text = match fs::read_to_string(root.join(RELEASE_WORKFLOW_PATH)) {

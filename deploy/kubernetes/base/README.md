@@ -293,6 +293,16 @@ scheme-prefixed references fail the manifest validator. The same validation
 must run on the final rendered manifests, after all overlay and GitOps image
 rewrites; validating the base alone is not deployment evidence.
 
+The tag-release workflow renders the files in the contract's fixed order with
+the exact `docker/build-push-action` API and portal digest outputs. Its dedicated
+`release-image-final-render` validation mode rejects this reserved registry,
+the zero/all-ones source sentinels, missing or mutable references, and any image
+digest that differs from the corresponding publisher output. The validated
+bytes are digest-sealed across the write-authorized release-job handoff and
+attached to the release. Registry provenance, admission readback, and observed
+running image IDs remain deployment evidence and are not inferred from that
+repository artifact.
+
 Local Compose remains a separate developer surface and may build/use the
 `ryuki/*:rust-dev` tags on loopback. Those local tags must never be copied into
 a Kubernetes base, overlay, or rendered deployment.

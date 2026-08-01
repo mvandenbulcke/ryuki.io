@@ -1730,6 +1730,24 @@ fn run() -> Result<ExitCode, String> {
             };
             print_json(&ErrorsOutput { errors })
         }
+        "validate-release-image-render" => {
+            let slice = require_slice(&args)?;
+            if slice != "kubernetes-manifest" {
+                return Err(format!(
+                    "validate-release-image-render is not supported for {slice}"
+                ));
+            }
+            let (render, api_digest, portal_digest) = parse_final_render_args(&args[2..])?;
+            let errors = kubernetes_manifest::validate_release_image_render_file(
+                &render,
+                &api_digest,
+                &portal_digest,
+            )?;
+            if !errors.is_empty() {
+                exit_code = ExitCode::FAILURE;
+            }
+            print_json(&ErrorsOutput { errors })
+        }
         "check-controls" => {
             let slice = require_slice(&args)?;
             let input = read_stdin()?;
@@ -2385,7 +2403,7 @@ fn run() -> Result<ExitCode, String> {
 }
 
 fn usage() -> String {
-    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|generate-endpoints-doc|generate-api-doc|scaffold-docs|check-config> <slice> [options]"
+    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|validate-release-image-render|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|generate-endpoints-doc|generate-api-doc|scaffold-docs|check-config> <slice> [options]"
         .to_string()
 }
 
@@ -2561,6 +2579,40 @@ fn parse_root_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), String
             .map_err(|error| format!("failed to resolve current directory: {error}"))?,
     };
     Ok((root, context_json))
+}
+
+fn parse_final_render_args(args: &[String]) -> Result<(PathBuf, String, String), String> {
+    let mut render = None;
+    let mut api_digest = None;
+    let mut portal_digest = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let (slot, label): (&mut Option<_>, &str) = match args[index].as_str() {
+            "--render" => (&mut render, "--render"),
+            "--api-digest" => (&mut api_digest, "--api-digest"),
+            "--portal-digest" => (&mut portal_digest, "--portal-digest"),
+            unknown => return Err(format!("unknown argument: {unknown}")),
+        };
+        if slot.is_some() {
+            return Err(format!("duplicate argument: {label}"));
+        }
+        index += 1;
+        let value = args
+            .get(index)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{label} requires a value"))?;
+        *slot = Some(value.clone());
+        index += 1;
+    }
+
+    let render =
+        render.ok_or_else(|| "validate-release-image-render requires --render".to_string())?;
+    let api_digest = api_digest
+        .ok_or_else(|| "validate-release-image-render requires --api-digest".to_string())?;
+    let portal_digest = portal_digest
+        .ok_or_else(|| "validate-release-image-render requires --portal-digest".to_string())?;
+    Ok((PathBuf::from(render), api_digest, portal_digest))
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<(), String> {

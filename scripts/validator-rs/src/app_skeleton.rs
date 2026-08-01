@@ -2441,7 +2441,14 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
     if block.stmts.iter().any(statement_has_attributes)
         || block.stmts.iter().any(statement_has_early_exit)
         || block.stmts.iter().any(|statement| match statement {
-            syn::Stmt::Item(syn::Item::Use(item_use)) => use_tree_contains_rename(&item_use.tree),
+            syn::Stmt::Item(syn::Item::Use(item_use)) => {
+                use_tree_contains_rename(&item_use.tree)
+                    || PORTAL_MAIN_TRUSTED_PATH_ROOTS
+                        .iter()
+                        .any(|root| use_tree_binds_explicit_name(&item_use.tree, root))
+                    || (use_tree_contains_glob(&item_use.tree)
+                        && !use_tree_is_exact_leptos_prelude_glob(&item_use.tree))
+            }
             syn::Stmt::Item(_) | syn::Stmt::Macro(_) => true,
             _ => false,
         })
@@ -2702,6 +2709,12 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
             continue;
         };
         if *listener_index >= serve_index || !serve_has_success_tail(block, serve_index) {
+            continue;
+        }
+        if block.stmts[router.statement_index + 1..serve_index]
+            .iter()
+            .any(|statement| statement_references_local_value(statement, &router.name))
+        {
             continue;
         }
         let has_boundary = boundaries
@@ -3440,6 +3453,51 @@ fn serve_has_success_tail(block: &syn::Block, serve_index: usize) -> bool {
     )
 }
 
+struct LocalValueReferenceDetector<'a> {
+    name: &'a str,
+    found: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for LocalValueReferenceDetector<'_> {
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        if self.found {
+            return;
+        }
+        match expression {
+            syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.segments.len() == 1
+                    && path
+                        .path
+                        .segments
+                        .first()
+                        .is_some_and(|segment| segment.ident == self.name) =>
+            {
+                self.found = true;
+            }
+            // Macro tokens and verbatim future syntax cannot be resolved by
+            // this structural proof. Fail closed once the canonical Router
+            // exists so they cannot mutate or replace the served binding.
+            syn::Expr::Macro(_) | syn::Expr::Verbatim(_) => {
+                self.found = true;
+            }
+            _ => syn::visit::visit_expr(self, expression),
+        }
+    }
+}
+
+fn statement_references_local_value(statement: &syn::Stmt, name: &str) -> bool {
+    let mut detector = LocalValueReferenceDetector { name, found: false };
+    match statement {
+        syn::Stmt::Local(local) => detector.visit_local(local),
+        syn::Stmt::Expr(expression, _) => detector.visit_expr(expression),
+        syn::Stmt::Item(syn::Item::Use(_)) => {}
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => return true,
+    }
+    detector.found
+}
+
 #[derive(Default)]
 struct AttributeDetector {
     found: bool,
@@ -3906,16 +3964,47 @@ fn item_binds_type_root(item: &syn::Item, name: &str) -> bool {
 }
 
 fn use_tree_binds_name_or_glob(tree: &syn::UseTree, name: &str) -> bool {
-    match tree {
-        syn::UseTree::Path(path) => use_tree_binds_name_or_glob(&path.tree, name),
-        syn::UseTree::Name(bound) => bound.ident == name,
-        syn::UseTree::Rename(bound) => bound.rename == name,
-        syn::UseTree::Group(group) => group
-            .items
-            .iter()
-            .any(|item| use_tree_binds_name_or_glob(item, name)),
-        syn::UseTree::Glob(_) => true,
+    use_tree_binds_explicit_name(tree, name) || use_tree_contains_glob(tree)
+}
+
+fn use_tree_binds_explicit_name(tree: &syn::UseTree, name: &str) -> bool {
+    fn binds(tree: &syn::UseTree, name: &str, parent_path_segment: Option<&syn::Ident>) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => binds(&path.tree, name, Some(&path.ident)),
+            // `use attacker::leptos::{self};` binds the parent path segment,
+            // not the literal identifier `self` that Syn stores here.
+            syn::UseTree::Name(bound) if bound.ident == "self" => {
+                parent_path_segment.is_some_and(|segment| segment == name)
+            }
+            syn::UseTree::Name(bound) => bound.ident == name,
+            syn::UseTree::Rename(bound) => bound.rename == name,
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .any(|item| binds(item, name, parent_path_segment)),
+            syn::UseTree::Glob(_) => false,
+        }
     }
+
+    binds(tree, name, None)
+}
+
+fn use_tree_contains_glob(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => use_tree_contains_glob(&path.tree),
+        syn::UseTree::Group(group) => group.items.iter().any(use_tree_contains_glob),
+        syn::UseTree::Glob(_) => true,
+        syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
+    }
+}
+
+fn use_tree_is_exact_leptos_prelude_glob(tree: &syn::UseTree) -> bool {
+    let mut imports = Vec::new();
+    collect_use_paths(tree, &mut Vec::new(), &mut imports);
+    imports.len() == 1
+        && imports
+            .first()
+            .is_some_and(|path| path_matches_segments(path, &["leptos", "prelude", "*"]))
 }
 
 fn use_tree_contains_rename(tree: &syn::UseTree) -> bool {
@@ -4649,6 +4738,57 @@ mod tests {
     }
 
     #[test]
+    fn trusted_decoys_cannot_mask_attacker_served_app_and_context() {
+        let main_rs = context_aware_ssr_main();
+        let decoy_runtime = main_rs.replace(
+            "    let app = Router::new()",
+            concat!(
+                "    let _trusted_context_decoy = move || ",
+                "provide_context(upstream_for_routes.clone());\n",
+                "    let _trusted_fallback_decoy = file_and_error_handler_with_context(\n",
+                "        move || provide_context(upstream_for_fallback.clone()),\n",
+                "        shell,\n",
+                "    );\n",
+                "    let _trusted_app_decoy = {\n",
+                "        let leptos_options = leptos_options.clone();\n",
+                "        move || shell(leptos_options.clone())\n",
+                "    };\n",
+                "    let app = Router::new()"
+            ),
+        );
+        let attacker_context_runtime = decoy_runtime
+            .replace(
+                "    let upstream_for_fallback = upstream.clone();",
+                concat!(
+                    "    let upstream_for_fallback = upstream.clone();\n",
+                    "    let attacker_context = String::from(\"attacker\");\n",
+                    "    let attacker_context_for_routes = attacker_context.clone();\n",
+                    "    let attacker_context_for_fallback = attacker_context.clone();"
+                ),
+            )
+            .replace(
+                "            move || provide_context(upstream_for_routes.clone()),",
+                "            move || provide_context(attacker_context_for_routes.clone()),",
+            )
+            .replace(
+                "            move || provide_context(upstream_for_fallback.clone()),",
+                "            move || provide_context(attacker_context_for_fallback.clone()),",
+            );
+        let attacker_app_runtime = decoy_runtime.replace(
+            "                move || shell(leptos_options.clone())",
+            "                move || attacker_shell(leptos_options.clone())",
+        );
+
+        assert_ne!(decoy_runtime, main_rs);
+        assert!(inspect_portal_main(&decoy_runtime).runs_axum_leptos_ssr);
+        for attacker_runtime in [attacker_context_runtime, attacker_app_runtime] {
+            assert_ne!(attacker_runtime, decoy_runtime);
+            assert_ne!(attacker_runtime, main_rs);
+            assert!(!inspect_portal_main(&attacker_runtime).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
     fn trusted_portal_runtime_bindings_cannot_be_reassigned() {
         let main_rs = context_aware_ssr_main();
         let reassigned_origin = main_rs.replace(
@@ -4762,11 +4902,37 @@ mod tests {
             "struct tokio;",
             "use attacker as leptos;",
             "use attacker as ryuki_portal_ui;",
+            "use attacker::leptos::{self};",
+            "use attacker::axum::{self};",
+            "use attacker::ryuki_portal_ui::{self};",
         ] {
             let shadowed_main = format!("{shadow}\n{main_rs}");
             assert!(
                 !inspect_portal_main(&shadowed_main).runs_axum_leptos_ssr,
                 "trusted crate root remained shadowable: {shadow}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_scoped_trusted_crate_roots_cannot_be_shadowed() {
+        let main_rs = context_aware_ssr_main();
+        let insertion_point = "    use axum::{routing::{any, get}, Router};";
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for shadow in [
+            "    use attacker::leptos;",
+            "    use attacker::leptos::{self};",
+            "    use attacker::*;",
+            "    mod leptos { pub mod prelude { pub fn provide_context<T>(_value: T) {} } }",
+            "    extern crate attacker as leptos;",
+        ] {
+            let shadowed_main =
+                main_rs.replace(insertion_point, &format!("{shadow}\n{insertion_point}"));
+            assert_ne!(shadowed_main, main_rs);
+            assert!(
+                !inspect_portal_main(&shadowed_main).runs_axum_leptos_ssr,
+                "block-scoped trusted crate root remained shadowable: {shadow}"
             );
         }
     }
@@ -4815,6 +4981,32 @@ mod tests {
         ] {
             assert_ne!(invalid_main, main_rs);
             assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn served_router_cannot_be_transformed_after_the_canonical_chain() {
+        let main_rs = context_aware_ssr_main();
+        let insertion_point = "    let listener = tokio::net::TcpListener::bind(address).await?;";
+        let invalid_transformations = [
+            "    app.replace_with_attacker();",
+            "    attacker::replace_router(&app);",
+            "    let _replacement = attacker::replace_router(&app);",
+            "    let _late_transform = || attacker::replace_router(&app);",
+            "    let _replacement = replace_router!(app);",
+        ];
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for transformation in invalid_transformations {
+            let invalid_main = main_rs.replace(
+                insertion_point,
+                &format!("{transformation}\n{insertion_point}"),
+            );
+            assert_ne!(invalid_main, main_rs);
+            assert!(
+                !inspect_portal_main(&invalid_main).runs_axum_leptos_ssr,
+                "post-construction Router transformation remained accepted: {transformation}"
+            );
         }
     }
 

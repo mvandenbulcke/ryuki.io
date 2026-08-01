@@ -673,6 +673,45 @@ pub fn validate_values_json(input: &str) -> Result<Vec<String>, String> {
     Ok(errors)
 }
 
+/// Validate the deterministic post-publication release render against the
+/// exact image digests returned by the two build-push steps. This mode is
+/// intentionally stronger than source-template validation: fixture registries
+/// and placeholder digests are useful in the checked-in base, but are never
+/// admissible in a release artifact.
+pub fn validate_release_image_render_file(
+    path: &Path,
+    expected_api_digest: &str,
+    expected_portal_digest: &str,
+) -> Result<Vec<String>, String> {
+    let payload = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let mut errors = Vec::new();
+    validate_yaml_duplicate_keys_text(&payload, &path.display().to_string(), &mut errors);
+
+    let documents = serde_yaml::Deserializer::from_str(&payload)
+        .map(Value::deserialize)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid release Kubernetes image render YAML: {error}"))?;
+    expect(
+        documents.iter().all(Value::is_object),
+        &mut errors,
+        "release Kubernetes image render must contain only mapping documents",
+    );
+    let manifests = documents
+        .into_iter()
+        .filter(Value::is_object)
+        .collect::<Vec<_>>();
+
+    errors.extend(validate_documents(&manifests, None));
+    validate_release_image_binding(
+        &manifests,
+        expected_api_digest,
+        expected_portal_digest,
+        &mut errors,
+    );
+    Ok(errors)
+}
+
 pub fn scan_prohibited_json(input: &str) -> Result<Vec<String>, String> {
     let payload: ProhibitedInput = serde_json::from_str(input)
         .map_err(|error| format!("invalid kubernetes manifest prohibited JSON: {error}"))?;
@@ -715,6 +754,128 @@ fn validate_documents(
         None,
     );
     errors
+}
+
+fn validate_release_image_binding(
+    manifests: &[Value],
+    expected_api_digest: &str,
+    expected_portal_digest: &str,
+    errors: &mut Vec<String>,
+) {
+    let expected_api_digest =
+        validate_expected_release_digest("platform-api", expected_api_digest, errors);
+    let expected_portal_digest =
+        validate_expected_release_digest("portal-ui", expected_portal_digest, errors);
+    if expected_api_digest.is_some() && expected_api_digest == expected_portal_digest {
+        errors.push(
+            "expected published platform-api and portal-ui digests must be distinct".to_string(),
+        );
+    }
+
+    for (component, expected_digest) in [
+        ("platform-api", expected_api_digest),
+        ("portal-ui", expected_portal_digest),
+    ] {
+        let matching_deployments = manifests
+            .iter()
+            .filter(|manifest| {
+                str_at(manifest, &["kind"]) == Some("Deployment")
+                    && str_at(manifest, &["metadata", "name"]) == Some(component)
+            })
+            .collect::<Vec<_>>();
+        let images = matching_deployments
+            .first()
+            .map(|deployment| {
+                array_at_path(deployment, &["spec", "template", "spec", "containers"])
+                    .iter()
+                    .filter(|container| str_at(container, &["name"]) == Some(component))
+                    .filter_map(|container| str_at(container, &["image"]))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        expect(
+            matching_deployments.len() == 1 && images.len() == 1,
+            errors,
+            format!(
+                "release Kubernetes image render must contain exactly one {component} Deployment with one same-named image"
+            ),
+        );
+        let Some(image) = images.first().copied() else {
+            continue;
+        };
+        expect(
+            is_qualified_immutable_image(image),
+            errors,
+            format!(
+                "release Kubernetes image render {component} image must be a qualified digest-only image reference"
+            ),
+        );
+        expect(
+            !image_uses_reserved_registry(image),
+            errors,
+            format!(
+                "release Kubernetes image render {component} image must not use reserved registry.example.invalid"
+            ),
+        );
+
+        let actual_digest = immutable_image_digest(image);
+        expect(
+            actual_digest.is_some_and(|digest| !is_release_digest_sentinel(digest)),
+            errors,
+            format!(
+                "release Kubernetes image render {component} image must not use a zero or source-template sentinel digest"
+            ),
+        );
+        if let Some(expected_digest) = expected_digest {
+            expect(
+                actual_digest == Some(expected_digest),
+                errors,
+                format!(
+                    "release Kubernetes image render {component} image digest must equal the exact published digest sha256:{expected_digest}"
+                ),
+            );
+        }
+    }
+}
+
+fn validate_expected_release_digest<'a>(
+    component: &str,
+    digest: &'a str,
+    errors: &mut Vec<String>,
+) -> Option<&'a str> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        errors.push(format!(
+            "expected published {component} digest is missing or malformed"
+        ));
+        return None;
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || is_release_digest_sentinel(hex)
+    {
+        errors.push(format!(
+            "expected published {component} digest must be a non-sentinel sha256 digest with 64 lowercase hexadecimal characters"
+        ));
+        return None;
+    }
+    Some(hex)
+}
+
+fn image_uses_reserved_registry(image: &str) -> bool {
+    image.split_once('/').is_some_and(|(registry, _)| {
+        registry
+            .split_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(registry)
+            == "registry.example.invalid"
+    })
+}
+
+fn is_release_digest_sentinel(digest: &str) -> bool {
+    digest.bytes().all(|byte| byte == b'0') || digest.bytes().all(|byte| byte == b'1')
 }
 
 fn validate_allowed_kinds(manifests: &[Value], errors: &mut Vec<String>) {
@@ -952,8 +1113,7 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
             && str_at(portal, &["data", "RYUKI_API_URL"]) == Some(expected_origin.as_str())
             && str_at(portal, &["data", "RYUKI_PORTAL_PUBLIC_ORIGIN"])
                 == Some(expected_origin.as_str())
-            && str_at(portal, &["data", "RYUKI_PORTAL_EXECUTION_MODE"])
-                == Some("live-provider")
+            && str_at(portal, &["data", "RYUKI_PORTAL_EXECUTION_MODE"]) == Some("live-provider")
             && str_at(portal, &["data", "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK"]) == Some("false"),
         errors,
         "portal-ui-config must contain only the exact reviewed keys, use live-provider mode, and use the exact HTTPS ingress origin with insecure-loopback disabled",
@@ -2825,25 +2985,28 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
                 PUBLIC_INGRESS_ATTESTATION_KEYS,
                 "ryuki.io/pin-public-ingress-attestation-receipt",
             )
-            && object_at(contract, &["productionPinProjections", "firstOwnerAuthority"])
-                .is_some_and(|group| {
-                    object_has_exact_keys(
-                        group,
-                        &[
-                            "configMapName",
-                            "contentDigest",
-                            "uid",
-                            "resourceVersion",
-                            "jobReceiptAnnotation",
-                            "configKeys",
-                            "productionOnly",
-                            "independentlyGovernedAuthorityRequired",
-                            "ed25519Required",
-                            "privateKeyInWorkloadForbidden",
-                            "socketProjectionRequired",
-                        ],
-                    )
-                })
+            && object_at(
+                contract,
+                &["productionPinProjections", "firstOwnerAuthority"],
+            )
+            .is_some_and(|group| {
+                object_has_exact_keys(
+                    group,
+                    &[
+                        "configMapName",
+                        "contentDigest",
+                        "uid",
+                        "resourceVersion",
+                        "jobReceiptAnnotation",
+                        "configKeys",
+                        "productionOnly",
+                        "independentlyGovernedAuthorityRequired",
+                        "ed25519Required",
+                        "privateKeyInWorkloadForbidden",
+                        "socketProjectionRequired",
+                    ],
+                )
+            })
             && cutover_pin_group_fields_match(
                 contract,
                 &["productionPinProjections", "firstOwnerAuthority"],
@@ -7836,6 +7999,207 @@ mod tests {
         assert!(
             errors.is_empty(),
             "platform-worker should not be subject to hardening checks"
+        );
+    }
+
+    fn release_image_binding_fixture(api_digest: &str, portal_digest: &str) -> Vec<Value> {
+        vec![
+            json!({
+                "kind": "Deployment",
+                "metadata": { "name": "platform-api" },
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [{
+                                "name": "platform-api",
+                                "image": format!("ghcr.io/example/ryuki-platform-api@sha256:{api_digest}")
+                            }]
+                        }
+                    }
+                }
+            }),
+            json!({
+                "kind": "Deployment",
+                "metadata": { "name": "portal-ui" },
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [{
+                                "name": "portal-ui",
+                                "image": format!("ghcr.io/example/ryuki-portal-ui@sha256:{portal_digest}")
+                            }]
+                        }
+                    }
+                }
+            }),
+        ]
+    }
+
+    #[test]
+    fn release_image_render_binds_exact_published_image_digests() {
+        let api_digest = "a".repeat(64);
+        let portal_digest = "b".repeat(64);
+        let manifests = release_image_binding_fixture(&api_digest, &portal_digest);
+        let mut errors = Vec::new();
+        validate_release_image_binding(
+            &manifests,
+            &format!("sha256:{api_digest}"),
+            &format!("sha256:{portal_digest}"),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "exact post-publication image digests must be admitted: {errors:?}"
+        );
+
+        let mut equal_digest_errors = Vec::new();
+        validate_release_image_binding(
+            &manifests,
+            &format!("sha256:{api_digest}"),
+            &format!("sha256:{api_digest}"),
+            &mut equal_digest_errors,
+        );
+        assert!(
+            equal_digest_errors
+                .iter()
+                .any(|error| error.contains("must be distinct")),
+            "collapsed API/portal publisher outputs must fail closed: {equal_digest_errors:?}"
+        );
+    }
+
+    #[test]
+    fn release_image_render_rejects_portal_digest_and_registry_mutations() {
+        let api_digest = "a".repeat(64);
+        let portal_digest = "b".repeat(64);
+        let expected_api = format!("sha256:{api_digest}");
+        let expected_portal = format!("sha256:{portal_digest}");
+        let valid = release_image_binding_fixture(&api_digest, &portal_digest);
+
+        let mut cases = Vec::new();
+        let mut missing = valid.clone();
+        missing[1]["spec"]["template"]["spec"]["containers"][0]
+            .as_object_mut()
+            .expect("portal container")
+            .remove("image");
+        cases.push(("missing", missing, expected_portal.clone()));
+
+        let mut reserved = valid.clone();
+        reserved[1]["spec"]["template"]["spec"]["containers"][0]["image"] = json!(format!(
+            "registry.example.invalid/ryuki/portal-ui@sha256:{portal_digest}"
+        ));
+        cases.push(("reserved registry", reserved, expected_portal.clone()));
+
+        let mut reserved_port = valid.clone();
+        reserved_port[1]["spec"]["template"]["spec"]["containers"][0]["image"] = json!(format!(
+            "registry.example.invalid:443/ryuki/portal-ui@sha256:{portal_digest}"
+        ));
+        cases.push((
+            "reserved registry with port",
+            reserved_port,
+            expected_portal.clone(),
+        ));
+
+        let mut zero = valid.clone();
+        zero[1]["spec"]["template"]["spec"]["containers"][0]["image"] = json!(format!(
+            "ghcr.io/example/ryuki-portal-ui@sha256:{}",
+            "0".repeat(64)
+        ));
+        cases.push(("zero", zero, expected_portal.clone()));
+
+        let mut sentinel = valid.clone();
+        sentinel[1]["spec"]["template"]["spec"]["containers"][0]["image"] =
+            json!("RENDER_REQUIRED");
+        cases.push(("sentinel", sentinel, expected_portal.clone()));
+
+        let mut mismatch = valid.clone();
+        mismatch[1]["spec"]["template"]["spec"]["containers"][0]["image"] = json!(format!(
+            "ghcr.io/example/ryuki-portal-ui@sha256:{}",
+            "c".repeat(64)
+        ));
+        cases.push(("mismatched", mismatch, expected_portal.clone()));
+        cases.push(("missing expected", valid, String::new()));
+
+        for (label, manifests, expected_portal) in cases {
+            let mut errors = Vec::new();
+            validate_release_image_binding(
+                &manifests,
+                &expected_api,
+                &expected_portal,
+                &mut errors,
+            );
+            assert!(
+                !errors.is_empty(),
+                "release-image-render portal mutation {label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn release_image_render_rejects_non_mapping_documents() {
+        let path = std::env::temp_dir().join(format!(
+            "ryuki-release-image-render-non-mapping-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(&path, "scalar-document\n").expect("write non-mapping release render fixture");
+        let errors = validate_release_image_render_file(
+            &path,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+        )
+        .expect("non-mapping YAML remains parseable for fail-closed validation");
+        let _ = fs::remove_file(&path);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("only mapping documents")),
+            "a scalar YAML document must not be filtered out: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn checked_in_release_renderer_is_deterministic_and_admissible() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let suffix = std::process::id();
+        let first =
+            std::env::temp_dir().join(format!("ryuki-release-image-render-{suffix}-first.yaml"));
+        let second =
+            std::env::temp_dir().join(format!("ryuki-release-image-render-{suffix}-second.yaml"));
+        let api_digest = format!("sha256:{}", "a".repeat(64));
+        let portal_digest = format!("sha256:{}", "b".repeat(64));
+
+        for output in [&first, &second] {
+            let status = std::process::Command::new("bash")
+                .arg(root.join("scripts/release/render-kubernetes-images-v1.sh"))
+                .args(["--root"])
+                .arg(&root)
+                .args(["--output"])
+                .arg(output)
+                .arg("--api-repository")
+                .arg("ghcr.io/example/ryuki-platform-api")
+                .arg("--api-digest")
+                .arg(&api_digest)
+                .arg("--portal-repository")
+                .arg("ghcr.io/example/ryuki-portal-ui")
+                .arg("--portal-digest")
+                .arg(&portal_digest)
+                .status()
+                .expect("execute checked-in release renderer");
+            assert!(status.success(), "checked-in release renderer must succeed");
+        }
+
+        let first_bytes = fs::read(&first).expect("read first release render");
+        let second_bytes = fs::read(&second).expect("read second release render");
+        assert_eq!(
+            first_bytes, second_bytes,
+            "same inputs must produce byte-identical release renders"
+        );
+        let errors = validate_release_image_render_file(&first, &api_digest, &portal_digest)
+            .expect("validate checked-in release render");
+        let _ = fs::remove_file(&first);
+        let _ = fs::remove_file(&second);
+        assert!(
+            errors.is_empty(),
+            "checked-in renderer output must satisfy the full manifest and exact image binding contracts: {errors:?}"
         );
     }
 }

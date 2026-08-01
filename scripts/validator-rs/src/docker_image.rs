@@ -37,6 +37,18 @@ const PORTAL_RUNTIME_ENVIRONMENT: &[(&str, &str)] = &[
 ];
 const PORTAL_DOCKERFILE_PATH: &str = "portal/portal-ui/Dockerfile";
 const RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+const RELEASE_RENDER_SCRIPT_PATH: &str = "scripts/release/render-kubernetes-images-v1.sh";
+const RELEASE_RENDER_PATH: &str = "${{ runner.temp }}/ryuki-release-kubernetes.yaml";
+const RELEASE_RENDER_COMMAND: &str = "bash scripts/release/render-kubernetes-images-v1.sh --root . --output \"${RENDER_PATH}\" --api-repository \"${API_REPOSITORY}\" --api-digest \"${API_DIGEST}\" --portal-repository \"${PORTAL_REPOSITORY}\" --portal-digest \"${PORTAL_DIGEST}\"";
+const RELEASE_RENDER_VALIDATOR_COMMAND: &str = "cargo run --locked --manifest-path scripts/validator-rs/Cargo.toml -- validate-release-image-render kubernetes-manifest --render \"${RENDER_PATH}\" --api-digest \"${API_DIGEST}\" --portal-digest \"${PORTAL_DIGEST}\"";
+const RELEASE_RENDER_HANDOFF_COMMAND: &str = r#"set -euo pipefail
+render_bytes="$(LC_ALL=C wc -c < "${RENDER_PATH}" | tr -d '[:space:]')"
+[[ "${render_bytes}" =~ ^[0-9]+$ && "${render_bytes}" -le 131072 ]]
+{
+  printf 'content-b64='
+  base64 -w 0 "${RENDER_PATH}"
+  printf '\nsha256=%s\n' "$(sha256sum "${RENDER_PATH}" | awk '{print $1}')"
+} >> "${GITHUB_OUTPUT}""#;
 const CARGO_CHEF_VERSION: &str = "0.1.77";
 const CARGO_LEPTOS_VERSION: &str = "0.3.7";
 const BASE_CARGO_PATH: &str = "/usr/local/cargo/bin/cargo";
@@ -101,6 +113,7 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
 
     errors.extend(validate_api_dockerfile(&context.api_dockerfile, &members));
     validate_portal_release_binding(&context.release_workflow, &mut errors);
+    validate_release_render_binding(&context.release_workflow, &mut errors);
     errors.extend(validate_portal_dockerfile(
         &context.portal_dockerfile,
         &members,
@@ -254,6 +267,187 @@ fn validate_portal_release_binding(content: &str, errors: &mut Vec<String>) {
             "{RELEASE_WORKFLOW_PATH}: id=portal must use docker/build-push-action with repository context '.', file {PORTAL_DOCKERFILE_PATH}, push true, and target {PORTAL_RUNTIME_STAGE}"
         ));
     }
+}
+
+/// Require the release render to consume the immutable outputs of both image
+/// publishers, validate the exact rendered bytes, and bind only that validated
+/// handoff into the GitHub release. Registry provenance and cluster admission
+/// remain external evidence; this control closes the repository-local digest
+/// substitution gap only.
+fn validate_release_render_binding(content: &str, errors: &mut Vec<String>) {
+    let workflow: YamlValue = match serde_yaml::from_str(content) {
+        Ok(workflow) => workflow,
+        Err(_) => return,
+    };
+    let Some(images) = workflow.get("jobs").and_then(|jobs| jobs.get("images")) else {
+        return;
+    };
+    let Some(steps) = images.get("steps").and_then(YamlValue::as_sequence) else {
+        return;
+    };
+
+    let step_positions = |id: &str| {
+        steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.get("id").and_then(YamlValue::as_str) == Some(id))
+            .collect::<Vec<_>>()
+    };
+    let api = step_positions("api");
+    let portal = step_positions("portal");
+    let render = step_positions("kubernetes-render");
+    let validator = step_positions("kubernetes-render-validator");
+    let handoff = step_positions("kubernetes-render-handoff");
+    if api.len() != 1
+        || portal.len() != 1
+        || render.len() != 1
+        || validator.len() != 1
+        || handoff.len() != 1
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: images job must contain exactly one api publisher, portal publisher, kubernetes-render, kubernetes-render-validator, and kubernetes-render-handoff step"
+        ));
+        return;
+    }
+    let (api_index, _) = api[0];
+    let (portal_index, _) = portal[0];
+    let (render_index, render_step) = render[0];
+    let (validator_index, validator_step) = validator[0];
+    let (handoff_index, handoff_step) = handoff[0];
+    if render_index <= api_index.max(portal_index)
+        || validator_index != render_index + 1
+        || handoff_index != validator_index + 1
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: release render, exact-digest validator, and sealed handoff must run consecutively in that order after both image publishers"
+        ));
+    }
+
+    let render_env = [
+        (
+            "API_REPOSITORY",
+            "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}",
+        ),
+        ("API_DIGEST", "${{ steps.api.outputs.digest }}"),
+        (
+            "PORTAL_REPOSITORY",
+            "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}",
+        ),
+        ("PORTAL_DIGEST", "${{ steps.portal.outputs.digest }}"),
+        ("RENDER_PATH", RELEASE_RENDER_PATH),
+    ];
+    if !yaml_mapping_has_exact_keys(render_step, &["name", "id", "env", "run"])
+        || !step_has_exact_env(render_step, &render_env)
+        || !step_run_equals(render_step, RELEASE_RENDER_COMMAND)
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: kubernetes-render must run {RELEASE_RENDER_SCRIPT_PATH} with the exact api/portal publisher outputs and fixed runner-temp destination"
+        ));
+    }
+
+    let validator_env = [
+        ("API_DIGEST", "${{ steps.api.outputs.digest }}"),
+        ("PORTAL_DIGEST", "${{ steps.portal.outputs.digest }}"),
+        ("RENDER_PATH", RELEASE_RENDER_PATH),
+    ];
+    if !yaml_mapping_has_exact_keys(validator_step, &["name", "id", "env", "run"])
+        || !step_has_exact_env(validator_step, &validator_env)
+        || !step_run_equals(validator_step, RELEASE_RENDER_VALIDATOR_COMMAND)
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: kubernetes-render-validator must validate the exact render against both immutable publisher digest outputs"
+        ));
+    }
+
+    if !yaml_mapping_has_exact_keys(handoff_step, &["name", "id", "env", "run"])
+        || !step_has_exact_env(handoff_step, &[("RENDER_PATH", RELEASE_RENDER_PATH)])
+        || !step_run_equals(handoff_step, RELEASE_RENDER_HANDOFF_COMMAND)
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: kubernetes-render-handoff must size-bound, digest, and encode only the validated runner-temp render"
+        ));
+    }
+
+    let image_outputs = images.get("outputs");
+    if image_outputs
+        .and_then(|outputs| outputs.get("kubernetes-render-b64"))
+        .and_then(YamlValue::as_str)
+        != Some("${{ steps.kubernetes-render-handoff.outputs.content-b64 }}")
+        || image_outputs
+            .and_then(|outputs| outputs.get("kubernetes-render-sha256"))
+            .and_then(YamlValue::as_str)
+            != Some("${{ steps.kubernetes-render-handoff.outputs.sha256 }}")
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: images job must export only the sealed Kubernetes render bytes and digest"
+        ));
+    }
+
+    let release = workflow.get("jobs").and_then(|jobs| jobs.get("release"));
+    let release_env = release
+        .and_then(|job| job.get("steps"))
+        .and_then(YamlValue::as_sequence)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| step.get("id").and_then(YamlValue::as_str) == Some("publish"))
+        })
+        .and_then(|step| step.get("env"));
+    let release_run = release
+        .and_then(|job| job.get("steps"))
+        .and_then(YamlValue::as_sequence)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| step.get("id").and_then(YamlValue::as_str) == Some("publish"))
+        })
+        .and_then(|step| step.get("run"))
+        .and_then(YamlValue::as_str)
+        .unwrap_or_default();
+    if release_env
+        .and_then(|env| env.get("KUBERNETES_RENDER_B64"))
+        .and_then(YamlValue::as_str)
+        != Some("${{ needs.images.outputs.kubernetes-render-b64 }}")
+        || release_env
+            .and_then(|env| env.get("KUBERNETES_RENDER_SHA256"))
+            .and_then(YamlValue::as_str)
+            != Some("${{ needs.images.outputs.kubernetes-render-sha256 }}")
+        || !release_run.contains("actual_render_sha256")
+        || !release_run.contains("${KUBERNETES_RENDER_SHA256}")
+        || !release_run.contains("ryuki-release-kubernetes.yaml#Ryuki release Kubernetes render")
+    {
+        errors.push(format!(
+            "{RELEASE_WORKFLOW_PATH}: release publication must verify and attach the sealed Kubernetes render handoff"
+        ));
+    }
+}
+
+fn step_has_exact_env(step: &YamlValue, expected: &[(&str, &str)]) -> bool {
+    step.get("env")
+        .and_then(YamlValue::as_mapping)
+        .is_some_and(|env| {
+            env.len() == expected.len()
+                && expected.iter().all(|(key, value)| {
+                    env.get(&YamlValue::String((*key).to_string()))
+                        .and_then(YamlValue::as_str)
+                        == Some(*value)
+                })
+        })
+}
+
+fn yaml_mapping_has_exact_keys(value: &YamlValue, expected: &[&str]) -> bool {
+    value.as_mapping().is_some_and(|mapping| {
+        mapping.len() == expected.len()
+            && expected
+                .iter()
+                .all(|key| mapping.contains_key(&YamlValue::String((*key).to_string())))
+    })
+}
+
+fn step_run_equals(step: &YamlValue, expected: &str) -> bool {
+    step.get("run")
+        .and_then(YamlValue::as_str)
+        .is_some_and(|run| run.split_whitespace().eq(expected.split_whitespace()))
 }
 
 /// Prove the reviewed contract inside the exact stage selected by the release
@@ -1419,6 +1613,54 @@ name = "ryuki-integration-tests"
         }
     }
 
+    fn canonical_install_arguments(package: &str, version: &str) -> Vec<String> {
+        vec![
+            BASE_CARGO_PATH.to_string(),
+            "install".to_string(),
+            package.to_string(),
+            "--version".to_string(),
+            version.to_string(),
+            "--locked".to_string(),
+            "--root".to_string(),
+            format!("{PROTECTED_TOOL_ROOT}/{package}-{version}"),
+        ]
+    }
+
+    fn replace_run_arguments(
+        dockerfile: &str,
+        original: &[String],
+        replacement: &[String],
+    ) -> String {
+        let original = format!(
+            "RUN {}\n",
+            serde_json::to_string(original).expect("serialize original RUN fixture")
+        );
+        let replacement = format!(
+            "RUN {}\n",
+            serde_json::to_string(replacement).expect("serialize replacement RUN fixture")
+        );
+        let replaced = dockerfile.replacen(&original, &replacement, 1);
+        assert_ne!(
+            replaced, dockerfile,
+            "canonical RUN fixture to replace was not present"
+        );
+        replaced
+    }
+
+    fn insert_after_run_arguments(dockerfile: &str, original: &[String], inserted: &str) -> String {
+        let original = format!(
+            "RUN {}\n",
+            serde_json::to_string(original).expect("serialize insertion anchor fixture")
+        );
+        let replacement = format!("{original}{inserted}");
+        let replaced = dockerfile.replacen(&original, &replacement, 1);
+        assert_ne!(
+            replaced, dockerfile,
+            "canonical RUN fixture insertion anchor was not present"
+        );
+        replaced
+    }
+
     // ── workspace member parsing ──────────────────────────────────────────
 
     #[test]
@@ -1707,6 +1949,75 @@ name = "ryuki-integration-tests"
     }
 
     #[test]
+    fn checked_in_release_binds_and_validates_exact_rendered_digests() {
+        let mut errors = Vec::new();
+        validate_release_render_binding(
+            include_str!("../../../.github/workflows/release.yml"),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "checked-in release render binding is invalid: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn release_render_workflow_rejects_digest_and_handoff_mutations() {
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+        let mutations = [
+            (
+                "renderer digest substitution",
+                workflow.replacen(
+                    "--portal-digest \"${PORTAL_DIGEST}\"",
+                    "--portal-digest \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+                    1,
+                ),
+            ),
+            (
+                "validator removal",
+                workflow.replacen(
+                    "id: kubernetes-render-validator",
+                    "id: kubernetes-render-validator-disabled",
+                    1,
+                ),
+            ),
+            (
+                "validator continue-on-error bypass",
+                workflow.replacen(
+                    "        id: kubernetes-render-validator\n        env:",
+                    "        id: kubernetes-render-validator\n        continue-on-error: true\n        env:",
+                    1,
+                ),
+            ),
+            (
+                "post-validation render rewrite",
+                workflow.replacen(
+                    "      - name: Seal validated Kubernetes render handoff",
+                    "      - name: Rewrite render after validation\n        run: printf exploit > \"${RENDER_PATH}\"\n      - name: Seal validated Kubernetes render handoff",
+                    1,
+                ),
+            ),
+            (
+                "unsealed release attachment",
+                workflow.replacen(
+                    "ryuki-release-kubernetes.yaml#Ryuki release Kubernetes render",
+                    "unvalidated-kubernetes.yaml#Ryuki release Kubernetes render",
+                    1,
+                ),
+            ),
+        ];
+
+        for (label, mutation) in mutations {
+            let mut errors = Vec::new();
+            validate_release_render_binding(&mutation, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "release workflow mutation {label} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn portal_release_target_keeps_appended_stage_out_of_published_image() {
         let dockerfile = format!(
             concat!(
@@ -1835,24 +2146,26 @@ name = "ryuki-integration-tests"
             ("cargo-chef", CARGO_CHEF_VERSION),
             ("cargo-leptos", CARGO_LEPTOS_VERSION),
         ] {
-            let dockerfile = format!(
-                "# escape=`\n{}",
-                canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
-            );
-            let mut errors = Vec::new();
-            validate_protected_cargo_tool_lifecycle(
-                &dockerfile,
-                "Dockerfile",
-                package,
-                version,
-                &mut errors,
-            );
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("default Dockerfile escape")),
-                "nondefault Dockerfile escape was accepted for {package}: {errors:?}"
-            );
+            for directive in ["# escape=`\n", "#escape=`\n", "# ESCAPE = `\n"] {
+                let dockerfile = format!(
+                    "{directive}{}",
+                    canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
+                );
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.contains("default Dockerfile escape")),
+                    "nondefault Dockerfile escape {directive:?} was accepted for {package}: {errors:?}"
+                );
+            }
         }
     }
 
@@ -1910,6 +2223,213 @@ name = "ryuki-integration-tests"
                     .iter()
                     .any(|error| error.contains("arbitrary RUN instructions")),
                 "renamed interpreter lifecycle bypass was accepted for {package}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_post_install_execution_bypass_matrix() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let install = canonical_install_arguments(package, version);
+            let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
+            let overwrite = format!(
+                "{BASE_CARGO_PATH} install attacker-tool --bin {package} --force --root {tool_root}"
+            );
+            let timeout = serde_json::to_string(&vec![
+                "/usr/bin/timeout".to_string(),
+                "600".to_string(),
+                BASE_CARGO_PATH.to_string(),
+                "install".to_string(),
+                "attacker-tool".to_string(),
+                "--bin".to_string(),
+                package.to_string(),
+                "--force".to_string(),
+                "--root".to_string(),
+                tool_root.clone(),
+            ])
+            .expect("serialize timeout wrapper fixture");
+            let dash = serde_json::to_string(&vec![
+                "/usr/bin/dash".to_string(),
+                "-c".to_string(),
+                overwrite.clone(),
+            ])
+            .expect("serialize dash wrapper fixture");
+            let shell = serde_json::to_string(&vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                overwrite.clone(),
+            ])
+            .expect("serialize shell wrapper fixture");
+            let python = serde_json::to_string(&vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                format!(
+                    "import subprocess; subprocess.run([{BASE_CARGO_PATH:?}, 'install', 'attacker-tool', '--bin', {package:?}, '--force', '--root', {tool_root:?}], check=True)"
+                ),
+            ])
+            .expect("serialize Python subprocess fixture");
+            let bypasses = [
+                format!("RUN {timeout}\n"),
+                format!("RUN exec {overwrite}\n"),
+                format!("RUN {dash}\n"),
+                format!("RUN {shell}\n"),
+                format!(
+                    "RUN printf '%s\\n' attacker-tool | /usr/bin/xargs {BASE_CARGO_PATH} install --bin {package} --force --root {tool_root}\n"
+                ),
+                format!("RUN {python}\n"),
+                format!(
+                    "RUN ${{CARGO_EXECUTABLE}} install attacker-tool --bin {package} --force --root {tool_root}\n"
+                ),
+                format!(
+                    "RUN {BASE_CARGO_PATH} ${{CARGO_SUBCOMMAND}} attacker-tool --bin {package} --force --root {tool_root}\n"
+                ),
+                format!(
+                    "RUN {BASE_CARGO_PATH} install ${{CARGO_PACKAGE}} --bin {package} --force --root {tool_root}\n"
+                ),
+                format!("RUN <<'EOF'\n{overwrite}\nEOF\n"),
+            ];
+
+            for bypass in bypasses {
+                let canonical = canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ");
+                let dockerfile = insert_after_run_arguments(&canonical, &install, &bypass);
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    errors.iter().any(|error| error.contains(
+                        "root setup step 1 must be the next exact JSON-exec action"
+                    )),
+                    "post-install execution bypass was accepted for {package}: {bypass:?}; {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_dynamic_canonical_positions() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let canonical = canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ");
+            let install = canonical_install_arguments(package, version);
+            for (position, expansion) in [
+                (0, "${CARGO_EXECUTABLE}"),
+                (1, "${CARGO_SUBCOMMAND}"),
+                (2, "${CARGO_PACKAGE}"),
+            ] {
+                let mut dynamic = install.clone();
+                dynamic[position] = expansion.to_string();
+                let dockerfile = replace_run_arguments(&canonical, &install, &dynamic);
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    errors.iter().any(|error| error.contains(
+                        "expected one canonical JSON-exec"
+                    )),
+                    "dynamic canonical install position {position} was accepted for {package}: {errors:?}"
+                );
+            }
+
+            let tool_path = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}/bin/{package}");
+            let expected_use = canonical_protected_tool_uses(package, &tool_path)
+                .into_iter()
+                .next()
+                .expect("protected tool has a canonical use");
+            for (position, expansion) in [(0, "${TOOL_EXECUTABLE}"), (1, "${TOOL_SUBCOMMAND}")] {
+                let mut dynamic = expected_use.clone();
+                dynamic[position] = expansion.to_string();
+                let dockerfile = replace_run_arguments(&canonical, &expected_use, &dynamic);
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.contains("canonical absolute-path")),
+                    "dynamic canonical use position {position} was accepted for {package}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_later_protected_binary_replacement() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let tool_path = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}/bin/{package}");
+            let canonical = canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ");
+            let replacements = [
+                format!(
+                    "COPY --link --chown={BUILD_USER} fake-protected-tool {tool_path}\n"
+                ),
+                format!(
+                    "RUN [\"/usr/bin/install\", \"-m\", \"0755\", \"/tmp/fake-protected-tool\", \"{tool_path}\"]\n"
+                ),
+                format!(
+                    "FROM build AS post-build\nCOPY --link --chown={BUILD_USER} fake-protected-tool {tool_path}\n"
+                ),
+            ];
+            for replacement in replacements {
+                let dockerfile = format!("{canonical}{replacement}");
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    !errors.is_empty(),
+                    "later protected-binary replacement was accepted for {package}: {replacement:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_allows_only_the_default_escape_directive() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let dockerfile = format!(
+                "# escape=\\\n{}",
+                canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
+            );
+            let mut errors = Vec::new();
+            validate_protected_cargo_tool_lifecycle(
+                &dockerfile,
+                "Dockerfile",
+                package,
+                version,
+                &mut errors,
+            );
+            assert!(
+                errors.is_empty(),
+                "explicit default Dockerfile escape must preserve the canonical lifecycle: {errors:?}"
             );
         }
     }

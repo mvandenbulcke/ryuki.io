@@ -192,6 +192,8 @@ jobs:
     outputs:
       api-digest: ${{ steps.api.outputs.digest }}
       portal-digest: ${{ steps.portal.outputs.digest }}
+      kubernetes-render-b64: ${{ steps.kubernetes-render-handoff.outputs.content-b64 }}
+      kubernetes-render-sha256: ${{ steps.kubernetes-render-handoff.outputs.sha256 }}
     steps:
       - name: Require the remote tag to retain the validated object
         id: revalidate-tag
@@ -287,6 +289,49 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           API_DIGEST: ${{ steps.api.outputs.digest }}
           PORTAL_DIGEST: ${{ steps.portal.outputs.digest }}
+      - name: Install Rust toolchain for release-image-render validation
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
+      - name: Render release Kubernetes image bindings
+        id: kubernetes-render
+        env:
+          API_REPOSITORY: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}
+          API_DIGEST: ${{ steps.api.outputs.digest }}
+          PORTAL_REPOSITORY: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}
+          PORTAL_DIGEST: ${{ steps.portal.outputs.digest }}
+          RENDER_PATH: ${{ runner.temp }}/ryuki-release-kubernetes.yaml
+        run: >-
+          bash scripts/release/render-kubernetes-images-v1.sh
+          --root .
+          --output "${RENDER_PATH}"
+          --api-repository "${API_REPOSITORY}"
+          --api-digest "${API_DIGEST}"
+          --portal-repository "${PORTAL_REPOSITORY}"
+          --portal-digest "${PORTAL_DIGEST}"
+      - name: Validate exact release Kubernetes image bindings
+        id: kubernetes-render-validator
+        env:
+          API_DIGEST: ${{ steps.api.outputs.digest }}
+          PORTAL_DIGEST: ${{ steps.portal.outputs.digest }}
+          RENDER_PATH: ${{ runner.temp }}/ryuki-release-kubernetes.yaml
+        run: >-
+          cargo run --locked --manifest-path scripts/validator-rs/Cargo.toml --
+          validate-release-image-render kubernetes-manifest
+          --render "${RENDER_PATH}"
+          --api-digest "${API_DIGEST}"
+          --portal-digest "${PORTAL_DIGEST}"
+      - name: Seal validated Kubernetes render handoff
+        id: kubernetes-render-handoff
+        env:
+          RENDER_PATH: ${{ runner.temp }}/ryuki-release-kubernetes.yaml
+        run: |
+          set -euo pipefail
+          render_bytes="$(LC_ALL=C wc -c < "${RENDER_PATH}" | tr -d '[:space:]')"
+          [[ "${render_bytes}" =~ ^[0-9]+$ && "${render_bytes}" -le 131072 ]]
+          {
+            printf 'content-b64='
+            base64 -w 0 "${RENDER_PATH}"
+            printf '\nsha256=%s\n' "$(sha256sum "${RENDER_PATH}" | awk '{print $1}')"
+          } >> "${GITHUB_OUTPUT}"
 
   # Generate release-note data without repository write authority. The
   # contents:write job below consumes this output as data and runs no external
@@ -344,6 +389,8 @@ jobs:
           PORTAL_REF: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}
           API_DIGEST: ${{ needs.images.outputs.api-digest }}
           PORTAL_DIGEST: ${{ needs.images.outputs.portal-digest }}
+          KUBERNETES_RENDER_B64: ${{ needs.images.outputs.kubernetes-render-b64 }}
+          KUBERNETES_RENDER_SHA256: ${{ needs.images.outputs.kubernetes-render-sha256 }}
         run: |
           set -euo pipefail
           fail() {
@@ -358,8 +405,18 @@ jobs:
           [[ "${remote_tag_object}" == "${EXPECTED_TAG_OBJECT}" ]] || \
             fail "Release tag moved after provenance validation"
           [[ -n "${RELEASE_NOTES_B64}" ]] || fail "Validated release notes are missing"
+          [[ "${KUBERNETES_RENDER_SHA256}" =~ ^[0-9a-f]{64}$ ]] || \
+            fail "Validated Kubernetes render digest is malformed"
+          [[ -n "${KUBERNETES_RENDER_B64}" ]] || \
+            fail "Validated Kubernetes render is missing"
           printf '%s' "${RELEASE_NOTES_B64}" | base64 --decode > release-notes.md || \
             fail "Validated release notes are not canonical base64"
+          printf '%s' "${KUBERNETES_RENDER_B64}" | base64 --decode \
+            > ryuki-release-kubernetes.yaml || \
+            fail "Validated Kubernetes render is not canonical base64"
+          actual_render_sha256="$(sha256sum ryuki-release-kubernetes.yaml | awk '{print $1}')"
+          [[ "${actual_render_sha256}" == "${KUBERNETES_RENDER_SHA256}" ]] || \
+            fail "Validated Kubernetes render changed across the job handoff"
           note_bytes="$(LC_ALL=C wc -c < release-notes.md | tr -d '[:space:]')"
           [[ "${note_bytes}" =~ ^[0-9]+$ && "${note_bytes}" -le 131072 ]] || \
             fail "Validated release notes exceed the 128 KiB handoff limit"
@@ -378,4 +435,5 @@ jobs:
           gh release create "${TAG}" \
             --title "${TAG}" \
             --notes-file release-body.md \
+            "ryuki-release-kubernetes.yaml#Ryuki release Kubernetes render" \
             --verify-tag
