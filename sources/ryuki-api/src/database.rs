@@ -5528,7 +5528,7 @@ async fn attest_principal_registry_authority_chain(
                 ('public.principal_registry_provider_lock_key(text)', 'f99703254188848ff5fdbd6110986724ea60d5bb00b823502568650312adb214', 'sql', 'pg_catalog.int8', FALSE, 'i', 's', NULL),
                 ('public.principal_registry_writer_contract_is_held(text,text,text)', '8c26393eda2903881fa432dc56837d86ddee39defcb184fcc41720e5b201d916', 'sql', 'pg_catalog.bool', TRUE, 's', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.reject_principal_registry_evidence_mutation()', '8e0862f12278ceda802a1b90c896da1fed4929bb767db8077788eff494d8f69e', 'plpgsql', 'pg_catalog.trigger', FALSE, 'v', 'u', NULL),
-                ('public.enforce_principal_lifecycle()', '838cf16b820b3c2a89eda3356f9a6dbdfc57f4b31810886e9c8e7d8c0c7b3b54', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
+                ('public.enforce_principal_lifecycle()', '5807627555989c478cc7c535e93068d8f51c1e38b8c12d54f4668ea399cf9dce', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.enforce_agent_principal_binding()', '410e86c617278908bbd37cc7ae985f6a4d4a24bce2396c429c354e09b0bc3b0f', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.enforce_principal_provider_tombstone()', '46cae1bc7a41cdcafee69b1a14d2b4b79e70645b58cfca1f2c3a95b3144f74a8', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
                 ('public.enforce_principal_key_lifecycle()', 'acb477819995dcbcda226cfb0d59a5649e9552742c01b4e301acb93e9fc3f0e2', 'plpgsql', 'pg_catalog.trigger', TRUE, 'v', 'u', ARRAY['search_path=pg_catalog, public']::text[]),
@@ -5676,15 +5676,33 @@ async fn attest_principal_registry_authority_chain(
                   (expected.predicate_kind = 0 AND trigger.tgqual IS NULL)
                   OR (
                       expected.predicate_kind = 1
+                      AND trigger.tgqual IS NOT NULL
                       AND pg_catalog.regexp_replace(
-                            pg_catalog.pg_get_expr(trigger.tgqual, trigger.tgrelid),
+                            pg_catalog.split_part(
+                                pg_catalog.split_part(
+                                    pg_catalog.pg_get_triggerdef(trigger.oid, false),
+                                    ' WHEN ',
+                                    2
+                                ),
+                                ' EXECUTE FUNCTION ',
+                                1
+                            ),
                             '[[:space:]()]', '', 'g'
                           ) = 'new.key_state=''tombstoned''::textANDold.key_state<>''tombstoned''::text'
                   )
                   OR (
                       expected.predicate_kind = 2
+                      AND trigger.tgqual IS NOT NULL
                       AND pg_catalog.regexp_replace(
-                            pg_catalog.pg_get_expr(trigger.tgqual, trigger.tgrelid),
+                            pg_catalog.split_part(
+                                pg_catalog.split_part(
+                                    pg_catalog.pg_get_triggerdef(trigger.oid, false),
+                                    ' WHEN ',
+                                    2
+                                ),
+                                ' EXECUTE FUNCTION ',
+                                1
+                            ),
                             '[[:space:]()]', '', 'g'
                           ) = 'old.agent_idISDISTINCTFROMnew.agent_idORold.statusISDISTINCTFROMnew.statusORold.platformISDISTINCTFROMnew.platformORold.capabilitiesISDISTINCTFROMnew.capabilitiesORold.public_keyISDISTINCTFROMnew.public_keyORold.token_hashISDISTINCTFROMnew.token_hashORold.enrollment_expires_atISDISTINCTFROMnew.enrollment_expires_atORold.enrollment_bounds_versionISDISTINCTFROMnew.enrollment_bounds_versionORold.enrollment_challenge_idISDISTINCTFROMnew.enrollment_challenge_id'
                   )

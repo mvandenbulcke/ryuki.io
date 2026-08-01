@@ -1888,6 +1888,31 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_json_redactor_treats_secret_id_as_credential_material() {
+        let detail = serde_json::json!({
+            "secret_id": "sec-reference-123",
+            "secret_id_hint": "sec-reference-123",
+            "secret_value": "ordinary-looking-but-keyed-secret",
+            "resource_id": "sec-reference-123"
+        });
+
+        let redacted = redact_json_evidence_value(&detail);
+        assert_eq!(redacted["secret_id"], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(redacted["secret_id_hint"], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(redacted["secret_value"], REDACTED_EVIDENCE_VALUE);
+        assert_eq!(redacted["resource_id"], "sec-reference-123");
+
+        let credential = serde_json::json!({
+            "resource_id": "Basic YXVkaXQtdXNlcjpwYXNzd29yZA=="
+        });
+        assert_eq!(
+            redact_json_evidence_value(&credential)["resource_id"],
+            REDACTED_EVIDENCE_VALUE,
+            "a neutral reference key must never bypass value-based credential detection"
+        );
+    }
+
+    #[test]
     fn test_structured_json_redactor_handles_named_and_tuple_authorization_entries() {
         let named_marker = "SYNTH-NAMED-BASIC-CANARY";
         let tuple_marker = "SYNTH-TUPLE-BASIC-CANARY";

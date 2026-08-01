@@ -10708,10 +10708,12 @@ mod tests {
             .execute(&mut *tx)
             .await
             .expect("set agent enrollment fixture deadline");
-        sqlx::query("ALTER TABLE agents ENABLE TRIGGER agents_enrollment_contract_v3_mutation")
-            .execute(&mut *tx)
-            .await
-            .expect("restore agent enrollment guard after fixture");
+        sqlx::query(
+            "ALTER TABLE agents ENABLE ALWAYS TRIGGER agents_enrollment_contract_v3_mutation",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("restore always-on agent enrollment guard after fixture");
         tx.commit().await.expect("commit agent deadline fixture");
     }
 

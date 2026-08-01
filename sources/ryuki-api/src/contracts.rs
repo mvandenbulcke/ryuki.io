@@ -18849,7 +18849,10 @@ async fn admin_tokens_create(
                 None,
                 "created",
                 json!({
-                    "token_id": row.id,
+                    // The action names the resource kind. A neutral reference
+                    // key preserves the non-secret UUID without globally
+                    // exempting arbitrary `token_id` values from redaction.
+                    "resource_id": row.id,
                     "name": row.name,
                     "issuing_principal_id": row.issuing_principal_id,
                     "roles": row.roles,
@@ -19095,7 +19098,7 @@ async fn admin_tokens_revoke(
                 "api-token-revoke",
                 Some("active"),
                 "revoked",
-                json!({ "token_id": id }),
+                json!({ "resource_id": id }),
             ),
         )
         .await,
@@ -20254,11 +20257,12 @@ async fn apply_approval_decision_audited(
     // a non-Planned (terminal / already-decided) request yields the engine's clear
     // 400 ("Cannot approve request in status ..."), NOT a misleading 409. Running it
     // here also produces the approve stage / evidence / approval_route on the LOCKED
-    // state, so a concurrent completing approver builds on any prior approver's
-    // persisted partial and cannot drop their route/evidence. Before the idempotent
-    // short-circuit so re-approving a non-approvable request still 400s.
+    // state. Canonical prior approvers are merged from the immutable ledger below,
+    // because partial approvals deliberately do not mutate the request resource.
+    // Before the idempotent short-circuit so re-approving a non-approvable request
+    // still 400s.
     let request = db_row_to_request(&current, &request_id);
-    let approved = match request_lifecycle::approve_request(&request, &actor_principal) {
+    let mut approved = match request_lifecycle::approve_request(&request, &actor_principal) {
         Ok(a) => a,
         Err(e) => {
             tx.rollback().await.ok();
@@ -20279,7 +20283,8 @@ async fn apply_approval_decision_audited(
           AND d.role = ANY(p.role_allowlist) \
          WHERE d.request_id = $1 AND d.approval_epoch = $2 \
            AND d.approval_basis_resource_version = $3 \
-           AND d.principal_binding_state = 'exact-v1'";
+           AND d.principal_binding_state = 'exact-v1' \
+         ORDER BY d.decided_at, d.id";
     let to_decisions = |rows: Vec<(String, String, String)>| -> Vec<ApprovalDecision> {
         // Destructure to distinct names so the per-decision role is never confused
         // with the session's `role` used in the short-circuit comparison below.
@@ -20361,6 +20366,19 @@ async fn apply_approval_decision_audited(
         .map_err(db_error)?;
     let decisions = to_decisions(after);
     let quorum = evaluate_quorum(&decisions, req, req);
+
+    // Partial approvals intentionally leave the request row untouched so every
+    // checker signs the same database-owned resource version. Reconstruct the
+    // durable route from the canonical, current-version ledger when the final
+    // checker persists the approval artifacts. Existing lifecycle route entries
+    // stay in place, followed by each current checker in decision order.
+    let mut merged_approval_route = request.approval_route.clone();
+    for decision in &decisions {
+        if decision.decision == "approved" && !merged_approval_route.contains(&decision.actor) {
+            merged_approval_route.push(decision.actor.clone());
+        }
+    }
+    approved.approval_route = merged_approval_route;
 
     let stages_json = sanitize_stages_for_portal(
         &serde_json::to_value(&approved.stages).unwrap_or_else(|_| json!([])),
@@ -25104,6 +25122,101 @@ mod step_authoring_db_tests {
             .ok();
     }
 
+    /// Drive a newly created request through the real reviewed lifecycle so
+    /// its signed whole-request LivePlan is bound to the exact post-lock
+    /// version. The approver is deliberately distinct from the creator.
+    async fn drive_request_to_locked(
+        pool: &PgPool,
+        request_id: Uuid,
+        creator: &AuthSession,
+    ) -> ryuki_protocol::RequestResourceVersion {
+        let request_id_text = request_id.to_string();
+        let approver_label = format!("step-author-approver-{}", request_id.simple());
+        let approver = admin_session(pool, &approver_label).await;
+
+        let _ = requests_validate(
+            Path(request_id_text.clone()),
+            AuthExtractor(creator.clone()),
+        )
+        .await
+        .expect("validate request before whole-request LivePlan");
+        let _ = requests_plan(
+            Path(request_id_text.clone()),
+            AuthExtractor(creator.clone()),
+        )
+        .await
+        .expect("plan request before whole-request LivePlan");
+        let _ = requests_approve(
+            Path(request_id_text.clone()),
+            AuthExtractor(approver),
+            reviewed_request_approval_body(&request_id_text).await,
+        )
+        .await
+        .expect("approve request before whole-request LivePlan");
+        let _ = requests_lock(
+            Path(request_id_text.clone()),
+            AuthExtractor(creator.clone()),
+        )
+        .await
+        .expect("lock request before whole-request LivePlan");
+
+        let (status, stage, resource_version, stages): (
+            String,
+            String,
+            i64,
+            sqlx::types::Json<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, stage, resource_version, stages FROM requests WHERE id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("read canonical post-lock request");
+        assert_eq!(status, "locked");
+        assert_eq!(stage, "lock");
+        let stages: Vec<ryuki_engine::models::Stage> =
+            serde_json::from_value(stages.0).expect("valid post-lock request stages");
+        assert!(
+            stages.iter().any(|stage| stage.name == "execute"),
+            "canonical planning must materialize the execute stage"
+        );
+        ryuki_protocol::RequestResourceVersion::try_from(resource_version)
+            .expect("post-lock request resource version is positive")
+    }
+
+    /// Seed the exact signed LivePlan at request version N, persist its
+    /// canonical whole-request backlink, and advance the mutation spec to the
+    /// DB-owned successor version N + 1. Both positive and step-plan denial
+    /// tests must cross the real lineage boundary before testing the mint.
+    async fn seed_exact_whole_request_live_handoff(
+        pool: &PgPool,
+        request_id: Uuid,
+        platform: &str,
+        mutation_spec: &mut ryuki_protocol::JobSpec,
+        raw_plan_digest: &str,
+    ) -> (crate::agents::ApprovedPlanReference, String) {
+        let (approved_plan, plan_agent_id) =
+            super::step_materialization_db_tests::seed_exact_signed_live_plan(
+                pool,
+                request_id,
+                platform,
+                mutation_spec,
+                raw_plan_digest,
+            )
+            .await;
+        let mutation_version =
+            super::db_lifecycle_tests::record_test_whole_request_live_plan_backlink(
+                pool,
+                request_id,
+                &approved_plan,
+            )
+            .await;
+        mutation_spec.request_resource_version =
+            ryuki_protocol::RequestResourceVersion::try_from(mutation_version)
+                .expect("whole-request LivePlan backlink version is positive");
+        (approved_plan, plan_agent_id)
+    }
+
     /// Creating a ServerDeployment request with `deployment_profile:
     /// managed-onboarding` materializes EXACTLY the 3-step managed-onboarding
     /// plan (preflight/deploy/monitor, deps as designed, all Pending) linked to
@@ -25305,14 +25418,14 @@ mod step_authoring_db_tests {
         };
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
+        let locked_version = drive_request_to_locked(pool, id, &admin).await;
 
-        // Directly exercise the shared minting choke point (this is what
-        // requests_approve_live_apply delegates to once it has a completed
-        // plan+grant; the guard fires before any of that machinery matters).
-        let spec = ryuki_protocol::JobSpec {
+        // Directly exercise the shared minting choke point with a complete,
+        // exact plan/backlink lineage. The step-plan guard must remain the
+        // decisive denial after every preceding authority check succeeds.
+        let mut spec = ryuki_protocol::JobSpec {
             request_id: id,
-            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
-                .expect("positive request resource version"),
+            request_resource_version: locked_version,
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -25331,16 +25444,14 @@ mod step_authoring_db_tests {
             mode: ryuki_protocol::JobMode::LiveApply,
         };
         let digest = "a".repeat(64);
+        let (approved_plan, plan_agent_id) =
+            seed_exact_whole_request_live_handoff(pool, id, "DEFRA", &mut spec, &digest).await;
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         let grant_scope = admitted_control_plane_grant_scope().expect("test grant scope");
         let result = crate::agents::create_live_apply_job(
             pool,
             &grant_scope,
-            crate::agents::ApprovedPlanReference {
-                job_id: Uuid::new_v4(),
-                attempt_id: Uuid::new_v4(),
-                expected_execution_authority: None,
-            },
+            approved_plan,
             id,
             "DEFRA",
             &spec,
@@ -25371,6 +25482,16 @@ mod step_authoring_db_tests {
         );
 
         cleanup_request(pool, id).await;
+        sqlx::query("DELETE FROM agents WHERE agent_id = $1")
+            .bind(&plan_agent_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agent_enrollment_challenges WHERE agent_id = $1")
+            .bind(&plan_agent_id)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// A normal (no-plan) request is unaffected by the guard: the mint proceeds
@@ -25396,11 +25517,11 @@ mod step_authoring_db_tests {
         };
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
+        let locked_version = drive_request_to_locked(pool, id, &admin).await;
 
-        let spec = ryuki_protocol::JobSpec {
+        let mut spec = ryuki_protocol::JobSpec {
             request_id: id,
-            request_resource_version: ryuki_protocol::RequestResourceVersion::new(1)
-                .expect("positive request resource version"),
+            request_resource_version: locked_version,
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
@@ -25420,10 +25541,7 @@ mod step_authoring_db_tests {
         };
         let digest = "a".repeat(64);
         let (approved_plan, plan_agent_id) =
-            super::step_materialization_db_tests::seed_exact_signed_live_plan(
-                pool, id, "DEFRA", &spec, &digest,
-            )
-            .await;
+            seed_exact_whole_request_live_handoff(pool, id, "DEFRA", &mut spec, &digest).await;
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         let grant_scope = admitted_control_plane_grant_scope().expect("test grant scope");
         let result = crate::agents::create_live_apply_job(
@@ -47647,7 +47765,7 @@ async fn secrets_register(
                 None,
                 "registered",
                 json!({
-                    "secret_id": &secret.id,
+                    "resource_id": &secret.id,
                     "name": secret.name.trim(),
                     "site": &secret.site,
                 }),
@@ -47817,7 +47935,7 @@ async fn secrets_update(
             None,
             "updated",
             json!({
-                "secret_id": &id,
+                "resource_id": &id,
                 "site": &site,
             }),
         ),
@@ -47892,7 +48010,7 @@ async fn secrets_deregister(
                     // re-deregister) rather than a fabricated active->retired transition.
                     Some(prior_status.as_deref().unwrap_or("active")),
                     "retired",
-                    json!({ "secret_id": &id }),
+                    json!({ "resource_id": &id }),
                 ),
             )
             .await
@@ -47985,7 +48103,7 @@ async fn secrets_rotate(
                 Some(&prior_status),
                 "rotated",
                 json!({
-                    "secret_id": id,
+                    "resource_id": id,
                     "site": secret.site,
                     "rotation_run_id": run.id,
                     "new_version": run.new_version,
@@ -48294,7 +48412,7 @@ async fn secrets_rotation_fail(
                 "secrets-rotation-fail",
                 None,
                 "failed",
-                json!({ "rotation_run_id": &b.rotation_id, "secret_id": &failed.secret_id }),
+                json!({ "rotation_run_id": &b.rotation_id, "resource_id": &failed.secret_id }),
             ),
         )
         .await
@@ -62892,7 +63010,7 @@ mod db_lifecycle_tests {
     /// Mirror the production LivePlan result backlink: persist the exact plan
     /// receipt on the execute stage and let the DB-owned request trigger advance
     /// the request from the plan's version N to N + 1.
-    async fn record_test_whole_request_live_plan_backlink(
+    pub(super) async fn record_test_whole_request_live_plan_backlink(
         pool: &PgPool,
         request_id: Uuid,
         approved_plan: &crate::agents::ApprovedPlanReference,
@@ -63199,7 +63317,7 @@ mod db_lifecycle_tests {
 
         let (c_action, c_actor, c_detail) = sqlx::query_as::<_, (String, String, String)>(
             "SELECT action, actor_principal, detail::text FROM audit_log \
-             WHERE action = 'api-token-create' AND detail->>'token_id' = $1 \
+             WHERE action = 'api-token-create' AND detail->>'resource_id' = $1 \
              ORDER BY id DESC LIMIT 1",
         )
         .bind(&token_id)
@@ -63223,7 +63341,7 @@ mod db_lifecycle_tests {
         assert!(revoked.is_ok(), "revoke must succeed: {revoked:?}");
         let revoke_audited: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM audit_log \
-             WHERE action = 'api-token-revoke' AND detail->>'token_id' = $1)",
+             WHERE action = 'api-token-revoke' AND detail->>'resource_id' = $1)",
         )
         .bind(&token_id)
         .fetch_one(pool)
@@ -65110,8 +65228,8 @@ mod db_lifecycle_tests {
             maintenance_window: "2099-01-01T00:00:00Z".into(),
         };
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon =
+            registered_scoped_admin_session(pool, "vm-day2-gblon-reader", &["GBLON"], &[]).await;
 
         // Planning an authoritative target in a foreign site is non-enumerating.
         let foreign =
@@ -65122,8 +65240,9 @@ mod db_lifecycle_tests {
         );
 
         // Environment scope is applied to the CMDB row before it is decoded.
-        let mut staging = AuthSession::static_dry_run();
-        staging.environment_scope = vec!["staging".into()];
+        let staging =
+            registered_scoped_admin_session(pool, "vm-day2-staging-reader", &[], &["staging"])
+                .await;
         let env_denied = vm_day2_plan(AuthExtractor(staging), Json(plan_req(&gblon_target))).await;
         assert!(
             matches!(env_denied, Err((StatusCode::NOT_FOUND, _))),
@@ -68449,13 +68568,6 @@ mod db_lifecycle_tests {
         .await
         .expect("seed cross-aggregate non-alert pair");
 
-        let scoped = |site: &str, environment: &str, user_id: &str| {
-            let mut session = AuthSession::static_dry_run();
-            bind_test_principal(&mut session, user_id);
-            session.site_scope = vec![site.to_string()];
-            session.environment_scope = vec![environment.to_string()];
-            session
-        };
         let defra =
             registered_scoped_admin_session(pool, "agent-alert-defra", &["DEFRA"], &["production"])
                 .await;
@@ -68465,7 +68577,8 @@ mod db_lifecycle_tests {
             .to_string();
         // This principal exactly matches the spoofed event axes. The vulnerable
         // event-row policy would admit it; the request relation must still deny.
-        let gblon = scoped("GBLON", "test", "agent-alert-gblon");
+        let gblon =
+            registered_scoped_admin_session(pool, "agent-alert-gblon", &["GBLON"], &["test"]).await;
         let query = || {
             Query(EventsQuery {
                 event_type: None,
@@ -69328,20 +69441,20 @@ mod db_lifecycle_tests {
         // A whole-request LivePlan belongs to the executable version of a
         // genuinely reviewed request. Drive the canonical lifecycle instead
         // of fabricating the execute stage or reusing the intake version.
-        requests_validate(p(&id_str), AuthExtractor(requester.clone()))
+        let _ = requests_validate(p(&id_str), AuthExtractor(requester.clone()))
             .await
             .expect("validate request before whole-request LivePlan");
-        requests_plan(p(&id_str), AuthExtractor(requester.clone()))
+        let _ = requests_plan(p(&id_str), AuthExtractor(requester.clone()))
             .await
             .expect("plan request before whole-request LivePlan");
-        requests_approve(
+        let _ = requests_approve(
             p(&id_str),
             AuthExtractor(admin.clone()),
             reviewed_request_approval_body(&id_str).await,
         )
         .await
         .expect("approve request before whole-request LivePlan");
-        requests_lock(p(&id_str), AuthExtractor(requester.clone()))
+        let _ = requests_lock(p(&id_str), AuthExtractor(requester.clone()))
             .await
             .expect("lock request before whole-request LivePlan");
 
@@ -69488,15 +69601,14 @@ mod db_lifecycle_tests {
             record_test_whole_request_live_plan_backlink(pool, id, &plan_b).await;
         assert_eq!(plan_b_backlink_version, request_resource_version + 1);
 
-        // Any unrelated post-plan request edit advances the DB-owned version
-        // again. Refreshing the body to that newer version must not launder the
-        // older signed plan into fresh mutation authority.
-        sqlx::query("UPDATE requests SET justification = $2 WHERE id = $1")
+        // A non-review-basis operational mutation still advances the DB-owned
+        // version. Refreshing the body to that newer version must not launder
+        // the older signed plan into fresh mutation authority.
+        sqlx::query("UPDATE requests SET last_drift_check_at = NOW() WHERE id = $1")
             .bind(id)
-            .bind("unrelated edit after the canonical live-plan backlink")
             .execute(pool)
             .await
-            .expect("advance request version after the live-plan backlink");
+            .expect("advance request version without mutating immutable review authority");
         let stale_after_edit_version = read_global_row(pool, id).await.resource_version;
         assert_eq!(stale_after_edit_version, plan_b_backlink_version + 1);
         let stale_after_edit = requests_approve_live_apply(
@@ -69544,6 +69656,36 @@ mod db_lifecycle_tests {
         );
         let reviewed_selection =
             reviewed_plan_selection(&plan_c, &evidence_digest, mutation_request_resource_version);
+
+        // This test intentionally performs several lineage-negative controls
+        // before the legitimate mint. Refresh the independently measured site
+        // authority immediately before that final boundary so a slow CI host
+        // cannot turn the five-minute liveness window into an unrelated 409.
+        sqlx::query(
+            "UPDATE site_status \
+             SET state = 'healthy', api_status = 'up', db_status = 'up', \
+                 degradation_reason = NULL, last_check = NOW(), updated_at = NOW() \
+             WHERE site = 'DEFRA'",
+        )
+        .execute(pool)
+        .await
+        .expect("refresh whole-request LiveApply site status");
+        sqlx::query(
+            "UPDATE component_status SET status = 'up', last_check = NOW() \
+             WHERE site = 'DEFRA' AND adapter_name = 'vmware'",
+        )
+        .execute(pool)
+        .await
+        .expect("refresh whole-request LiveApply VMware status");
+        let authority_epoch: Option<i64> =
+            sqlx::query_scalar("SELECT ryuki_acquire_live_site_execution_epoch('DEFRA')")
+                .fetch_one(pool)
+                .await
+                .expect("acquire whole-request LiveApply authority epoch");
+        assert!(
+            authority_epoch.is_some(),
+            "the refreshed active site must authorize the legitimate LiveApply control"
+        );
 
         // Admin approve -> mints exactly one LiveApply job (signed grant).
         let _ = requests_approve_live_apply(
@@ -70128,7 +70270,7 @@ mod db_lifecycle_tests {
         let audited_basis: Option<i64> = sqlx::query_scalar(
             "SELECT (detail->>'approval_basis_resource_version')::bigint \
              FROM audit_log WHERE request_id = $1 AND action = 'request.reject' \
-             AND outcome = 'applied' ORDER BY created_at DESC LIMIT 1",
+             AND outcome = 'applied' ORDER BY occurred_at DESC, id DESC LIMIT 1",
         )
         .bind(id)
         .fetch_one(pool)
@@ -70148,12 +70290,11 @@ mod db_lifecycle_tests {
         };
         let id = seed_request(pool, "planned", "approve").await;
         let reviewed_resource_version = read_global_row(pool, id).await.resource_version;
-        sqlx::query("UPDATE requests SET justification = $2 WHERE id = $1")
+        sqlx::query("UPDATE requests SET last_drift_check_at = NOW() WHERE id = $1")
             .bind(id)
-            .bind("changed after rejection review")
             .execute(pool)
             .await
-            .expect("advance request resource version");
+            .expect("advance request version without mutating immutable review authority");
         let current = read_global_row(pool, id).await;
         assert!(current.resource_version > reviewed_resource_version);
 
@@ -72189,6 +72330,26 @@ mod quorum_enforcement_db_tests {
             "/../../migrations/174_request_approval_lifecycle_epoch.sql"
         ))
         .expect("read migration 174");
+        // Exercise the actual constraint-installation block from migration 174,
+        // not its one-time provenance backfill or pre-principal-registry trigger
+        // definitions. Replaying those unrelated historical sections against the
+        // shared post-199 schema can rotate surviving test fixtures and replace
+        // current trigger bodies, even though this transaction ultimately rolls
+        // back. Slicing by the unique target-constraint anchor keeps this probe
+        // both source-backed and limited to the behavior under test.
+        let constraint_guard_anchor =
+            "WHERE constraint_catalog.conname = 'requests_approval_epoch_positive'";
+        let constraint_guard_anchor_offset = sql
+            .find(constraint_guard_anchor)
+            .expect("migration 174 contains the requests constraint guard");
+        let constraint_guard_start = sql[..constraint_guard_anchor_offset]
+            .rfind("DO $$")
+            .expect("migration 174 constraint guard starts in a DO block");
+        let constraint_guard_end = sql[constraint_guard_start..]
+            .find("\n\nCREATE INDEX IF NOT EXISTS idx_rad_request_epoch")
+            .map(|offset| constraint_guard_start + offset)
+            .expect("migration 174 constraint guard ends before its index");
+        let constraint_guard_sql = &sql[constraint_guard_start..constraint_guard_end];
         let schema = format!("approval_epoch_decoy_{}", Uuid::new_v4().simple());
         let mut tx = pool.begin().await.expect("begin constraint-collision test");
 
@@ -72218,10 +72379,10 @@ mod quorum_enforcement_db_tests {
         .await
         .expect("install cross-schema decoys and remove target constraints");
 
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(constraint_guard_sql)
             .execute(&mut *tx)
             .await
-            .expect("migration must install target constraints despite decoys");
+            .expect("migration constraint guards must install targets despite decoys");
 
         let target_constraints: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
@@ -72482,7 +72643,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("an approval decision cannot be retargeted to another request");
         assert!(rekey
             .to_string()
-            .contains("approval decision identity is immutable"));
+            .contains("approval decision principal evidence is immutable"));
 
         let rewrite = sqlx::query(
             "UPDATE request_approval_decisions \
@@ -72498,7 +72659,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("decision, actor, time, and reason are immutable evidence");
         assert!(rewrite
             .to_string()
-            .contains("approval decision evidence is immutable"));
+            .contains("approval decision principal evidence is immutable"));
         let preserved: (String, String, Option<String>) = sqlx::query_as(
             "SELECT decision, actor_principal_id::text AS actor, reason \
              FROM request_approval_decisions \
@@ -72635,7 +72796,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("direct Planned -> Approved must not bypass the required quorum");
         assert!(bypass
             .to_string()
-            .contains("current-epoch role and actor quorum"));
+            .contains("request approval quorum contains stale principal authority"));
         assert_eq!(read_row(pool, id).await.status, "planned");
 
         sqlx::query(
@@ -72663,7 +72824,7 @@ mod quorum_enforcement_db_tests {
                 .expect_err("Planned -> Locked must not skip the approved predecessor");
         assert!(skipped_state
             .to_string()
-            .contains("locked state may be entered only from approved"));
+            .contains("request approval quorum contains stale principal authority"));
 
         let same_actor = sqlx::query(
             "UPDATE requests SET status = 'approved', updated_at = NOW() WHERE id = $1",
@@ -72674,7 +72835,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("two canonical roles held by one actor are not a two-party quorum");
         assert!(same_actor
             .to_string()
-            .contains("current-epoch role and actor quorum"));
+            .contains("request approval quorum contains stale principal authority"));
         assert_eq!(read_row(pool, id).await.status, "planned");
 
         cleanup(pool, id).await;
@@ -72958,7 +73119,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("approved evidence cannot precede Planned");
         assert!(early_approval
             .to_string()
-            .contains("canonical request decision order"));
+            .contains("approved decision must bind the current planned request version"));
         sqlx::query("ROLLBACK TO SAVEPOINT approval_before_planning")
             .execute(&mut *tx)
             .await
@@ -73001,7 +73162,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("rejected evidence follows the Planned -> Rejected update");
         assert!(early_rejection
             .to_string()
-            .contains("canonical request decision order"));
+            .contains("rejected decision must bind the pre-transition request version"));
         sqlx::query("ROLLBACK TO SAVEPOINT rejection_before_status")
             .execute(&mut *tx)
             .await
@@ -73088,7 +73249,7 @@ mod quorum_enforcement_db_tests {
         .expect_err("approved evidence is accepted only while Planned");
         assert!(late_approval
             .to_string()
-            .contains("canonical request decision order"));
+            .contains("approved decision must bind the current planned request version"));
         sqlx::query("ROLLBACK TO SAVEPOINT approval_after_rejection")
             .execute(&mut *tx)
             .await
@@ -73441,12 +73602,12 @@ mod quorum_enforcement_db_tests {
     }
 
     /// Two approvers racing the SAME required=2 request must both end up on the
-    /// request-row route (no lost-evidence): the engine approval is recomputed
-    /// under the FOR UPDATE lock, so whoever completes the quorum builds on the
-    /// other's already-persisted partial. Without that, the completer would
-    /// overwrite stages/route with its own stale (lockless) view and drop the
+    /// request-row route (no lost-evidence): the request lock serializes both
+    /// exact-snapshot decisions, and the completing write reconstructs its route
+    /// from their canonical immutable ledger rows. Without that merge, the
+    /// completer would persist only its own engine-produced route and drop the
     /// first approver. Driven via two concurrent handler calls; the row lock
-    /// serializes them at the DB.
+    /// serializes them at the DB without invalidating their shared review version.
     #[tokio::test]
     async fn concurrent_two_approvers_keep_both_in_route() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -73477,19 +73638,10 @@ mod quorum_enforcement_db_tests {
             requests_approve(Path(id_s.clone()), AuthExtractor(a.clone()), Json(reviewed),),
             requests_approve(Path(id_s.clone()), AuthExtractor(b.clone()), Json(reviewed),),
         );
-        assert_eq!(
-            usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
-            1,
-            "one exact reviewed snapshot wins and the other must go stale: A={ra:?}, B={rb:?}"
+        assert!(
+            ra.is_ok() && rb.is_ok(),
+            "both exact-snapshot approvals serialize and succeed: A={ra:?}, B={rb:?}"
         );
-        let retry_actor = if ra.is_err() { a } else { b };
-        let _ = requests_approve(
-            Path(id_s.clone()),
-            AuthExtractor(retry_actor),
-            reviewed_request_approval_body(&id_s).await,
-        )
-        .await
-        .expect("the stale approver can refresh and complete the quorum");
 
         // Final invariant: quorum met (approved) with BOTH approvers on the route.
         let final_row = read_row(pool, id).await;
@@ -76146,21 +76298,6 @@ mod shift_queue_db_tests {
         .await
     }
 
-    async fn registered_scoped_operator_session(
-        pool: &PgPool,
-        label: &str,
-        site: &str,
-        environment: &str,
-    ) -> AuthSession {
-        registry_backed_local_test_session(
-            pool,
-            label,
-            &[ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR],
-            &[site],
-            &[environment],
-        )
-        .await
-    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -76284,6 +76421,12 @@ mod shift_queue_db_tests {
         };
         let environment = format!("handover-page-{}", Uuid::new_v4());
         let item_type = format!("handover-page-test-{}", Uuid::new_v4());
+        let session = scoped_operator_session("alice", "DEFRA", &environment);
+        let principal = session
+            .principal_id
+            .as_ref()
+            .expect("scoped operator has an opaque principal")
+            .to_string();
         sqlx::query(
             "WITH generated AS ( \
                  SELECT gen_random_uuid() AS id, sequence \
@@ -76295,7 +76438,7 @@ mod shift_queue_db_tests {
                   source_ci_key, scope_provenance, created_at) \
              SELECT id, $1, 'Handover page item ' || sequence::text, \
                     'Bounded handover page regression', 'P2', 'alice', \
-                    'resource', 'DEFRA', $2, 'alice', id::text, \
+                    'resource', 'DEFRA', $2, $3, id::text, \
                     'scheduler-resource-v1', \
                     '2026-01-01T00:00:00Z'::timestamptz \
                         + sequence * INTERVAL '1 second' \
@@ -76303,10 +76446,10 @@ mod shift_queue_db_tests {
         )
         .bind(&item_type)
         .bind(&environment)
+        .bind(&principal)
         .execute(pool)
         .await
         .expect("seed 201 handover rows");
-        let session = scoped_operator_session("alice", "DEFRA", &environment);
 
         let Json(first) = shift_handover(
             AuthExtractor(session.clone()),
@@ -76390,6 +76533,12 @@ mod shift_queue_db_tests {
         };
         let environment = format!("handover-resolved-{}", Uuid::new_v4());
         let item_type = format!("handover-resolved-test-{}", Uuid::new_v4());
+        let session = scoped_operator_session("alice", "DEFRA", &environment);
+        let principal = session
+            .principal_id
+            .as_ref()
+            .expect("scoped operator has an opaque principal")
+            .to_string();
         sqlx::query(
             "WITH generated AS ( \
                  SELECT gen_random_uuid() AS id, sequence \
@@ -76401,7 +76550,7 @@ mod shift_queue_db_tests {
                   source_ci_key, scope_provenance, resolved, resolution, resolved_at) \
              SELECT id, $1, 'Resolved item ' || sequence::text, \
                     'Resolved handover cursor regression', 'P2', 'alice', \
-                    'resource', 'DEFRA', $2, 'alice', id::text, \
+                    'resource', 'DEFRA', $2, $3, id::text, \
                     'scheduler-resource-v1', true, \
                     'Resolution ' || sequence::text, \
                     clock_timestamp() - sequence * INTERVAL '1 minute' \
@@ -76409,10 +76558,10 @@ mod shift_queue_db_tests {
         )
         .bind(&item_type)
         .bind(&environment)
+        .bind(&principal)
         .execute(pool)
         .await
         .expect("seed resolved handover rows");
-        let session = scoped_operator_session("alice", "DEFRA", &environment);
 
         let mut resolved_after = None;
         let mut seen = std::collections::HashSet::new();
@@ -76470,6 +76619,12 @@ mod shift_queue_db_tests {
             );
         }
         let environment = format!("handover-wide-{}", Uuid::new_v4());
+        let session = scoped_operator_session("alice", "DEFRA", &environment);
+        let principal = session
+            .principal_id
+            .as_ref()
+            .expect("scoped operator has an opaque principal")
+            .to_string();
         let open_id = Uuid::new_v4();
         let resolved_id = Uuid::new_v4();
         let wide = |prefix: &str, max_chars: i32, tail: &str| {
@@ -76512,7 +76667,7 @@ mod shift_queue_db_tests {
                  (id, item_type, title, description, priority, assigned_to, \
                   visibility_kind, site, environment, owner_principal, \
                   source_ci_key, scope_provenance, escalated, escalation_reason, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'resource', 'DEFRA', $7, 'alice', \
+             VALUES ($1, $2, $3, $4, $5, $6, 'resource', 'DEFRA', $7, $9, \
                      $1::text, 'scheduler-resource-v1', true, $8, \
                      jsonb_build_object('storage_only', \
                          repeat('m', 1000000) || 'METADATA_SENTINEL'))",
@@ -76525,6 +76680,7 @@ mod shift_queue_db_tests {
         .bind(&assigned_to)
         .bind(&environment)
         .bind(&escalation_reason)
+        .bind(&principal)
         .execute(pool)
         .await
         .expect("seed wide open handover row");
@@ -76534,7 +76690,7 @@ mod shift_queue_db_tests {
                   visibility_kind, site, environment, owner_principal, \
                   source_ci_key, scope_provenance, resolved, resolution, resolved_at, metadata) \
              VALUES ($1, 'resolved-wide', $2, 'resolved description', 'P2', 'alice', \
-                     'resource', 'DEFRA', $3, 'alice', $1::text, \
+                     'resource', 'DEFRA', $3, $5, $1::text, \
                      'scheduler-resource-v1', true, $4, clock_timestamp(), \
                      jsonb_build_object('storage_only', \
                          repeat('n', 1000000) || 'RESOLVED_METADATA_SENTINEL'))",
@@ -76543,6 +76699,7 @@ mod shift_queue_db_tests {
         .bind(&title)
         .bind(&environment)
         .bind(&resolution)
+        .bind(&principal)
         .execute(pool)
         .await
         .expect("seed wide resolved handover row");
@@ -76557,7 +76714,7 @@ mod shift_queue_db_tests {
         assert!(stored_metadata_bytes > 2_000_000);
 
         let Json(body) = shift_handover(
-            AuthExtractor(scoped_operator_session("alice", "DEFRA", &environment)),
+            AuthExtractor(session),
             Query(ShiftHandoverQuery {
                 limit: Some(1),
                 open_after: None,
@@ -77004,30 +77161,33 @@ mod shift_queue_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let id = "e0000291-0000-0000-0000-000000000009";
-        // Insert an item with a created_at 5 hours ago so it qualifies as stale.
-        sqlx::query(
-            "INSERT INTO shift_queue \
-             (id, item_type, title, description, priority, created_at, \
-              visibility_kind, site, source_ci_key, scope_provenance) \
-             VALUES ($1::uuid, 'blocked-request', 'Stale DB test', 'desc', 'P3', \
-                     NOW() - INTERVAL '5 hours', 'resource', 'DEFRA', $1::text, \
-                     'scheduler-resource-v1') \
-             ON CONFLICT (id) DO NOTHING",
+        let id = Uuid::new_v4().to_string();
+        let environment = format!("shift-stale-{}", Uuid::new_v4());
+        seed_scoped_item(
+            pool,
+            &id,
+            "blocked-request",
+            "P3",
+            None,
+            "DEFRA",
+            Some(environment.as_str()),
+            None,
+            "2020-01-01T00:00:00Z",
         )
-        .bind(id)
-        .execute(pool)
-        .await
-        .expect("seed stale item");
+        .await;
 
         let Json(body) = shift_stale(
-            AuthExtractor(approver_session("stale-reader")),
+            AuthExtractor(scoped_operator_session(
+                "stale-reader",
+                "DEFRA",
+                &environment,
+            )),
             Query(ShiftPageQuery::default()),
         )
         .await
         .expect("stale list must succeed");
 
-        cleanup_item(pool, id).await;
+        cleanup_item(pool, &id).await;
 
         assert_eq!(body["source"], "database");
         let items = body["items"].as_array().expect("items array");
@@ -77513,6 +77673,13 @@ mod shift_queue_db_tests {
         let environment = format!("shift-production-{}", Uuid::new_v4());
         let other_environment = format!("shift-development-{}", Uuid::new_v4());
         let item_type = format!("scope-test-{}", Uuid::new_v4());
+        let session = scoped_operator_session("alice", &site, &environment);
+        let alice_principal = session
+            .principal_id
+            .as_ref()
+            .expect("scoped operator has an opaque principal")
+            .to_string();
+        let bob_principal = test_principal_id("shift-scope-bob").to_string();
         let allowed_a = Uuid::new_v4().to_string();
         let allowed_b = Uuid::new_v4().to_string();
         let foreign = Uuid::new_v4().to_string();
@@ -77524,7 +77691,7 @@ mod shift_queue_db_tests {
                 allowed_a.as_str(),
                 site.as_str(),
                 environment.as_str(),
-                Some("alice"),
+                Some(alice_principal.as_str()),
             ),
             (
                 allowed_b.as_str(),
@@ -77548,7 +77715,7 @@ mod shift_queue_db_tests {
                 wrong_owner.as_str(),
                 site.as_str(),
                 environment.as_str(),
-                Some("bob"),
+                Some(bob_principal.as_str()),
             ),
         ] {
             seed_scoped_item(
@@ -77556,7 +77723,7 @@ mod shift_queue_db_tests {
                 id,
                 &item_type,
                 "P2",
-                Some("alice"),
+                Some(alice_principal.as_str()),
                 row_site,
                 Some(environment),
                 owner,
@@ -77568,15 +77735,15 @@ mod shift_queue_db_tests {
             "INSERT INTO shift_queue \
              (id, item_type, title, description, priority, assigned_to, metadata, created_at) \
              VALUES ($1::uuid, $2, 'Metadata-only scope', 'must stay quarantined', 'P2', \
-                     'alice', $3::jsonb, '2020-01-01T00:00:00Z'::timestamptz)",
+                     $3, $4::jsonb, '2020-01-01T00:00:00Z'::timestamptz)",
         )
         .bind(&metadata_only)
         .bind(&item_type)
+        .bind(&alice_principal)
         .bind(json!({"site": &site, "environment": &environment}).to_string())
         .execute(pool)
         .await
         .expect("seed metadata-only quarantined row");
-        let session = scoped_operator_session("alice", &site, &environment);
 
         let Json(summary_first) = shift_summary(
             AuthExtractor(session.clone()),
@@ -77630,7 +77797,7 @@ mod shift_queue_db_tests {
         )
         .await
         .expect("scoped my-items");
-        assert_eq!(mine["user"], "alice");
+        assert_eq!(mine["user"], alice_principal);
         assert_eq!(mine["count"], 1);
         assert_eq!(mine["has_more"], true);
 
@@ -77821,6 +77988,11 @@ mod shift_queue_db_tests {
             .await;
         }
         let admin = approver_session("shift-global-admin");
+        let admin_principal = admin
+            .principal_id
+            .as_ref()
+            .expect("global admin has an opaque principal")
+            .to_string();
 
         let Json(assigned) = shift_assign(
             Path(assign_id.clone()),
@@ -77831,7 +78003,7 @@ mod shift_queue_db_tests {
         )
         .await
         .expect("global verified-human admin assignment");
-        assert_eq!(assigned["assigned_by"], "shift-global-admin");
+        assert_eq!(assigned["assigned_by"], admin_principal);
         assert_eq!(assigned["assigned_to"], "operations-team");
 
         let Json(resolved) = shift_resolve(
@@ -78262,9 +78434,13 @@ mod shift_queue_db_tests {
     }
 
     async fn list_body(params: super::ShiftListParams) -> serde_json::Value {
-        // static_dry_run holds admin → satisfies the handler's execute check.
         let Json(body) = super::shift_list(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(verified_human_session(
+                "shift-list-reader",
+                &[ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR],
+                &[],
+                &[],
+            )),
             super::Query(params),
         )
         .await
@@ -78494,13 +78670,7 @@ mod shift_queue_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let role_session = |role: &str| {
-            let mut s = AuthSession::static_dry_run();
-            bind_test_principal(&mut s, "shift-reader");
-            s.provider_mode = "local".into();
-            s.roles = vec![role.to_string()];
-            s
-        };
+        let role_session = |role: &str| verified_human_session("shift-reader", &[role], &[], &[]);
 
         // Auditor (holds `audit`, not `execute`) → 403.
         let Err((status, _)) = super::shift_list(
@@ -78795,7 +78965,7 @@ mod secrets_rotation_db_tests {
         let res = secrets_deregister(AuthExtractor(caller), Path(id.into())).await;
         let from_status: Option<String> = sqlx::query_scalar(
             "SELECT from_status FROM audit_log \
-             WHERE action = 'secret-deregister' AND detail->>'secret_id' = $1 \
+             WHERE action = 'secret-deregister' AND detail->>'resource_id' = $1 \
              ORDER BY id DESC LIMIT 1",
         )
         .bind(id)
@@ -79154,7 +79324,7 @@ mod secrets_rotation_db_tests {
         let row = sqlx::query_as::<_, (String, String, String, String)>(
             "SELECT action, actor_principal, to_status, detail::text \
              FROM audit_log WHERE action = 'secret-rotate' \
-               AND detail->>'secret_id' = $1 ORDER BY id DESC LIMIT 1",
+               AND detail->>'resource_id' = $1 ORDER BY id DESC LIMIT 1",
         )
         .bind(id)
         .fetch_optional(pool)
@@ -79411,7 +79581,7 @@ mod secrets_rotation_db_tests {
         // NEVER leaking the vault path / secret material.
         let (audit_actor, audit_detail) = sqlx::query_as::<_, (String, String)>(
             "SELECT actor_principal, detail::text FROM audit_log \
-             WHERE action = 'secret-register' AND detail->>'secret_id' = $1 \
+             WHERE action = 'secret-register' AND detail->>'resource_id' = $1 \
              ORDER BY id DESC LIMIT 1",
         )
         .bind(new_id)
@@ -88058,10 +88228,11 @@ mod software_deployment_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        let maker = registered_session(pool, "software-invalid-target-maker", &[], &[]).await;
 
         let missing_server = format!("srv-missing-{}", Uuid::new_v4());
         let missing = software_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(maker.clone()),
             Json(plan_body(&missing_server)),
         )
         .await
@@ -88076,12 +88247,9 @@ mod software_deployment_db_tests {
             let server = format!("srv-{label}-{}", Uuid::new_v4());
             let site = unique_site("SOFTWARE-INVALID-TARGET");
             seed_target(pool, &server, &site, environment, ci_type, active).await;
-            let result = software_plan(
-                AuthExtractor(AuthSession::static_dry_run()),
-                Json(plan_body(&server)),
-            )
-            .await
-            .expect_err("invalid authoritative target must fail closed");
+            let result = software_plan(AuthExtractor(maker.clone()), Json(plan_body(&server)))
+                .await
+                .expect_err("invalid authoritative target must fail closed");
             assert_eq!(result.0, StatusCode::NOT_FOUND, "unexpected {label} status");
             let persisted: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM software_deployments WHERE server_name = $1",
@@ -88107,12 +88275,10 @@ mod software_deployment_db_tests {
         let server = format!("srv-target-drift-{}", Uuid::new_v4());
         let site = unique_site("SOFTWARE-DRIFT");
         seed_target(pool, &server, &site, Some("production"), "Server", true).await;
-        let Json(planned) = software_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&server)),
-        )
-        .await
-        .expect("plan authoritative target");
+        let maker = registered_session(pool, "software-target-drift-maker", &[], &[]).await;
+        let Json(planned) = software_plan(AuthExtractor(maker.clone()), Json(plan_body(&server)))
+            .await
+            .expect("plan authoritative target");
         let id = planned["id"].as_str().expect("deployment id").to_string();
 
         let rebind_error =
@@ -88132,7 +88298,7 @@ mod software_deployment_db_tests {
             .expect("deactivate authoritative target site");
         let inactive = software_approve(
             Path(id.clone()),
-            AuthExtractor(approver_session("inactive-site-checker")),
+            AuthExtractor(registered_session(pool, "inactive-site-checker", &[], &[]).await),
         )
         .await
         .expect_err("inactive target site must quarantine lifecycle transition");
@@ -88146,12 +88312,10 @@ mod software_deployment_db_tests {
         assert!(inactive_direct
             .to_string()
             .contains("software deployment requires an exact active CMDB target relation"));
-        let Json(inactive_history) = software_history(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(server.clone()),
-        )
-        .await
-        .expect("inactive history is non-enumerating");
+        let Json(inactive_history) =
+            software_history(AuthExtractor(maker.clone()), Path(server.clone()))
+                .await
+                .expect("inactive history is non-enumerating");
         assert_eq!(inactive_history, json!([]));
 
         sqlx::query("UPDATE site_registry SET active = true WHERE unlocode = $1")
@@ -88166,7 +88330,7 @@ mod software_deployment_db_tests {
             .expect("change current target authority");
         let changed = software_approve(
             Path(id.clone()),
-            AuthExtractor(approver_session("changed-target-checker")),
+            AuthExtractor(registered_session(pool, "changed-target-checker", &[], &[]).await),
         )
         .await
         .expect_err("changed CMDB tuple must not re-authorize persisted plan");
@@ -88180,12 +88344,9 @@ mod software_deployment_db_tests {
         assert!(changed_direct
             .to_string()
             .contains("software deployment requires an exact active CMDB target relation"));
-        let Json(changed_history) = software_history(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(server.clone()),
-        )
-        .await
-        .expect("changed-target history is non-enumerating");
+        let Json(changed_history) = software_history(AuthExtractor(maker), Path(server.clone()))
+            .await
+            .expect("changed-target history is non-enumerating");
         assert_eq!(changed_history, json!([]));
         let status: String =
             sqlx::query_scalar("SELECT status FROM software_deployments WHERE id = $1")
@@ -88263,11 +88424,8 @@ mod software_deployment_db_tests {
         let server = format!("srv-cas-{}", uuid::Uuid::new_v4());
         let site = unique_site("SOFTWARE-CAS");
         seed_target(pool, &server, &site, Some("production"), "Server", true).await;
-        let Ok(Json(planned)) = software_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&server)),
-        )
-        .await
+        let maker = registered_session(pool, "software-cas-maker", &[], &[]).await;
+        let Ok(Json(planned)) = software_plan(AuthExtractor(maker), Json(plan_body(&server))).await
         else {
             panic!("plan failed");
         };
@@ -88276,7 +88434,7 @@ mod software_deployment_db_tests {
         // First approve: OK.
         let Ok(_) = software_approve(
             Path(id.clone()),
-            AuthExtractor(approver_session("approver-1")),
+            AuthExtractor(registered_session(pool, "software-cas-approver-1", &[], &[]).await),
         )
         .await
         else {
@@ -88289,7 +88447,7 @@ mod software_deployment_db_tests {
         // we expect an Err.
         let Err(_) = software_approve(
             Path(id.clone()),
-            AuthExtractor(approver_session("approver-2")),
+            AuthExtractor(registered_session(pool, "software-cas-approver-2", &[], &[]).await),
         )
         .await
         else {
@@ -88317,6 +88475,11 @@ mod software_deployment_db_tests {
         let site = unique_site("SOFTWARE-DIRECT");
         let configuration_item_id =
             seed_target(pool, &server, &site, Some("production"), "Server", true).await;
+        let maker = registered_session(pool, "software-direct-maker", &[], &[]).await;
+        let maker_principal = maker
+            .principal_id
+            .expect("direct-row maker has an opaque principal")
+            .to_string();
         sqlx::query(
             "INSERT INTO software_deployments \
              (id, configuration_item_id, scope_provenance, server_name, site, \
@@ -88325,47 +88488,42 @@ mod software_deployment_db_tests {
               evidence_json) \
              VALUES ($1, $2, 'cmdb-configuration-item', $3, $4, 'production', \
                      'pkg-zabbix-agent', 'Zabbix Agent 7.0', '7.0.4', \
-                     '2099-12-31T22:00:00Z', 'db-tester', 'db-tester', \
+                     '2099-12-31T22:00:00Z', $5, $5, \
                      'Planned', NULL, '[]'::jsonb)",
         )
         .bind(&id)
         .bind(configuration_item_id)
         .bind(&server)
         .bind(&site)
+        .bind(&maker_principal)
         .execute(pool)
         .await
         .expect("direct SQL insert");
 
         // Approve.
-        let Ok(Json(approved)) = software_approve(
-            Path(id.clone()),
-            AuthExtractor(approver_session("db-approver")),
-        )
-        .await
+        let checker = registered_session(pool, "software-direct-checker", &[], &[]).await;
+        let checker_principal = checker
+            .principal_id
+            .expect("direct-row checker has an opaque principal")
+            .to_string();
+        let Ok(Json(approved)) = software_approve(Path(id.clone()), AuthExtractor(checker)).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("approve on direct-insert row must succeed");
         };
         assert_eq!(approved["status"], "Approved");
-        assert_eq!(approved["approved_by"], "db-approver");
+        assert_eq!(approved["approved_by"], checker_principal);
 
         // Execute.
-        let Ok(Json(_executed)) = software_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(_executed)) =
+            software_execute(AuthExtractor(maker.clone()), Path(id.clone())).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("execute on direct-insert row must succeed");
         };
 
         // Verify.
-        let Ok(Json(verified)) = software_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(verified)) = software_verify(AuthExtractor(maker), Path(id.clone())).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("verify on direct-insert row must succeed");
@@ -90602,15 +90760,22 @@ mod snapshots_db_tests {
             support_group: "expiry-order-group".into(),
             change_context: "typed expiry ordering regression".into(),
         };
+        let operator = registered_session(
+            pool,
+            "snapshot-expiry-order-operator",
+            &[&site],
+            &["production"],
+        )
+        .await;
 
         let Json(later_expiry) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(plan("created first", "2021-01-01T00:00:00Z")),
         )
         .await
         .expect("plan later-expiry snapshot first");
         let Json(earlier_expiry) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(plan("created second", "2020-01-01T00:00:00Z")),
         )
         .await
@@ -90790,17 +90955,14 @@ mod snapshots_db_tests {
             support_group: "test-sg".into(),
             change_context: "remediate test".into(),
         };
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(past_body),
-        )
-        .await
+        let operator = registered_session(pool, "snapshot-remediation-operator", &[], &[]).await;
+        let Ok(Json(created)) =
+            snapshot_plan(AuthExtractor(operator.clone()), Json(past_body)).await
         else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let operator = registered_session(pool, "snapshot-remediation-operator", &[], &[]).await;
         if snapshot_flag_stale(AuthExtractor(operator.clone()))
             .await
             .is_err()
@@ -90845,20 +91007,18 @@ mod snapshots_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let ci_name = format!("ci-test-{suffix}");
         seed_ci(pool, &ci_name, "SNAP-A", Some("production")).await;
+        let operator = registered_session(pool, "snapshot-remediation-negative", &[], &[]).await;
 
         // Future expiry -> stays Draft (flag-stale would not touch it).
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            snapshot_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         let Err((status, _)) = snapshot_remediate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(SnapshotActionRequest {
                 snapshot_id: id.clone(),
             }),
@@ -90893,12 +91053,10 @@ mod snapshots_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let ci_name = format!("ci-test-{suffix}");
         seed_ci(pool, &ci_name, "SNAP-A", Some("production")).await;
+        let planner = registered_session(pool, "snapshot-cas-planner", &[], &[]).await;
 
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            snapshot_plan(AuthExtractor(planner), Json(plan_body(&suffix))).await
         else {
             panic!("snapshot_plan failed");
         };
@@ -90913,7 +91071,7 @@ mod snapshots_db_tests {
 
         // Advance it to ReviewRequested through the normal path.
         if snapshot_review(
-            AuthExtractor(scoped_session("snapshot-reviewer", &[], &[])),
+            AuthExtractor(registered_session(pool, "snapshot-cas-reviewer", &[], &[]).await),
             Json(SnapshotActionRequest {
                 snapshot_id: id.clone(),
             }),
@@ -90962,21 +91120,17 @@ mod snapshots_db_tests {
             support_group: "test-sg".into(),
             change_context: "stale test".into(),
         };
+        let operator = registered_session(pool, "snapshot-stale-operator", &[], &[]).await;
 
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(past_body),
-        )
-        .await
+        let Ok(Json(created)) =
+            snapshot_plan(AuthExtractor(operator.clone()), Json(past_body)).await
         else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // Call the no-body flag-stale endpoint.
-        let Ok(Json(flagged_list)) =
-            snapshot_flag_stale(AuthExtractor(AuthSession::static_dry_run())).await
-        else {
+        let Ok(Json(flagged_list)) = snapshot_flag_stale(AuthExtractor(operator)).await else {
             cleanup(pool, &id, &ci_name).await;
             panic!("snapshot_flag_stale failed");
         };
@@ -91016,11 +91170,18 @@ mod snapshots_db_tests {
         let ci_name = format!("ci-stale-claim-{suffix}");
         let site = format!("SNAP-CLAIM-{suffix}");
         seed_ci(pool, &ci_name, &site, Some("production")).await;
+        let operator = registered_session(
+            pool,
+            "snapshot-stale-claim-operator",
+            &[&site],
+            &["production"],
+        )
+        .await;
 
         let mut ids = Vec::new();
         for label in ["a", "b"] {
             let Ok(Json(created)) = snapshot_plan(
-                AuthExtractor(AuthSession::static_dry_run()),
+                AuthExtractor(operator.clone()),
                 Json(SnapshotPlanRequest {
                     platform_ci_key: ci_name.clone(),
                     snapshot_purpose: format!("stale claim {label}"),
@@ -91129,49 +91290,51 @@ mod snapshots_db_tests {
             support_group: "descriptive-group-only".into(),
             change_context: "two-site authorization regression".into(),
         };
-        let scoped_a = || scoped_session("snapshot-operator-a", &[&site_a], &["production"]);
+        let scoped_a =
+            registered_session(pool, "snapshot-operator-a", &[&site_a], &["production"]).await;
+        let scoped_a_principal = scoped_a
+            .principal_id
+            .expect("site-A operator has an opaque principal")
+            .to_string();
+        let unrestricted =
+            registered_session(pool, "snapshot-unrestricted-operator", &[], &[]).await;
 
         // C361: a scoped principal cannot create governance state for a known
         // foreign CI, and an unknown environment never behaves like a wildcard.
-        let foreign_plan = snapshot_plan(AuthExtractor(scoped_a()), Json(body(&ci_b)))
+        let foreign_plan = snapshot_plan(AuthExtractor(scoped_a.clone()), Json(body(&ci_b)))
             .await
             .expect_err("site-A principal must not plan for site B");
         assert_eq!(foreign_plan.0, StatusCode::FORBIDDEN);
         let unresolved_environment_plan =
-            snapshot_plan(AuthExtractor(scoped_a()), Json(body(&ci_unknown_env)))
+            snapshot_plan(AuthExtractor(scoped_a.clone()), Json(body(&ci_unknown_env)))
                 .await
                 .expect_err("environment-scoped principal must fail closed on NULL environment");
         assert_eq!(unresolved_environment_plan.0, StatusCode::FORBIDDEN);
         let foreign_environment_plan =
-            snapshot_plan(AuthExtractor(scoped_a()), Json(body(&ci_dev)))
+            snapshot_plan(AuthExtractor(scoped_a.clone()), Json(body(&ci_dev)))
                 .await
                 .expect_err("production principal must not plan for a development CI");
         assert_eq!(foreign_environment_plan.0, StatusCode::FORBIDDEN);
         let unknown_site_plan = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(unrestricted.clone()),
             Json(body(&ci_unknown_site)),
         )
         .await
         .expect_err("unknown-site CI must fail closed before persistence");
         assert_eq!(unknown_site_plan.0, StatusCode::NOT_FOUND);
 
-        let Json(created_a) = snapshot_plan(AuthExtractor(scoped_a()), Json(body(&ci_a)))
+        let Json(created_a) = snapshot_plan(AuthExtractor(scoped_a.clone()), Json(body(&ci_a)))
             .await
             .expect("site-A operator plans its own CI");
-        let Json(created_b) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(body(&ci_b)),
-        )
-        .await
-        .expect("unrestricted operator plans site B");
-        let Json(created_dev) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(body(&ci_dev)),
-        )
-        .await
-        .expect("unrestricted operator plans development snapshot");
+        let Json(created_b) = snapshot_plan(AuthExtractor(unrestricted.clone()), Json(body(&ci_b)))
+            .await
+            .expect("unrestricted operator plans site B");
+        let Json(created_dev) =
+            snapshot_plan(AuthExtractor(unrestricted.clone()), Json(body(&ci_dev)))
+                .await
+                .expect("unrestricted operator plans development snapshot");
         let Json(created_null_env) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(unrestricted.clone()),
             Json(body(&ci_unknown_env)),
         )
         .await
@@ -91190,7 +91353,7 @@ mod snapshots_db_tests {
         assert_eq!(created_a["environment"].as_str(), Some("production"));
         assert_eq!(
             created_a["created_by"].as_str(),
-            Some("snapshot-operator-a")
+            Some(scoped_a_principal.as_str())
         );
         assert_eq!(
             created_a["scope_provenance"].as_str(),
@@ -91227,7 +91390,7 @@ mod snapshots_db_tests {
             "inactive sites must be quarantined even from an unscoped reader"
         );
         let inactive_review = snapshot_review(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Json(SnapshotActionRequest {
                 snapshot_id: id_a.clone(),
             }),
@@ -91279,7 +91442,7 @@ mod snapshots_db_tests {
             .execute(pool)
             .await
             .expect("move CI A to canonical site B");
-        let old_site_session = scoped_a();
+        let old_site_session = scoped_a.clone();
         assert!(crate::repos::snapshots::get_authorized(
             pool,
             &id_a,
@@ -91311,7 +91474,7 @@ mod snapshots_db_tests {
 
         // C106: the row page and X-Total-Count use the same authorized relation.
         let (headers, Json(records)) = snapshot_records_list(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Query(AdminListPage {
                 limit: Some(100),
                 offset: Some(0),
@@ -91344,11 +91507,11 @@ mod snapshots_db_tests {
 
         // C108/C109: foreign and missing IDs have the same non-enumerating 404,
         // while an authorized same-site validation remains functional.
-        let foreign_get = snapshot_record_get(AuthExtractor(scoped_a()), Path(id_b.clone()))
+        let foreign_get = snapshot_record_get(AuthExtractor(scoped_a.clone()), Path(id_b.clone()))
             .await
             .expect_err("foreign detail must be hidden");
         let missing_get = snapshot_record_get(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Path(uuid::Uuid::new_v4().to_string()),
         )
         .await
@@ -91365,19 +91528,21 @@ mod snapshots_db_tests {
             "foreign and missing responses must have the same shape"
         );
         let Json(same_site_detail) =
-            snapshot_record_get(AuthExtractor(scoped_a()), Path(id_a.clone()))
+            snapshot_record_get(AuthExtractor(scoped_a.clone()), Path(id_a.clone()))
                 .await
                 .expect("same-site detail remains available");
         assert_eq!(same_site_detail["id"].as_str(), Some(id_a.as_str()));
         for restricted_id in [&id_dev, &id_null_env] {
-            let restricted_detail =
-                snapshot_record_get(AuthExtractor(scoped_a()), Path(restricted_id.to_string()))
-                    .await
-                    .expect_err("foreign or unresolved environment detail must be hidden");
+            let restricted_detail = snapshot_record_get(
+                AuthExtractor(scoped_a.clone()),
+                Path(restricted_id.to_string()),
+            )
+            .await
+            .expect_err("foreign or unresolved environment detail must be hidden");
             assert_eq!(restricted_detail.0, StatusCode::NOT_FOUND);
         }
         let foreign_validate = snapshot_validate(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Json(SnapshotActionRequest {
                 snapshot_id: id_b.clone(),
             }),
@@ -91387,7 +91552,7 @@ mod snapshots_db_tests {
         assert_eq!(foreign_validate.0, StatusCode::NOT_FOUND);
         for restricted_id in [&id_dev, &id_null_env] {
             let restricted_validate = snapshot_validate(
-                AuthExtractor(scoped_a()),
+                AuthExtractor(scoped_a.clone()),
                 Json(SnapshotActionRequest {
                     snapshot_id: restricted_id.to_string(),
                 }),
@@ -91397,7 +91562,7 @@ mod snapshots_db_tests {
             assert_eq!(restricted_validate.0, StatusCode::NOT_FOUND);
         }
         let _ = snapshot_validate(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Json(SnapshotActionRequest {
                 snapshot_id: id_a.clone(),
             }),
@@ -91408,7 +91573,7 @@ mod snapshots_db_tests {
         // C110: foreign review returns 404 before lifecycle evaluation, writes
         // neither state nor a success audit, and same-site review still works.
         let foreign_review = snapshot_review(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Json(SnapshotActionRequest {
                 snapshot_id: id_b.clone(),
             }),
@@ -91431,7 +91596,7 @@ mod snapshots_db_tests {
         assert!(!foreign_review_audit);
         for restricted_id in [&id_dev, &id_null_env] {
             let restricted_review = snapshot_review(
-                AuthExtractor(scoped_a()),
+                AuthExtractor(scoped_a.clone()),
                 Json(SnapshotActionRequest {
                     snapshot_id: restricted_id.to_string(),
                 }),
@@ -91445,7 +91610,7 @@ mod snapshots_db_tests {
             );
         }
         let _ = snapshot_review(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Json(SnapshotActionRequest {
                 snapshot_id: id_a.clone(),
             }),
@@ -91454,7 +91619,7 @@ mod snapshots_db_tests {
         .expect("same-site review remains available");
 
         // C107: a site-A stale sweep cannot transition the eligible site-B row.
-        let _ = snapshot_flag_stale(AuthExtractor(scoped_a()))
+        let _ = snapshot_flag_stale(AuthExtractor(scoped_a.clone()))
             .await
             .expect("scoped stale sweep");
         assert_eq!(
@@ -91476,7 +91641,7 @@ mod snapshots_db_tests {
         // C111: a foreign remediation lookup is a 404 and leaves state/audit
         // unchanged. Use an unrestricted sweep to make B legitimately eligible,
         // then prove the site-A principal still cannot plan its remediation.
-        let _ = snapshot_flag_stale(AuthExtractor(AuthSession::static_dry_run()))
+        let _ = snapshot_flag_stale(AuthExtractor(unrestricted))
             .await
             .expect("unrestricted stale sweep");
         assert_eq!(
@@ -91489,7 +91654,7 @@ mod snapshots_db_tests {
                 ryuki_engine::models::SnapshotStatus::StaleFlagged
             );
             let restricted_remediate = snapshot_remediate(
-                AuthExtractor(scoped_a()),
+                AuthExtractor(scoped_a.clone()),
                 Json(SnapshotActionRequest {
                     snapshot_id: restricted_id.to_string(),
                 }),
@@ -91503,7 +91668,7 @@ mod snapshots_db_tests {
             );
         }
         let foreign_remediate = snapshot_remediate(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a.clone()),
             Json(SnapshotActionRequest {
                 snapshot_id: id_b.clone(),
             }),
@@ -91525,7 +91690,7 @@ mod snapshots_db_tests {
         .expect("query foreign remediation audit");
         assert!(!foreign_remediation_audit);
         let _ = snapshot_remediate(
-            AuthExtractor(scoped_a()),
+            AuthExtractor(scoped_a),
             Json(SnapshotActionRequest {
                 snapshot_id: id_a.clone(),
             }),
@@ -92296,10 +92461,11 @@ mod backup_restore_db_tests {
         assert_eq!(inactive_source.0, StatusCode::NOT_FOUND);
         set_restore_site_active(pool, &source_site, true).await;
 
+        let alternate_restore_point = "2026-06-10T03:00:00Z";
         let second_source = seed_authorized_restore_source(
             pool,
-            &format!("other-restore-source-{}", Uuid::new_v4()),
-            restore_point,
+            &source_ci_key,
+            alternate_restore_point,
             &source_site,
             "production",
         )
@@ -92335,12 +92501,19 @@ mod backup_restore_db_tests {
 
         let forged_rebind = sqlx::query(
             "UPDATE restore_requests \
-             SET source_configuration_item_id = $2, restore_point_id = $3 \
+             SET source_ci_key = $2, restore_point = $3, \
+                 source_configuration_item_id = $4, restore_point_id = $5, \
+                 source_site = $6, source_environment = $7, \
+                 source_scope_provenance = 'backup-restore-point' \
              WHERE id = $1::uuid",
         )
         .bind(&id)
+        .bind(&source_ci_key)
+        .bind(alternate_restore_point)
         .bind(second_source.configuration_item_id)
         .bind(second_source.restore_point_id)
+        .bind(&source_site)
+        .bind("production")
         .execute(pool)
         .await
         .expect_err("persisted source authority must be immutable");
@@ -93239,7 +93412,7 @@ mod backup_restore_db_tests {
                 .expect_err("verified restore target provenance must be immutable");
         assert!(target_rebind
             .to_string()
-            .contains("verified restore authority tuple and planner are immutable"));
+            .contains("verified restore target authority is immutable"));
 
         set_restore_site_active(pool, &site, false).await;
         let inactive_site_approver = registered_admin_session(pool, "inactive-site-approver").await;
