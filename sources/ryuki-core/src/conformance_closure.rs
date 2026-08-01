@@ -49,7 +49,7 @@ const CONTROL_TRACE_SCHEMA: &str =
 const CONTROL_TRACE_DOCUMENT_ID: &str = "control-trace:ryuki-security-boundary-v1";
 const CONTROL_TRACE_LEDGER_ID: &str = "ryuki-security-boundary";
 const CANONICAL_CONTROL_SET_DIGEST: &str =
-    "sha256:9e4ad7fdf00ec7bc98a1e896ea4460e32351ab05ffca4524f39dcdc8880ae351";
+    "sha256:1dbc47952424a4d10ae63ec5c6f0b67ed6df64a955f09ad0391f9ae091a231b2";
 const CANONICAL_CASE_SET_DIGEST: &str =
     "sha256:e85db6dbcc2bb50045b712d264feb918e8ecd7f60750873b5b5fc5d8a6bc8002";
 const MAX_LEDGER_ROWS: usize = 4096;
@@ -5830,13 +5830,13 @@ pub mod tests {
             &claims,
         )
         .map_err(|error| error.to_string())?;
-        assert_eq!(applicability.instances.len(), 143);
+        assert_eq!(applicability.instances.len(), 148);
         let implementation_count = applicability
             .instances
             .iter()
             .filter(|instance| instance.scope == ApplicabilityScope::Implementation)
             .count();
-        assert_eq!(implementation_count, 138);
+        assert_eq!(implementation_count, 143);
         manifest.implementation_applicability = recompute_applicability_inventory_binding(
             &crate::conformance_applicability::ApplicabilityControlTraceBinding {
                 document_id: preliminary_profile.control_trace_ref.document_id.clone(),
@@ -6298,7 +6298,7 @@ pub mod tests {
         .map_err(|error| error.to_string())
     }
 
-    /// Builds the same genuinely signed 143-instance closure used by the core
+    /// Builds the same genuinely signed 148-instance closure used by the core
     /// acceptance test and returns its exact bound profile representation.
     ///
     /// This is feature-gated test support so downstream startup-composition
@@ -6313,12 +6313,12 @@ pub mod tests {
     }
 
     #[test]
-    fn public_entrypoint_accepts_one_genuine_opaque_143_instance_closure() {
+    fn public_entrypoint_accepts_one_genuine_opaque_148_instance_closure() {
         let closure = verify_public_fixture(PublicFixtureMutation::None)
             .expect("the public closure boundary must accept one exact authenticated fixture");
         assert_eq!(closure.package_count(), 10);
-        assert_eq!(closure.evidence_count(), 143);
-        assert_eq!(closure.applicability_instances().len(), 143);
+        assert_eq!(closure.evidence_count(), 148);
+        assert_eq!(closure.applicability_instances().len(), 148);
         assert_eq!(closure.runtime_guard_requirements().len(), 8);
         for requirement in closure.runtime_guard_requirements() {
             assert_eq!(

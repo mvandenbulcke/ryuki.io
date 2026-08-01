@@ -2730,20 +2730,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_subjects_across_provider_or_issuer_get_distinct_principals() {
+    async fn db_identical_subjects_across_provider_or_issuer_get_distinct_principals() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             return;
         };
+        let origin_a = test_browser_origin();
+        let origin_b = test_browser_origin();
+        reconcile_test_authenticator_runtime(pool, &origin_a)
+            .await
+            .expect("publish first canonical authenticator origin");
+        reconcile_test_authenticator_runtime(pool, &origin_b)
+            .await
+            .expect("publish second canonical authenticator origin");
+        let provider_a = origin_a.provider_id();
+        let provider_b = origin_b.provider_id();
+        assert_ne!(provider_a, provider_b);
         let suffix = Uuid::new_v4();
         let subject = format!("shared-subject-{suffix}");
         let issuer_a = format!("urn:ryuki:test:issuer-a:{suffix}");
         let issuer_b = format!("urn:ryuki:test:issuer-b:{suffix}");
         let roles = vec!["Auditor".to_string()];
         for (provider, issuer) in [
-            ("oidc", issuer_a.as_str()),
-            ("oidc", issuer_b.as_str()),
-            ("entra-id", issuer_a.as_str()),
+            (provider_a, issuer_a.as_str()),
+            (provider_a, issuer_b.as_str()),
+            (provider_b, issuer_a.as_str()),
         ] {
             provision_global_assignment(pool, provider, issuer, &subject, &roles).await;
         }
@@ -2752,12 +2763,14 @@ mod tests {
             "SELECT l.principal_id FROM principal_keys k \
              JOIN principal_links l ON l.principal_key_id = k.principal_key_id \
              WHERE k.subject = $1 AND ( \
-               (k.provider_id = 'oidc' AND k.issuer = $2) OR \
-               (k.provider_id = 'oidc' AND k.issuer = $3) OR \
-               (k.provider_id = 'entra-id' AND k.issuer = $2) \
+               (k.provider_id = $2 AND k.issuer = $4) OR \
+               (k.provider_id = $2 AND k.issuer = $5) OR \
+               (k.provider_id = $3 AND k.issuer = $4) \
              ) ORDER BY k.provider_id, k.issuer",
         )
         .bind(&subject)
+        .bind(provider_a)
+        .bind(provider_b)
         .bind(&issuer_a)
         .bind(&issuer_b)
         .fetch_all(pool)
@@ -2775,13 +2788,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_revoke_tombstones_the_binding_and_never_relinks_it() {
+    async fn db_lifecycle_revoke_tombstones_the_binding_and_never_relinks_it() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             return;
         };
         let session = session_config();
-        let provider = "passkey";
+        let authenticator_origin = test_browser_origin();
+        reconcile_test_authenticator_runtime(pool, &authenticator_origin)
+            .await
+            .expect("publish canonical authenticator origin");
+        let provider = authenticator_origin.provider_id();
         let issuer = format!("urn:ryuki:test:tombstone:{}", Uuid::new_v4());
         let subject = format!("tombstoned-subject-{}", Uuid::new_v4());
         let roles = vec!["Auditor".to_string()];
@@ -3710,7 +3727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assignment_revoke_and_lifecycle_revoke_serialize_without_deadlock() {
+    async fn db_assignment_revoke_and_lifecycle_revoke_serialize_without_deadlock() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             return;
@@ -3807,7 +3824,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(states, ("revoked".to_string(), "revoked".to_string()));
+        assert_eq!(states, ("tombstoned".to_string(), "tombstoned".to_string()));
         cleanup_identity(pool, &provider, issuer, &subject).await;
     }
 

@@ -6844,109 +6844,117 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let mut tx = pool.begin().await.unwrap();
-        let scan_epoch: bool = sqlx::query_scalar(
-            "SELECT active_epoch FROM certificate_expiry_scan_state WHERE singleton",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
         let valid_to = chrono::Utc::now() - chrono::Duration::days(7);
         let ids = [
             uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-000000000001").unwrap(),
             uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-000000000002").unwrap(),
             uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-000000000003").unwrap(),
         ];
-        sqlx::query("DELETE FROM certificates WHERE id IN ($1, $2, $3)")
-            .bind(ids[0])
-            .bind(ids[1])
-            .bind(ids[2])
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        for id in ids {
-            sqlx::query(
-                "INSERT INTO certificates \
-                 (id, common_name, subject, valid_from, valid_to, service_type, \
-                  hostname, site, status) \
-                 VALUES ($1, $2, 'CN=page-boundary', $3 - INTERVAL '1 year', $3, \
-                         'IIS', 'page-boundary.test', 'GBLON', 'Active')",
+        let mut tx = pool.begin().await.unwrap();
+        let exercise: Result<(Vec<uuid::Uuid>, Vec<uuid::Uuid>, bool, bool), sqlx::Error> = async {
+            // Migration 209 requires the transaction-local protocol marker on
+            // every direct epoch mutation. Install it before any fixture or
+            // page mutation so this test exercises the production boundary.
+            admit_certificate_scan_protocol(&mut tx, CERTIFICATE_SCAN_JOB_KIND).await?;
+            let scan_epoch: bool = sqlx::query_scalar(
+                "SELECT active_epoch FROM certificate_expiry_scan_state WHERE singleton",
             )
-            .bind(id)
-            .bind(format!("page-boundary-{id}"))
-            .bind(valid_to)
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        }
-        let cutoff: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO certificate_expiry_scan_progress \
-             (schedule_id, job_kind, protocol_version, scan_epoch, \
-              high_water_valid_to, high_water_id, cycle_cutoff) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(CERT_SCAN_SEED_ID)
-        .bind(CERTIFICATE_SCAN_JOB_KIND)
-        .bind(CERTIFICATE_SCAN_PROTOCOL_VERSION)
-        .bind(scan_epoch)
-        .bind(valid_to)
-        .bind(ids[2])
-        .bind(cutoff)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        admit_certificate_scan_protocol(&mut tx, CERTIFICATE_SCAN_JOB_KIND)
-            .await
-            .unwrap();
-        let first_progress = CertificateScanProgress {
-            job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
-            protocol_version: CERTIFICATE_SCAN_PROTOCOL_VERSION,
-            scan_epoch,
-            cursor_valid_to: Some(valid_to - chrono::Duration::microseconds(1)),
-            cursor_id: Some(uuid::Uuid::nil()),
-            high_water_valid_to: valid_to,
-            high_water_id: ids[2],
-            cycle_cutoff: cutoff,
-        };
-        let first = certificate_scan_page(&mut tx, &first_progress, 2)
-            .await
-            .unwrap();
+            .await?;
+            sqlx::query("DELETE FROM certificates WHERE id IN ($1, $2, $3)")
+                .bind(ids[0])
+                .bind(ids[1])
+                .bind(ids[2])
+                .execute(&mut *tx)
+                .await?;
+            for id in ids {
+                sqlx::query(
+                    "INSERT INTO certificates \
+                     (id, common_name, subject, valid_from, valid_to, service_type, \
+                      hostname, site, status) \
+                     VALUES ($1, $2, 'CN=page-boundary', $3 - INTERVAL '1 year', $3, \
+                             'IIS', 'page-boundary.test', 'GBLON', 'Active')",
+                )
+                .bind(id)
+                .bind(format!("page-boundary-{id}"))
+                .bind(valid_to)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let cutoff: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT clock_timestamp()")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            sqlx::query(
+                "INSERT INTO certificate_expiry_scan_progress \
+                 (schedule_id, job_kind, protocol_version, scan_epoch, \
+                  high_water_valid_to, high_water_id, cycle_cutoff) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(CERT_SCAN_SEED_ID)
+            .bind(CERTIFICATE_SCAN_JOB_KIND)
+            .bind(CERTIFICATE_SCAN_PROTOCOL_VERSION)
+            .bind(scan_epoch)
+            .bind(valid_to)
+            .bind(ids[2])
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?;
+            let first_progress = CertificateScanProgress {
+                job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
+                protocol_version: CERTIFICATE_SCAN_PROTOCOL_VERSION,
+                scan_epoch,
+                cursor_valid_to: Some(valid_to - chrono::Duration::microseconds(1)),
+                cursor_id: Some(uuid::Uuid::nil()),
+                high_water_valid_to: valid_to,
+                high_water_id: ids[2],
+                cycle_cutoff: cutoff,
+            };
+            let first = certificate_scan_page(&mut tx, &first_progress, 2).await?;
+            let first_ids = first.iter().map(|row| row.id).collect::<Vec<_>>();
+            let second_progress = CertificateScanProgress {
+                job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
+                protocol_version: CERTIFICATE_SCAN_PROTOCOL_VERSION,
+                scan_epoch,
+                cursor_valid_to: Some(valid_to),
+                cursor_id: Some(ids[1]),
+                high_water_valid_to: valid_to,
+                high_water_id: ids[2],
+                cycle_cutoff: cutoff,
+            };
+            let second = certificate_scan_page(&mut tx, &second_progress, 2).await?;
+            let second_ids = second.iter().map(|row| row.id).collect::<Vec<_>>();
+            let rejects_zero = matches!(
+                certificate_scan_page(&mut tx, &first_progress, 0).await,
+                Err(sqlx::Error::Protocol(_))
+            );
+            let rejects_oversized = matches!(
+                certificate_scan_page(&mut tx, &first_progress, POPULATION_SCAN_BATCH + 1).await,
+                Err(sqlx::Error::Protocol(_))
+            );
+            Ok((first_ids, second_ids, rejects_zero, rejects_oversized))
+        }
+        .await;
+
+        // Roll back the singleton progress row and every claimed epoch before
+        // evaluating assertions. A failed query or assertion therefore cannot
+        // leave the global slot occupied for a later database test.
+        let rollback = tx.rollback().await;
+        rollback.expect("certificate page boundary fixture must roll back cleanly");
+        let (first_ids, second_ids, rejects_zero, rejects_oversized) =
+            exercise.expect("certificate page boundary fixture must succeed");
         assert_eq!(
-            first.iter().map(|row| row.id).collect::<Vec<_>>(),
+            first_ids,
             ids[..2],
             "same-deadline rows use UUID as a strict stable tie-breaker"
         );
-        let second_progress = CertificateScanProgress {
-            job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
-            protocol_version: CERTIFICATE_SCAN_PROTOCOL_VERSION,
-            scan_epoch,
-            cursor_valid_to: Some(valid_to),
-            cursor_id: Some(ids[1]),
-            high_water_valid_to: valid_to,
-            high_water_id: ids[2],
-            cycle_cutoff: cutoff,
-        };
-        let second = certificate_scan_page(&mut tx, &second_progress, 2)
-            .await
-            .unwrap();
         assert_eq!(
-            second.iter().map(|row| row.id).collect::<Vec<_>>(),
+            second_ids,
             vec![ids[2]],
             "the next page resumes strictly after the committed composite cursor"
         );
-        assert!(matches!(
-            certificate_scan_page(&mut tx, &first_progress, 0).await,
-            Err(sqlx::Error::Protocol(_))
-        ));
-        assert!(matches!(
-            certificate_scan_page(&mut tx, &first_progress, POPULATION_SCAN_BATCH + 1).await,
-            Err(sqlx::Error::Protocol(_))
-        ));
-        tx.rollback().await.unwrap();
+        assert!(rejects_zero);
+        assert!(rejects_oversized);
     }
 
     #[tokio::test]
@@ -7123,16 +7131,20 @@ mod db_tests {
             "new enrollment and a processed deadline mutation join the next epoch"
         );
         let mut next_page_tx = pool.begin().await.unwrap();
-        let next_page = certificate_scan_page(&mut next_page_tx, &progress, POPULATION_SCAN_BATCH)
-            .await
-            .unwrap();
+        let next_page = async {
+            admit_certificate_scan_protocol(&mut next_page_tx, CERTIFICATE_SCAN_JOB_KIND).await?;
+            certificate_scan_page(&mut next_page_tx, &progress, POPULATION_SCAN_BATCH).await
+        }
+        .await;
+        let rollback = next_page_tx.rollback().await;
+        rollback.expect("direct continuation page must roll back cleanly");
+        let next_page = next_page.expect("direct continuation page must succeed");
         assert!(
             next_page
                 .iter()
                 .all(|row| row.id != late_id && row.id != first_id),
             "next-epoch enrollment and renewal cannot re-enter the active keyset"
         );
-        next_page_tx.rollback().await.unwrap();
 
         // Drain the remaining bounded pages so the committed epoch transition
         // completes before this test removes its disabled schedule.

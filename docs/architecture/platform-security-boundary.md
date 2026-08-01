@@ -3,7 +3,7 @@
 - Status: **proposed normative production boundary**
 - Owner: platform and security engineering
 - Evidence revision: `8212748308372e92d9cf794907d85fe103afd1da`
-- Last updated: 2026-07-27
+- Last updated: 2026-07-31
 - Production gate: **blocking until the required invariants are implemented and verified**
 
 This specification defines one security boundary for every Ryuki caller and
@@ -85,18 +85,18 @@ already conforms.
 
 ## Evidence basis and current limitations
 
-A repository-wide deep static security review of the pinned revision produced
-368 canonical candidates. Central validation sent 320 through attack-path
-analysis; the strict attack-path aggregate classifies 232 as reportable (3
-High, 169 Medium, and 60 Low), rejects 88 after calibration, and records 48 that
-did not enter attack-path analysis. At this document revision the top-level
-canonical `scan-manifest.json`, `findings.json`, `coverage.json`, and generated
-report have not yet been finalized, so this specification does not describe the
-aggregate as a completed or sealed canonical scan. These are source-level
-results for the pinned revision, not claims about a rendered production
-deployment. The requirements below treat repeated root controls as
-platform-boundary work rather than asking each route or adapter to rediscover
-the same invariant.
+The completed repository-wide security scan
+`130831dd-558e-46db-8ec5-20f929ddefe6` sealed 231 reportable findings for the
+pinned revision. The later completed Codex Security diff scan
+`34dd2f56-f231-4e6f-a99f-1490a30b93d4` sealed 28 indexed findings for its
+validated change set. The remediation ledger reproduces only the scan-34
+identifiers that survived in repository evidence; missing identifiers are not
+inferred. Current working-tree remediations remain implementation evidence,
+not verified closure, until the focused PostgreSQL, clean repository, and final
+working-tree security-diff gates pass. These are source-level results, not
+claims about a rendered production deployment. The requirements below treat
+repeated root controls as platform-boundary work rather than asking each route
+or adapter to rediscover the same invariant.
 
 | Risk theme | Source areas inspected | Structural concern |
 | --- | --- | --- |
@@ -109,10 +109,10 @@ the same invariant.
 | Resource and supply-chain safety | scheduler, runner, CI, Docker, Compose, and Kubernetes files | Admission budgets, bounded work, immutable build inputs, and production-safe defaults are part of the same boundary's availability and integrity guarantees. |
 
 Representative validated findings are traced to their required shared controls
-below. Until canonical finalization, the strict attack-path aggregate and its
-checksums are the per-instance policy source; after finalization, the generated
-canonical report and finding records take over that role. This table prevents
-the implementation program from reducing the work to a vendor or route
+below. The sealed canonical reports and finding records, together with the
+repository remediation ledger, are the per-instance evidence source. Presence
+in the current working tree is not verification evidence by itself. This table
+prevents the implementation program from reducing the work to a vendor or route
 checklist.
 
 | Validated finding family | Representative scan ids | Required boundary closure |
@@ -2491,6 +2491,15 @@ and cannot close those requirements.
   credentials are formed only from an explicit typed schema, derived values are
   zeroized, and bounded structured inspection fails closed without guessing
   arbitrary field pairs or decoding attacker-controlled output.
+
+Current remediation evidence for SB-AUD-06 remains pending final verification.
+The shared detector recognizes a standalone `Basic <token68>` value in a generic
+field only when bounded canonical RFC 4648 Base64 decodes to `user:password`;
+safe scheme metadata remains visible and oversized credential-shaped input fails
+closed. API audit detail is sanitized before both local and PostgreSQL
+persistence, so the durable hash-chain input is already redacted. The focused
+evidence lives in `sources/ryuki-engine/src/evidence_pipeline.rs` and
+`sources/ryuki-api/src/audit.rs`.
 43. **SB-SC-01 — Immutable privileged build inputs.** Privileged CI actions,
     builder/runtime images, Helm charts, ad-hoc Cargo tools, and deployment
     dependencies are pinned to immutable revisions or digests and updated by a
@@ -2523,11 +2532,28 @@ and cannot close those requirements.
   embedded name exactly equals the requested release name, and uses that same
   object ID for signature verification, peeling, and provenance. An abbreviated
   ref or signed object copied behind another name conveys no release authority.
-- **SB-SC-08 — Analyzable build-tool installation.** A privileged build tool
-  has one directly analyzable immutable installation. Shell control flow,
-  functions, nested interpreters, subshells, command substitution, and dynamic
-  command construction around that install fail admission rather than hiding a
-  later replacement from static validation.
+- **SB-SC-08 — Closed build-tool install-to-use lifecycle.** A privileged build
+  tool has one directly analyzable immutable installation in its admitted
+  pinned builder stage. Installation, root-owned hardening, build environment,
+  working directory, permanent non-root transition, linked source copies, and
+  every tool invocation follow a closed canonical instruction grammar. The
+  protected binary is invoked only by its immutable absolute path, descendant
+  stages inherit proof state and taint, and no instruction may follow a stage's
+  final protected action. Shell control flow, custom syntax or escape modes,
+  heredocs, functions, nested interpreters, subshells, command substitution,
+  dynamic command construction, mutable copies, root re-entry, mount shadowing,
+  later replacement, and detached-stage use fail admission.
+
+Current build-artifact containment evidence remains pending final verification.
+Cargo target and build directories are structurally external to the checkout:
+focused and clean verification use one supervised disposable run directory, and
+human development uses `../.ryuki-target-ryuki.io`. The process-group
+supervisors clean normal and interrupted runs; the target ceiling is 24 GiB and
+the free-space reserve is 30 GiB, and configuration may only tighten those
+bounds. Tracked regular-file `target` and `debug` blockers prevent checkout-local
+fallback. Docker build contexts exclude the blockers while container stages keep
+their normal `/app/target`, preserving the closed immutable tool lifecycle
+without copying host build artifacts into an image.
 
 ## Options considered
 

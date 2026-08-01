@@ -15,7 +15,7 @@ use ryuki_engine::models::AdapterType;
 const BASELINE_ID: &str = "baseline:repository-development-fixture-v1";
 const BASELINE_VERSION: u64 = 1;
 const BASELINE_DIGEST: &str =
-    "sha256:3c47bcbfe8afbbb34686faccc756d689d3c6135228f97b7ccd1c90a637d28cd3";
+    "sha256:a567d5f8ca431b0c160907a26ab7d23c39389771f475294e56416ac4bf2374f5";
 const BASELINE_LOCATOR: &str = "docs/architecture/platform-security-boundary.md";
 const BASELINE_TRACE_IDS: [&str; 3] = [
     "TRACE-SB-CONF-03-AC-048",

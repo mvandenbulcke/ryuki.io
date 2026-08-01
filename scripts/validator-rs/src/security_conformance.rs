@@ -170,7 +170,7 @@ const INSTANCES: [(&str, &str); 6] = [
 
 // This list is intentionally independent of control-trace.implementation.json.
 // Editing the ledger cannot silently redefine the normative control inventory.
-const CANONICAL_CONTROL_IDS: [&str; 135] = [
+const CANONICAL_CONTROL_IDS: [&str; 140] = [
     "SB-BOUND-01",
     "SB-BOUND-02",
     "SB-IDL-01",
@@ -237,6 +237,7 @@ const CANONICAL_CONTROL_IDS: [&str; 135] = [
     "SB-AZ-08",
     "SB-AZ-09",
     "SB-AZ-09A",
+    "SB-AZ-09B",
     "SB-AZ-10",
     "SB-APR-01",
     "SB-APR-02",
@@ -300,12 +301,16 @@ const CANONICAL_CONTROL_IDS: [&str; 135] = [
     "SB-AUD-02",
     "SB-AUD-03",
     "SB-AUD-04",
+    "SB-AUD-05",
+    "SB-AUD-06",
     "SB-SC-01",
     "SB-SC-02",
     "SB-SC-03",
     "SB-SC-04",
     "SB-SC-05",
     "SB-SC-06",
+    "SB-SC-07",
+    "SB-SC-08",
 ];
 
 #[derive(Debug)]

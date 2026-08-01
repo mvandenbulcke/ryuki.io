@@ -29,25 +29,25 @@
       {
         "document_id": "source:ryuki-api-build-identity",
         "document_version": 1,
-        "content_digest": "sha256:c51777685a5110e7090c74ec7afed63dac89ea4fb4e11d48607978871ec9aa8e",
+      "content_digest": "sha256:d74121e7b7dbfac523dccf6d993743f45007863400c2ab8e4dcad4ca545e4da8",
         "artifact_locator": "sources/ryuki-api/src/build_identity.rs"
       },
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:d9f790f3e61d6201cc977bb7a8e399abf1ac24caac907baeaa38ef92b69e6854",
+      "content_digest": "sha256:833aa1c3d7b42dd162e43fd1d09ae8537b4be57bcb39da7958fcc29a2854db97",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {
         "document_id": "source:ryuki-api-scheduler",
         "document_version": 1,
-        "content_digest": "sha256:f312c8ca1b5f52a57337b00b5906edb6efee58fbfea9a336cf7ab23197f4e818",
+      "content_digest": "sha256:f488ffdaae2a3cfc3cea1177dd53175a3c609067a88036e36bfff8670b04505c",
         "artifact_locator": "sources/ryuki-api/src/scheduler.rs"
       },
       {
         "document_id": "source:ryuki-api-agents",
         "document_version": 1,
-        "content_digest": "sha256:cec2bfc37ea3907502f76210b49f30f280fc2d039bd54aeae2238b20e332c2e6",
+      "content_digest": "sha256:eed4c5a0e475f43e20c89b402856c34c644d78092435b5c468f005a4a95c93fc",
         "artifact_locator": "sources/ryuki-api/src/agents.rs"
       },
       {
@@ -77,7 +77,7 @@
       {
         "document_id": "source:ryuki-api-database-boundary",
         "document_version": 1,
-        "content_digest": "sha256:dcfc8848e3ca80d9b0325f5d439ceaf84b860c0c5fadfb41bbb489029ced9228",
+      "content_digest": "sha256:5faed7d2c6ee9920795e95f5d0cc69fdc4e8de0fcdf389e193b4b9886dd20e93",
         "artifact_locator": "sources/ryuki-api/src/database.rs"
       },
       {
@@ -101,7 +101,7 @@
       {
         "document_id": "source:ryuki-api-audit-repository",
         "document_version": 1,
-        "content_digest": "sha256:e92b1df13a140423dd8177e6cbdfc6e833b132d5f5d9a74062d8490ebd95d233",
+      "content_digest": "sha256:586d0e86577ab964e8c648a53d7f75cba84b8c428a2c92ad10f038dc464d13b9",
         "artifact_locator": "sources/ryuki-api/src/audit.rs"
       },
       {
@@ -113,7 +113,7 @@
       {
         "document_id": "source:ryuki-api-identity-authority",
         "document_version": 1,
-        "content_digest": "sha256:7269d315c99bb766e0480b6b2e7ee219c042cffb7114f57ab5dc8a97e70a6493",
+      "content_digest": "sha256:3e01255ab0a0784b6fa7166d52fdd2c3c85a6208e2f0eaec853c65824f2e6dc1",
         "artifact_locator": "sources/ryuki-api/src/identity_authority.rs"
       },
       {

@@ -641,32 +641,101 @@ mod firmware_lifecycle_db_tests {
     }
 
     #[tokio::test]
-    async fn test_list_devices_returns_9_seeded_rows() {
+    async fn test_list_devices_contains_seeded_fixture_and_paginates_snapshot() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let devices = list_devices(&pool, "", 1000, 0)
+
+        // Keep the count/list/page reads stable without creating any fixture
+        // rows that would need cleanup. PostgreSQL releases this lock when the
+        // transaction is explicitly rolled back or dropped during a panic.
+        let mut snapshot_guard = pool.begin().await.expect("begin firmware snapshot guard");
+        sqlx::query("LOCK TABLE firmware_records IN SHARE MODE")
+            .execute(&mut *snapshot_guard)
+            .await
+            .expect("lock firmware records against concurrent fixture writes");
+
+        const MIGRATION_071_DEVICE_IDS: [&str; 9] = [
+            "fw-defra-srv-001",
+            "fw-defra-sw-001",
+            "fw-defra-pdu-001",
+            "fw-gblon-srv-001",
+            "fw-gblon-sw-001",
+            "fw-gblon-crac-001",
+            "fw-deber-fw-001",
+            "fw-deber-srv-001",
+            "fw-deber-pdu-001",
+        ];
+
+        // The shared integration database may legitimately contain records
+        // created by another test or retained after a prior panic. Derive the
+        // global list/count assertions from one serialized snapshot, and scope
+        // the migration assertion to the fixture's stable primary keys.
+        let total = count_devices(&pool, "").await.expect("count_devices");
+        assert!(
+            total >= MIGRATION_071_DEVICE_IDS.len() as i64,
+            "the database must contain every migration 071 fixture record"
+        );
+        let devices = list_devices(&pool, "", total, 0)
             .await
             .expect("list_devices failed");
-        assert_eq!(devices.len(), 9, "migration 071 seeds 9 firmware records");
         assert_eq!(
-            count_devices(&pool, "").await.expect("count_devices"),
-            9,
+            i64::try_from(devices.len()).expect("firmware record count fits i64"),
+            total,
             "#14: count_devices matches the full unpaged set"
         );
 
+        let expected_seed_ids: std::collections::BTreeSet<&str> =
+            MIGRATION_071_DEVICE_IDS.into_iter().collect();
+        let observed_seed_ids: std::collections::BTreeSet<&str> = devices
+            .iter()
+            .map(|device| device.id.as_str())
+            .filter(|id| expected_seed_ids.contains(*id))
+            .collect();
+        assert_eq!(
+            observed_seed_ids, expected_seed_ids,
+            "migration 071 firmware fixture is incomplete"
+        );
+
         // #14 pagination: LIMIT bounds the page and OFFSET advances it; the
-        // `ORDER BY id` tie-breaker keeps the two pages disjoint and stable.
+        // `ORDER BY id` tie-breaker must reproduce the corresponding slices of
+        // the same complete snapshot even when unrelated records are present.
         let page1 = list_devices(&pool, "", 4, 0).await.expect("page1");
         let page2 = list_devices(&pool, "", 4, 4).await.expect("page2");
-        assert_eq!(page1.len(), 4, "LIMIT 4 bounds the first page");
-        assert_eq!(page2.len(), 4, "second full page of 4 (9 seeded)");
-        assert!(
-            page1.iter().all(|d| page2.iter().all(|e| e.id != d.id)),
-            "offset page is disjoint from the first (stable id order)"
+        let expected_page1: Vec<&str> = devices
+            .iter()
+            .take(4)
+            .map(|device| device.id.as_str())
+            .collect();
+        let expected_page2: Vec<&str> = devices
+            .iter()
+            .skip(4)
+            .take(4)
+            .map(|device| device.id.as_str())
+            .collect();
+        assert_eq!(
+            page1
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_page1,
+            "LIMIT 4 returns the first stable id-ordered page"
         );
+        assert_eq!(
+            page2
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_page2,
+            "OFFSET 4 returns the next stable id-ordered page"
+        );
+
+        snapshot_guard
+            .rollback()
+            .await
+            .expect("release firmware snapshot guard");
     }
 
     #[tokio::test]

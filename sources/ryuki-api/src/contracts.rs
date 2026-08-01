@@ -81,6 +81,102 @@ fn bind_test_principal(session: &mut AuthSession, label: &str) -> PrincipalId {
     principal_id
 }
 
+/// Construct an explicitly authenticated test session around an opaque
+/// principal. This is intentionally separate from `static_dry_run`: callers
+/// that exercise missing-principal or simulated-mode behavior must continue to
+/// opt into that fixture directly.
+#[cfg(test)]
+fn verified_test_session(label: &str, roles: &[&str]) -> AuthSession {
+    let mut roles = roles
+        .iter()
+        .map(|role| (*role).to_string())
+        .collect::<Vec<_>>();
+    roles.sort();
+    roles.dedup();
+
+    let mut session = AuthSession::static_dry_run();
+    bind_test_principal(&mut session, label);
+    session.display_name = format!("{label} (test)");
+    session.roles = roles;
+    session.token_valid = true;
+    session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
+    session.provider_mode = "test-verified-human".into();
+    session
+}
+
+/// Register a fresh local human principal and return the verified session that
+/// production DB triggers expect. Registry identity is provider-qualified and
+/// random; `label` remains display-only fixture metadata.
+#[cfg(test)]
+async fn registry_backed_local_test_session(
+    pool: &sqlx::PgPool,
+    label: &str,
+    roles: &[&str],
+    site_scope: &[&str],
+    environment_scope: &[&str],
+) -> AuthSession {
+    let mut roles = roles
+        .iter()
+        .map(|role| (*role).to_string())
+        .collect::<Vec<_>>();
+    roles.sort();
+    roles.dedup();
+    let mut site_scope = site_scope
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    site_scope.sort();
+    site_scope.dedup();
+    let mut environment_scope = environment_scope
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    environment_scope.sort();
+    environment_scope.dedup();
+
+    let subject = format!("{label}-{}", Uuid::new_v4().simple());
+    let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+    let mut tx = pool.begin().await.expect("begin local test-principal seed");
+    let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
+        &mut tx,
+        crate::identity_authority::LOCAL_PROVIDER,
+        crate::identity_authority::LOCAL_ISSUER,
+        &subject,
+        &crate::principal_registry::InitialHumanAuthority {
+            authority_digest: &authority_digest,
+            roles: &roles,
+            site_mode: if site_scope.is_empty() {
+                "global"
+            } else {
+                "scoped"
+            },
+            site_scope: &site_scope,
+            environment_mode: if environment_scope.is_empty() {
+                "global"
+            } else {
+                "scoped"
+            },
+            environment_scope: &environment_scope,
+            created_by: "contracts-test-fixture",
+        },
+    )
+    .await
+    .expect("seed local test-principal binding");
+    tx.commit().await.expect("commit local test-principal seed");
+
+    AuthSession {
+        display_user_id: binding.principal_id.to_string(),
+        principal_id: Some(binding.principal_id),
+        display_name: format!("{label} (test)"),
+        roles,
+        token_valid: true,
+        actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+        provider_mode: crate::identity_authority::LOCAL_PROVIDER.into(),
+        site_scope,
+        environment_scope,
+    }
+}
+
 /// DB-backed proofs for the firmware exception maker/checker and atomic-audit
 /// boundary. They skip only when no database URL was supplied.
 #[cfg(test)]
@@ -101,19 +197,7 @@ mod firmware_exception_handler_security_tests {
     }
 
     fn actor(display_user_id: &str, roles: &[&str]) -> AuthSession {
-        let principal_id =
-            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
-        AuthSession {
-            display_user_id: display_user_id.into(),
-            principal_id: Some(principal_id),
-            display_name: format!("Firmware test actor {display_user_id}"),
-            roles: roles.iter().map(|role| (*role).to_string()).collect(),
-            token_valid: true,
-            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
-            provider_mode: "test-verified".into(),
-            site_scope: vec![],
-            environment_scope: vec![],
-        }
+        verified_test_session(display_user_id, roles)
     }
 
     async fn seed_device(pool: &PgPool, id: &str) {
@@ -340,11 +424,16 @@ mod firmware_exception_handler_security_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("reject_firmware_audit_{suffix}");
         let trigger_name = format!("reject_firmware_audit_trigger_{suffix}");
+        let checker = actor("firmware-audit-checker", &[APP_ROLE_DATACENTER_APPROVER]);
+        let checker_principal = checker
+            .principal_id
+            .expect("checker has an opaque principal")
+            .to_string();
         sqlx::query(&format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
              BEGIN \
                IF NEW.action = 'firmware-exception-approve' \
-                  AND NEW.actor_principal = 'firmware-audit-checker' THEN \
+                  AND NEW.actor_principal = '{checker_principal}' THEN \
                  RAISE EXCEPTION 'injected firmware audit failure' USING ERRCODE = '23514'; \
                END IF; \
                RETURN NEW; \
@@ -361,7 +450,6 @@ mod firmware_exception_handler_security_tests {
         .await
         .expect("create audit failure trigger");
 
-        let checker = actor("firmware-audit-checker", &[APP_ROLE_DATACENTER_APPROVER]);
         let result = firmware_approve_exception(
             AuthExtractor(checker),
             Path(exception_id.clone()),
@@ -24344,8 +24432,8 @@ mod step_materialization_db_tests {
         };
         let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
             &mut tx,
-            "step-materialization-test",
-            "https://step-materialization.test",
+            crate::identity_authority::LOCAL_PROVIDER,
+            crate::identity_authority::LOCAL_ISSUER,
             &subject,
             &authority,
         )
@@ -24958,39 +25046,14 @@ mod step_authoring_db_tests {
     }
 
     async fn admin_session(pool: &PgPool, subject: &str) -> AuthSession {
-        let roles = vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()];
-        let authority_digest: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
-        let mut tx = pool.begin().await.expect("begin principal seed");
-        let authority = crate::principal_registry::InitialHumanAuthority {
-            authority_digest: &authority_digest,
-            roles: &roles,
-            site_mode: "global",
-            site_scope: &[],
-            environment_mode: "global",
-            environment_scope: &[],
-            created_by: "step-authoring-test",
-        };
-        let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
-            &mut tx,
-            "step-authoring-test",
-            "https://step-authoring.test",
+        registry_backed_local_test_session(
+            pool,
             subject,
-            &authority,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
         )
         .await
-        .expect("seed exact test principal binding");
-        tx.commit().await.expect("commit principal seed");
-        AuthSession {
-            display_user_id: format!("{subject} (test)"),
-            principal_id: Some(binding.principal_id),
-            display_name: format!("{subject} (test)"),
-            roles,
-            token_valid: true,
-            provider_mode: "local".into(),
-            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
-            site_scope: vec![],
-            environment_scope: vec![],
-        }
     }
 
     fn create_body(name: &str, deployment_profile: Option<&str>) -> CreateRequest {
@@ -40243,13 +40306,7 @@ mod image_factory_audit_db_tests {
     }
 
     fn actor_session(actor: &str) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
-        bind_test_principal(&mut session, actor);
-        session.display_name = format!("{actor} (test)");
-        session.token_valid = true;
-        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        session.provider_mode = "test-verified-human".into();
-        session
+        verified_test_session(actor, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN])
     }
 
     #[tokio::test]
@@ -40277,7 +40334,7 @@ mod image_factory_audit_db_tests {
         );
     }
 
-    async fn install_audit_failure_trigger(pool: &PgPool) {
+    async fn install_audit_failure_trigger(pool: &PgPool, actor_principal: &str) {
         sqlx::query("DROP TRIGGER IF EXISTS zz_ryuki_test_reject_image_audit ON audit_log")
             .execute(pool)
             .await
@@ -40286,16 +40343,16 @@ mod image_factory_audit_db_tests {
             .execute(pool)
             .await
             .expect("drop stale image audit function");
-        sqlx::query(
+        sqlx::query(&format!(
             "CREATE FUNCTION ryuki_test_reject_image_audit() RETURNS trigger \
              LANGUAGE plpgsql AS $$ \
              BEGIN \
-               IF NEW.actor_principal LIKE 'dbtest-image-audit-failure-%' THEN \
+               IF NEW.actor_principal = '{actor_principal}' THEN \
                  RAISE EXCEPTION 'injected image audit failure' USING ERRCODE = '23514'; \
                END IF; \
                RETURN NEW; \
-             END $$",
-        )
+             END $$"
+        ))
         .execute(pool)
         .await
         .expect("create image audit function");
@@ -40332,6 +40389,10 @@ mod image_factory_audit_db_tests {
         let site = format!("DBIMG-{}", Uuid::new_v4().simple());
         let actor = "dbtest-image-promoter";
         let session = actor_session(actor);
+        let actor_principal = session
+            .principal_id
+            .expect("image promoter has an opaque principal")
+            .to_string();
         seed_image(pool, target, &site, "testing", "target").await;
         seed_image(pool, peer, &site, "promoted", "peer").await;
 
@@ -40387,7 +40448,7 @@ mod image_factory_audit_db_tests {
             prev_hash,
             entry_hash,
         ) = &audits[0];
-        assert_eq!(audit_actor, actor);
+        assert_eq!(audit_actor, &actor_principal);
         assert_eq!(actor_display, &session.display_name);
         assert_eq!(actor_roles, &session.roles);
         assert_eq!(provider_mode, &session.provider_mode);
@@ -40420,15 +40481,16 @@ mod image_factory_audit_db_tests {
         let peer = Uuid::new_v4();
         let site = format!("DBIMG-{}", Uuid::new_v4().simple());
         let actor = format!("dbtest-image-audit-failure-{}", Uuid::new_v4());
+        let session = actor_session(&actor);
+        let actor_principal = session
+            .principal_id
+            .expect("image promoter has an opaque principal")
+            .to_string();
         seed_image(pool, target, &site, "testing", "rollback-target").await;
         seed_image(pool, peer, &site, "promoted", "rollback-peer").await;
 
-        install_audit_failure_trigger(pool).await;
-        let result = image_factory_promote(
-            AuthExtractor(actor_session(&actor)),
-            Path(target.to_string()),
-        )
-        .await;
+        install_audit_failure_trigger(pool, &actor_principal).await;
+        let result = image_factory_promote(AuthExtractor(session), Path(target.to_string())).await;
         remove_audit_failure_trigger(pool).await;
 
         assert!(matches!(
@@ -40455,7 +40517,7 @@ mod image_factory_audit_db_tests {
             "SELECT COUNT(*) FROM audit_log WHERE actor_principal = $1 \
              AND action = 'golden-image-promote'",
         )
-        .bind(&actor)
+        .bind(actor_principal)
         .fetch_one(pool)
         .await
         .expect("count rejected image audits");
@@ -56968,7 +57030,10 @@ mod db_lifecycle_tests {
     use sqlx::PgPool;
 
     fn scoped_session(site: &[&str], environment: &[&str]) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
+        let mut session = verified_test_session(
+            "db-lifecycle-scoped-admin",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+        );
         session.site_scope = site.iter().map(|scope| (*scope).to_string()).collect();
         session.environment_scope = environment
             .iter()
@@ -56995,14 +57060,21 @@ mod db_lifecycle_tests {
     }
 
     fn approver_session() -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, "approver-db");
-        s.display_name = "Approver DB".into();
-        s.provider_mode = "local".into();
-        s.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+        verified_test_session(
+            "approver-db",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+    }
+
+    async fn registered_approver_session(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+            &[],
+            &[],
+        )
+        .await
     }
 
     fn request_read_session(user_id: &str, role: &str) -> AuthSession {
@@ -57016,25 +57088,20 @@ mod db_lifecycle_tests {
         session
     }
 
-    fn monitoring_operator_session(
-        user_id: &str,
+    async fn registered_monitoring_operator_session(
+        pool: &PgPool,
+        label: &str,
         sites: &[&str],
         environments: &[&str],
     ) -> AuthSession {
-        AuthSession {
-            display_user_id: user_id.to_string(),
-            principal_id: Some(test_principal_id(user_id)),
-            display_name: format!("{user_id} (monitoring DB test)"),
-            roles: vec![ryuki_engine::auth::APP_ROLE_MONITORING_OPERATOR.to_string()],
-            token_valid: true,
-            actor_class: ryuki_engine::auth::ActorClass::Workload,
-            provider_mode: "test-verified".to_string(),
-            site_scope: sites.iter().map(|scope| (*scope).to_string()).collect(),
-            environment_scope: environments
-                .iter()
-                .map(|scope| (*scope).to_string())
-                .collect(),
-        }
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_MONITORING_OPERATOR],
+            sites,
+            environments,
+        )
+        .await
     }
 
     /// Seeds one request row directly in the given status/stage, returns its id.
@@ -57201,8 +57268,8 @@ mod db_lifecycle_tests {
 
         // Out-of-scope (GBLON) → 404 from the after-load scope guard, BEFORE any
         // engine logic (so it is not a state oracle either).
-        let mut gblon = AuthSession::static_dry_run();
-        bind_test_principal(&mut gblon, "op-gblon");
+        let mut gblon =
+            verified_test_session("op-gblon", &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
         gblon.site_scope = vec!["GBLON".into()];
         let denied = requests_plan(Path(id_s.clone()), AuthExtractor(gblon)).await;
         assert!(
@@ -57211,10 +57278,8 @@ mod db_lifecycle_tests {
         );
 
         // In-scope (DEFRA/production) → passes the gate and the transition runs.
-        let mut defra = AuthSession::static_dry_run();
-        bind_test_principal(&mut defra, "op-defra");
-        defra.site_scope = vec!["DEFRA".into()];
-        defra.environment_scope = vec!["production".into()];
+        let defra =
+            registered_scoped_admin_session(pool, "op-defra", &["DEFRA"], &["production"]).await;
         let allowed = requests_plan(Path(id_s.clone()), AuthExtractor(defra)).await;
         assert!(
             allowed.is_ok(),
@@ -57274,14 +57339,18 @@ mod db_lifecycle_tests {
             .expect("seed owner-bound request");
         }
         // Migration 199 quarantines pre-cutover subject labels and rejects every
-        // new non-opaque request. Recreate that historical row only in this
-        // rollback-safe fixture path, with ordinary trigger enforcement restored
-        // before any production read is exercised.
+        // new non-opaque request. Recreate that historical row through the
+        // schema-owner fixture path used by migration-overlap tests: disable only
+        // the principal-binding trigger inside this transaction, then restore it
+        // to ENABLE ALWAYS before the row becomes visible.
         let mut legacy_fixture_tx = pool.begin().await.expect("begin legacy request fixture");
-        sqlx::query("SET LOCAL session_replication_role = 'replica'")
-            .execute(&mut *legacy_fixture_tx)
-            .await
-            .expect("suppress origin triggers for the pre-cutover request fixture");
+        sqlx::query(
+            "ALTER TABLE public.requests \
+             DISABLE TRIGGER trg_requests_00_principal_binding",
+        )
+        .execute(&mut *legacy_fixture_tx)
+        .await
+        .expect("open the exact historical request fixture boundary");
         sqlx::query(
             "INSERT INTO requests (id, request_type, status, stage, site, environment, \
              name, cpu, memory_gb, principal_binding_state, legacy_created_by_label, \
@@ -57294,10 +57363,13 @@ mod db_lifecycle_tests {
         .execute(&mut *legacy_fixture_tx)
         .await
         .expect("seed quarantined legacy request");
-        sqlx::query("SET LOCAL session_replication_role = 'origin'")
-            .execute(&mut *legacy_fixture_tx)
-            .await
-            .expect("restore request trigger enforcement after the pre-cutover fixture");
+        sqlx::query(
+            "ALTER TABLE public.requests \
+             ENABLE ALWAYS TRIGGER trg_requests_00_principal_binding",
+        )
+        .execute(&mut *legacy_fixture_tx)
+        .await
+        .expect("restore always-on request principal enforcement");
         legacy_fixture_tx
             .commit()
             .await
@@ -57438,12 +57510,29 @@ mod db_lifecycle_tests {
         .await
         .expect("seed execution job");
 
-        let owner = request_read_session("requester-db", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        let owner_principal = read_row(pool, id)
+            .await
+            .created_by
+            .expect("seeded request has an exact creator")
+            .parse::<PrincipalId>()
+            .expect("seeded creator is an opaque principal id");
+        let mut owner =
+            request_read_session("requester-db", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        owner.display_user_id = owner_principal.to_string();
+        owner.principal_id = Some(owner_principal);
+        owner.provider_mode = crate::identity_authority::LOCAL_PROVIDER.into();
         let foreign = request_read_session(
             "foreign-requester-db",
             ryuki_engine::auth::APP_ROLE_REQUESTER,
         );
-        let auditor = request_read_session("auditor-db", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let auditor = registry_backed_local_test_session(
+            pool,
+            "request-child-auditor",
+            &[ryuki_engine::auth::APP_ROLE_AUDITOR],
+            &[],
+            &[],
+        )
+        .await;
         let path = || Path(id.to_string());
 
         assert!(
@@ -58761,6 +58850,7 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "certificate-delete-actor").await;
         let suffix = Uuid::new_v4();
         for status in ["Expired", "Revoked"] {
             let id = seed_cert(
@@ -58771,12 +58861,9 @@ mod db_lifecycle_tests {
                 "GBLON",
             )
             .await;
-            let Json(body) = certificates_delete(
-                AuthExtractor(AuthSession::static_dry_run()),
-                Path(id.clone()),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("delete of a {status} cert must succeed: {e:?}"));
+            let Json(body) = certificates_delete(AuthExtractor(actor.clone()), Path(id.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("delete of a {status} cert must succeed: {e:?}"));
             assert_eq!(body["deleted"], id);
             // Gone.
             let gone: i64 =
@@ -59728,7 +59815,7 @@ mod db_lifecycle_tests {
         };
         let id = seed_request(&pool, "approved", "approve").await;
         seed_current_epoch_approval(&pool, id).await;
-        let session = approver_session();
+        let session = registered_approver_session(&pool, "transition-cas-approver").await;
         let current = read_row(&pool, id).await;
 
         let ok = apply_transition_audited(
@@ -59784,7 +59871,7 @@ mod db_lifecycle_tests {
         };
         let id = seed_request(&pool, "approved", "approve").await;
         seed_current_epoch_approval(&pool, id).await;
-        let session = approver_session();
+        let session = registered_approver_session(&pool, "transition-race-approver").await;
         // Capture the snapshot ONCE: all N callers carry the SAME
         // expected_from_status ("approved"), exactly as N concurrent identical
         // transitions racing off one read would. Re-reading per task would let a
@@ -59864,6 +59951,9 @@ mod db_lifecycle_tests {
         subject: &str,
         roles: &[String],
     ) -> (String, crate::principal_registry::PrincipalBinding) {
+        let mut roles = roles.to_vec();
+        roles.sort();
+        roles.dedup();
         let issuer = if provider == crate::identity_authority::LOCAL_PROVIDER {
             crate::identity_authority::LOCAL_ISSUER.to_string()
         } else {
@@ -59878,7 +59968,7 @@ mod db_lifecycle_tests {
             subject,
             &crate::principal_registry::InitialHumanAuthority {
                 authority_digest: &authority_digest,
-                roles,
+                roles: &roles,
                 site_mode: "global",
                 site_scope: &[],
                 environment_mode: "global",
@@ -59954,7 +60044,7 @@ mod db_lifecycle_tests {
         count > 0
     }
 
-    async fn install_logout_audit_failure_probe(pool: &PgPool) {
+    async fn install_logout_audit_failure_probe(pool: &PgPool, actor_principal: &str) {
         sqlx::query("DROP TRIGGER IF EXISTS ryuki_test_reject_logout_audit ON audit_log")
             .execute(pool)
             .await
@@ -59963,17 +60053,17 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .expect("drop stale logout probe function");
-        sqlx::query(
+        sqlx::query(&format!(
             "CREATE FUNCTION ryuki_test_reject_logout_audit() RETURNS trigger \
              LANGUAGE plpgsql AS $$ \
              BEGIN \
                IF NEW.action = 'session.logout' \
-                  AND NEW.actor_principal LIKE 'logout-rollback-%' THEN \
+                  AND NEW.actor_principal = '{actor_principal}' THEN \
                  RAISE EXCEPTION 'intentional logout audit failure probe'; \
                END IF; \
                RETURN NEW; \
-             END; $$",
-        )
+             END; $$"
+        ))
         .execute(pool)
         .await
         .expect("create logout probe function");
@@ -60030,7 +60120,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "metric-series-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         // Three increasing samples at 1h spacing, with explicit timestamps so the
         // series and its forecast are deterministic.
         for (i, v) in [(0i64, 10.0f64), (1, 20.0), (2, 30.0)] {
@@ -60094,7 +60185,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "metric-insights-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         for (i, v) in [(0i64, 5.0f64), (1, 5.0), (2, 5.0), (3, 5.0), (4, 100.0)] {
             let body = MetricSampleRequest {
                 metric_key: key.to_string(),
@@ -60159,7 +60251,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "metric-suggestions-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         // Under-utilized series with a spike, scoped to the test site.
         for (i, v) in [(0i64, 5.0f64), (1, 5.0), (2, 5.0), (3, 5.0), (4, 100.0)] {
             let body = MetricSampleRequest {
@@ -60242,7 +60335,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "metric-what-if-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         // A perfectly rising series (10 per hour) → projection extends the line.
         for (i, v) in [(0i64, 10.0f64), (1, 20.0), (2, 30.0), (3, 40.0), (4, 50.0)] {
             let body = MetricSampleRequest {
@@ -60312,7 +60406,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "metric-budget-status-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         // Latest value 80, well above a threshold of 50.
         for (i, v) in [(0i64, 60.0f64), (1, 70.0), (2, 80.0)] {
             let body = MetricSampleRequest {
@@ -61235,7 +61330,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "metric-commitment-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         // Mean of [80, 100, 120] = 100.
         for (i, v) in [(0i64, 80.0f64), (1, 100.0), (2, 120.0)] {
             let body = MetricSampleRequest {
@@ -61286,8 +61382,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "ipam-reserve-actor").await;
         let Json(created) = ipam_subnet_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(IpamSubnetCreateRequest {
                 cidr: "10.77.0.0/24".to_string(),
                 gateway: "10.77.0.1".to_string(),
@@ -61302,9 +61399,10 @@ mod db_lifecycle_tests {
         let reserve = |hostname: &str| {
             let id = id.clone();
             let hostname = hostname.to_string();
+            let actor = actor.clone();
             async move {
                 ipam_reserve_ip(
-                    Extension(AuthSession::static_dry_run()),
+                    Extension(actor),
                     Json(IpamReserveRequest {
                         subnet_id: id,
                         hostname,
@@ -61359,8 +61457,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "ipam-availability-actor").await;
         let Json(created) = ipam_subnet_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(IpamSubnetCreateRequest {
                 cidr: "10.78.0.0/24".to_string(),
                 gateway: "10.78.0.1".to_string(),
@@ -61374,9 +61473,10 @@ mod db_lifecycle_tests {
 
         let check = |count: u32| {
             let id = id.clone();
+            let actor = actor.clone();
             async move {
                 ipam_check_availability(
-                    AuthExtractor(AuthSession::static_dry_run()),
+                    AuthExtractor(actor),
                     Path(id),
                     Query(IpamAvailabilityQuery { count: Some(count) }),
                 )
@@ -61389,7 +61489,7 @@ mod db_lifecycle_tests {
         // Reserve two IPs, decrementing the authoritative counter to 252.
         for hostname in ["avail-a", "avail-b"] {
             let Json(_) = ipam_reserve_ip(
-                Extension(AuthSession::static_dry_run()),
+                Extension(actor.clone()),
                 Json(IpamReserveRequest {
                     subnet_id: id.clone(),
                     hostname: hostname.to_string(),
@@ -61403,7 +61503,7 @@ mod db_lifecycle_tests {
         let Json(after) = check(252).await.expect("availability after");
         let Json(over) = check(253).await.expect("availability over");
         let missing = ipam_check_availability(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Path("subnet-does-not-exist".to_string()),
             Query(IpamAvailabilityQuery { count: Some(1) }),
         )
@@ -61455,8 +61555,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "ipam-release-actor").await;
         let Json(created) = ipam_subnet_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(IpamSubnetCreateRequest {
                 cidr: "10.88.0.0/24".to_string(),
                 gateway: "10.88.0.1".to_string(),
@@ -61469,7 +61570,7 @@ mod db_lifecycle_tests {
         let subnet_id = created["subnet"]["id"].as_str().unwrap().to_string();
 
         let Json(r) = ipam_reserve_ip(
-            Extension(AuthSession::static_dry_run()),
+            Extension(actor.clone()),
             Json(IpamReserveRequest {
                 subnet_id: subnet_id.clone(),
                 hostname: "h".to_string(),
@@ -61481,13 +61582,10 @@ mod db_lifecycle_tests {
         .expect("reserve");
         let res_id = r["reservation"]["id"].as_str().unwrap().to_string();
 
-        let Json(_) = ipam_release_ip(
-            Extension(AuthSession::static_dry_run()),
-            Path(res_id.clone()),
-        )
-        .await
-        .expect("first release");
-        let second = ipam_release_ip(Extension(AuthSession::static_dry_run()), Path(res_id)).await;
+        let Json(_) = ipam_release_ip(Extension(actor.clone()), Path(res_id.clone()))
+            .await
+            .expect("first release");
+        let second = ipam_release_ip(Extension(actor), Path(res_id)).await;
 
         let available: i32 =
             sqlx::query_scalar("SELECT available_ips FROM ipam_subnets WHERE id = $1")
@@ -61521,10 +61619,11 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "ipam-subnet-crud-actor").await;
 
         // CREATE — a /24 yields 254 usable hosts.
         let Json(created) = ipam_subnet_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(IpamSubnetCreateRequest {
                 cidr: "10.99.0.0/24".to_string(),
                 gateway: "10.99.0.1".to_string(),
@@ -61551,7 +61650,7 @@ mod db_lifecycle_tests {
 
         // UPDATE gateway + status; the reservation counters are preserved.
         let Json(updated) = ipam_subnet_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Path(id.clone()),
             Json(IpamSubnetUpdateRequest {
                 gateway: Some("10.99.0.254".to_string()),
@@ -61568,7 +61667,7 @@ mod db_lifecycle_tests {
         // An invalid status is a 400, never a silent coercion.
         assert!(
             ipam_subnet_update(
-                AuthExtractor(AuthSession::static_dry_run()),
+                AuthExtractor(actor.clone()),
                 Path(id.clone()),
                 Json(IpamSubnetUpdateRequest {
                     gateway: None,
@@ -61591,12 +61690,7 @@ mod db_lifecycle_tests {
         .execute(pool)
         .await
         .unwrap();
-        match ipam_subnet_delete(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        {
+        match ipam_subnet_delete(AuthExtractor(actor.clone()), Path(id.clone())).await {
             Err((status, _)) => assert_eq!(status, StatusCode::CONFLICT),
             Ok(_) => panic!("delete must be refused while reservations exist"),
         }
@@ -61607,12 +61701,9 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .unwrap();
-        let Json(deleted) = ipam_subnet_delete(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .expect("delete subnet");
+        let Json(deleted) = ipam_subnet_delete(AuthExtractor(actor), Path(id.clone()))
+            .await
+            .expect("delete subnet");
         assert_eq!(deleted["deleted"], true);
 
         // #7 audit: the delete wrote a durable audit_log row.
@@ -61711,12 +61802,13 @@ mod db_lifecycle_tests {
     #[tokio::test]
     async fn test_on_call_contact_crud() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "on-call-crud-actor").await;
+        let sess = || AuthExtractor(actor.clone());
 
         let Json(created) = on_call_contact_create(
             sess(),
@@ -61733,12 +61825,9 @@ mod db_lifecycle_tests {
         .expect("create");
         let id = created["id"].as_str().unwrap().to_string();
 
-        let Json(got) = on_call_contact_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .expect("get");
+        let Json(got) = on_call_contact_get(AuthExtractor(actor.clone()), Path(id.clone()))
+            .await
+            .expect("get");
         assert_eq!(got["contact"]["name"], "Alice");
         assert_eq!(got["contact"]["escalation_tier"], 1);
 
@@ -61787,12 +61876,9 @@ mod db_lifecycle_tests {
             .expect("delete");
         assert_eq!(del["deleted"], true);
         assert!(
-            on_call_contact_get(
-                AuthExtractor(AuthSession::static_dry_run()),
-                Path(id.clone())
-            )
-            .await
-            .is_err(),
+            on_call_contact_get(AuthExtractor(actor.clone()), Path(id.clone()))
+                .await
+                .is_err(),
             "the contact is gone after delete"
         );
     }
@@ -61805,11 +61891,12 @@ mod db_lifecycle_tests {
     #[tokio::test]
     async fn on_call_contact_is_site_scoped() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let admin = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "on-call-scope-admin").await;
+        let admin = || AuthExtractor(actor.clone());
         let mk = |site: Option<String>, name: &str| OnCallContactCreateRequest {
             name: name.to_string(),
             role: "SRE".to_string(),
@@ -61885,8 +61972,7 @@ mod db_lifecycle_tests {
             "scoped list must exclude foreign-site and platform-wide contacts: {names:?}"
         );
 
-        let mut defra_sess = AuthSession::static_dry_run();
-        defra_sess.site_scope = vec!["DEFRA".into()];
+        let defra_sess = scoped_session(&["DEFRA"], &[]);
         assert!(
             on_call_contact_get(AuthExtractor(defra_sess), Path(defra_id.clone()))
                 .await
@@ -61914,7 +62000,8 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let admin = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "on-call-list-admin").await;
+        let admin = || AuthExtractor(actor.clone());
         // Idempotent re-run guard: drop leftovers from a crashed earlier run.
         sqlx::query("DELETE FROM on_call_contacts WHERE role = 'p14-page-test'")
             .execute(pool)
@@ -62189,7 +62276,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "slo-status-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         for (k, v) in [(good_key, 999.0f64), (total_key, 1000.0)] {
             let _ = metrics_record_sample(
                 sess(),
@@ -62386,7 +62474,8 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let actor = registered_admin_session(pool, "chargeback-actor").await;
+        let sess = || AuthExtractor(actor.clone());
         let _ = chargeback_rate_set(
             sess(),
             Json(CostRateRequest {
@@ -62503,8 +62592,10 @@ mod db_lifecycle_tests {
         assert!(!session_exists(pool, cookie_caller.record_id).await);
 
         let logout_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_log WHERE action = 'session.logout' AND actor_principal = 'user-a'",
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'session.logout' AND actor_principal = $1",
         )
+        .bind(a.principal_id.to_string())
         .fetch_one(pool)
         .await
         .expect("count logout audit");
@@ -62518,10 +62609,16 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+        let logout_principals = vec![
+            a.principal_id.to_string(),
+            bearer_caller.principal_id.to_string(),
+            cookie_caller.principal_id.to_string(),
+        ];
         sqlx::query(
             "DELETE FROM audit_log WHERE action = 'session.logout' \
-             AND actor_principal IN ('user-a', 'user-bearer', 'user-cookie')",
+             AND actor_principal = ANY($1)",
         )
+        .bind(&logout_principals)
         .execute(pool)
         .await
         .ok();
@@ -62539,7 +62636,8 @@ mod db_lifecycle_tests {
         };
         let subject = format!("logout-rollback-{}", Uuid::new_v4().simple());
         let seeded = seed_session(pool, &subject).await;
-        install_logout_audit_failure_probe(pool).await;
+        let seeded_principal = seeded.principal_id.to_string();
+        install_logout_audit_failure_probe(pool, &seeded_principal).await;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -62621,10 +62719,14 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
-        sqlx::query("DELETE FROM audit_log WHERE action = 'session.logout' AND actor_principal = 'user-caller'")
-            .execute(pool)
-            .await
-            .ok();
+        sqlx::query(
+            "DELETE FROM audit_log \
+             WHERE action = 'session.logout' AND actor_principal = $1",
+        )
+        .bind(caller.principal_id.to_string())
+        .execute(pool)
+        .await
+        .ok();
     }
 
     /// B4 (b): only an absent credential is idempotent. Explicit malformed or
@@ -62744,13 +62846,34 @@ mod db_lifecycle_tests {
     /// full lifecycle through the handlers, which resolve the process-global
     /// `get_db()` pool. provider_mode=local so the audit/DB path is exercised.
     fn admin_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+        verified_test_session(user_id, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN])
+    }
+
+    async fn registered_admin_session(pool: &PgPool, user_id: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
+    }
+
+    async fn registered_scoped_admin_session(
+        pool: &PgPool,
+        user_id: &str,
+        sites: &[&str],
+        environments: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            sites,
+            environments,
+        )
+        .await
     }
 
     fn reviewed_plan_selection(
@@ -63028,7 +63151,9 @@ mod db_lifecycle_tests {
         let subject = "dbtest-admin-tok-4d2";
         let (issuer, principal_binding) =
             seed_test_principal_binding(pool, "local", subject, &admin.roles).await;
+        admin.display_user_id = principal_binding.principal_id.to_string();
         admin.principal_id = Some(principal_binding.principal_id);
+        admin.provider_mode = crate::identity_authority::LOCAL_PROVIDER.into();
         let issuing_authority = crate::human_authority::InteractiveHumanAuthorityContext {
             principal_binding,
             provider: "local".into(),
@@ -63277,6 +63402,10 @@ mod db_lifecycle_tests {
         // passes require_verified_external_admin_permission for any auth_mode.
         let mut admin = admin_session("dbtest-admin-cfg-6e0");
         admin.token_valid = true;
+        let admin_principal = admin
+            .principal_id
+            .expect("settings admin has an opaque principal")
+            .to_string();
         let marker = "DBTEST Audit Platform 6e0";
         let body = ryuki_core::types::PlatformConfig {
             platform_name: marker.into(),
@@ -63302,7 +63431,7 @@ mod db_lifecycle_tests {
         let _ = admin_platform_settings_reset(AuthExtractor(admin)).await;
 
         assert_eq!(action, "platform-settings-update");
-        assert_eq!(actor, "dbtest-admin-cfg-6e0", "actor must be the admin");
+        assert_eq!(actor, admin_principal, "actor must be the admin");
         assert!(
             detail.contains(marker),
             "audit must record the new settings"
@@ -63323,12 +63452,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        let actor = registered_admin_session(pool, "lb-vs-drain-actor").await;
         let vs_id = "vs-defra-web"; // seeded by migration 072
-        let res = lb_vs_drain(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(vs_id.to_string()),
-        )
-        .await;
+        let res = lb_vs_drain(AuthExtractor(actor.clone()), Path(vs_id.to_string())).await;
         let drained_ok = res.is_ok();
         // Only meaningful when the drain itself succeeded.
         let audited = if drained_ok {
@@ -63345,11 +63471,7 @@ mod db_lifecycle_tests {
         };
         // Restore the seeded VS to enabled before asserting, so a failed
         // assertion never leaves the fixture draining.
-        let _ = lb_vs_enable(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(vs_id.to_string()),
-        )
-        .await;
+        let _ = lb_vs_enable(AuthExtractor(actor), Path(vs_id.to_string())).await;
         assert!(drained_ok, "lb_vs_drain must succeed: {res:?}");
         assert!(audited, "lb_vs_drain must write a durable audit row");
     }
@@ -63854,6 +63976,7 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        let actor = registered_admin_session(pool, "patch-wave-delete-actor").await;
         let id = "cccccccc-0000-0000-0000-0000000000c1";
         seed_wave(pool, id, "Draft", "DEFRA").await;
         // Codex MINOR: count the audit rows for THIS wave_id before the delete so the
@@ -63878,12 +64001,9 @@ mod db_lifecycle_tests {
             .expect("seed child server");
         }
 
-        let Json(body) = patch_wave_delete(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.to_string()),
-        )
-        .await
-        .expect("delete of a Draft wave must succeed");
+        let Json(body) = patch_wave_delete(AuthExtractor(actor), Path(id.to_string()))
+            .await
+            .expect("delete of a Draft wave must succeed");
         assert_eq!(body["deleted"], id);
 
         let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM patch_waves WHERE id = $1::uuid")
@@ -64047,11 +64167,7 @@ mod db_lifecycle_tests {
         let defra = "lh-00000000-0000-0000-0000-000000000001";
         let gblon_hold = "lh-00000000-0000-0000-0000-000000000002";
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.token_valid = true;
-        gblon.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        gblon.provider_mode = "test-verified-human".into();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon = scoped_session(&["GBLON"], &[]);
 
         // validate: out-of-scope == not-found (the handler's own 400).
         let validated =
@@ -64111,7 +64227,7 @@ mod db_lifecycle_tests {
 
         // unrestricted -> passes.
         let any = legal_hold_evidence(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(admin_session("legal-hold-unrestricted-reader")),
             Path(defra.to_string()),
         )
         .await;
@@ -64137,11 +64253,7 @@ mod db_lifecycle_tests {
         let defra_approved = "d0000100-1000-1000-1000-000000000003"; // DEFRA, Approved
         let gblon_id = "d0000100-1000-1000-1000-000000000002"; // GBLON
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.token_valid = true;
-        gblon.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        gblon.provider_mode = "test-verified-human".into();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon = scoped_session(&["GBLON"], &[]);
 
         // approve/execute a DEFRA change -> 404 (out-of-scope, before any mutation
         // or status-409 leak).
@@ -64196,10 +64308,7 @@ mod db_lifecycle_tests {
         );
 
         // Unrestricted approve passes the scope gate (then fails on state, not 404).
-        let mut unrestricted = AuthSession::static_dry_run();
-        unrestricted.token_valid = true;
-        unrestricted.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        unrestricted.provider_mode = "test-verified-human".into();
+        let unrestricted = admin_session("emergency-unrestricted-approver");
         let any = emergency_approve(
             AuthExtractor(unrestricted),
             Path(defra_approved.to_string()),
@@ -64227,8 +64336,7 @@ mod db_lifecycle_tests {
         let defra = "sr-defra-001";
         let gblon_secret = "sr-gblon-001";
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon = scoped_session(&["GBLON"], &[]);
 
         // read / rotate / update a DEFRA secret -> 404.
         let got = secrets_get(AuthExtractor(gblon.clone()), Path(defra.to_string())).await;
@@ -64309,7 +64417,7 @@ mod db_lifecycle_tests {
             "in-scope secrets_get must pass: {own:?}"
         );
         let any = secrets_get(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(admin_session("secrets-unrestricted-reader")),
             Path(defra.to_string()),
         )
         .await;
@@ -64425,11 +64533,7 @@ mod db_lifecycle_tests {
             return;
         };
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.token_valid = true;
-        gblon.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        gblon.provider_mode = "test-verified-human".into();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon = scoped_session(&["GBLON"], &[]);
 
         // read a DEFRA share -> 404.
         let got = shares_get(AuthExtractor(gblon.clone()), Path(defra_id.clone())).await;
@@ -64468,7 +64572,11 @@ mod db_lifecycle_tests {
             "in-scope shares_get must pass: {own:?}"
         );
         // unrestricted read passes.
-        let any = shares_get(AuthExtractor(AuthSession::static_dry_run()), Path(defra_id)).await;
+        let any = shares_get(
+            AuthExtractor(admin_session("shares-unrestricted-reader")),
+            Path(defra_id),
+        )
+        .await;
         assert!(
             !matches!(any, Err((StatusCode::NOT_FOUND, _))),
             "unrestricted shares_get must pass: {any:?}"
@@ -65023,13 +65131,16 @@ mod db_lifecycle_tests {
         );
 
         // Own scope and unrestricted authority can plan their exact CMDB target.
-        let own = vm_day2_plan(AuthExtractor(gblon.clone()), Json(plan_req(&gblon_target))).await;
+        let own_actor =
+            registered_scoped_admin_session(pool, "vm-day2-gblon-operator", &["GBLON"], &[]).await;
+        let unrestricted_actor = registered_admin_session(pool, "vm-day2-global-operator").await;
+        let own = vm_day2_plan(AuthExtractor(own_actor), Json(plan_req(&gblon_target))).await;
         let own_id = own.expect("in-scope vm_day2_plan must succeed").0["id"]
             .as_str()
             .expect("own operation id")
             .to_string();
         let any = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(unrestricted_actor),
             Json(plan_req(&defra_target)),
         )
         .await;
@@ -65143,11 +65254,7 @@ mod db_lifecycle_tests {
             return;
         };
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.token_valid = true;
-        gblon.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        gblon.provider_mode = "test-verified-human".into();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon = scoped_session(&["GBLON"], &[]);
 
         // active (Path = site) for a foreign site -> 403.
         let foreign =
@@ -65164,7 +65271,7 @@ mod db_lifecycle_tests {
             "in-scope image_factory_active must pass: {own:?}"
         );
         let any = image_factory_active(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(admin_session("image-factory-unrestricted-reader")),
             Path("DEFRA".into()),
         )
         .await;
@@ -65201,8 +65308,7 @@ mod db_lifecycle_tests {
             return;
         };
 
-        let mut gblon = AuthSession::static_dry_run();
-        gblon.site_scope = vec!["GBLON".into()];
+        let gblon = scoped_session(&["GBLON"], &[]);
 
         let start_req = |site: &str| RunbookStartRequest {
             runbook_id: "rb-nonexistent".into(),
@@ -65223,7 +65329,7 @@ mod db_lifecycle_tests {
             "in-scope runbook_start must pass the gate: {own:?}"
         );
         let any = runbook_start(
-            Extension(AuthSession::static_dry_run()),
+            Extension(admin_session("runbook-unrestricted-operator")),
             Json(start_req("DEFRA")),
         )
         .await;
@@ -66117,24 +66223,32 @@ mod db_lifecycle_tests {
     #[tokio::test]
     async fn requests_list_db_total_count_header() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
         let user = "rl-dbtotal-7q3";
-        let list = |reader: AuthSession| async move {
-            requests_list(
-                AuthExtractor(reader),
-                Query(RequestListParams {
-                    limit: Some(1),
-                    offset: Some(0),
-                    include_total: Some(true),
-                    created_by: Some(user.into()),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("list")
+        let session = registered_admin_session(pool, user).await;
+        let requester_principal = session
+            .principal_id
+            .expect("requester has an opaque principal")
+            .to_string();
+        let list = |reader: AuthSession| {
+            let requester_principal = requester_principal.clone();
+            async move {
+                requests_list(
+                    AuthExtractor(reader),
+                    Query(RequestListParams {
+                        limit: Some(1),
+                        offset: Some(0),
+                        include_total: Some(true),
+                        created_by: Some(requester_principal),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("list")
+            }
         };
         let total_of = |headers: &HeaderMap| -> i64 {
             headers
@@ -66149,7 +66263,6 @@ mod db_lifecycle_tests {
         let (before_headers, _) = list(admin_session("rl-dbtotal-reader")).await;
         let before = total_of(&before_headers);
 
-        let session = admin_session(user);
         for _ in 0..2 {
             let _created = requests_create(
                 AuthExtractor(session.clone()),
@@ -66331,8 +66444,7 @@ mod db_lifecycle_tests {
         };
         let before = count(pool).await;
 
-        let mut session = AuthSession::static_dry_run();
-        bind_test_principal(&mut session, actor);
+        let session = verified_test_session(actor, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
         let resp = user_preferences_put(
             AuthExtractor(session),
             Json(UserPreferencesRequest {
@@ -66358,13 +66470,14 @@ mod db_lifecycle_tests {
     #[tokio::test]
     async fn ad_get_by_name_returns_computer_or_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "ad-get-by-name-actor").await;
         let name = "DEFRA-SRV-91";
         let prestage = ad_prestage(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(AdPrestageRequest {
                 name: name.into(),
                 site: "DEFRA".into(),
@@ -66380,19 +66493,12 @@ mod db_lifecycle_tests {
             );
         }
 
-        let got = ad_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(name.to_string()),
-        )
-        .await
-        .expect("a prestaged computer must be found by name");
+        let got = ad_get(AuthExtractor(actor.clone()), Path(name.to_string()))
+            .await
+            .expect("a prestaged computer must be found by name");
         assert_eq!(got.0["name"], json!(name));
 
-        let missing = ad_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path("ZZZZZ-NONE-00".to_string()),
-        )
-        .await;
+        let missing = ad_get(AuthExtractor(actor), Path("ZZZZZ-NONE-00".to_string())).await;
         assert!(
             matches!(missing, Err((StatusCode::NOT_FOUND, _))),
             "an unknown name must 404: {missing:?}"
@@ -66597,8 +66703,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "metric-budget-update-actor").await;
         let created = metrics_budget_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(MetricBudgetCreateRequest {
                 metric_key: "cost.test.budget_update".into(),
                 site: None,
@@ -66612,7 +66719,7 @@ mod db_lifecycle_tests {
         let id = created.0["id"].as_str().expect("budget id").to_string();
 
         let updated = metrics_budget_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Path(id.clone()),
             Json(MetricBudgetUpdateRequest {
                 threshold: Some(250.0),
@@ -66636,7 +66743,7 @@ mod db_lifecycle_tests {
         assert!(!enabled, "budget must be disabled after update");
 
         let missing = metrics_budget_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor),
             Path("nonexistent-budget-id".into()),
             Json(MetricBudgetUpdateRequest {
                 threshold: Some(1.0),
@@ -66666,8 +66773,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "slo-update-actor").await;
         let created = slo_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(SloCreateRequest {
                 name: "test-slo-update".into(),
                 target: 0.99,
@@ -66683,7 +66791,7 @@ mod db_lifecycle_tests {
         let id = created.0["id"].as_str().expect("slo id").to_string();
 
         let updated = slo_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Path(id.clone()),
             Json(SloUpdateRequest {
                 name: Some("test-slo-renamed".into()),
@@ -66709,7 +66817,7 @@ mod db_lifecycle_tests {
         assert!(!enabled, "slo must be disabled after update");
 
         let missing = slo_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor),
             Path("nonexistent-slo-id".into()),
             Json(SloUpdateRequest {
                 name: None,
@@ -66744,6 +66852,7 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let seed_actor = registered_admin_session(pool, "slo-scope-seed-actor").await;
 
         // Create three SLOs with distinct footprints (all via an unrestricted admin).
         let mut ids: Vec<(String, &str)> = Vec::new();
@@ -66753,7 +66862,7 @@ mod db_lifecycle_tests {
             (Some("GBLON".to_string()), "scope-gblon"),
         ] {
             let created = slo_create(
-                AuthExtractor(AuthSession::static_dry_run()),
+                AuthExtractor(seed_actor.clone()),
                 Json(SloCreateRequest {
                     name: name.to_string(),
                     target: 0.99,
@@ -66834,8 +66943,10 @@ mod db_lifecycle_tests {
         );
 
         // Positive: in-scope GBLON row updates fine for the scoped principal.
+        let in_scope_actor =
+            registered_scoped_admin_session(pool, "slo-scope-gblon-actor", &["GBLON"], &[]).await;
         let ok = slo_update(
-            AuthExtractor(scoped()),
+            AuthExtractor(in_scope_actor),
             Path(gblon_id.clone()),
             Json(SloUpdateRequest {
                 name: Some("scope-gblon-renamed".into()),
@@ -67231,11 +67342,12 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "slo-breach-scan-actor").await;
         let suffix = Uuid::new_v4().simple().to_string();
         let good_key = format!("slo.scan.good.{suffix}");
         let total_key = format!("slo.scan.total.{suffix}");
         let created = slo_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(SloCreateRequest {
                 name: format!("scan-test-{suffix}"),
                 target: 0.99,
@@ -67281,7 +67393,7 @@ mod db_lifecycle_tests {
         );
 
         let alerts = events_alerts(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor),
             Query(EventsQuery {
                 event_type: None,
                 aggregate_id: Some(slo_id.clone()),
@@ -67377,10 +67489,11 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "budget-breach-scan-actor").await;
         let suffix = Uuid::new_v4().simple().to_string();
         let key = format!("cost.scan.{suffix}");
         let created = metrics_budget_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor.clone()),
             Json(MetricBudgetCreateRequest {
                 metric_key: key.clone(),
                 site: None,
@@ -67419,7 +67532,7 @@ mod db_lifecycle_tests {
         );
 
         let alerts = events_alerts(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor),
             Query(EventsQuery {
                 event_type: None,
                 aggregate_id: Some(budget_id.clone()),
@@ -67602,6 +67715,14 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let feed_actor =
+            registered_monitoring_operator_session(pool, "ops-feed-user", &[], &[]).await;
+        let ack_actor =
+            registered_monitoring_operator_session(pool, "ops-ack-user", &[], &[]).await;
+        let ack_principal = ack_actor
+            .principal_id
+            .expect("registered alert operator has an opaque principal")
+            .to_string();
         let agg = format!("ack-test-{}", Uuid::new_v4());
         let event_id = crate::repos::domain_events::insert(
             pool,
@@ -67625,12 +67746,9 @@ mod db_lifecycle_tests {
         };
 
         // Before ack: present, not acknowledged.
-        let before = events_alerts(
-            AuthExtractor(monitoring_operator_session("ops-feed-user", &[], &[])),
-            Query(q(agg.clone())),
-        )
-        .await
-        .expect("alerts before");
+        let before = events_alerts(AuthExtractor(feed_actor.clone()), Query(q(agg.clone())))
+            .await
+            .expect("alerts before");
         let a = before.0["alerts"]
             .as_array()
             .unwrap()
@@ -67642,7 +67760,7 @@ mod db_lifecycle_tests {
 
         // Acknowledge as a specific operator.
         let resp = events_alert_ack(
-            AuthExtractor(monitoring_operator_session("ops-ack-user", &[], &[])),
+            AuthExtractor(ack_actor),
             Path(event_id),
             Json(AlertAckBody {
                 note: Some("looking into it".into()),
@@ -67653,12 +67771,9 @@ mod db_lifecycle_tests {
         assert_eq!(resp.0["acknowledged"], json!(true));
 
         // After ack: acknowledged=true, attributed to the operator.
-        let after = events_alerts(
-            AuthExtractor(monitoring_operator_session("ops-feed-user", &[], &[])),
-            Query(q(agg.clone())),
-        )
-        .await
-        .expect("alerts after");
+        let after = events_alerts(AuthExtractor(feed_actor.clone()), Query(q(agg.clone())))
+            .await
+            .expect("alerts after");
         let a2 = after.0["alerts"]
             .as_array()
             .unwrap()
@@ -67667,11 +67782,11 @@ mod db_lifecycle_tests {
             .expect("alert present after ack")
             .clone();
         assert_eq!(a2["acknowledged"], json!(true));
-        assert_eq!(a2["acknowledged_by"], json!("ops-ack-user"));
+        assert_eq!(a2["acknowledged_by"], json!(ack_principal));
 
         // An unknown event id is a 404.
         let missing = events_alert_ack(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(feed_actor.clone()),
             Path(-999_i64),
             Json(AlertAckBody::default()),
         )
@@ -67702,7 +67817,7 @@ mod db_lifecycle_tests {
         .await
         .expect("insert non-alert event");
         let na = events_alert_ack(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(feed_actor),
             Path(nonalert_id),
             Json(AlertAckBody::default()),
         )
@@ -67766,10 +67881,16 @@ mod db_lifecycle_tests {
         let e1 = seed_alert_event(pool, &agg, None).await; // platform-wide
         let e2 = seed_alert_event(pool, &agg, None).await; // platform-wide
         let e3 = seed_alert_event(pool, &agg, Some("GBLON")).await; // GBLON-only
+        let actor =
+            registered_monitoring_operator_session(pool, "ops-batch", &["DEFRA"], &[]).await;
+        let actor_principal = actor
+            .principal_id
+            .expect("registered batch operator has an opaque principal")
+            .to_string();
 
         // A DEFRA-scoped operator: sees the platform-wide ones, NOT the GBLON one.
         let Json(out) = events_alert_batch_ack(
-            AuthExtractor(monitoring_operator_session("ops-batch", &["DEFRA"], &[])),
+            AuthExtractor(actor),
             Json(BatchAlertAckBody {
                 event_ids: vec![e1, e2, e3],
                 note: Some("triage".into()),
@@ -67801,7 +67922,10 @@ mod db_lifecycle_tests {
         .fetch_all(pool)
         .await
         .expect("read batch acknowledgement actors");
-        assert_eq!(persisted_actors, vec!["ops-batch", "ops-batch"]);
+        assert_eq!(
+            persisted_actors,
+            vec![actor_principal.clone(), actor_principal]
+        );
         assert_eq!(
             ack_count(pool, e3).await,
             0,
@@ -67826,8 +67950,9 @@ mod db_lifecycle_tests {
         };
         let agg = format!("bdedup-{}", Uuid::new_v4());
         let id = seed_alert_event(pool, &agg, None).await;
+        let actor = registered_monitoring_operator_session(pool, "ops-batch-dedup", &[], &[]).await;
         let Json(out) = events_alert_batch_ack(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(actor),
             Json(BatchAlertAckBody {
                 event_ids: vec![id, id, id],
                 note: None,
@@ -67891,15 +68016,17 @@ mod db_lifecycle_tests {
         .await
         .expect("insert platform-wide alert");
 
-        let scoped = || {
-            let mut s = AuthSession::static_dry_run();
-            s.site_scope = vec!["GBLON".into()];
-            s
-        };
+        let scoped_actor = registered_monitoring_operator_session(
+            pool,
+            "alert-scope-gblon-operator",
+            &["GBLON"],
+            &[],
+        )
+        .await;
 
         // Cross-site (DEFRA) alert → 404 for a GBLON-scoped principal.
         let r = events_alert_ack(
-            AuthExtractor(scoped()),
+            AuthExtractor(scoped_actor.clone()),
             Path(defra_id),
             Json(AlertAckBody::default()),
         )
@@ -67910,7 +68037,7 @@ mod db_lifecycle_tests {
         );
         // Platform-wide (NULL) alert → permitted (the feed shows it to scoped users).
         let r = events_alert_ack(
-            AuthExtractor(scoped()),
+            AuthExtractor(scoped_actor),
             Path(global_id),
             Json(AlertAckBody::default()),
         )
@@ -67963,16 +68090,8 @@ mod db_lifecycle_tests {
         .await
         .expect("insert site-only SLO breach");
 
-        let defra = || {
-            let mut s = AuthSession::static_dry_run();
-            s.site_scope = vec!["DEFRA".into()];
-            s
-        };
-        let env_only = || {
-            let mut s = AuthSession::static_dry_run();
-            s.environment_scope = vec!["production".into()];
-            s
-        };
+        let defra = || scoped_session(&["DEFRA"], &[]);
+        let env_only = || scoped_session(&[], &["production"]);
         let aggq = |session| {
             (
                 AuthExtractor(session),
@@ -68041,8 +68160,15 @@ mod db_lifecycle_tests {
             "no ack row may be written for the denied env-scoped principal"
         );
         // Same-site principal CAN ack it (exactly one ack row results).
+        let defra_ack_actor = registered_monitoring_operator_session(
+            pool,
+            "site-only-alert-defra-operator",
+            &["DEFRA"],
+            &[],
+        )
+        .await;
         let defra_ack = events_alert_ack(
-            AuthExtractor(defra()),
+            AuthExtractor(defra_ack_actor),
             Path(event_id),
             Json(AlertAckBody::default()),
         )
@@ -68126,16 +68252,8 @@ mod db_lifecycle_tests {
             .expect("events list");
             out["events"].as_array().map(|a| a.len()).unwrap_or(0)
         };
-        let site_scoped = || {
-            let mut s = AuthSession::static_dry_run();
-            s.site_scope = vec!["DEFRA".into()];
-            s
-        };
-        let env_scoped = || {
-            let mut s = AuthSession::static_dry_run();
-            s.environment_scope = vec!["production".into()];
-            s
-        };
+        let site_scoped = || scoped_session(&["DEFRA"], &[]);
+        let env_scoped = || scoped_session(&[], &["production"]);
 
         // SITE-scoped principal: does NOT see the env-only alert (reverse leak fixed)…
         assert_eq!(
@@ -68178,8 +68296,15 @@ mod db_lifecycle_tests {
             0,
             "no ack row for the denied attempt"
         );
+        let allowed_actor = registered_monitoring_operator_session(
+            pool,
+            "env-only-alert-site-operator",
+            &["DEFRA"],
+            &[],
+        )
+        .await;
         let allowed = events_alert_ack(
-            AuthExtractor(site_scoped()),
+            AuthExtractor(allowed_actor),
             Path(global_event),
             Json(AlertAckBody::default()),
         )
@@ -68331,7 +68456,13 @@ mod db_lifecycle_tests {
             session.environment_scope = vec![environment.to_string()];
             session
         };
-        let defra = scoped("DEFRA", "production", "agent-alert-defra");
+        let defra =
+            registered_scoped_admin_session(pool, "agent-alert-defra", &["DEFRA"], &["production"])
+                .await;
+        let defra_principal = defra
+            .principal_id
+            .expect("registered alert owner has an opaque principal")
+            .to_string();
         // This principal exactly matches the spoofed event axes. The vulnerable
         // event-row policy would admit it; the request relation must still deny.
         let gblon = scoped("GBLON", "test", "agent-alert-gblon");
@@ -68408,7 +68539,7 @@ mod db_lifecycle_tests {
         .await
         .expect("read atomic acknowledgement");
         assert_eq!(ack_count_after, 1);
-        assert_eq!(acknowledged_by, "agent-alert-defra");
+        assert_eq!(acknowledged_by, defra_principal);
 
         // Malformed spec authority cannot be persisted for a handler to trust.
         let malformed_job_id = Uuid::new_v4();
@@ -68463,8 +68594,9 @@ mod db_lifecycle_tests {
             orphan_events["events"].as_array().unwrap().is_empty(),
             "orphan agent-job events must fail closed even for unrestricted readers"
         );
+        let orphan_actor = admin_session("orphan-alert-admin");
         assert!(matches!(
-            ack_alert_one(&AuthSession::static_dry_run(), pool, orphan_event, None,).await,
+            ack_alert_one(&orphan_actor, pool, orphan_event, None,).await,
             Err((StatusCode::NOT_FOUND, _))
         ));
 
@@ -68517,8 +68649,13 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let actor = registered_admin_session(pool, "degr-actor-7x2").await;
+        let actor_principal = actor
+            .principal_id
+            .expect("degradation actor has an opaque principal")
+            .to_string();
         let _ = degradation_enter(
-            AuthExtractor(admin_session("degr-actor-7x2")),
+            AuthExtractor(actor),
             Path("DEFRA".into()),
             Json(DegradationEnterRequest {
                 reason: "db-test induced degradation".into(),
@@ -68537,8 +68674,9 @@ mod db_lifecycle_tests {
         let audited: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM audit_log \
              WHERE action = 'site-enter-degradation' AND detail->>'site' = 'DEFRA' \
-               AND actor_principal = 'degr-actor-7x2')",
+               AND actor_principal = $1)",
         )
+        .bind(actor_principal)
         .fetch_one(pool)
         .await
         .expect("query audit");
@@ -68576,7 +68714,11 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let session = admin_session("requester-p2");
+        let session = registered_admin_session(pool, "requester-p2").await;
+        let requester_principal = session
+            .principal_id
+            .expect("requester has an opaque principal")
+            .to_string();
 
         let types = [
             "server-deployment",
@@ -68606,8 +68748,16 @@ mod db_lifecycle_tests {
 
             let row = read_global_row(pool, id).await;
             // requester/owner anchored to the verified principal, not the name.
-            assert_eq!(row.requester.as_deref(), Some("requester-p2"), "{rt}");
-            assert_eq!(row.owner.as_deref(), Some("requester-p2"), "{rt}");
+            assert_eq!(
+                row.requester.as_deref(),
+                Some(requester_principal.as_str()),
+                "{rt}"
+            );
+            assert_eq!(
+                row.owner.as_deref(),
+                Some(requester_principal.as_str()),
+                "{rt}"
+            );
             assert_eq!(row.criticality, "standard", "{rt}");
             // The intake stage is REAL persisted history, not fabricated.
             let stages: Vec<ryuki_engine::models::Stage> =
@@ -68653,7 +68803,16 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let session = admin_session("approver-p2");
+        let session = registered_admin_session(pool, "requester-p2-lifecycle").await;
+        let approver = registered_admin_session(pool, "approver-p2").await;
+        let requester_principal = session
+            .principal_id
+            .expect("requester has an opaque principal")
+            .to_string();
+        let approver_principal = approver
+            .principal_id
+            .expect("approver has an opaque principal")
+            .to_string();
 
         let Ok(Json(created)) = requests_create(
             AuthExtractor(session.clone()),
@@ -68676,7 +68835,7 @@ mod db_lifecycle_tests {
             .expect("plan");
         let _ = requests_approve(
             p(&id_str),
-            AuthExtractor(session.clone()),
+            AuthExtractor(approver),
             reviewed_request_approval_body(&id_str).await,
         )
         .await
@@ -68772,15 +68931,13 @@ mod db_lifecycle_tests {
 
         // approval_route persisted with the verified approver.
         assert!(
-            rehydrated
-                .approval_route
-                .contains(&"approver-p2".to_string()),
+            rehydrated.approval_route.contains(&approver_principal),
             "approval_route persisted; got {:?}",
             rehydrated.approval_route
         );
 
         // requester is the verified principal, NOT the request name.
-        assert_eq!(rehydrated.requester, "approver-p2");
+        assert_eq!(rehydrated.requester, requester_principal);
         assert_ne!(rehydrated.requester, row.name);
 
         // No fabricated DRY-RUN reconstruction string leaks into any plan stage
@@ -68809,7 +68966,8 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let session = admin_session("approver-pp");
+        let session = registered_admin_session(pool, "requester-pp").await;
+        let approver = registered_admin_session(pool, "approver-pp").await;
         let p = |s: &str| Path(s.to_string());
 
         let Ok(Json(created)) = requests_create(
@@ -68831,7 +68989,7 @@ mod db_lifecycle_tests {
             .expect("plan");
         let _ = requests_approve(
             p(&id_str),
-            AuthExtractor(session.clone()),
+            AuthExtractor(approver),
             reviewed_request_approval_body(&id_str).await,
         )
         .await
@@ -68991,7 +69149,8 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let session = admin_session("approver-lp");
+        let session = registered_admin_session(pool, "requester-lp").await;
+        let approver = registered_admin_session(pool, "approver-lp").await;
         let p = |s: &str| Path(s.to_string());
 
         // live-apply is never dispatchable via execute -> 400 (mode resolution
@@ -69028,7 +69187,7 @@ mod db_lifecycle_tests {
             .expect("plan");
         let _ = requests_approve(
             p(&id_str),
-            AuthExtractor(session.clone()),
+            AuthExtractor(approver),
             reviewed_request_approval_body(&id_str).await,
         )
         .await
@@ -69073,8 +69232,8 @@ mod db_lifecycle_tests {
         };
         // A distinct requester creates a DEFRA/production request (create_body
         // site); the unrestricted admin is the approving principal.
-        let admin = admin_session("la-scope-admin");
-        let requester = admin_session("la-scope-requester");
+        let admin = registered_admin_session(pool, "la-scope-admin").await;
+        let requester = registered_admin_session(pool, "la-scope-requester").await;
         let p = |s: &str| Path(s.to_string());
         let Ok(Json(created)) = requests_create(
             AuthExtractor(requester.clone()),
@@ -69104,8 +69263,8 @@ mod db_lifecycle_tests {
 
         // A GBLON-scoped admin must 404 (not 409) — scope guard precedes the
         // no-completed-plan 409, so it is not an existence oracle.
-        let mut gblon_admin = admin.clone();
-        gblon_admin.site_scope = vec!["GBLON".into()];
+        let gblon_admin =
+            registered_scoped_admin_session(pool, "la-scope-gblon-admin", &["GBLON"], &[]).await;
         let scoped = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(gblon_admin),
@@ -69151,12 +69310,12 @@ mod db_lifecycle_tests {
         crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
             &rand::random(),
         ));
-        let admin = admin_session("approver-la");
-        let requester = admin_session("requester-la");
+        let admin = registered_admin_session(pool, "approver-la").await;
+        let requester = registered_admin_session(pool, "requester-la").await;
         let p = |s: &str| Path(s.to_string());
 
         let Ok(Json(created)) = requests_create(
-            AuthExtractor(requester),
+            AuthExtractor(requester.clone()),
             Json(create_body("server-deployment")),
         )
         .await
@@ -69165,6 +69324,27 @@ mod db_lifecycle_tests {
         };
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        // A whole-request LivePlan belongs to the executable version of a
+        // genuinely reviewed request. Drive the canonical lifecycle instead
+        // of fabricating the execute stage or reusing the intake version.
+        requests_validate(p(&id_str), AuthExtractor(requester.clone()))
+            .await
+            .expect("validate request before whole-request LivePlan");
+        requests_plan(p(&id_str), AuthExtractor(requester.clone()))
+            .await
+            .expect("plan request before whole-request LivePlan");
+        requests_approve(
+            p(&id_str),
+            AuthExtractor(admin.clone()),
+            reviewed_request_approval_body(&id_str).await,
+        )
+        .await
+        .expect("approve request before whole-request LivePlan");
+        requests_lock(p(&id_str), AuthExtractor(requester.clone()))
+            .await
+            .expect("lock request before whole-request LivePlan");
+
         let Json(reviewed_request) = reviewed_request_approval_body(&id_str).await;
         let request_resource_version = reviewed_request.request_resource_version;
 
@@ -69740,17 +69920,26 @@ mod db_lifecycle_tests {
         };
         // A DatacenterApprover so the decision role key is the route role, not a
         // bare user id.
-        let mut session = admin_session("dc-approver-p2");
-        session.roles = vec![
+        let role_names = vec![
             ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
         ];
-        let (_, binding) =
-            seed_test_principal_binding(pool, "local", "dc-approver-p2", &session.roles).await;
+        let subject = format!("dc-approver-p2-{}", Uuid::new_v4().simple());
+        let (_, binding) = seed_test_principal_binding(pool, "local", &subject, &role_names).await;
+        let mut session = verified_test_session(
+            "dc-approver-p2",
+            &[
+                ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            ],
+        );
         session.principal_id = Some(binding.principal_id);
+        session.display_user_id = binding.principal_id.to_string();
+        session.provider_mode = crate::identity_authority::LOCAL_PROVIDER.into();
+        let creator = registered_admin_session(pool, "approval-decision-creator").await;
 
         let Ok(Json(created)) = requests_create(
-            AuthExtractor(session.clone()),
+            AuthExtractor(creator.clone()),
             Json(create_body("server-deployment")),
         )
         .await
@@ -69761,10 +69950,10 @@ mod db_lifecycle_tests {
         let id = Uuid::parse_str(&id_str).expect("uuid");
 
         let p = |s: &str| Path(s.to_string());
-        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+        let _ = requests_validate(p(&id_str), AuthExtractor(creator.clone()))
             .await
             .expect("validate");
-        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+        let _ = requests_plan(p(&id_str), AuthExtractor(creator))
             .await
             .expect("plan");
         let _ = requests_approve(
@@ -69817,11 +70006,17 @@ mod db_lifecycle_tests {
         };
         // Build a planned DEFRA request (create_body uses site DEFRA) as an
         // unrestricted approver.
-        let mut admin = admin_session("approvals-scope-admin");
-        admin.roles = vec![
-            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
-            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
-        ];
+        let admin = registry_backed_local_test_session(
+            pool,
+            "approvals-scope-admin",
+            &[
+                ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            ],
+            &[],
+            &[],
+        )
+        .await;
         let Ok(Json(created)) = requests_create(
             AuthExtractor(admin.clone()),
             Json(create_body("server-deployment")),
@@ -69882,14 +70077,21 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let mut session = admin_session("dc-rejecter-p2");
-        session.roles = vec![
-            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
-            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
-        ];
+        let creator = registered_admin_session(pool, "reject-decision-creator").await;
+        let session = registry_backed_local_test_session(
+            pool,
+            "dc-rejecter-p2",
+            &[
+                ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            ],
+            &[],
+            &[],
+        )
+        .await;
 
         let Ok(Json(created)) = requests_create(
-            AuthExtractor(session.clone()),
+            AuthExtractor(creator.clone()),
             Json(create_body("server-deployment")),
         )
         .await
@@ -69900,10 +70102,10 @@ mod db_lifecycle_tests {
         let id = Uuid::parse_str(&id_str).expect("uuid");
 
         let p = |s: &str| Path(s.to_string());
-        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+        let _ = requests_validate(p(&id_str), AuthExtractor(creator.clone()))
             .await
             .expect("validate");
-        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+        let _ = requests_plan(p(&id_str), AuthExtractor(creator))
             .await
             .expect("plan");
         let reviewed = reviewed_request_reject_body(&id_str, "policy violation").await;
@@ -69955,9 +70157,10 @@ mod db_lifecycle_tests {
         let current = read_global_row(pool, id).await;
         assert!(current.resource_version > reviewed_resource_version);
 
+        let approver = registered_approver_session(pool, "stale-reject-approver").await;
         let err = requests_reject(
             Path(id.to_string()),
-            AuthExtractor(approver_session()),
+            AuthExtractor(approver),
             Json(RejectRequestBody {
                 reason: "policy violation".into(),
                 request_resource_version: reviewed_resource_version,
@@ -69998,8 +70201,9 @@ mod db_lifecycle_tests {
             items.push(reviewed_batch_reject_item(&id.to_string()).await);
         }
 
+        let approver = registered_approver_session(pool, "batch-reject-happy-approver").await;
         let Json(out) = requests_batch_reject(
-            AuthExtractor(approver_session()),
+            AuthExtractor(approver),
             Json(BatchRejectRequest {
                 items,
                 reason: "policy violation".into(),
@@ -70049,8 +70253,9 @@ mod db_lifecycle_tests {
             reviewed_batch_reject_item(&terminal.to_string()).await,
         ];
 
+        let approver = registered_approver_session(pool, "batch-reject-partial-approver").await;
         let Json(out) = requests_batch_reject(
-            AuthExtractor(approver_session()),
+            AuthExtractor(approver),
             Json(BatchRejectRequest {
                 items,
                 reason: "policy violation".into(),
@@ -70095,12 +70300,13 @@ mod db_lifecycle_tests {
         };
         let id = seed_request(pool, "planned", "approve").await;
         let actor = "batch-reject-auditor-p2";
-        let mut auditor = AuthSession::static_dry_run();
-        bind_test_principal(&mut auditor, actor);
-        auditor.provider_mode = "local".into();
-        auditor.roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
+        let auditor = verified_test_session(actor, &[ryuki_engine::auth::APP_ROLE_AUDITOR]);
+        let actor_principal = auditor
+            .principal_id
+            .expect("auditor has an opaque principal")
+            .to_string();
 
-        let denied_count = |actor: &'static str| async move {
+        let denied_count = |actor: String| async move {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM audit_log \
                  WHERE action = 'request.reject' AND outcome = 'denied' AND actor_principal = $1",
@@ -70110,7 +70316,7 @@ mod db_lifecycle_tests {
             .await
             .expect("count denied")
         };
-        let before = denied_count(actor).await;
+        let before = denied_count(actor_principal.clone()).await;
 
         let Err((status, _)) = requests_batch_reject(
             AuthExtractor(auditor),
@@ -70127,7 +70333,7 @@ mod db_lifecycle_tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
 
         // Exactly one denial audit row was written for the whole batch.
-        assert_eq!(denied_count(actor).await - before, 1);
+        assert_eq!(denied_count(actor_principal).await - before, 1);
         // The request was never rejected.
         assert_eq!(read_global_row(pool, id).await.status, "planned");
 
@@ -70165,9 +70371,14 @@ mod db_lifecycle_tests {
         .await
         .expect("seed GBLON request");
 
-        let mut defra = approver_session();
-        defra.site_scope = vec!["DEFRA".into()];
-        defra.environment_scope = vec!["production".into()];
+        let defra = registry_backed_local_test_session(
+            pool,
+            "batch-reject-scoped-approver",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+            &["DEFRA"],
+            &["production"],
+        )
+        .await;
 
         let Json(out) = requests_batch_reject(
             AuthExtractor(defra),
@@ -70210,13 +70421,15 @@ mod db_lifecycle_tests {
 
     // ─── #17 slice 3: batch rework + fail (DB) ───
 
-    /// An execute-tier (operator) session for the fail DB tests — same scaffold as
-    /// `approver_session` but holding `execute` (VMwareOperator) instead of `approve`.
-    fn operator_session() -> AuthSession {
-        let mut s = approver_session();
-        bind_test_principal(&mut s, "operator-db");
-        s.roles = vec![ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string()];
-        s
+    async fn registered_operator_session(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR],
+            &[],
+            &[],
+        )
+        .await
     }
 
     #[tokio::test]
@@ -70229,8 +70442,10 @@ mod db_lifecycle_tests {
 
         let rework_id = seed_request(pool, "planned", "approve").await;
         let rework_marker = "SYNTH-REWORK-DB-COOKIE-CANARY";
+        let rework_actor =
+            registered_approver_session(pool, "cookie-redaction-rework-approver").await;
         let rework_response = rework_one(
-            &approver_session(),
+            &rework_actor,
             &rework_id.to_string(),
             &format!("__Host-ryuki_session={rework_marker}"),
         )
@@ -70239,8 +70454,9 @@ mod db_lifecycle_tests {
 
         let fail_id = seed_request(pool, "planned", "approve").await;
         let fail_marker = "SYNTH-FAIL-DB-COOKIE-CANARY";
+        let fail_actor = registered_operator_session(pool, "cookie-redaction-fail-operator").await;
         let fail_response = fail_one(
-            &operator_session(),
+            &fail_actor,
             &fail_id.to_string(),
             &format!("Cookie: __Host-ryuki_session={fail_marker}"),
         )
@@ -70325,8 +70541,9 @@ mod db_lifecycle_tests {
             ids.push(seed_request(pool, "planned", "approve").await);
         }
         let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let approver = registered_approver_session(pool, "batch-rework-happy-approver").await;
         let Json(out) = requests_batch_rework(
-            AuthExtractor(approver_session()),
+            AuthExtractor(approver),
             Json(BatchReworkRequest {
                 ids: id_strs,
                 reason: "needs changes".into(),
@@ -70398,8 +70615,9 @@ mod db_lifecycle_tests {
             "the two seeds must have different current stages (got {exp_a} / {exp_b})"
         );
 
+        let operator = registered_operator_session(pool, "batch-fail-stage-operator").await;
         let Json(out) = requests_batch_fail(
-            AuthExtractor(operator_session()),
+            AuthExtractor(operator),
             Json(BatchFailRequest {
                 ids: vec![a.to_string(), b.to_string()],
                 reason: "infeasible".into(),
@@ -70498,9 +70716,10 @@ mod db_lifecycle_tests {
         let request_id = seed_request(pool, "approved", "execute").await;
         let platform = "DEFRA";
         let job_id = seed_pending_live_apply_for_request(pool, request_id, platform).await;
+        let operator = registered_operator_session(pool, "request-fail-live-apply-operator").await;
 
         fail_one(
-            &operator_session(),
+            &operator,
             &request_id.to_string(),
             "operator stopped request before dispatch",
         )
@@ -70567,11 +70786,11 @@ mod db_lifecycle_tests {
         )
         .await;
 
+        let operator = registered_operator_session(pool, "request-fail-lease-race-operator").await;
         for _ in 0..12 {
             let request_id = seed_request(pool, "approved", "execute").await;
             let job_id = seed_pending_live_apply_for_request(pool, request_id, platform).await;
             let request_id_string = request_id.to_string();
-            let operator = operator_session();
             let (failed, leased) = tokio::join!(
                 fail_one(&operator, &request_id_string, "race failure"),
                 crate::agents::lease_pending_job(pool, &race_agent),
@@ -70644,8 +70863,12 @@ mod db_lifecycle_tests {
         let actor = "batch-fail-approver-p2";
         let mut approver = approver_session();
         bind_test_principal(&mut approver, actor);
+        let actor_principal = approver
+            .principal_id
+            .expect("batch-fail approver has an opaque principal")
+            .to_string();
 
-        let denied_count = |actor: &'static str| async move {
+        let denied_count = |actor: String| async move {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM audit_log \
                  WHERE action = 'request.fail' AND outcome = 'denied' AND actor_principal = $1",
@@ -70655,7 +70878,7 @@ mod db_lifecycle_tests {
             .await
             .expect("count denied")
         };
-        let before = denied_count(actor).await;
+        let before = denied_count(actor_principal.clone()).await;
 
         let Err((status, _)) = requests_batch_fail(
             AuthExtractor(approver),
@@ -70672,7 +70895,7 @@ mod db_lifecycle_tests {
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(
-            denied_count(actor).await - before,
+            denied_count(actor_principal).await - before,
             1,
             "exactly one denial audit for the whole batch, regardless of id count"
         );
@@ -70711,9 +70934,14 @@ mod db_lifecycle_tests {
         .await
         .expect("seed GBLON request");
 
-        let mut defra = approver_session();
-        defra.site_scope = vec!["DEFRA".into()];
-        defra.environment_scope = vec!["production".into()];
+        let defra = registry_backed_local_test_session(
+            pool,
+            "batch-rework-scoped-approver",
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+            &["DEFRA"],
+            &["production"],
+        )
+        .await;
         let Json(out) = requests_batch_rework(
             AuthExtractor(defra),
             Json(BatchReworkRequest {
@@ -70749,14 +70977,7 @@ mod db_lifecycle_tests {
     // ─── approvals_pending — DB-backed integration tests (T3 / T4) ───
 
     fn dc_approver_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+        verified_test_session(user_id, &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER])
     }
 
     /// Seeds a request row in 'planned' status with an EMPTY approval_route,
@@ -71137,8 +71358,11 @@ mod db_lifecycle_tests {
             return;
         };
         let uid = format!("pref-user-{}", Uuid::new_v4());
-        let mut session = AuthSession::static_dry_run();
-        let principal = bind_test_principal(&mut session, &uid).to_string();
+        let session = verified_test_session(&uid, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
+        let principal = session
+            .principal_id
+            .expect("preferences caller has an opaque principal")
+            .to_string();
 
         // Set both.
         let Ok(Json(set)) = user_preferences_put(
@@ -71261,12 +71485,10 @@ mod db_lifecycle_tests {
         .execute(pool)
         .await
         .expect("seed budget");
+        let actor = registered_admin_session(pool, "metric-budget-delete-actor").await;
 
-        let Ok(Json(out)) = metrics_budget_delete(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(out)) =
+            metrics_budget_delete(AuthExtractor(actor.clone()), Path(id.clone())).await
         else {
             sqlx::query("DELETE FROM metric_budgets WHERE id = $1")
                 .bind(&id)
@@ -71292,12 +71514,9 @@ mod db_lifecycle_tests {
         );
 
         // A second delete of the now-absent budget is a 404.
-        let err = metrics_budget_delete(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .expect_err("deleting an absent budget must 404");
+        let err = metrics_budget_delete(AuthExtractor(actor), Path(id.clone()))
+            .await
+            .expect_err("deleting an absent budget must 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }
@@ -71342,8 +71561,8 @@ mod quorum_enforcement_db_tests {
         let mut tx = pool.begin().await.expect("begin quorum principal seed");
         let (binding, _) = crate::principal_registry::resolve_or_create_active_binding_tx(
             &mut tx,
-            "quorum-test",
-            "https://quorum.test",
+            crate::identity_authority::LOCAL_PROVIDER,
+            crate::identity_authority::LOCAL_ISSUER,
             &subject,
             &crate::principal_registry::InitialHumanAuthority {
                 authority_digest: &authority_digest,
@@ -71363,15 +71582,8 @@ mod quorum_enforcement_db_tests {
 
     /// A verified approver session with an explicit principal AND approval role,
     /// so distinct (principal id, role) pairs can form (or fail to form) a quorum.
-    fn approver(user_id: &str, role: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s.roles = vec![role.to_string()];
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+    async fn approver(pool: &PgPool, user_id: &str, role: &str) -> AuthSession {
+        registry_backed_local_test_session(pool, user_id, &[role], &[], &[]).await
     }
 
     fn create_body(name: &str) -> CreateRequest {
@@ -71474,7 +71686,12 @@ mod quorum_enforcement_db_tests {
         name: &str,
         required_roles: i32,
     ) -> Uuid {
-        let creator = approver("creator-q", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let creator = approver(
+            pool,
+            "creator-q",
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+        )
+        .await;
         let Ok(Json(created)) =
             requests_create(AuthExtractor(creator.clone()), Json(create_body(name))).await
         else {
@@ -71514,7 +71731,12 @@ mod quorum_enforcement_db_tests {
         // The migration backfills required_approval_roles = 1 by default.
         assert_eq!(read_row(pool, id).await.required_approval_roles, 1);
 
-        let approver = approver("dc-1", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let approver = approver(
+            pool,
+            "dc-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let id_s = id.to_string();
         let Json(body) = requests_approve(
             Path(id_s.clone()),
@@ -71541,7 +71763,16 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-two-role", 2).await;
 
         // First approval (DatacenterApprover / dc-2) -> PARTIAL, stays Planned.
-        let dc = approver("dc-2", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let dc = approver(
+            pool,
+            "dc-2",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
+        let dc_principal = dc
+            .principal_id
+            .expect("datacenter approver has an opaque principal")
+            .to_string();
         let id_s = id.to_string();
         let Json(first) = requests_approve(
             Path(id_s.clone()),
@@ -71558,7 +71789,11 @@ mod quorum_enforcement_db_tests {
         assert_eq!(count_events(pool, id, "request.approve").await, 0);
 
         // Second, DISTINCT approver+role (PlatformAdmin / pa-2) -> quorum met.
-        let pa = approver("pa-2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let pa = approver(pool, "pa-2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN).await;
+        let pa_principal = pa
+            .principal_id
+            .expect("platform approver has an opaque principal")
+            .to_string();
         let Json(second) = requests_approve(
             Path(id_s.clone()),
             AuthExtractor(pa),
@@ -71579,12 +71814,18 @@ mod quorum_enforcement_db_tests {
         // it preserves the first approver's entry — both are on the request row.
         let final_req = db_row_to_request(&read_row(pool, id).await, &id.to_string());
         assert!(
-            final_req.approval_route.iter().any(|r| r.contains("dc-2")),
+            final_req
+                .approval_route
+                .iter()
+                .any(|r| r.contains(&dc_principal)),
             "first approver must survive in the route: {:?}",
             final_req.approval_route
         );
         assert!(
-            final_req.approval_route.iter().any(|r| r.contains("pa-2")),
+            final_req
+                .approval_route
+                .iter()
+                .any(|r| r.contains(&pa_principal)),
             "second approver must be in the route: {:?}",
             final_req.approval_route
         );
@@ -71604,9 +71845,11 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-break-glass", 2).await;
 
         let emergency = approver(
+            pool,
             "emergency-q",
             ryuki_engine::auth::APP_ROLE_BREAK_GLASS_ADMIN,
-        );
+        )
+        .await;
         assert!(check_permission(&emergency, "approve"));
         let id_s = id.to_string();
         let denied = requests_approve(
@@ -71635,9 +71878,11 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-rework-epoch", 2).await;
 
         let old_dc = approver(
+            pool,
             "dc-old-cycle",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
-        );
+        )
+        .await;
         let id_s = id.to_string();
         let Json(old_partial) = requests_approve(
             Path(id_s.clone()),
@@ -71651,7 +71896,12 @@ mod quorum_enforcement_db_tests {
         assert_eq!(read_row(pool, id).await.approval_epoch, 1);
         assert_eq!(count_current_decisions(pool, id).await, 1);
 
-        let reworker = approver("pa-reworker", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let reworker = approver(
+            pool,
+            "pa-reworker",
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+        )
+        .await;
         let _ = requests_rework(
             Path(id.to_string()),
             AuthExtractor(reworker.clone()),
@@ -71680,9 +71930,11 @@ mod quorum_enforcement_db_tests {
             .expect("plan fresh cycle");
 
         let fresh_pa = approver(
+            pool,
             "pa-fresh-cycle",
             ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
-        );
+        )
+        .await;
         let Json(fresh_partial) = requests_approve(
             Path(id_s.clone()),
             AuthExtractor(fresh_pa),
@@ -71697,9 +71949,11 @@ mod quorum_enforcement_db_tests {
         assert_eq!(count_current_decisions(pool, id).await, 1);
 
         let fresh_dc = approver(
+            pool,
             "dc-fresh-cycle",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
-        );
+        )
+        .await;
         let Json(completed) = requests_approve(
             Path(id_s.clone()),
             AuthExtractor(fresh_dc),
@@ -71713,7 +71967,7 @@ mod quorum_enforcement_db_tests {
         assert_eq!(count_current_decisions(pool, id).await, 2);
         assert_eq!(count_decisions(pool, id).await, 3);
 
-        let auditor = approver("epoch-auditor", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let auditor = approver(pool, "epoch-auditor", ryuki_engine::auth::APP_ROLE_AUDITOR).await;
         let Json(ledger) =
             requests_approval_decisions(AuthExtractor(auditor), Path(id.to_string()))
                 .await
@@ -71751,9 +72005,11 @@ mod quorum_enforcement_db_tests {
         };
         let id = seed_planned_with_required_roles(pool, "q-concurrent-rework", 2).await;
         let old_dc = approver(
+            pool,
             "dc-before-race",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
-        );
+        )
+        .await;
         let id_s = id.to_string();
         let _ = requests_approve(
             Path(id_s.clone()),
@@ -71763,11 +72019,18 @@ mod quorum_enforcement_db_tests {
         .await
         .expect("seed partial decision");
 
-        let a = approver("pa-rework-a", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let a = approver(
+            pool,
+            "pa-rework-a",
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+        )
+        .await;
         let b = approver(
+            pool,
             "dc-rework-b",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
-        );
+        )
+        .await;
         let request_id = id.to_string();
         let (ra, rb) = tokio::join!(
             rework_one(&a, &request_id, "concurrent correction"),
@@ -71849,9 +72112,11 @@ mod quorum_enforcement_db_tests {
         };
         let id = seed_planned_with_required_roles(pool, "q-migration-174-rerun", 2).await;
         let dc = approver(
+            pool,
             "dc-migration-174",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
-        );
+        )
+        .await;
         let id_s = id.to_string();
         let _ = requests_approve(
             Path(id_s.clone()),
@@ -71868,17 +72133,43 @@ mod quorum_enforcement_db_tests {
             "/../../migrations/174_request_approval_lifecycle_epoch.sql"
         ))
         .expect("read migration 174");
+        // Migration 199 deliberately replaces migration 174's request/approval
+        // trigger bodies after renaming the legacy identity columns. Replaying
+        // the historical migration against the shared post-cutover test schema
+        // must therefore remain a rollback-only compatibility probe: allowing
+        // its pre-cutover trigger definitions to commit would corrupt every
+        // later request write in this process.
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin rollback-only migration 174 replay");
         sqlx::raw_sql(&sql)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .expect("re-running migration 174 must be a no-op for lifecycle data");
 
+        let approval_epoch: i64 =
+            sqlx::query_scalar("SELECT approval_epoch FROM requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read request epoch inside migration replay");
         assert_eq!(
-            read_row(pool, id).await.approval_epoch,
-            1,
+            approval_epoch, 1,
             "the guarded provenance backfill must not rotate live post-migration data"
         );
-        assert_eq!(count_current_decisions(pool, id).await, 1);
+        let current_decisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_approval_decisions \
+             WHERE request_id = $1 AND approval_epoch = 1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count current decisions inside migration replay");
+        assert_eq!(current_decisions, 1);
+        tx.rollback()
+            .await
+            .expect("restore post-migration request trigger definitions");
 
         cleanup(pool, id).await;
     }
@@ -72834,9 +73125,11 @@ mod quorum_enforcement_db_tests {
         let name = format!("immutable-review-basis-{}", Uuid::new_v4());
         let id = seed_planned_with_required_roles(pool, &name, 2).await;
         let first_checker = approver(
+            pool,
             "immutable-basis-checker",
             ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
-        );
+        )
+        .await;
         let id_s = id.to_string();
         let _ = requests_approve(
             Path(id_s.clone()),
@@ -72861,9 +73154,11 @@ mod quorum_enforcement_db_tests {
             .contains("reviewed request authority is immutable"));
 
         let reworker = approver(
+            pool,
             "immutable-basis-reworker",
             ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
-        );
+        )
+        .await;
         let _ = requests_rework(
             Path(id.to_string()),
             AuthExtractor(reworker),
@@ -72909,7 +73204,12 @@ mod quorum_enforcement_db_tests {
         };
         let a = seed_planned(pool, "ba-1").await;
         let b = seed_planned(pool, "ba-2").await;
-        let approver = approver("dc-ba", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let approver = approver(
+            pool,
+            "dc-ba",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let Json(out) = requests_batch_approve(
             AuthExtractor(approver),
             Json(BatchApproveRequest {
@@ -72953,7 +73253,12 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "ba-quorum", 2).await;
 
         // ONE approver via the BATCH endpoint → PARTIAL, still Planned, NOT approved.
-        let dc = approver("dc-ba2", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let dc = approver(
+            pool,
+            "dc-ba2",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let Json(first) = requests_batch_approve(
             AuthExtractor(dc),
             Json(BatchApproveRequest {
@@ -72978,7 +73283,7 @@ mod quorum_enforcement_db_tests {
         assert_eq!(count_decisions(pool, id).await, 1);
 
         // A DISTINCT second approver+role via the batch endpoint → quorum met.
-        let pa = approver("pa-ba2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let pa = approver(pool, "pa-ba2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN).await;
         let Json(second) = requests_batch_approve(
             AuthExtractor(pa),
             Json(BatchApproveRequest {
@@ -73006,10 +73311,15 @@ mod quorum_enforcement_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let dc = || approver("dc-val", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let dc = approver(
+            pool,
+            "dc-val",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         assert!(matches!(
             requests_batch_approve(
-                AuthExtractor(dc()),
+                AuthExtractor(dc.clone()),
                 Json(BatchApproveRequest { items: vec![] })
             )
             .await,
@@ -73022,18 +73332,19 @@ mod quorum_enforcement_db_tests {
             })
             .collect();
         assert!(matches!(
-            requests_batch_approve(
-                AuthExtractor(dc()),
-                Json(BatchApproveRequest { items: many })
-            )
-            .await,
+            requests_batch_approve(AuthExtractor(dc), Json(BatchApproveRequest { items: many }))
+                .await,
             Err((StatusCode::BAD_REQUEST, _))
         ));
 
         let id = seed_planned(pool, "ba-forbid").await;
         let actor = "op-ba-forbid";
-        let operator = approver(actor, ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR);
-        let denied = |a: &'static str| async move {
+        let operator = approver(pool, actor, ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR).await;
+        let actor_principal = operator
+            .principal_id
+            .expect("operator has an opaque principal")
+            .to_string();
+        let denied = |a: String| async move {
             // request_id IS NULL asserts the denial used the non-id "batch" sentinel
             // (a non-UUID that the durable audit parses to NULL), not a per-id row.
             sqlx::query_scalar::<_, i64>(
@@ -73046,7 +73357,7 @@ mod quorum_enforcement_db_tests {
             .await
             .expect("count denied")
         };
-        let before = denied(actor).await;
+        let before = denied(actor_principal.clone()).await;
         let Err((status, _)) = requests_batch_approve(
             AuthExtractor(operator),
             Json(BatchApproveRequest {
@@ -73059,7 +73370,11 @@ mod quorum_enforcement_db_tests {
             panic!("an operator (no approve) must get a 403 for the whole batch");
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(denied(actor).await - before, 1, "exactly one denial audit");
+        assert_eq!(
+            denied(actor_principal).await - before,
+            1,
+            "exactly one denial audit"
+        );
         assert_eq!(
             read_row(pool, id).await.status,
             "planned",
@@ -73079,7 +73394,12 @@ mod quorum_enforcement_db_tests {
         };
         let valid = seed_planned(pool, "ba-dedup").await;
         let missing = Uuid::new_v4();
-        let approver = approver("dc-dedup", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let approver = approver(
+            pool,
+            "dc-dedup",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let valid_item = reviewed_batch_approval_item(&valid.to_string()).await;
         let missing_item = reviewed_batch_approval_item(&missing.to_string()).await;
         let Json(out) = requests_batch_approve(
@@ -73136,8 +73456,21 @@ mod quorum_enforcement_db_tests {
         };
         let id = seed_planned_with_required_roles(pool, "q-concurrent", 2).await;
 
-        let a = approver("dc-cc", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
-        let b = approver("pa-cc", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let a = approver(
+            pool,
+            "dc-cc",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
+        let a_principal = a
+            .principal_id
+            .expect("datacenter approver has an opaque principal")
+            .to_string();
+        let b = approver(pool, "pa-cc", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN).await;
+        let b_principal = b
+            .principal_id
+            .expect("platform approver has an opaque principal")
+            .to_string();
         let id_s = id.to_string();
         let Json(reviewed) = reviewed_request_approval_body(&id_s).await;
         let (ra, rb) = tokio::join!(
@@ -73167,8 +73500,14 @@ mod quorum_enforcement_db_tests {
         assert_eq!(count_decisions(pool, id).await, 2);
         let final_req = db_row_to_request(&final_row, &id.to_string());
         assert!(
-            final_req.approval_route.iter().any(|r| r.contains("dc-cc"))
-                && final_req.approval_route.iter().any(|r| r.contains("pa-cc")),
+            final_req
+                .approval_route
+                .iter()
+                .any(|r| r.contains(&a_principal))
+                && final_req
+                    .approval_route
+                    .iter()
+                    .any(|r| r.contains(&b_principal)),
             "both racing approvers must survive in the route: {:?}",
             final_req.approval_route
         );
@@ -73187,7 +73526,12 @@ mod quorum_enforcement_db_tests {
         let id = seed_planned_with_required_roles(pool, "q-reject", 2).await;
 
         // One partial approve.
-        let dc = approver("dc-3", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let dc = approver(
+            pool,
+            "dc-3",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let id_s = id.to_string();
         let _ = requests_approve(
             Path(id_s.clone()),
@@ -73199,7 +73543,7 @@ mod quorum_enforcement_db_tests {
         assert_eq!(read_row(pool, id).await.status, "planned");
 
         // A distinct third principal REJECTS -> terminal.
-        let rej = approver("pa-3", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let rej = approver(pool, "pa-3", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN).await;
         let _ = requests_reject(
             Path(id.to_string()),
             AuthExtractor(rej),
@@ -73213,7 +73557,12 @@ mod quorum_enforcement_db_tests {
         assert_eq!(count_decisions(pool, id).await, 2);
 
         // A subsequent approve is refused by the engine from-status guard (400).
-        let late = approver("dc-3b", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let late = approver(
+            pool,
+            "dc-3b",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let err = requests_approve(
             Path(id_s.clone()),
             AuthExtractor(late),
@@ -73245,7 +73594,12 @@ mod quorum_enforcement_db_tests {
             .await
             .expect("force status off planned");
 
-        let sess = approver("racer", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let sess = approver(
+            pool,
+            "racer",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let role = approval_role_for(&sess).expect("ordinary approval role");
         let res = apply_approval_decision_audited(
             pool,
@@ -73270,7 +73624,8 @@ mod quorum_enforcement_db_tests {
     /// decision that the handler enforces under EntraId/Local.)
     #[tokio::test]
     async fn sod_blocks_self_approval_on_quorum_request() {
-        let creator = approver("self-q", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let creator =
+            verified_test_session("self-q", &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
         let creator_principal = creator
             .principal_id
             .expect("creator test principal")
@@ -73303,7 +73658,12 @@ mod quorum_enforcement_db_tests {
         };
         let id = seed_planned_with_required_roles(pool, "q-self", 2).await;
 
-        let same = approver("solo-q", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let same = approver(
+            pool,
+            "solo-q",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let id_s = id.to_string();
         let _ = requests_approve(
             Path(id_s.clone()),
@@ -73338,7 +73698,12 @@ mod quorum_enforcement_db_tests {
         };
         let id = seed_planned_with_required_roles(pool, "q-idem", 2).await;
 
-        let dc = approver("dc-idem", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let dc = approver(
+            pool,
+            "dc-idem",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let id_s = id.to_string();
         let _ = requests_approve(
             Path(id_s.clone()),
@@ -73388,7 +73753,12 @@ mod quorum_enforcement_db_tests {
         };
         let id = seed_planned_with_required_roles(pool, "q-no409", 2).await;
 
-        let dc = approver("dc-no409", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let dc = approver(
+            pool,
+            "dc-no409",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        )
+        .await;
         let id_s = id.to_string();
         let res = requests_approve(
             Path(id_s.clone()),
@@ -73474,10 +73844,15 @@ mod dns_records_db_tests {
         Some(pool)
     }
 
-    fn audit_actor(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s
+    async fn dns_operator(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_WINTEL_LINUX_OPERATOR],
+            &["DEFRA"],
+            &[],
+        )
+        .await
     }
 
     /// #7 audit: DNS record create + delete each write a durable,
@@ -73489,14 +73864,13 @@ mod dns_records_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let actor = "dns-audit-7c2";
-        let actor_session = audit_actor(actor);
+        let actor_session = dns_operator(pool, "dns-audit-7c2").await;
         let actor_principal = actor_session
             .principal_id
             .expect("DNS audit actor has a typed principal")
             .to_string();
         let Json(created) = dns_record_create(
-            AuthExtractor(actor_session),
+            AuthExtractor(actor_session.clone()),
             Json(DnsCreateRequest {
                 name: "audit".into(),
                 record_type: "A".into(),
@@ -73526,7 +73900,7 @@ mod dns_records_db_tests {
         );
         assert!(c_detail.contains("DEFRA"), "detail must name the site");
 
-        let _ = dns_record_delete(AuthExtractor(audit_actor(actor)), Path(id.clone()))
+        let _ = dns_record_delete(AuthExtractor(actor_session), Path(id.clone()))
             .await
             .expect("delete");
         let delete_audited: bool = sqlx::query_scalar(
@@ -73548,9 +73922,11 @@ mod dns_records_db_tests {
             return;
         };
 
+        let operator = dns_operator(pool, "dns-record-update").await;
+
         // Create a record, then update its value + TTL in place.
         let Json(created) = dns_record_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(DnsCreateRequest {
                 name: "www".into(),
                 record_type: "A".into(),
@@ -73565,7 +73941,7 @@ mod dns_records_db_tests {
         let id = created["record"]["id"].as_str().expect("id").to_string();
 
         let Json(updated) = dns_record_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path(id.clone()),
             Json(DnsUpdateRequest {
                 value: Some("10.0.0.99".into()),
@@ -73868,11 +74244,15 @@ mod ipam_subnets_db_tests {
 mod maint_calendar_db_tests {
     use super::*;
 
-    fn approver_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.provider_mode = "local".into();
-        s
+    async fn approver_session(pool: &PgPool, user_id: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
     }
 
     use crate::database::DB_TEST_SERIAL;
@@ -73985,9 +74365,11 @@ mod maint_calendar_db_tests {
             reason: "Proof: DB conflict must be enforced".into(),
             affected_cis: vec![],
         };
-        let result =
-            maintenance_calendar_schedule(Extension(approver_session("maint-user")), Json(body))
-                .await;
+        let result = maintenance_calendar_schedule(
+            Extension(approver_session(pool, "maint-conflict-user").await),
+            Json(body),
+        )
+        .await;
 
         cleanup_window(pool, seeded_id).await;
 
@@ -74018,9 +74400,11 @@ mod maint_calendar_db_tests {
             reason: "DB success test".into(),
             affected_cis: vec!["srv-test-01".into()],
         };
-        let result =
-            maintenance_calendar_schedule(Extension(approver_session("maint-user")), Json(body))
-                .await;
+        let result = maintenance_calendar_schedule(
+            Extension(approver_session(pool, "maint-success-user").await),
+            Json(body),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err");
         };
@@ -74069,9 +74453,11 @@ mod maint_calendar_db_tests {
             reason: "Must not be rejected by ghost".into(),
             affected_cis: vec![],
         };
-        let result =
-            maintenance_calendar_schedule(Extension(approver_session("maint-user")), Json(body))
-                .await;
+        let result = maintenance_calendar_schedule(
+            Extension(approver_session(pool, "maint-ghost-user").await),
+            Json(body),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("ghost in-memory window must NOT false-reject DB-mode schedule; got Err");
         };
@@ -74417,11 +74803,8 @@ mod maint_calendar_db_tests {
         )
         .await;
 
-        let result = maintenance_calendar_cancel(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.to_string()),
-        )
-        .await;
+        let actor = approver_session(pool, "maint-cancel-user").await;
+        let result = maintenance_calendar_cancel(AuthExtractor(actor), Path(id.to_string())).await;
         cleanup_window(pool, id).await;
 
         let Ok(Json(body)) = result else {
@@ -75751,6 +76134,33 @@ mod shift_queue_db_tests {
             &[environment],
         )
     }
+
+    async fn registered_approver_session(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
+    }
+
+    async fn registered_scoped_operator_session(
+        pool: &PgPool,
+        label: &str,
+        site: &str,
+        environment: &str,
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR],
+            &[site],
+            &[environment],
+        )
+        .await
+    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -76249,11 +76659,9 @@ mod shift_queue_db_tests {
         seed_item(pool, id, "failed-operation", "P2", None).await;
 
         // Call the handler — must go through the DB path.
-        let result = shift_acknowledge(
-            Path(id.to_string()),
-            AuthExtractor(approver_session("db-test-user")),
-        )
-        .await;
+        let actor = registered_approver_session(pool, "db-test-user").await;
+        let actor_principal = actor.principal_id.expect("registered actor").to_string();
+        let result = shift_acknowledge(Path(id.to_string()), AuthExtractor(actor)).await;
 
         cleanup_item(pool, id).await;
 
@@ -76261,7 +76669,7 @@ mod shift_queue_db_tests {
             panic!("expected Ok, got Err: {result:?}");
         };
         assert_eq!(body["status"], "acknowledged");
-        assert_eq!(body["acknowledged_by"], "db-test-user");
+        assert_eq!(body["acknowledged_by"], actor_principal);
         assert_eq!(body["source"], "database");
         assert!(body["acknowledged_at"].as_str().is_some());
     }
@@ -76295,19 +76703,13 @@ mod shift_queue_db_tests {
         seed_item(pool, id, "pending-approval", "P3", Some("ops-lead")).await;
 
         // First acknowledge.
-        let _ = shift_acknowledge(
-            Path(id.to_string()),
-            AuthExtractor(approver_session("ops-lead")),
-        )
-        .await
-        .expect("first acknowledge must succeed");
+        let actor = registered_approver_session(pool, "ops-lead").await;
+        let _ = shift_acknowledge(Path(id.to_string()), AuthExtractor(actor.clone()))
+            .await
+            .expect("first acknowledge must succeed");
 
         // Second acknowledge must fail with 400.
-        let result = shift_acknowledge(
-            Path(id.to_string()),
-            AuthExtractor(approver_session("ops-lead")),
-        )
-        .await;
+        let result = shift_acknowledge(Path(id.to_string()), AuthExtractor(actor)).await;
 
         cleanup_item(pool, id).await;
 
@@ -76336,9 +76738,11 @@ mod shift_queue_db_tests {
         let id = "e0000291-0000-0000-0000-000000000003";
         seed_item(pool, id, "blocked-request", "P3", None).await;
 
+        let actor = registered_approver_session(pool, "shift-lead").await;
+        let actor_principal = actor.principal_id.expect("registered actor").to_string();
         let result = shift_assign(
             Path(id.to_string()),
-            AuthExtractor(approver_session("shift-lead")),
+            AuthExtractor(actor),
             Json(ShiftActionRequest {
                 user: "network-team".to_string(),
             }),
@@ -76362,7 +76766,7 @@ mod shift_queue_db_tests {
         assert_eq!(body["status"], "assigned");
         assert_eq!(body["source"], "database");
         assert_eq!(body["assigned_to"], "network-team");
-        assert_eq!(body["assigned_by"], "shift-lead");
+        assert_eq!(body["assigned_by"], actor_principal);
 
         let row = row.expect("row must exist after assign");
         assert_eq!(
@@ -76374,7 +76778,7 @@ mod shift_queue_db_tests {
         // from the assignee — proven against the persisted row.
         assert_eq!(
             row.assigned_by.as_deref(),
-            Some("shift-lead"),
+            Some(actor_principal.as_str()),
             "assigned_by must be the session principal, not the assignee"
         );
     }
@@ -76392,7 +76796,7 @@ mod shift_queue_db_tests {
         seed_item(pool, id, "active-incident", "P1", Some("storage-lead")).await;
 
         let result = shift_escalate(
-            AuthExtractor(approver_session("test-escalator")),
+            AuthExtractor(registered_approver_session(pool, "test-escalator").await),
             Path(id.to_string()),
             Json(ShiftEscalateRequest {
                 reason: "P1 needs manager escalation".to_string(),
@@ -76446,7 +76850,7 @@ mod shift_queue_db_tests {
                 .expect("count before");
 
         let result = shift_resolve(
-            AuthExtractor(approver_session("test-resolver")),
+            AuthExtractor(registered_approver_session(pool, "test-resolver").await),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "Backup job re-ran successfully".to_string(),
@@ -76501,8 +76905,9 @@ mod shift_queue_db_tests {
         let id = "e0000291-0000-0000-0000-000000000006";
         seed_item(pool, id, "expiring-cert", "P2", Some("sec-team")).await;
 
+        let actor = registered_approver_session(pool, "test-resolver").await;
         let _ = shift_resolve(
-            AuthExtractor(approver_session("test-resolver")),
+            AuthExtractor(actor.clone()),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "First resolution".to_string(),
@@ -76512,7 +76917,7 @@ mod shift_queue_db_tests {
         .expect("first resolve must succeed");
 
         let result = shift_resolve(
-            AuthExtractor(approver_session("test-resolver")),
+            AuthExtractor(actor),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "Second resolution".to_string(),
@@ -78137,6 +78542,32 @@ mod emergency_change_unit_tests {
         s
     }
 
+    async fn registered_operator_session(
+        pool: &PgPool,
+        user_id: &str,
+        site_scope: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            site_scope,
+            &[],
+        )
+        .await
+    }
+
+    async fn registered_approver_session(pool: &PgPool, user_id: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+            &[],
+            &[],
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_initiate_fallback_no_db() {
         if crate::database::get_db().is_some() {
@@ -78265,11 +78696,18 @@ mod secrets_rotation_db_tests {
     /// Authenticated rotating session — secrets_rotate stamps `rotated_by` from
     /// the typed principal, so the persisted run must carry exactly this id.
     fn caller_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s
+        verified_test_session(user_id, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN])
+    }
+
+    async fn registered_caller_session(pool: &PgPool, user_id: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
     }
 
     /// Initialises the PROCESS-GLOBAL `database::POOL` so handler calls routed
@@ -78379,11 +78817,8 @@ mod secrets_rotation_db_tests {
         .await
         .expect("seed expired secret");
 
-        let res = secrets_deregister(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.into()),
-        )
-        .await;
+        let caller = registered_caller_session(pool, "secrets-prior-status-admin").await;
+        let res = secrets_deregister(AuthExtractor(caller), Path(id.into())).await;
         let from_status: Option<String> = sqlx::query_scalar(
             "SELECT from_status FROM audit_log \
              WHERE action = 'secret-deregister' AND detail->>'secret_id' = $1 \
@@ -78446,6 +78881,7 @@ mod secrets_rotation_db_tests {
                 .map(|a| a.iter().any(|s| s["id"] == serde_json::json!(id)))
                 .unwrap_or(false)
         };
+        let caller = registered_caller_session(pool, "secrets-retirement-admin").await;
 
         // Due before retiring.
         let Ok(Json(due_before)) =
@@ -78457,11 +78893,8 @@ mod secrets_rotation_db_tests {
         assert!(has(&due_before, id), "overdue secret is due before retire");
 
         // Soft retire.
-        let Ok(Json(out)) = secrets_deregister(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.into()),
-        )
-        .await
+        let Ok(Json(out)) =
+            secrets_deregister(AuthExtractor(caller.clone()), Path(id.into())).await
         else {
             cleanup_secret(pool, id).await;
             panic!("deregister failed");
@@ -78483,7 +78916,7 @@ mod secrets_rotation_db_tests {
         };
         assert!(!has(&due_after, id), "retired secret is excluded from due");
         let Ok(Json(ra)) = secrets_rotate_all(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Query(SecretsSiteQuery {
                 site: Some(site.into()),
             }),
@@ -78500,7 +78933,7 @@ mod secrets_rotation_db_tests {
 
         // A direct rotate is refused (409) and records NO run (history preserved).
         let before_runs = run_count_for(pool, id).await;
-        let err = secrets_rotate(Path(id.into()), Extension(AuthSession::static_dry_run()))
+        let err = secrets_rotate(Path(id.into()), Extension(caller.clone()))
             .await
             .expect_err("rotating a retired secret must be refused");
         assert_eq!(err.0, StatusCode::CONFLICT);
@@ -78513,7 +78946,7 @@ mod secrets_rotation_db_tests {
         // REGRESSION: failing the preserved run must NOT un-retire the secret
         // (a fail must never re-arm a retired secret for rotation).
         let _ = secrets_rotation_fail(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(SecretsFailRequest {
                 rotation_id: run_id.into(),
                 error: "post-retire failure".into(),
@@ -78536,7 +78969,7 @@ mod secrets_rotation_db_tests {
             "still excluded from due after a fail"
         );
         assert_eq!(
-            secrets_rotate(Path(id.into()), Extension(AuthSession::static_dry_run()))
+            secrets_rotate(Path(id.into()), Extension(caller.clone()))
                 .await
                 .expect_err("still refused")
                 .0,
@@ -78544,11 +78977,8 @@ mod secrets_rotation_db_tests {
         );
 
         // Re-deregister is idempotent.
-        let Ok(Json(again)) = secrets_deregister(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.into()),
-        )
-        .await
+        let Ok(Json(again)) =
+            secrets_deregister(AuthExtractor(caller.clone()), Path(id.into())).await
         else {
             panic!("idempotent re-deregister failed");
         };
@@ -78558,7 +78988,7 @@ mod secrets_rotation_db_tests {
         // PUT metadata-update on a retired secret is allowed (record corrections)
         // and must NOT un-retire it.
         let _ = secrets_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Path(id.into()),
             Json(SecretsUpdateRequest {
                 name: Some("corrected-name".into()),
@@ -78577,7 +79007,7 @@ mod secrets_rotation_db_tests {
 
         // Deregistering a missing secret is a 404.
         let err = secrets_deregister(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Path("sr-not-a-real-secret-xyz".into()),
         )
         .await
@@ -78597,9 +79027,10 @@ mod secrets_rotation_db_tests {
         // seed_secret stamps last_rotated = 2026-01-01.
         let id = "sr-dbtest-update-9c1";
         seed_secret(pool, id, "DEFRA", "2099-01-01T00:00:00+00:00").await;
+        let caller = registered_caller_session(pool, "secrets-metadata-admin").await;
 
         let _ = secrets_update(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Path(id.into()),
             Json(SecretsUpdateRequest {
                 name: Some("renamed-secret".into()),
@@ -78632,7 +79063,7 @@ mod secrets_rotation_db_tests {
         // Blank owner → 400; missing secret → 404.
         assert!(matches!(
             secrets_update(
-                AuthExtractor(AuthSession::static_dry_run()),
+                AuthExtractor(caller.clone()),
                 Path(id.into()),
                 Json(SecretsUpdateRequest {
                     name: None,
@@ -78646,7 +79077,7 @@ mod secrets_rotation_db_tests {
         ));
         assert!(matches!(
             secrets_update(
-                AuthExtractor(AuthSession::static_dry_run()),
+                AuthExtractor(caller),
                 Path("sr-does-not-exist".into()),
                 Json(SecretsUpdateRequest {
                     name: Some("x".into()),
@@ -78675,7 +79106,7 @@ mod secrets_rotation_db_tests {
         // A distinctive session principal: if attribution leaked from anywhere
         // other than THIS session, the assertion below would not match.
         let session_user = "dbtest-principal-rotate-7f3a";
-        let session = caller_session(session_user);
+        let session = registered_caller_session(pool, session_user).await;
         let session_principal = session
             .principal_id
             .expect("rotation caller has a typed principal")
@@ -78735,7 +79166,7 @@ mod secrets_rotation_db_tests {
         };
         let id = "sr-dbtest-audit-9c1";
         let session_user = "dbtest-principal-audit-3b8e";
-        let session = caller_session(session_user);
+        let session = registered_caller_session(pool, session_user).await;
         let session_principal = session
             .principal_id
             .expect("rotation caller has a typed principal")
@@ -78808,7 +79239,7 @@ mod secrets_rotation_db_tests {
         assert_eq!(run_count_for(pool, id).await, 0, "fixture must start clean");
 
         let result = secrets_rotate_all(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "rotate-all-admin").await),
             Query(SecretsSiteQuery {
                 site: Some(site.to_string()),
             }),
@@ -78858,7 +79289,7 @@ mod secrets_rotation_db_tests {
             return;
         };
         let result = secrets_rotate_all(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller_session("rotate-all-validation-admin")),
             Query(SecretsSiteQuery {
                 site: Some("   ".to_string()),
             }),
@@ -78886,7 +79317,7 @@ mod secrets_rotation_db_tests {
         // Create a run to fail.
         let rotate = secrets_rotate(
             Path(id.to_string()),
-            Extension(caller_session("bob.operator")),
+            Extension(registered_caller_session(pool, "bob.operator").await),
         )
         .await
         .expect("rotate must succeed");
@@ -78896,7 +79327,7 @@ mod secrets_rotation_db_tests {
             .to_string();
 
         let result = secrets_rotation_fail(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "rotation-failure-admin").await),
             Json(SecretsFailRequest {
                 rotation_id: run_id.clone(),
                 error: "mock provider denied".to_string(),
@@ -78935,7 +79366,7 @@ mod secrets_rotation_db_tests {
             return;
         };
         let result = secrets_rotation_fail(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller_session("rotation-failure-missing-admin")),
             Json(SecretsFailRequest {
                 rotation_id: "rr-dbtest-missing".to_string(),
                 error: "whatever".to_string(),
@@ -78956,7 +79387,7 @@ mod secrets_rotation_db_tests {
             return;
         };
         let result = secrets_rotation_fail(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller_session("rotation-failure-validation-admin")),
             Json(SecretsFailRequest {
                 rotation_id: "rr-anything".to_string(),
                 error: "   ".to_string(),
@@ -78978,8 +79409,13 @@ mod secrets_rotation_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        let caller = registered_caller_session(pool, "secret-registration-admin").await;
+        let caller_principal = caller
+            .principal_id
+            .expect("secret registration caller has an opaque principal")
+            .to_string();
         let result = secrets_register(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(SecretsRegisterRequest {
                 name: "dbtest-registered-secret".to_string(),
                 secret_type: "token".to_string(),
@@ -79009,7 +79445,10 @@ mod secrets_rotation_db_tests {
         .await
         .expect("query register audit")
         .expect("a secret-register audit row must exist");
-        assert_eq!(audit_actor, "static-user", "audit actor must be the caller");
+        assert_eq!(
+            audit_actor, caller_principal,
+            "audit actor must be the caller"
+        );
         assert!(
             audit_detail.contains("dbtest-registered-secret"),
             "detail must name the secret"
@@ -79020,11 +79459,7 @@ mod secrets_rotation_db_tests {
         );
 
         // It must be readable straight back from the DB.
-        let readback = secrets_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(new_id.to_string()),
-        )
-        .await;
+        let readback = secrets_get(AuthExtractor(caller), Path(new_id.to_string())).await;
         cleanup_secret(pool, new_id).await;
 
         let Ok(Json(got)) = readback else {
@@ -80863,6 +81298,17 @@ mod oob_access_db_tests {
         Some(pool)
     }
 
+    async fn oob_operator(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
+    }
+
     /// Insert a test endpoint and return its UUID string.
     #[allow(clippy::too_many_arguments)]
     async fn seed_endpoint(
@@ -80933,7 +81379,7 @@ mod oob_access_db_tests {
         .await;
 
         let result = oob_test_endpoint(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(oob_operator(pool, "oob-test-endpoint-operator").await),
             Path(id.into()),
         )
         .await;
@@ -81330,6 +81776,17 @@ mod noise_remediation_db_tests {
         session.actor_class = ryuki_engine::auth::ActorClass::Workload;
         session.provider_mode = "api-token".into();
         session
+    }
+
+    async fn registered_noise_admin(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
     }
 
     async fn drain_noise_reconciliation(pool: &PgPool) {
@@ -82610,7 +83067,7 @@ mod noise_remediation_db_tests {
         .expect("reset trigger to Active");
 
         let result = noise_suppress(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_noise_admin(pool, "noise-suppress-operator").await),
             Path("e0000100-1000-1000-1000-000000000001".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 60,
@@ -82704,7 +83161,7 @@ mod noise_remediation_db_tests {
         .expect("reset trigger to Active");
 
         let result = noise_resolve(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_noise_admin(pool, "noise-resolve-operator").await),
             Path("e0000100-1000-1000-1000-000000000003".into()),
             Json(NoiseResolveRequest {
                 resolution: "Resolved via DB test — log rotation expanded".into(),
@@ -82833,9 +83290,11 @@ mod noise_remediation_db_tests {
         .await
         .expect("reset trigger to Active");
 
+        let operator = registered_noise_admin(pool, "noise-concurrent-operator").await;
+
         // First suppress → must succeed (200).
         let first = noise_suppress(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Path("e0000100-1000-1000-1000-000000000005".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 30,
@@ -82847,7 +83306,7 @@ mod noise_remediation_db_tests {
 
         // Second suppress → must fail (400 already suppressed), not silently overwrite.
         let second = noise_suppress(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path("e0000100-1000-1000-1000-000000000005".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 120,
@@ -83556,6 +84015,26 @@ mod servicenow_db_tests {
         Some(pool)
     }
 
+    async fn registered_caller_session(pool: &PgPool, label: &str) -> AuthSession {
+        registered_scoped_caller_session(pool, label, &[], &[]).await
+    }
+
+    async fn registered_scoped_caller_session(
+        pool: &PgPool,
+        label: &str,
+        site_scope: &[&str],
+        environment_scope: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            site_scope,
+            environment_scope,
+        )
+        .await
+    }
+
     async fn seed_ci(pool: &PgPool, ci_name: &str) -> (Uuid, ServiceNowEnvironmentAuthority) {
         let ci_id: Uuid = sqlx::query_scalar(
             "INSERT INTO configuration_items \
@@ -83807,8 +84286,12 @@ mod servicenow_db_tests {
             urgency: "2".into(),
             assignment_group: "Wintel-Operations".into(),
         };
-        let result =
-            servicenow_incident(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
+        let caller = registered_caller_session(pool, "servicenow-incident-creator").await;
+        let caller_principal = caller
+            .principal_id
+            .expect("ServiceNow caller has an opaque principal")
+            .to_string();
+        let result = servicenow_incident(AuthExtractor(caller), Json(body)).await;
         let Ok(Json(v)) = result else {
             panic!("expected Ok, got: {result:?}");
         };
@@ -83850,7 +84333,7 @@ mod servicenow_db_tests {
         assert_eq!(row.site.as_deref(), Some("DEFRA"));
         assert_eq!(row.environment.as_deref(), Some("test"));
         assert_eq!(row.ci_owner.as_deref(), Some("snow-test-team"));
-        assert_eq!(row.requested_by.as_deref(), Some("static-user"));
+        assert_eq!(row.requested_by.as_deref(), Some(caller_principal.as_str()));
     }
 
     #[tokio::test]
@@ -83896,9 +84379,13 @@ mod servicenow_db_tests {
         .await
         .expect("seed unreviewed operator-managed CI with a fixture-like name");
 
-        let mut scoped = AuthSession::static_dry_run();
-        scoped.site_scope = vec!["DEFRA".into()];
-        scoped.environment_scope = vec!["production".into()];
+        let scoped = registered_scoped_caller_session(
+            pool,
+            "servicenow-foreign-authority-reader",
+            &["DEFRA"],
+            &["production"],
+        )
+        .await;
         let foreign = servicenow_incident(
             AuthExtractor(scoped),
             Json(ServicenowIncidentRequest {
@@ -83911,8 +84398,10 @@ mod servicenow_db_tests {
         .await;
         assert!(matches!(foreign, Err((StatusCode::NOT_FOUND, _))));
 
+        let unrestricted =
+            registered_caller_session(pool, "servicenow-unresolved-authority-reader").await;
         let unresolved = servicenow_incident(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(unrestricted.clone()),
             Json(ServicenowIncidentRequest {
                 ci_name: unresolved_ci.clone(),
                 description: "must not queue".into(),
@@ -83923,7 +84412,7 @@ mod servicenow_db_tests {
         .await;
         assert!(matches!(unresolved, Err((StatusCode::CONFLICT, _))));
         let operator_managed = servicenow_incident(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(unrestricted),
             Json(ServicenowIncidentRequest {
                 ci_name: operator_ci.clone(),
                 description: "name and environment are not reviewed authority".into(),
@@ -84003,7 +84492,9 @@ mod servicenow_db_tests {
             .expect("deactivate reviewed CI site");
 
         let result = servicenow_incident(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-inactive-authority-reader").await,
+            ),
             Json(ServicenowIncidentRequest {
                 ci_name: ci_name.clone(),
                 description: "inactive current site must fail closed".into(),
@@ -84173,7 +84664,7 @@ mod servicenow_db_tests {
 
         seed_ci(pool, "srv-test-snow-02.corp.local").await;
         let result = servicenow_change(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-change-creator").await),
             Json(ServicenowChangeRequest {
                 ci_name: "srv-test-snow-02.corp.local".into(),
                 change_type: "Standard".into(),
@@ -84216,7 +84707,7 @@ mod servicenow_db_tests {
 
         seed_ci(pool, "srv-test-snow-03.corp.local").await;
         let result = servicenow_request(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-request-creator").await),
             Json(ServicenowRequestRequest {
                 ci_name: "srv-test-snow-03.corp.local".into(),
                 request_type: "software-upgrade".into(),
@@ -84256,7 +84747,7 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-validator").await),
             Path(id.into()),
         )
         .await;
@@ -84301,7 +84792,9 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-wrong-state-validator").await,
+            ),
             Path(id.into()),
         )
         .await;
@@ -84317,13 +84810,13 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_validate_missing_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-missing-validator").await),
             Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into()),
         )
         .await;
@@ -84338,13 +84831,13 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_validate_malformed_id_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-malformed-validator").await),
             Path("not-a-uuid".into()),
         )
         .await;
@@ -84378,7 +84871,7 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_approve(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-approver").await),
             Path(id.into()),
         )
         .await;
@@ -84403,7 +84896,9 @@ mod servicenow_db_tests {
         seed_row(pool, id, "change", "srv-app-02.local", "Failed", "", "desc").await;
 
         let result = servicenow_approve(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-failed-state-approver").await,
+            ),
             Path(id.into()),
         )
         .await;
@@ -84437,7 +84932,7 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_approve(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-draft-approver").await),
             Path(id.into()),
         )
         .await;
@@ -84481,7 +84976,7 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_submit(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-submitter").await),
             Path(id.into()),
         )
         .await;
@@ -84544,7 +85039,9 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_submit(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-submitted-state-submitter").await,
+            ),
             Path(id.into()),
         )
         .await;
@@ -84579,7 +85076,9 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_submit(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-failed-state-submitter").await,
+            ),
             Path(id.into()),
         )
         .await;
@@ -84595,13 +85094,13 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_submit_missing_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_submit(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-missing-submitter").await),
             Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into()),
         )
         .await;
@@ -84633,7 +85132,7 @@ mod servicenow_db_tests {
         )
         .await;
         let result = servicenow_status(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-status-reader").await),
             Path(id.into()),
         )
         .await;
@@ -84652,13 +85151,15 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_status_missing_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_status(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-missing-status-reader").await,
+            ),
             Path("d0000100-0000-0000-0000-eeeeeeeeeeee".into()),
         )
         .await;
@@ -84673,13 +85174,15 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_status_malformed_id_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_status(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-malformed-status-reader").await,
+            ),
             Path("sn-req-001".into()),
         )
         .await;
@@ -84721,7 +85224,10 @@ mod servicenow_db_tests {
             "pending",
         )
         .await;
-        let Ok(Json(v)) = servicenow_pending(AuthExtractor(AuthSession::static_dry_run())).await
+        let Ok(Json(v)) = servicenow_pending(AuthExtractor(
+            registered_caller_session(pool, "servicenow-pending-reader").await,
+        ))
+        .await
         else {
             panic!("expected Ok from servicenow_pending");
         };
@@ -84775,30 +85281,18 @@ mod servicenow_db_tests {
             .await
             .expect("drift current CI environment away from reviewed binding");
 
-        let status = servicenow_status(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.into()),
-        )
-        .await;
+        let caller = registered_caller_session(pool, "servicenow-drift-reader").await;
+
+        let status = servicenow_status(AuthExtractor(caller.clone()), Path(id.into())).await;
         assert!(matches!(status, Err((StatusCode::NOT_FOUND, _))));
 
-        let submit = servicenow_submit(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.into()),
-        )
-        .await;
+        let submit = servicenow_submit(AuthExtractor(caller.clone()), Path(id.into())).await;
         assert!(matches!(submit, Err((StatusCode::NOT_FOUND, _))));
 
-        let cancel = servicenow_cancel(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.into()),
-        )
-        .await;
+        let cancel = servicenow_cancel(AuthExtractor(caller.clone()), Path(id.into())).await;
         assert!(matches!(cancel, Err((StatusCode::NOT_FOUND, _))));
 
-        let Ok(Json(pending)) =
-            servicenow_pending(AuthExtractor(AuthSession::static_dry_run())).await
-        else {
+        let Ok(Json(pending)) = servicenow_pending(AuthExtractor(caller)).await else {
             panic!("expected pending list after quarantining drifted row");
         };
         assert!(
@@ -84836,7 +85330,7 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_cancel(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-canceller").await),
             Path(id.into()),
         )
         .await;
@@ -84885,7 +85379,9 @@ mod servicenow_db_tests {
         .await;
 
         let result = servicenow_cancel(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(
+                registered_caller_session(pool, "servicenow-submitted-state-canceller").await,
+            ),
             Path(id.into()),
         )
         .await;
@@ -84902,13 +85398,13 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_cancel_missing_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_cancel(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-missing-canceller").await),
             Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into()),
         )
         .await;
@@ -84923,13 +85419,13 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_cancel_malformed_id_returns_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let result = servicenow_cancel(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-malformed-canceller").await),
             Path("bad-uuid".into()),
         )
         .await;
@@ -84961,7 +85457,7 @@ mod servicenow_db_tests {
         )
         .await;
         let Ok(Json(v)) = servicenow_history(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-history-reader").await),
             Path("srv-defra-web01.example.local".into()),
         )
         .await
@@ -84979,13 +85475,13 @@ mod servicenow_db_tests {
     #[tokio::test]
     async fn test_history_empty_for_unknown_ci() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
         let Ok(Json(v)) = servicenow_history(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(registered_caller_session(pool, "servicenow-empty-history-reader").await),
             Path("nonexistent.ci.example.local".into()),
         )
         .await
@@ -85058,8 +85554,8 @@ mod alert_routes_db_tests {
     }
 
     fn scoped_admin(site: &str, environment: &str, user_id: &str) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
-        bind_test_principal(&mut session, user_id);
+        let mut session =
+            verified_test_session(user_id, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
         session.site_scope = vec![site.to_string()];
         session.environment_scope = vec![environment.to_string()];
         session
@@ -85176,7 +85672,15 @@ mod alert_routes_db_tests {
             return;
         };
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let admin = registry_backed_local_test_session(
+            pool,
+            "alert-route-roundtrip-global-admin",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await;
+        let sess = || AuthExtractor(admin.clone());
         let trigger = format!("test-trigger-{}", uuid::Uuid::new_v4());
         let body = AlertRouteCreateRequest {
             site: "DEFRA".into(),
@@ -85242,12 +85746,20 @@ mod alert_routes_db_tests {
     #[tokio::test]
     async fn test_alert_route_create_delete_get_is_404() {
         let _serial = DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
-        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let admin = registry_backed_local_test_session(
+            pool,
+            "alert-route-delete-scoped-admin",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &["DEFRA"],
+            &["production"],
+        )
+        .await;
+        let sess = || AuthExtractor(admin.clone());
         let trigger = format!("test-del-trigger-{}", uuid::Uuid::new_v4());
         let body = AlertRouteCreateRequest {
             site: "DEFRA".into(),
@@ -85321,6 +85833,15 @@ mod alert_routes_db_tests {
         .await
         .expect("direct SQL insert");
 
+        let admin = registry_backed_local_test_session(
+            pool,
+            "alert-route-direct-update-scoped-admin",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &["DEFRA"],
+            &["production"],
+        )
+        .await;
+
         // Update severity via handler — must hit the DB COALESCE path.
         let update = AlertRouteUpdateRequest {
             trigger_name: None,
@@ -85330,12 +85851,8 @@ mod alert_routes_db_tests {
             priority: None,
             enabled: None,
         };
-        let result = alert_routes_update(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(uid.to_string()),
-            Json(update),
-        )
-        .await;
+        let result =
+            alert_routes_update(AuthExtractor(admin), Path(uid.to_string()), Json(update)).await;
 
         sqlx::query("DELETE FROM alert_routes WHERE id = $1")
             .bind(uid)
@@ -86878,13 +87395,7 @@ mod software_deployment_db_tests {
     /// An authenticated approver session — software_approve records the typed
     /// principal, so the recorded `approved_by` is its opaque UUID.
     fn approver_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+        verified_test_session(user_id, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN])
     }
 
     fn scoped_session(user_id: &str, site: &str, environment: &str) -> AuthSession {
@@ -86892,6 +87403,22 @@ mod software_deployment_db_tests {
         session.site_scope = vec![site.into()];
         session.environment_scope = vec![environment.into()];
         session
+    }
+
+    async fn registered_session(
+        pool: &PgPool,
+        label: &str,
+        site_scope: &[&str],
+        environment_scope: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            site_scope,
+            environment_scope,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -86906,12 +87433,12 @@ mod software_deployment_db_tests {
         let site = unique_site("SOFTWARE-APPROVAL-AUDIT");
         let configuration_item_id =
             seed_target(pool, &server, &site, Some("production"), "Server", true).await;
-        let maker = approver_session("software-approval-audit-maker");
+        let maker = registered_session(pool, "software-approval-audit-maker", &[], &[]).await;
         let Json(planned) = software_plan(AuthExtractor(maker), Json(plan_body(&server)))
             .await
             .expect("plan approval-audit fixture");
         let deployment_id = planned["id"].as_str().expect("deployment id").to_string();
-        let checker = approver_session("software-approval-audit-checker");
+        let checker = registered_session(pool, "software-approval-audit-checker", &[], &[]).await;
         let checker_principal = checker.principal_id.expect("checker principal").to_string();
 
         let Json(approved) =
@@ -86971,13 +87498,16 @@ mod software_deployment_db_tests {
         let site = unique_site("SOFTWARE-APP-ROLLBACK");
         seed_target(pool, &server, &site, Some("production"), "Server", true).await;
         let Json(planned) = software_plan(
-            AuthExtractor(approver_session("software-approval-rollback-maker")),
+            AuthExtractor(
+                registered_session(pool, "software-approval-rollback-maker", &[], &[]).await,
+            ),
             Json(plan_body(&server)),
         )
         .await
         .expect("plan approval rollback fixture");
         let deployment_id = planned["id"].as_str().expect("deployment id").to_string();
-        let checker = approver_session("software-approval-rollback-checker");
+        let checker =
+            registered_session(pool, "software-approval-rollback-checker", &[], &[]).await;
         let checker_principal = checker.principal_id.expect("checker principal").to_string();
 
         let suffix = Uuid::new_v4().simple().to_string();
@@ -87104,8 +87634,12 @@ mod software_deployment_db_tests {
         let body = plan_body(&server);
 
         // Plan.
-        let Ok(Json(planned)) =
-            software_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+        let maker = registered_session(pool, "software-lifecycle-maker", &[], &[]).await;
+        let maker_principal = maker
+            .principal_id
+            .expect("software maker has an opaque principal")
+            .to_string();
+        let Ok(Json(planned)) = software_plan(AuthExtractor(maker.clone()), Json(body)).await
         else {
             panic!("plan failed");
         };
@@ -87121,11 +87655,11 @@ mod software_deployment_db_tests {
         );
         assert_eq!(planned["scope_provenance"], "cmdb-configuration-item");
         assert_eq!(
-            planned["maker_user_id"], "static-user",
+            planned["maker_user_id"], maker_principal,
             "maker provenance must come from the authenticated session"
         );
         assert_eq!(
-            planned["requester"], "static-user",
+            planned["requester"], maker_principal,
             "legacy requester output must mirror the authenticated maker"
         );
         let id = planned["id"].as_str().expect("id").to_string();
@@ -87135,11 +87669,12 @@ mod software_deployment_db_tests {
         );
 
         // Approve.
-        let Ok(Json(approved)) = software_approve(
-            Path(id.clone()),
-            AuthExtractor(approver_session("test-approver")),
-        )
-        .await
+        let checker = registered_session(pool, "test-approver", &[], &[]).await;
+        let checker_principal = checker
+            .principal_id
+            .expect("software checker has an opaque principal")
+            .to_string();
+        let Ok(Json(approved)) = software_approve(Path(id.clone()), AuthExtractor(checker)).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("approve failed");
@@ -87148,14 +87683,11 @@ mod software_deployment_db_tests {
             approved["status"], "Approved",
             "status after approve must be Approved"
         );
-        assert_eq!(approved["approved_by"], "test-approver");
+        assert_eq!(approved["approved_by"], checker_principal);
 
         // Execute.
-        let Ok(Json(_executed)) = software_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(_executed)) =
+            software_execute(AuthExtractor(maker.clone()), Path(id.clone())).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("execute failed");
@@ -87174,11 +87706,8 @@ mod software_deployment_db_tests {
         assert!(row.executed_at.is_some(), "executed_at must be set");
 
         // Verify.
-        let Ok(Json(verify_result)) = software_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(verify_result)) =
+            software_verify(AuthExtractor(maker.clone()), Path(id.clone())).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("verify failed");
@@ -87201,11 +87730,7 @@ mod software_deployment_db_tests {
         assert!(row2.verified_at.is_some(), "verified_at must be set");
 
         // History SELECT must include the deployment.
-        let Ok(Json(history)) = software_history(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(server.clone()),
-        )
-        .await
+        let Ok(Json(history)) = software_history(AuthExtractor(maker), Path(server.clone())).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("history failed");
@@ -87240,7 +87765,11 @@ mod software_deployment_db_tests {
         body.environment = "staging".into();
         body.target_version = "caller-spoofed-version".into();
         body.requester = "forged-client-maker".into();
-        let maker = scoped_session("software-maker", &site, "production");
+        let maker = registered_session(pool, "software-maker", &[&site], &["production"]).await;
+        let maker_principal = maker
+            .principal_id
+            .expect("software maker has an opaque principal")
+            .to_string();
         let Ok(Json(planned)) = software_plan(AuthExtractor(maker.clone()), Json(body)).await
         else {
             panic!("scoped plan must succeed");
@@ -87254,8 +87783,8 @@ mod software_deployment_db_tests {
         assert_eq!(planned["site"], site);
         assert_eq!(planned["environment"], "production");
         assert_eq!(planned["target_version"], "7.0.4");
-        assert_eq!(planned["maker_user_id"], "software-maker");
-        assert_eq!(planned["requester"], "software-maker");
+        assert_eq!(planned["maker_user_id"], maker_principal);
+        assert_eq!(planned["requester"], maker_principal);
 
         let same_actor = software_approve(Path(id.clone()), AuthExtractor(maker)).await;
         let Err((status, _)) = same_actor else {
@@ -87282,14 +87811,18 @@ mod software_deployment_db_tests {
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let checker = scoped_session("software-checker", &site, "production");
+        let checker = registered_session(pool, "software-checker", &[&site], &["production"]).await;
+        let checker_principal = checker
+            .principal_id
+            .expect("software checker has an opaque principal")
+            .to_string();
         let Ok(Json(approved)) = software_approve(Path(id.clone()), AuthExtractor(checker)).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("distinct in-scope checker must approve");
         };
         assert_eq!(approved["status"], "Approved");
-        assert_eq!(approved["approved_by"], "software-checker");
+        assert_eq!(approved["approved_by"], checker_principal);
 
         let Err((status, _)) =
             software_execute(AuthExtractor(foreign.clone()), Path(id.clone())).await
@@ -87299,7 +87832,8 @@ mod software_deployment_db_tests {
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let operator = scoped_session("software-operator", &site, "production");
+        let operator =
+            registered_session(pool, "software-operator", &[&site], &["production"]).await;
         assert!(
             software_execute(AuthExtractor(operator.clone()), Path(id.clone()))
                 .await
@@ -88061,9 +88595,10 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let body = plan_body(&suffix);
+        let operator = registered_operator_session(pool, "decommission-roundtrip", &[]).await;
 
         let Ok(Json(created)) =
-            decommission_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+            decommission_plan(AuthExtractor(operator.clone()), Json(body)).await
         else {
             panic!("plan failed");
         };
@@ -88072,11 +88607,7 @@ mod server_decommission_db_tests {
         // id must be parseable as a UUID
         uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
 
-        let Ok(Json(got)) = decommission_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(got)) = decommission_get(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("get after plan failed");
@@ -88110,38 +88641,30 @@ mod server_decommission_db_tests {
 
         // Plan a DEFRA decommission as an unrestricted admin.
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let planner = registered_operator_session(pool, "decommission-scope-planner", &[]).await;
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(planner), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // A GBLON-site-scoped principal (DEFRA is out of scope).
-        let scoped = || {
-            let mut s = AuthSession::static_dry_run();
-            s.token_valid = true;
-            s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-            s.provider_mode = "test-verified-human".into();
-            s.site_scope = vec!["GBLON".into()];
-            s
-        };
+        let scoped =
+            registered_operator_session(pool, "decommission-gblon-operator", &["GBLON"]).await;
 
-        let got = decommission_get(AuthExtractor(scoped()), Path(id.clone())).await;
+        let got = decommission_get(AuthExtractor(scoped.clone()), Path(id.clone())).await;
         assert!(
             matches!(got, Err((StatusCode::NOT_FOUND, _))),
             "out-of-scope get must 404: {got:?}"
         );
-        let v = decommission_verify(AuthExtractor(scoped()), Path(id.clone())).await;
+        let v = decommission_verify(AuthExtractor(scoped.clone()), Path(id.clone())).await;
         assert!(
             matches!(v, Err((StatusCode::NOT_FOUND, _))),
             "out-of-scope verify must 404: {v:?}"
         );
         // approve must 404 BEFORE any engine state 409 — no status oracle.
-        let a = decommission_approve(Path(id.clone()), Extension(scoped())).await;
+        let a = decommission_approve(Path(id.clone()), Extension(scoped.clone())).await;
         assert!(
             matches!(a, Err((StatusCode::NOT_FOUND, _))),
             "out-of-scope approve must 404: {a:?}"
@@ -88149,7 +88672,7 @@ mod server_decommission_db_tests {
 
         // Planning a foreign-site (DEFRA) decommission is a 403 (body-supplied site).
         let p = decommission_plan(
-            AuthExtractor(scoped()),
+            AuthExtractor(scoped),
             Json(plan_body(&uuid::Uuid::new_v4().to_string())),
         )
         .await;
@@ -88159,8 +88682,8 @@ mod server_decommission_db_tests {
         );
 
         // Positive: a DEFRA-scoped principal CAN read it (guard is not over-broad).
-        let mut defra = AuthSession::static_dry_run();
-        defra.site_scope = vec!["DEFRA".into()];
+        let defra =
+            registered_operator_session(pool, "decommission-defra-reader", &["DEFRA"]).await;
         let ok = decommission_get(AuthExtractor(defra), Path(id.clone())).await;
         assert!(ok.is_ok(), "in-scope DEFRA get must succeed: {ok:?}");
 
@@ -88178,13 +88701,12 @@ mod server_decommission_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator =
+            registered_operator_session(pool, "decommission-lifecycle-operator", &[]).await;
 
         // 1. plan
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
@@ -88193,7 +88715,7 @@ mod server_decommission_db_tests {
         // 2. approve
         let Ok(Json(approved)) = decommission_approve(
             Path(id.clone()),
-            Extension(approver_session("test-approver")),
+            Extension(registered_approver_session(pool, "test-approver").await),
         )
         .await
         else {
@@ -88203,11 +88725,8 @@ mod server_decommission_db_tests {
         assert_eq!(approved["status"].as_str().unwrap_or(""), "Approved");
 
         // verify persisted
-        let Ok(Json(got)) = decommission_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(got)) =
+            decommission_get(AuthExtractor(operator.clone()), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("get after approve failed");
@@ -88215,22 +88734,16 @@ mod server_decommission_db_tests {
         assert_eq!(got["status"].as_str().unwrap_or(""), "Approved");
 
         // 3. quarantine
-        let Ok(Json(quarantined)) = decommission_quarantine(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(quarantined)) =
+            decommission_quarantine(AuthExtractor(operator.clone()), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("quarantine failed");
         };
         assert_eq!(quarantined["status"].as_str().unwrap_or(""), "Quarantined");
 
-        let Ok(Json(got)) = decommission_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(got)) =
+            decommission_get(AuthExtractor(operator.clone()), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("get after quarantine failed");
@@ -88238,11 +88751,8 @@ mod server_decommission_db_tests {
         assert_eq!(got["status"].as_str().unwrap_or(""), "Quarantined");
 
         // 4. execute
-        let Ok(Json(executed)) = decommission_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(executed)) =
+            decommission_execute(AuthExtractor(operator.clone()), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("execute failed");
@@ -88264,11 +88774,8 @@ mod server_decommission_db_tests {
             "decommission execute must write a durable audit row"
         );
 
-        let Ok(Json(got)) = decommission_get(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(got)) =
+            decommission_get(AuthExtractor(operator.clone()), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("get after execute failed");
@@ -88276,11 +88783,8 @@ mod server_decommission_db_tests {
         assert_eq!(got["status"].as_str().unwrap_or(""), "Executed");
 
         // 5. verify
-        let Ok(Json(_evidence)) = decommission_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(_evidence)) =
+            decommission_verify(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("verify failed");
@@ -88323,37 +88827,29 @@ mod server_decommission_db_tests {
 
         // Plan a DEFRA decommission, then drive it: approve → quarantine → execute.
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let operator = registered_operator_session(pool, "decommission-event-operator", &[]).await;
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
         let Json(_) = decommission_approve(
             Path(id.clone()),
-            Extension(approver_session("evt-approver")),
+            Extension(registered_approver_session(pool, "evt-approver").await),
         )
         .await
         .expect("approve");
-        let Json(_) = decommission_quarantine(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .expect("quarantine");
-        let Json(_) = decommission_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .expect("execute");
+        let Json(_) = decommission_quarantine(AuthExtractor(operator.clone()), Path(id.clone()))
+            .await
+            .expect("quarantine");
+        let Json(_) = decommission_execute(AuthExtractor(operator.clone()), Path(id.clone()))
+            .await
+            .expect("execute");
 
         // Unrestricted admin: exactly the two emitted events, correctly shaped as
         // site-only (site=DEFRA, environment=NULL, aggregate_type=decommission).
-        let admin_events = events_seen(AuthSession::static_dry_run(), &id).await;
+        let admin_events = events_seen(operator, &id).await;
         assert_eq!(
             admin_events.len(),
             2,
@@ -88460,32 +88956,31 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let server_name = format!("srv-{suffix}");
+        let operator =
+            registered_operator_session(pool, "decommission-inventory-operator", &[]).await;
 
         // plan
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // approve
-        let Ok(_) =
-            decommission_approve(Path(id.clone()), Extension(approver_session("inv-tester"))).await
+        let Ok(_) = decommission_approve(
+            Path(id.clone()),
+            Extension(registered_approver_session(pool, "inv-tester").await),
+        )
+        .await
         else {
             cleanup(pool, &id).await;
             panic!("approve failed");
         };
 
         // quarantine
-        let Ok(_) = decommission_quarantine(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(_) =
+            decommission_quarantine(AuthExtractor(operator.clone()), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("quarantine failed");
@@ -88493,7 +88988,7 @@ mod server_decommission_db_tests {
 
         // inventory must include our server
         let Ok((_headers, Json(inventory))) = decommission_quarantine_inventory(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Query(AdminListPage {
                 limit: None,
                 offset: None,
@@ -88712,12 +89207,10 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let server_name = format!("srv-{suffix}");
+        let operator = registered_operator_session(pool, "decommission-audit-operator", &[]).await;
 
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
@@ -88725,7 +89218,7 @@ mod server_decommission_db_tests {
 
         let Ok(_) = decommission_approve(
             Path(id.clone()),
-            Extension(approver_session("audit-tester")),
+            Extension(registered_approver_session(pool, "audit-tester").await),
         )
         .await
         else {
@@ -88733,12 +89226,7 @@ mod server_decommission_db_tests {
             panic!("approve failed");
         };
 
-        let Ok(_) = decommission_quarantine(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        else {
+        let Ok(_) = decommission_quarantine(AuthExtractor(operator), Path(id.clone())).await else {
             cleanup(pool, &id).await;
             panic!("quarantine failed");
         };
@@ -88776,23 +89264,19 @@ mod server_decommission_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator =
+            registered_operator_session(pool, "decommission-wrong-state-quarantine", &[]).await;
 
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // Attempt quarantine without approve — must fail 409
-        let Err((status, _)) = decommission_quarantine(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Err((status, _)) =
+            decommission_quarantine(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("expected 409 but quarantine succeeded on a Planned request");
@@ -88816,31 +89300,29 @@ mod server_decommission_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator =
+            registered_operator_session(pool, "decommission-prequarantine-executor", &[]).await;
 
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // Approve so status = Approved, then try execute (skipping quarantine)
-        let Ok(_) =
-            decommission_approve(Path(id.clone()), Extension(approver_session("exec-tester")))
-                .await
+        let Ok(_) = decommission_approve(
+            Path(id.clone()),
+            Extension(registered_approver_session(pool, "exec-tester").await),
+        )
+        .await
         else {
             cleanup(pool, &id).await;
             panic!("approve failed");
         };
 
-        let Err((status, _)) = decommission_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Err((status, _)) =
+            decommission_execute(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("expected 409 but execute succeeded before quarantine");
@@ -88864,12 +89346,11 @@ mod server_decommission_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let planner =
+            registered_operator_session(pool, "decommission-missing-principal-planner", &[]).await;
 
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(planner), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
@@ -88898,12 +89379,11 @@ mod server_decommission_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let planner =
+            registered_operator_session(pool, "decommission-repeat-approval-planner", &[]).await;
 
-        let Ok(Json(created)) = decommission_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(planner), Json(plan_body(&suffix))).await
         else {
             panic!("plan failed");
         };
@@ -88912,7 +89392,7 @@ mod server_decommission_db_tests {
         // First approve — should succeed
         let Ok(_) = decommission_approve(
             Path(id.clone()),
-            Extension(approver_session("first-approver")),
+            Extension(registered_approver_session(pool, "first-approver").await),
         )
         .await
         else {
@@ -88923,7 +89403,7 @@ mod server_decommission_db_tests {
         // Second approve from Approved state — must return 409
         let Err((status, _)) = decommission_approve(
             Path(id.clone()),
-            Extension(approver_session("second-approver")),
+            Extension(registered_approver_session(pool, "second-approver").await),
         )
         .await
         else {
@@ -88969,13 +89449,15 @@ mod patch_waves_db_tests {
         }
     }
 
-    fn verified_actor(label: &str) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
-        bind_test_principal(&mut session, label);
-        session.token_valid = true;
-        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        session.provider_mode = "test-verified-human".into();
-        session
+    async fn verified_actor(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
+        .await
     }
 
     async fn cleanup(pool: &PgPool, id: &str) {
@@ -88998,7 +89480,7 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let maker = verified_actor(&format!("patch-maker-{suffix}"));
+        let maker = verified_actor(pool, &format!("patch-maker-{suffix}")).await;
         let maker_principal_id = maker.principal_id.expect("bound maker principal");
 
         let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
@@ -89042,8 +89524,9 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let maker = verified_actor(&format!("patch-maker-{suffix}"));
+        let maker = verified_actor(pool, &format!("patch-maker-{suffix}")).await;
         let maker_principal = maker.principal_id.expect("bound maker principal");
+        let operator = verified_actor(pool, &format!("patch-operator-{suffix}")).await;
 
         // 1. plan
         let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
@@ -89054,7 +89537,7 @@ mod patch_waves_db_tests {
 
         // 2. validate
         let Ok(Json(vr)) = patch_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89077,11 +89560,11 @@ mod patch_waves_db_tests {
         );
 
         // 3. approve — the session principal must land in the approval trail.
-        let mut approver = AuthSession::static_dry_run();
-        let approver_principal = bind_test_principal(&mut approver, "patch-approver").to_string();
-        approver.token_valid = true;
-        approver.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        approver.provider_mode = "test-verified-human".into();
+        let approver = verified_actor(pool, &format!("patch-approver-{suffix}")).await;
+        let approver_principal = approver
+            .principal_id
+            .expect("bound approver principal")
+            .to_string();
         let Ok(Json(approved)) = patch_approve(
             AuthExtractor(approver),
             Json(PatchActionRequest {
@@ -89144,7 +89627,7 @@ mod patch_waves_db_tests {
 
         // 4. execute
         let Ok(Json(evidence)) = patch_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89171,7 +89654,7 @@ mod patch_waves_db_tests {
 
         // 5. verify (evidence-only, no transition)
         let Ok(Json(verify_result)) = patch_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89198,7 +89681,7 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let maker = verified_actor(&format!("patch-self-maker-{suffix}"));
+        let maker = verified_actor(pool, &format!("patch-self-maker-{suffix}")).await;
         let maker_principal = maker.principal_id.expect("bound maker principal");
         let Ok(Json(created)) =
             patch_plan(AuthExtractor(maker.clone()), Json(plan_body(&suffix))).await
@@ -89208,7 +89691,7 @@ mod patch_waves_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         let _ = patch_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(maker.clone()),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89234,7 +89717,10 @@ mod patch_waves_db_tests {
         assert_eq!(record.maker_principal_id, Some(maker_principal));
         assert_eq!(record.approved_by_principal_id, None);
 
-        let replacement_maker = test_principal_id(&format!("replacement-maker-{suffix}"));
+        let replacement_maker = verified_actor(pool, &format!("replacement-maker-{suffix}"))
+            .await
+            .principal_id
+            .expect("replacement maker has a registered opaque principal");
         let rebind =
             sqlx::query("UPDATE patch_waves SET maker_principal_id = $2 WHERE id = $1::uuid")
                 .bind(&id)
@@ -89280,8 +89766,9 @@ mod patch_waves_db_tests {
         .await
         .expect("seed unresolved legacy wave");
 
+        let validator = verified_actor(pool, &format!("legacy-validator-{id}")).await;
         let _ = patch_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(validator),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89289,7 +89776,7 @@ mod patch_waves_db_tests {
         .await
         .expect("legacy validation compatibility must remain");
 
-        let checker = verified_actor(&format!("legacy-checker-{id}"));
+        let checker = verified_actor(pool, &format!("legacy-checker-{id}")).await;
         let denied = patch_approve(
             AuthExtractor(checker),
             Json(PatchActionRequest {
@@ -89389,15 +89876,16 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let maker = verified_actor(&format!("patch-race-maker-{suffix}"));
+        let maker = verified_actor(pool, &format!("patch-race-maker-{suffix}")).await;
         let maker_principal = maker.principal_id.expect("bound maker principal");
-        let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
+        let Ok(Json(created)) =
+            patch_plan(AuthExtractor(maker.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("patch_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
         let _ = patch_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(maker),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89405,8 +89893,8 @@ mod patch_waves_db_tests {
         .await
         .expect("patch_validate failed");
 
-        let checker_a = verified_actor(&format!("patch-race-checker-a-{suffix}"));
-        let checker_b = verified_actor(&format!("patch-race-checker-b-{suffix}"));
+        let checker_a = verified_actor(pool, &format!("patch-race-checker-a-{suffix}")).await;
+        let checker_b = verified_actor(pool, &format!("patch-race-checker-b-{suffix}")).await;
         let checker_a_principal = checker_a.principal_id.expect("checker A principal");
         let checker_b_principal = checker_b.principal_id.expect("checker B principal");
         let (result_a, result_b) = tokio::join!(
@@ -89479,9 +89967,10 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let maker = verified_actor(&format!("patch-maker-{suffix}"));
+        let maker = verified_actor(pool, &format!("patch-maker-{suffix}")).await;
 
-        let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
+        let Ok(Json(created)) =
+            patch_plan(AuthExtractor(maker.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("patch_plan failed");
         };
@@ -89496,7 +89985,7 @@ mod patch_waves_db_tests {
 
         // Advance it to Validated through the normal path.
         if patch_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(maker),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -89788,17 +90277,30 @@ mod snapshots_db_tests {
     }
 
     fn scoped_session(user: &str, sites: &[&str], environments: &[&str]) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
-        bind_test_principal(&mut session, user);
-        session.token_valid = true;
-        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        session.provider_mode = "test-verified-human".into();
+        let mut session =
+            verified_test_session(user, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
         session.site_scope = sites.iter().map(|value| (*value).to_string()).collect();
         session.environment_scope = environments
             .iter()
             .map(|value| (*value).to_string())
             .collect();
         session
+    }
+
+    async fn registered_session(
+        pool: &PgPool,
+        label: &str,
+        sites: &[&str],
+        environments: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            sites,
+            environments,
+        )
+        .await
     }
 
     async fn seed_ci(pool: &PgPool, ci_name: &str, site: &str, environment: Option<&str>) {
@@ -89949,11 +90451,13 @@ mod snapshots_db_tests {
         let ci_name = format!("ci-test-{suffix}");
         seed_ci(pool, &ci_name, "SNAP-A", Some("production")).await;
 
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let caller = registered_session(pool, "snapshot-roundtrip-admin", &[], &[]).await;
+        let caller_principal = caller
+            .principal_id
+            .expect("snapshot caller has an opaque principal")
+            .to_string();
+        let Ok(Json(created)) =
+            snapshot_plan(AuthExtractor(caller), Json(plan_body(&suffix))).await
         else {
             panic!("snapshot_plan failed");
         };
@@ -89970,7 +90474,10 @@ mod snapshots_db_tests {
         );
         assert_eq!(record.site.as_deref(), Some("SNAP-A"));
         assert_eq!(record.environment.as_deref(), Some("production"));
-        assert_eq!(record.created_by.as_deref(), Some("static-user"));
+        assert_eq!(
+            record.created_by.as_deref(),
+            Some(caller_principal.as_str())
+        );
         assert_eq!(
             record.scope_provenance.as_deref(),
             Some("cmdb-configuration-item")
@@ -90154,11 +90661,8 @@ mod snapshots_db_tests {
         let ci_name = format!("ci-test-{suffix}");
         seed_ci(pool, &ci_name, "SNAP-A", Some("production")).await;
 
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let actor = registered_session(pool, "snapshot-review-maker", &[], &[]).await;
+        let Ok(Json(created)) = snapshot_plan(AuthExtractor(actor), Json(plan_body(&suffix))).await
         else {
             panic!("snapshot_plan failed");
         };
@@ -90176,7 +90680,7 @@ mod snapshots_db_tests {
         assert!(plan_audited, "snapshot_plan must write a durable audit row");
 
         let Ok(Json(reviewed)) = snapshot_review(
-            AuthExtractor(scoped_session("snapshot-reviewer", &[], &[])),
+            AuthExtractor(registered_session(pool, "snapshot-reviewer", &[], &[]).await),
             Json(SnapshotActionRequest {
                 snapshot_id: id.clone(),
             }),
@@ -90209,11 +90713,8 @@ mod snapshots_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let ci_name = format!("ci-test-{suffix}");
         seed_ci(pool, &ci_name, "SNAP-A", Some("production")).await;
-        let Ok(Json(created)) = snapshot_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let actor = registered_session(pool, "snapshot-remediation-maker", &[], &[]).await;
+        let Ok(Json(created)) = snapshot_plan(AuthExtractor(actor), Json(plan_body(&suffix))).await
         else {
             panic!("snapshot_plan failed");
         };
@@ -90299,7 +90800,8 @@ mod snapshots_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        if snapshot_flag_stale(AuthExtractor(AuthSession::static_dry_run()))
+        let operator = registered_session(pool, "snapshot-remediation-operator", &[], &[]).await;
+        if snapshot_flag_stale(AuthExtractor(operator.clone()))
             .await
             .is_err()
         {
@@ -90308,7 +90810,7 @@ mod snapshots_db_tests {
         }
 
         let Ok(Json(remediated)) = snapshot_remediate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(SnapshotActionRequest {
                 snapshot_id: id.clone(),
             }),
@@ -91307,13 +91809,30 @@ mod backup_restore_db_tests {
     /// An authenticated approver session — backup_restore_approve records the
     /// session's opaque typed principal as the approver.
     fn approver_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        bind_test_principal(&mut s, user_id);
-        s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
-        s.token_valid = true;
-        s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        s
+        verified_test_session(user_id, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN])
+    }
+
+    /// Build the durable local-admin identity required by restore writes and
+    /// their transactional audit records. Labels remain display-only; all
+    /// security decisions use the registry-assigned opaque principal.
+    async fn registered_admin_session(pool: &PgPool, label: &str) -> AuthSession {
+        registered_scoped_admin_session(pool, label, &[], &[]).await
+    }
+
+    async fn registered_scoped_admin_session(
+        pool: &PgPool,
+        label: &str,
+        site_scope: &[&str],
+        environment_scope: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            site_scope,
+            environment_scope,
+        )
+        .await
     }
 
     async fn global_pool() -> Option<&'static PgPool> {
@@ -91599,7 +92118,7 @@ mod backup_restore_db_tests {
         };
 
         let Ok(Json(created)) = backup_coverage_report(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(approver_session("backup-coverage-planner")),
             Json(CoverageReportRequest {
                 site_scope: vec!["GBLON".into()],
                 environment_scope: vec!["production".into()],
@@ -91647,8 +92166,13 @@ mod backup_restore_db_tests {
         )
         .await;
 
+        let planner = approver_session("backup-restore-planner");
+        let planner_principal = planner
+            .principal_id
+            .expect("backup planner has an opaque principal")
+            .to_string();
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-db-test-001".into(),
                 restore_type: "full-vm".into(),
@@ -91680,7 +92204,7 @@ mod backup_restore_db_tests {
         assert_eq!(record.source_ci_key, "ci-db-test-001");
         assert_eq!(
             record.metadata.get("planned_by").map(String::as_str),
-            Some("static-user"),
+            Some(planner_principal.as_str()),
             "the security maker is server-derived and separate from body.owner"
         );
 
@@ -91714,7 +92238,7 @@ mod backup_restore_db_tests {
             owner: "source-authority-owner".into(),
         };
 
-        let mut target_only = AuthSession::static_dry_run();
+        let mut target_only = approver_session("restore-target-only");
         target_only.site_scope = vec!["GBLON".into()];
         target_only.environment_scope = vec!["production".into()];
         let foreign_source = backup_restore_plan(
@@ -91726,7 +92250,7 @@ mod backup_restore_db_tests {
         assert_eq!(foreign_source.0, StatusCode::NOT_FOUND);
 
         let missing_source = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(approver_session("restore-missing-source")),
             Json(body(
                 format!("missing-restore-source-{}", Uuid::new_v4()),
                 restore_point,
@@ -91737,7 +92261,7 @@ mod backup_restore_db_tests {
         assert_eq!(missing_source.0, StatusCode::NOT_FOUND);
 
         let missing_point = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(approver_session("restore-missing-point")),
             Json(body(source_ci_key.clone(), "2026-06-11T02:00:00Z")),
         )
         .await
@@ -91750,7 +92274,7 @@ mod backup_restore_db_tests {
             .await
             .expect("expire source restore point");
         let expired_point = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(approver_session("restore-expired-point")),
             Json(body(source_ci_key.clone(), restore_point)),
         )
         .await
@@ -91764,7 +92288,7 @@ mod backup_restore_db_tests {
 
         set_restore_site_active(pool, &source_site, false).await;
         let inactive_source = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(approver_session("restore-inactive-source")),
             Json(body(source_ci_key.clone(), restore_point)),
         )
         .await
@@ -91780,9 +92304,13 @@ mod backup_restore_db_tests {
             "production",
         )
         .await;
-        let mut source_and_target = AuthSession::static_dry_run();
-        source_and_target.site_scope = vec![source_site.clone(), "GBLON".into()];
-        source_and_target.environment_scope = vec!["production".into()];
+        let source_and_target = registered_scoped_admin_session(
+            pool,
+            "restore-authorized-planner",
+            &[source_site.as_str(), "GBLON"],
+            &["production"],
+        )
+        .await;
         let Json(created) = backup_restore_plan(
             AuthExtractor(source_and_target),
             Json(body(source_ci_key.clone(), restore_point)),
@@ -91825,8 +92353,9 @@ mod backup_restore_db_tests {
             .execute(pool)
             .await
             .expect("move source CI after planning");
+        let source_drift_checker = registered_admin_session(pool, "source-drift-checker").await;
         let moved_source = backup_restore_approve(
-            Extension(approver_session("source-drift-checker")),
+            Extension(source_drift_checker),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -91841,8 +92370,10 @@ mod backup_restore_db_tests {
             .await
             .expect("restore source CI scope for cleanup");
 
+        let source_restored_checker =
+            registered_admin_session(pool, "source-restored-checker").await;
         let _ = backup_restore_approve(
-            Extension(approver_session("source-restored-checker")),
+            Extension(source_restored_checker),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -91854,8 +92385,10 @@ mod backup_restore_db_tests {
             .execute(pool)
             .await
             .expect("expire source point after approval");
+        let expired_source_executor =
+            registered_admin_session(pool, "expired-source-executor").await;
         let expired_execution = backup_restore_execute(
-            AuthExtractor(approver_session("expired-source-executor")),
+            AuthExtractor(expired_source_executor),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -91907,8 +92440,10 @@ mod backup_restore_db_tests {
             .execute(pool)
             .await
             .expect("reactivate source point for positive control");
+        let restored_source_executor =
+            registered_admin_session(pool, "restored-source-executor").await;
         let _ = backup_restore_execute(
-            AuthExtractor(approver_session("restored-source-executor")),
+            AuthExtractor(restored_source_executor),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92058,9 +92593,10 @@ mod backup_restore_db_tests {
         )
         .await;
 
-        // Plan a GBLON/production restore as an unrestricted admin.
+        // Plan a GBLON/production restore as an unrestricted, durable admin.
+        let planner = registered_admin_session(pool, "restore-scope-planner").await;
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-scope-test-001".into(),
                 restore_type: "full-vm".into(),
@@ -92078,10 +92614,7 @@ mod backup_restore_db_tests {
 
         // A DEFRA-site-scoped principal (GBLON out of scope).
         let scoped = || {
-            let mut s = AuthSession::static_dry_run();
-            s.token_valid = true;
-            s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-            s.provider_mode = "test-verified-human".into();
+            let mut s = approver_session("restore-out-of-scope-admin");
             s.site_scope = vec!["DEFRA".into()];
             s
         };
@@ -92158,7 +92691,7 @@ mod backup_restore_db_tests {
         );
 
         // Positive: a GBLON/production principal CAN read it.
-        let mut gblon = AuthSession::static_dry_run();
+        let mut gblon = approver_session("restore-in-scope-reader");
         gblon.site_scope = vec!["GBLON".into()];
         gblon.environment_scope = vec!["production".into()];
         assert!(
@@ -92226,8 +92759,9 @@ mod backup_restore_db_tests {
             "production",
         )
         .await;
+        let defra_planner = registered_admin_session(pool, "defra-recency-planner").await;
         let _ = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(defra_planner),
             Json(RestorePlanRequest {
                 source_ci_key: defra_ci.clone(),
                 restore_type: "full-vm".into(),
@@ -92288,8 +92822,9 @@ mod backup_restore_db_tests {
         .await;
 
         // Plan first.
+        let planner = registered_admin_session(pool, "restore-approval-planner").await;
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-approve-test".into(),
                 restore_type: "file-level".into(),
@@ -92306,8 +92841,13 @@ mod backup_restore_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // Approve.
+        let approver = registered_admin_session(pool, "Datacenter Lead").await;
+        let approver_principal = approver
+            .principal_id
+            .expect("restore approver has an opaque principal")
+            .to_string();
         let Ok(Json(approved_resp)) = backup_restore_approve(
-            Extension(approver_session("Datacenter Lead")),
+            Extension(approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92345,7 +92885,7 @@ mod backup_restore_db_tests {
         );
         assert_eq!(
             record.metadata.get("approver").map(String::as_str),
-            Some("Datacenter Lead"),
+            Some(approver_principal.as_str()),
             "approver must be in metadata"
         );
 
@@ -92371,8 +92911,9 @@ mod backup_restore_db_tests {
         .await;
 
         // Plan then approve once.
+        let planner = registered_admin_session(pool, "double-approval-planner").await;
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-double-approve".into(),
                 restore_type: "full-vm".into(),
@@ -92388,8 +92929,9 @@ mod backup_restore_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
+        let first_approver = registered_admin_session(pool, "First Approver").await;
         if backup_restore_approve(
-            Extension(approver_session("First Approver")),
+            Extension(first_approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92402,8 +92944,9 @@ mod backup_restore_db_tests {
         }
 
         // Second approve must fail (Approved != Planned → engine guard → 409).
+        let second_approver = registered_admin_session(pool, "Second Approver").await;
         let Err((status, _)) = backup_restore_approve(
-            Extension(approver_session("Second Approver")),
+            Extension(second_approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92440,8 +92983,9 @@ mod backup_restore_db_tests {
         )
         .await;
 
+        let planner = registered_admin_session(pool, "restore-execution-planner").await;
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-execute-test".into(),
                 restore_type: "instant-vm-recovery".into(),
@@ -92457,8 +93001,9 @@ mod backup_restore_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
+        let approver = registered_admin_session(pool, "Exec Approver").await;
         if backup_restore_approve(
-            Extension(approver_session("Exec Approver")),
+            Extension(approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92470,8 +93015,9 @@ mod backup_restore_db_tests {
             panic!("approve failed");
         }
 
+        let executor = registered_admin_session(pool, "Exec Actor").await;
         let Ok(Json(evidence)) = backup_restore_execute(
-            AuthExtractor(approver_session("Exec Actor")),
+            AuthExtractor(executor.clone()),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92502,7 +93048,7 @@ mod backup_restore_db_tests {
 
         // A second execute must be rejected — the request is no longer Approved.
         let Err((status, _)) = backup_restore_execute(
-            AuthExtractor(approver_session("Exec Actor")),
+            AuthExtractor(executor),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92539,8 +93085,9 @@ mod backup_restore_db_tests {
         )
         .await;
 
+        let planner = registered_admin_session(pool, "unapproved-restore-planner").await;
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-no-approve-execute".into(),
                 restore_type: "full-vm".into(),
@@ -92556,8 +93103,9 @@ mod backup_restore_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
+        let executor = registered_admin_session(pool, "unapproved-restore-executor").await;
         let Err((status, _)) = backup_restore_execute(
-            AuthExtractor(approver_session("Exec Actor")),
+            AuthExtractor(executor),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92594,8 +93142,9 @@ mod backup_restore_db_tests {
         )
         .await;
 
+        let planner = registered_admin_session(pool, "restore-cas-planner").await;
         let Ok(Json(created)) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: "ci-cas-test".into(),
                 restore_type: "application-item".into(),
@@ -92622,8 +93171,9 @@ mod backup_restore_db_tests {
         );
 
         // Advance it to Approved through the normal path.
+        let approver = registered_admin_session(pool, "CAS Approver").await;
         if backup_restore_approve(
-            Extension(approver_session("CAS Approver")),
+            Extension(approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92665,8 +93215,9 @@ mod backup_restore_db_tests {
             "production",
         )
         .await;
+        let planner = registered_admin_session(pool, "restore-authority-planner").await;
         let Json(created) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key: source_ci_key.clone(),
                 restore_type: "full-vm".into(),
@@ -92691,8 +93242,9 @@ mod backup_restore_db_tests {
             .contains("verified restore authority tuple and planner are immutable"));
 
         set_restore_site_active(pool, &site, false).await;
+        let inactive_site_approver = registered_admin_session(pool, "inactive-site-approver").await;
         let approval_denial = backup_restore_approve(
-            Extension(approver_session("inactive-site-approver")),
+            Extension(inactive_site_approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92764,8 +93316,9 @@ mod backup_restore_db_tests {
         );
 
         set_restore_site_active(pool, &site, true).await;
+        let active_site_approver = registered_admin_session(pool, "active-site-approver").await;
         let _ = backup_restore_approve(
-            Extension(approver_session("active-site-approver")),
+            Extension(active_site_approver),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92774,8 +93327,9 @@ mod backup_restore_db_tests {
         .expect("reactivation restores legitimate approval");
 
         set_restore_site_active(pool, &site, false).await;
+        let inactive_site_executor = registered_admin_session(pool, "inactive-site-executor").await;
         let execution_denial = backup_restore_execute(
-            AuthExtractor(approver_session("inactive-site-executor")),
+            AuthExtractor(inactive_site_executor),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92802,8 +93356,9 @@ mod backup_restore_db_tests {
         assert!(!execution_audited, "denied execution must create no audit");
 
         set_restore_site_active(pool, &site, true).await;
+        let active_site_executor = registered_admin_session(pool, "active-site-executor").await;
         let Json(evidence) = backup_restore_execute(
-            AuthExtractor(approver_session("active-site-executor")),
+            AuthExtractor(active_site_executor),
             Json(RestoreActionRequest {
                 restore_id: id.clone(),
             }),
@@ -92844,8 +93399,9 @@ mod backup_restore_db_tests {
             "production",
         )
         .await;
+        let planner = registered_admin_session(pool, "restore-site-race-planner").await;
         let Json(created) = backup_restore_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(planner),
             Json(RestorePlanRequest {
                 source_ci_key,
                 restore_type: "application-item".into(),
@@ -93323,6 +93879,17 @@ mod certificates_db_tests {
         Some(pool)
     }
 
+    async fn certificate_operator(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_WINTEL_LINUX_OPERATOR],
+            &["GBLON"],
+            &[],
+        )
+        .await
+    }
+
     fn request_body(suffix: &str) -> CertificateRequestRequest {
         CertificateRequestRequest {
             common_name: format!("test-{suffix}.local"),
@@ -93357,12 +93924,10 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-request-roundtrip").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator), Json(request_body(&suffix))).await
         else {
             panic!("certificates_request failed");
         };
@@ -93444,12 +94009,11 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-renew-transition").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator.clone()), Json(request_body(&suffix)))
+                .await
         else {
             panic!("certificates_request failed");
         };
@@ -93457,7 +94021,7 @@ mod certificates_db_tests {
         let original_valid_to = created["valid_to"].as_str().expect("valid_to").to_string();
 
         let Ok(Json(renewed)) = certificates_renew(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path(id.clone()),
             Json(CertificateRenewRequest { validity_days: 730 }),
         )
@@ -93496,12 +94060,11 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-revoke-transition").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator.clone()), Json(request_body(&suffix)))
+                .await
         else {
             panic!("certificates_request failed");
         };
@@ -93521,11 +94084,8 @@ mod certificates_db_tests {
             "certificate request must write a durable audit row"
         );
 
-        let Ok(Json(revoked)) = certificates_revoke(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(revoked)) =
+            certificates_revoke(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("certificates_revoke failed");
@@ -93569,35 +94129,27 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-double-revoke").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator.clone()), Json(request_body(&suffix)))
+                .await
         else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // First revoke — must succeed.
-        if certificates_revoke(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .is_err()
+        if certificates_revoke(AuthExtractor(operator.clone()), Path(id.clone()))
+            .await
+            .is_err()
         {
             cleanup(pool, &id).await;
             panic!("first revoke failed");
         }
 
         // Second revoke — must be 409.
-        let Err((status, _)) = certificates_revoke(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Err((status, _)) = certificates_revoke(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("expected second revoke to be rejected");
@@ -93622,12 +94174,11 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-status-cas").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator.clone()), Json(request_body(&suffix)))
+                .await
         else {
             panic!("certificates_request failed");
         };
@@ -93644,12 +94195,9 @@ mod certificates_db_tests {
         );
 
         // Advance it to Revoked through the normal path.
-        if certificates_revoke(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .is_err()
+        if certificates_revoke(AuthExtractor(operator), Path(id.clone()))
+            .await
+            .is_err()
         {
             cleanup(pool, &id).await;
             panic!("certificates_revoke failed");
@@ -93688,12 +94236,11 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-valid-to-cas").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator.clone()), Json(request_body(&suffix)))
+                .await
         else {
             panic!("certificates_request failed");
         };
@@ -93712,7 +94259,7 @@ mod certificates_db_tests {
         // Renew once through the normal path — advances valid_to to V1, status
         // stays Active.
         if certificates_renew(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path(id.clone()),
             Json(CertificateRenewRequest { validity_days: 730 }),
         )
@@ -93747,30 +94294,26 @@ mod certificates_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = certificate_operator(pool, "certificate-revoked-renew").await;
 
-        let Ok(Json(created)) = certificates_request(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(request_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            certificates_request(AuthExtractor(operator.clone()), Json(request_body(&suffix)))
+                .await
         else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        if certificates_revoke(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
-        .is_err()
+        if certificates_revoke(AuthExtractor(operator.clone()), Path(id.clone()))
+            .await
+            .is_err()
         {
             cleanup(pool, &id).await;
             panic!("revoke failed");
         }
 
         let Err((status, _)) = certificates_renew(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path(id.clone()),
             Json(CertificateRenewRequest { validity_days: 365 }),
         )
@@ -93844,6 +94387,17 @@ mod gmsa_db_tests {
         Some(pool)
     }
 
+    async fn caller_session(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_WINTEL_LINUX_OPERATOR],
+            &["GBLON"],
+            &[],
+        )
+        .await
+    }
+
     /// Delete only the rows we created in a test — never touch the 3 seed rows
     /// from migration 020. Delete children while the active owner row is still
     /// present so the namespace trigger can authorize the removal; the FK
@@ -93886,8 +94440,13 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("testcrt-{uid}")[..20]);
 
+        let caller = caller_session(pool, "gmsa-creator").await;
+        let caller_principal = caller
+            .principal_id
+            .expect("gMSA caller has an opaque principal")
+            .to_string();
         let Ok(Json(created)) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
@@ -93915,7 +94474,10 @@ mod gmsa_db_tests {
         .await
         .expect("query gmsa-create audit")
         .expect("a gmsa-create audit row must exist");
-        assert_eq!(audit_actor, "static-user", "audit actor must be the caller");
+        assert_eq!(
+            audit_actor, caller_principal,
+            "audit actor must be the caller"
+        );
         assert!(audit_detail.contains(&name), "detail must name the gMSA");
         assert!(
             !audit_detail.to_lowercase().contains("password"),
@@ -94379,15 +94941,10 @@ mod gmsa_db_tests {
             spns: vec!["HTTP/host1.corp.local".into()],
             site: "GBLON".into(),
         };
+        let caller = caller_session(pool, "gmsa-concurrent-claim").await;
         let (left, right) = tokio::join!(
-            gmsa_create(
-                AuthExtractor(AuthSession::static_dry_run()),
-                Json(request())
-            ),
-            gmsa_create(
-                AuthExtractor(AuthSession::static_dry_run()),
-                Json(request())
-            )
+            gmsa_create(AuthExtractor(caller.clone()), Json(request())),
+            gmsa_create(AuthExtractor(caller), Json(request()))
         );
         assert_eq!(
             [left.is_ok(), right.is_ok()]
@@ -94438,6 +94995,7 @@ mod gmsa_db_tests {
         // over the array_agg JOIN would total the CHILD rows, not the accounts.
         let uid = uuid::Uuid::new_v4().to_string();
         let mut names = Vec::new();
+        let caller = caller_session(pool, "gmsa-inventory-seed").await;
         for i in 0..3 {
             let name = test_name(&format!("pg{i}-{uid}")[..20]);
             names.push(name.clone());
@@ -94449,7 +95007,7 @@ mod gmsa_db_tests {
                 .map(|h| format!("HTTP/host{h}.corp.local"))
                 .collect();
             let Ok(_) = gmsa_create(
-                AuthExtractor(AuthSession::static_dry_run()),
+                AuthExtractor(caller.clone()),
                 Json(GmsaCreateRequest {
                     name: name.clone(),
                     hosts,
@@ -94598,9 +95156,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstasgn-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-assign-host").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into()],
@@ -94615,7 +95174,7 @@ mod gmsa_db_tests {
 
         // Assign a second host.
         let Ok(Json(assigned)) = gmsa_assign(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Path((name.clone(), "host2.corp.local".into())),
         )
         .await
@@ -94660,9 +95219,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrmv-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-remove-host").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
@@ -94676,7 +95236,7 @@ mod gmsa_db_tests {
         };
 
         let Ok(Json(removed)) = gmsa_remove(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Path((name.clone(), "host2.corp.local".into())),
         )
         .await
@@ -94720,9 +95280,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstlast-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-last-host-conflict").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into()],
@@ -94736,7 +95297,7 @@ mod gmsa_db_tests {
         };
 
         let Err((status, _)) = gmsa_remove(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Path((name.clone(), "host1.corp.local".into())),
         )
         .await
@@ -94765,9 +95326,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrot-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-rotate").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into()],
@@ -94790,12 +95352,7 @@ mod gmsa_db_tests {
         // Small delay to ensure last_rotation_at advances.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let Ok(Json(rotated)) = gmsa_rotate(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(name.clone()),
-        )
-        .await
-        else {
+        let Ok(Json(rotated)) = gmsa_rotate(AuthExtractor(caller), Path(name.clone())).await else {
             cleanup(pool, &name).await;
             panic!("gmsa_rotate failed");
         };
@@ -94835,9 +95392,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstdup-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-duplicate-name").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into()],
@@ -94851,7 +95409,7 @@ mod gmsa_db_tests {
         };
 
         let Err((status, _)) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host2.corp.local".into()],
@@ -94885,9 +95443,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstarvk-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-revoked-assign").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into()],
@@ -94908,7 +95467,7 @@ mod gmsa_db_tests {
             .expect("status update failed");
 
         let Err((status, _)) = gmsa_assign(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Path((name.clone(), "host2.corp.local".into())),
         )
         .await
@@ -94937,9 +95496,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrotvk-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-revoked-rotate").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller.clone()),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["host1.corp.local".into()],
@@ -94959,12 +95519,7 @@ mod gmsa_db_tests {
             .await
             .expect("status update failed");
 
-        let Err((status, _)) = gmsa_rotate(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(name.clone()),
-        )
-        .await
-        else {
+        let Err((status, _)) = gmsa_rotate(AuthExtractor(caller), Path(name.clone())).await else {
             cleanup(pool, &name).await;
             panic!("expected rotate on revoked account to fail");
         };
@@ -94996,9 +95551,10 @@ mod gmsa_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrepo-{uid}")[..20]);
+        let caller = caller_session(pool, "gmsa-repo-last-host").await;
 
         let Ok(_) = gmsa_create(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(caller),
             Json(GmsaCreateRequest {
                 name: name.clone(),
                 hosts: vec!["h1.corp.local".into(), "h2.corp.local".into()],
@@ -95075,6 +95631,17 @@ mod hardware_db_tests {
         Some(pool)
     }
 
+    async fn hardware_operator(pool: &PgPool, label: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_WINTEL_LINUX_OPERATOR],
+            &["GBLON"],
+            &[],
+        )
+        .await
+    }
+
     /// Delete only rows we created in a test. migration 039 seeds 6 rows; we
     /// never touch them. `firmware_history` has NO ON DELETE CASCADE (migration
     /// 039), so we must delete child rows BEFORE the parent.
@@ -95118,12 +95685,10 @@ mod hardware_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let serial = format!("HPE-TEST-{uid}")[..20].to_string();
+        let operator = hardware_operator(pool, "hardware-add-roundtrip").await;
 
-        let Ok(Json(created)) = hardware_add(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(add_request("HPE", &serial)),
-        )
-        .await
+        let Ok(Json(created)) =
+            hardware_add(AuthExtractor(operator), Json(add_request("HPE", &serial))).await
         else {
             panic!("hardware_add failed");
         };
@@ -95186,9 +95751,10 @@ mod hardware_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let serial = format!("HPE-FW-{uid}")[..18].to_string();
+        let operator = hardware_operator(pool, "hardware-firmware-update").await;
 
         let Ok(Json(created)) = hardware_add(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(add_request("HPE", &serial)),
         )
         .await
@@ -95198,7 +95764,7 @@ mod hardware_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         let Ok(Json(updated)) = hardware_update_firmware(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path(id.clone()),
             Json(HardwareUpdateFirmwareRequest {
                 version: "3.00".into(),
@@ -95260,9 +95826,10 @@ mod hardware_db_tests {
 
         let uid = uuid::Uuid::new_v4().to_string();
         let serial = format!("HPE-CHK-{uid}")[..19].to_string();
+        let operator = hardware_operator(pool, "hardware-firmware-compliance").await;
 
         let Ok(Json(created)) = hardware_add(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(add_request("HPE", &serial)),
         )
         .await
@@ -95273,7 +95840,7 @@ mod hardware_db_tests {
 
         // firmware_baseline is "pending" after add_asset; update to match it.
         let Ok(_) = hardware_update_firmware(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Path(id.clone()),
             Json(HardwareUpdateFirmwareRequest {
                 version: "pending".into(),
@@ -95285,11 +95852,8 @@ mod hardware_db_tests {
             panic!("hardware_update_firmware failed");
         };
 
-        let Ok(Json(check)) = hardware_firmware_check(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Path(id.clone()),
-        )
-        .await
+        let Ok(Json(check)) =
+            hardware_firmware_check(AuthExtractor(operator), Path(id.clone())).await
         else {
             cleanup(pool, &id).await;
             panic!("hardware_firmware_check failed");
@@ -95370,8 +95934,9 @@ mod hardware_db_tests {
         // when 039 was applied and may have drifted on a long-lived test DB).
         let uid = uuid::Uuid::new_v4().to_string();
         let warranty = (chrono::Utc::now() + chrono::Duration::days(45)).to_rfc3339();
+        let operator = hardware_operator(pool, "hardware-inventory-fixture").await;
         let Ok(Json(created)) = hardware_add(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(HardwareAddRequest {
                 vendor: "HPE".into(),
                 model: "TestModel".into(),
@@ -95407,7 +95972,7 @@ mod hardware_db_tests {
         // Induce a firmware gap: update installed firmware so it differs from the
         // baseline ('pending'), then it must appear in firmware-gaps.
         if hardware_update_firmware(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Path(id.clone()),
             Json(HardwareUpdateFirmwareRequest {
                 version: "9.9.9".into(),
@@ -97646,13 +98211,14 @@ mod vm_day2_operations_db_tests {
     }
 
     fn checker_session(suffix: &str) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
-        bind_test_principal(&mut session, &format!("vm-checker-{suffix}"));
-        session.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
-        session.token_valid = true;
-        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
-        session.provider_mode = "test-verified-human".into();
-        session
+        verified_test_session(
+            &format!("vm-checker-{suffix}"),
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+        )
+    }
+
+    fn operator_session(label: &str) -> AuthSession {
+        verified_test_session(label, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN])
     }
 
     async fn cleanup(pool: &PgPool, id: &str) {
@@ -97666,14 +98232,14 @@ mod vm_day2_operations_db_tests {
     }
 
     async fn create_validated(body: VmDay2PlanRequest) -> String {
-        let Ok(Json(created)) =
-            vm_day2_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+        let operator = operator_session("vm-day2-create-validated");
+        let Ok(Json(created)) = vm_day2_plan(AuthExtractor(operator.clone()), Json(body)).await
         else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
         let Ok(Json(validation)) = vm_day2_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97697,11 +98263,13 @@ mod vm_day2_operations_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let planner = operator_session("vm-day2-roundtrip-planner");
+        let planner_principal = planner
+            .principal_id
+            .expect("VM day-2 planner has an opaque principal")
+            .to_string();
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(planner), Json(plan_body(&suffix))).await
         else {
             panic!("vm_day2_plan failed");
         };
@@ -97737,7 +98305,7 @@ mod vm_day2_operations_db_tests {
             "status after plan must be Planned"
         );
         let governance = op.governance.as_ref().expect("governance binding");
-        assert_eq!(governance.planned_by, "static-user");
+        assert_eq!(governance.planned_by, planner_principal);
         assert!(!governance.plan_digest.is_empty());
 
         cleanup(pool, &id).await;
@@ -97765,7 +98333,7 @@ mod vm_day2_operations_db_tests {
             .expect("decode compatibility request")
         };
 
-        let mut foreign = AuthSession::static_dry_run();
+        let mut foreign = operator_session("vm-day2-spoofed-foreign-scope");
         foreign.site_scope = vec!["GBLON".into()];
         foreign.environment_scope = vec!["development".into()];
         let denied = vm_day2_plan(AuthExtractor(foreign), Json(spoofed_body())).await;
@@ -97775,7 +98343,7 @@ mod vm_day2_operations_db_tests {
         );
 
         let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator_session("vm-day2-authoritative-plan")),
             Json(spoofed_body()),
         )
         .await
@@ -97801,13 +98369,15 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = operator_session("vm-day2-lifecycle-operator");
+        let operator_principal = operator
+            .principal_id
+            .expect("VM day-2 operator has an opaque principal")
+            .to_string();
 
         // 1. plan
-        let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("vm_day2_plan failed");
         };
@@ -97815,7 +98385,7 @@ mod vm_day2_operations_db_tests {
 
         // 2. validate
         let Ok(Json(vr)) = vm_day2_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97841,8 +98411,13 @@ mod vm_day2_operations_db_tests {
         );
 
         // 3. approve as a distinct checker
+        let checker = checker_session(&suffix);
+        let checker_principal = checker
+            .principal_id
+            .expect("VM day-2 checker has an opaque principal")
+            .to_string();
         let Ok(Json(approved)) = vm_day2_approve(
-            AuthExtractor(checker_session(&suffix)),
+            AuthExtractor(checker),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97855,12 +98430,12 @@ mod vm_day2_operations_db_tests {
         assert_eq!(approved["status"], "Approved");
         assert_eq!(
             approved["governance"]["approval"]["approved_by"],
-            format!("vm-checker-{suffix}")
+            checker_principal
         );
 
         // 4. acquire the operation lock
         let Ok(Json(locked)) = vm_day2_lock(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97874,10 +98449,14 @@ mod vm_day2_operations_db_tests {
         assert!(locked["governance"]["operation_lock"]["lock_id"]
             .as_str()
             .is_some_and(|lock_id| !lock_id.is_empty()));
+        assert_eq!(
+            locked["governance"]["operation_lock"]["locked_by"],
+            operator_principal
+        );
 
         // 5. execute
         let Ok(Json(executed)) = vm_day2_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97904,7 +98483,7 @@ mod vm_day2_operations_db_tests {
 
         // 6. verify
         let Ok(Json(evidence)) = vm_day2_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97945,7 +98524,7 @@ mod vm_day2_operations_db_tests {
         let id = create_validated(plan_body(&suffix)).await;
 
         let result = vm_day2_approve(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator_session("vm-day2-create-validated")),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -97986,7 +98565,7 @@ mod vm_day2_operations_db_tests {
         let id = create_validated(plan_body(&suffix)).await;
 
         let result = vm_day2_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator_session("vm-day2-create-validated")),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98030,8 +98609,9 @@ mod vm_day2_operations_db_tests {
             assert!(approved.is_ok(), "distinct checker approval must succeed");
         }
 
+        let lock_operator = operator_session("vm-day2-overlap-lock-operator");
         let first_lock = vm_day2_lock(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(lock_operator.clone()),
             Json(VmDay2ActionRequest {
                 operation_id: first_id.clone(),
             }),
@@ -98039,7 +98619,7 @@ mod vm_day2_operations_db_tests {
         .await;
         assert!(first_lock.is_ok());
         let second_lock = vm_day2_lock(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(lock_operator),
             Json(VmDay2ActionRequest {
                 operation_id: second_id.clone(),
             }),
@@ -98086,7 +98666,7 @@ mod vm_day2_operations_db_tests {
         .await
         .expect("approve");
         let _ = vm_day2_lock(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator_session("vm-day2-expired-lock-operator")),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98142,7 +98722,7 @@ mod vm_day2_operations_db_tests {
         let missing_id = uuid::Uuid::new_v4().to_string();
 
         let result = vm_day2_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator_session("vm-day2-missing-id-operator")),
             Json(VmDay2ActionRequest {
                 operation_id: missing_id.clone(),
             }),
@@ -98167,12 +98747,10 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = operator_session("vm-day2-cas-operator");
 
-        let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("vm_day2_plan failed");
         };
@@ -98190,7 +98768,7 @@ mod vm_day2_operations_db_tests {
 
         // Advance it to Validated through the normal path.
         if vm_day2_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98226,12 +98804,10 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let operator = operator_session("vm-day2-completed-operator");
 
-        let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("vm_day2_plan failed");
         };
@@ -98249,7 +98825,7 @@ mod vm_day2_operations_db_tests {
             .expect("force-transition");
 
         let result = vm_day2_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98280,16 +98856,16 @@ mod vm_day2_operations_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let mut body = plan_body(&suffix);
         body.target_value = 0; // makes resize-cpu validation fail
+        let operator = operator_session("vm-day2-validation-failure-operator");
 
-        let Ok(Json(created)) =
-            vm_day2_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+        let Ok(Json(created)) = vm_day2_plan(AuthExtractor(operator.clone()), Json(body)).await
         else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         let Ok(Json(vr)) = vm_day2_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98329,18 +98905,16 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let operator = operator_session("vm-day2-execute-before-validate-operator");
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         let result = vm_day2_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98367,18 +98941,16 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = vm_day2_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let operator = operator_session("vm-day2-verify-before-execute-operator");
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(operator.clone()), Json(plan_body(&suffix))).await
         else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         let result = vm_day2_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(VmDay2ActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98491,6 +99063,17 @@ mod linux_deployment_requests_db_tests {
         }
     }
 
+    async fn linux_operator(pool: &PgPool, label: &str, site_scope: &[&str]) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_WINTEL_LINUX_OPERATOR],
+            site_scope,
+            &[],
+        )
+        .await
+    }
+
     async fn cleanup(pool: &PgPool, id: &str) {
         if let Ok(uid) = uuid::Uuid::parse_str(id) {
             sqlx::query("DELETE FROM linux_deployment_requests WHERE id = $1")
@@ -98511,7 +99094,7 @@ mod linux_deployment_requests_db_tests {
         };
 
         let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(linux_operator(pool, "linux-plan-operator", &[]).await),
             Json(plan_body()),
         )
         .await
@@ -98566,7 +99149,7 @@ mod linux_deployment_requests_db_tests {
 
         // Plan a DEFRA deployment as an unrestricted admin.
         let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(linux_operator(pool, "linux-global-operator", &[]).await),
             Json(plan_body()),
         )
         .await
@@ -98576,32 +99159,28 @@ mod linux_deployment_requests_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // A GBLON-site-scoped principal (DEFRA out of scope).
-        let scoped = || {
-            let mut s = AuthSession::static_dry_run();
-            s.site_scope = vec!["GBLON".into()];
-            s
-        };
+        let scoped = linux_operator(pool, "linux-gblon-operator", &["GBLON"]).await;
         let act = |op: String| LinuxDeployActionRequest { operation_id: op };
 
         // By-id actions 404 BEFORE any lifecycle 409 — no status oracle.
-        let v = linux_deploy_validate(AuthExtractor(scoped()), Json(act(id.clone()))).await;
+        let v = linux_deploy_validate(AuthExtractor(scoped.clone()), Json(act(id.clone()))).await;
         assert!(
             matches!(v, Err((StatusCode::NOT_FOUND, _))),
             "out-of-scope validate must 404: {v:?}"
         );
-        let e = linux_deploy_execute(AuthExtractor(scoped()), Json(act(id.clone()))).await;
+        let e = linux_deploy_execute(AuthExtractor(scoped.clone()), Json(act(id.clone()))).await;
         assert!(
             matches!(e, Err((StatusCode::NOT_FOUND, _))),
             "out-of-scope execute must 404: {e:?}"
         );
-        let vf = linux_deploy_verify(AuthExtractor(scoped()), Json(act(id.clone()))).await;
+        let vf = linux_deploy_verify(AuthExtractor(scoped.clone()), Json(act(id.clone()))).await;
         assert!(
             matches!(vf, Err((StatusCode::NOT_FOUND, _))),
             "out-of-scope verify must 404: {vf:?}"
         );
 
         // Planning a foreign-site (DEFRA) deployment is a 403 (body-supplied site).
-        let p = linux_deploy_plan(AuthExtractor(scoped()), Json(plan_body())).await;
+        let p = linux_deploy_plan(AuthExtractor(scoped), Json(plan_body())).await;
         assert!(
             matches!(p, Err((StatusCode::FORBIDDEN, _))),
             "out-of-scope plan must 403: {p:?}"
@@ -98619,8 +99198,7 @@ mod linux_deployment_requests_db_tests {
         );
 
         // Positive: a DEFRA-scoped principal CAN validate it (guard not over-broad).
-        let mut defra = AuthSession::static_dry_run();
-        defra.site_scope = vec!["DEFRA".into()];
+        let defra = linux_operator(pool, "linux-defra-operator", &["DEFRA"]).await;
         let ok = linux_deploy_validate(AuthExtractor(defra), Json(act(id.clone()))).await;
         assert!(ok.is_ok(), "in-scope DEFRA validate must succeed: {ok:?}");
 
@@ -98637,12 +99215,11 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
+        let operator = linux_operator(pool, "linux-lifecycle-operator", &[]).await;
+
         // 1. plan
-        let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body()),
-        )
-        .await
+        let Ok(Json(created)) =
+            linux_deploy_plan(AuthExtractor(operator.clone()), Json(plan_body())).await
         else {
             panic!("linux_deploy_plan failed");
         };
@@ -98650,7 +99227,7 @@ mod linux_deployment_requests_db_tests {
 
         // 2. validate
         let Ok(Json(vr)) = linux_deploy_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98677,7 +99254,7 @@ mod linux_deployment_requests_db_tests {
 
         // 3. execute
         let Ok(Json(executed)) = linux_deploy_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator.clone()),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98704,7 +99281,7 @@ mod linux_deployment_requests_db_tests {
 
         // 4. verify
         let Ok(Json(verification)) = linux_deploy_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98768,11 +99345,9 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body()),
-        )
-        .await
+        let operator = linux_operator(pool, "linux-cas-operator", &[]).await;
+        let Ok(Json(created)) =
+            linux_deploy_plan(AuthExtractor(operator.clone()), Json(plan_body())).await
         else {
             panic!("linux_deploy_plan failed");
         };
@@ -98790,7 +99365,7 @@ mod linux_deployment_requests_db_tests {
 
         // Advance it to Validated through the normal path.
         if linux_deploy_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98830,11 +99405,9 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body()),
-        )
-        .await
+        let operator = linux_operator(pool, "linux-completed-operator", &[]).await;
+        let Ok(Json(created)) =
+            linux_deploy_plan(AuthExtractor(operator.clone()), Json(plan_body())).await
         else {
             panic!("linux_deploy_plan failed");
         };
@@ -98854,7 +99427,7 @@ mod linux_deployment_requests_db_tests {
         tx_force.commit().await.expect("commit force-transition");
 
         let result = linux_deploy_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98882,12 +99455,11 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
+        let operator = linux_operator(pool, "linux-invalid-operator", &[]).await;
+
         // Plan a valid request.
-        let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body()),
-        )
-        .await
+        let Ok(Json(created)) =
+            linux_deploy_plan(AuthExtractor(operator.clone()), Json(plan_body())).await
         else {
             panic!("linux_deploy_plan failed");
         };
@@ -98908,7 +99480,7 @@ mod linux_deployment_requests_db_tests {
 
         // Validate should return Ok(passed=false), not Err.
         let Ok(Json(vr)) = linux_deploy_validate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98944,18 +99516,16 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body()),
-        )
-        .await
+        let operator = linux_operator(pool, "linux-early-execute-operator", &[]).await;
+        let Ok(Json(created)) =
+            linux_deploy_plan(AuthExtractor(operator.clone()), Json(plan_body())).await
         else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         let result = linux_deploy_execute(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -98981,18 +99551,16 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body()),
-        )
-        .await
+        let operator = linux_operator(pool, "linux-early-verify-operator", &[]).await;
+        let Ok(Json(created)) =
+            linux_deploy_plan(AuthExtractor(operator.clone()), Json(plan_body())).await
         else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         let result = linux_deploy_verify(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(operator),
             Json(LinuxDeployActionRequest {
                 operation_id: id.clone(),
             }),
@@ -99012,7 +99580,7 @@ mod linux_deployment_requests_db_tests {
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins runbook_executions_db_tests -- --test-threads=1
 #[cfg(test)]
 mod runbook_executions_db_tests {
-    use super::bind_test_principal;
+    use super::{bind_test_principal, verified_test_session};
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -99099,8 +99667,11 @@ mod runbook_executions_db_tests {
             return;
         };
         let actor_label = format!("runbook-active-start-{}", uuid::Uuid::new_v4());
-        let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
-        let actor = bind_test_principal(&mut session, &actor_label);
+        let session =
+            verified_test_session(&actor_label, &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN]);
+        let actor = session
+            .principal_id
+            .expect("runbook actor has an opaque principal");
 
         crate::repos::site_registry::set_active(pool, "DEFRA", false)
             .await
@@ -99118,7 +99689,11 @@ mod runbook_executions_db_tests {
             .expect("restore durable runbook site");
 
         let unknown_suffix = uuid::Uuid::new_v4().simple().to_string();
-        let unknown_site = format!("R11-UNKNOWN-{}", &unknown_suffix[..8]);
+        let unknown_site = ryuki_engine::site_registry::normalize_site_code(
+            &format!("R11-UNKNOWN-{}", &unknown_suffix[..8]),
+            ryuki_engine::site_registry::SiteCodeSystem::Custom,
+        )
+        .expect("normalize custom runbook test site");
         let unknown = super::runbook_start(
             super::Extension(session.clone()),
             super::Json(super::RunbookStartRequest {
@@ -100598,6 +101173,21 @@ mod incident_contexts_db_tests {
         Some(pool)
     }
 
+    async fn incident_operator(
+        pool: &PgPool,
+        label: &str,
+        site: &str,
+    ) -> ryuki_engine::auth::AuthSession {
+        super::registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_MONITORING_OPERATOR],
+            &[site],
+            &[],
+        )
+        .await
+    }
+
     async fn cleanup(pool: &PgPool, id: &str) {
         sqlx::query("DELETE FROM incident_contexts WHERE incident_id = $1")
             .bind(id)
@@ -101472,8 +102062,10 @@ mod incident_contexts_db_tests {
             Some(super::StatusCode::BAD_REQUEST)
         );
 
+        let defra_operator =
+            incident_operator(pool, "incident-authoritative-mutation", "DEFRA").await;
         let super::Json(created) = super::incident_assemble(
-            super::AuthExtractor(scoped_session("DEFRA")),
+            super::AuthExtractor(defra_operator.clone()),
             super::Json(super::IncidentAssembleRequest {
                 incident_title: "authoritative binding".into(),
                 severity: "sev2".into(),
@@ -101552,7 +102144,7 @@ mod incident_contexts_db_tests {
         );
 
         let added = super::incident_add_ci(
-            super::AuthExtractor(scoped_session("DEFRA")),
+            super::AuthExtractor(defra_operator.clone()),
             super::Path(id.clone()),
             super::Json(super::IncidentAddCiRequest {
                 ci_name: "app-billing".into(),
@@ -101567,7 +102159,7 @@ mod incident_contexts_db_tests {
         );
 
         let _ = super::incident_escalate(
-            super::AuthExtractor(scoped_session("DEFRA")),
+            super::AuthExtractor(defra_operator.clone()),
             super::Path(id.clone()),
             super::Json(super::IncidentEscalateRequest {
                 reason: "same-site positive control".into(),
@@ -101576,7 +102168,7 @@ mod incident_contexts_db_tests {
         .await
         .expect("same-site escalation");
         let _ = super::incident_resolve(
-            super::AuthExtractor(scoped_session("DEFRA")),
+            super::AuthExtractor(defra_operator),
             super::Path(id.clone()),
             super::Json(super::IncidentResolveRequest {
                 resolution: "same-site resolution".into(),
@@ -101603,8 +102195,9 @@ mod incident_contexts_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+        let operator = incident_operator(pool, "outage-notice-create", "DEFRA").await;
         let res = super::outage_notices_create(
-            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::AuthExtractor(operator),
             super::Json(super::OutageNoticeCreateRequest {
                 site: "DEFRA".into(),
                 affected_systems: vec!["sys-oaudit-1".into()],
@@ -102100,9 +102693,10 @@ mod incident_contexts_db_tests {
 
         let candidate_a = ci_names[initial_count].clone();
         let candidate_b = ci_names[initial_count + 1].clone();
+        let operator = incident_operator(pool, "incident-boundary-race", "DEFRA").await;
         let (result_a, result_b) = tokio::join!(
             super::incident_add_ci(
-                super::AuthExtractor(scoped_session("DEFRA")),
+                super::AuthExtractor(operator.clone()),
                 super::Path(id.clone()),
                 super::Json(super::IncidentAddCiRequest {
                     ci_name: candidate_a.clone(),
@@ -102110,7 +102704,7 @@ mod incident_contexts_db_tests {
                 }),
             ),
             super::incident_add_ci(
-                super::AuthExtractor(scoped_session("DEFRA")),
+                super::AuthExtractor(operator),
                 super::Path(id.clone()),
                 super::Json(super::IncidentAddCiRequest {
                     ci_name: candidate_b.clone(),
@@ -102173,6 +102767,21 @@ mod dr_plans_db_tests {
         Some(pool)
     }
 
+    async fn dr_operator(
+        pool: &PgPool,
+        label: &str,
+        site: &str,
+    ) -> ryuki_engine::auth::AuthSession {
+        super::registry_backed_local_test_session(
+            pool,
+            label,
+            &[ryuki_engine::auth::APP_ROLE_BACKUP_OPERATOR],
+            &[site],
+            &[],
+        )
+        .await
+    }
+
     async fn cleanup(pool: &PgPool, id: &str) {
         sqlx::query("DELETE FROM dr_plans WHERE id = $1")
             .bind(id)
@@ -102204,8 +102813,9 @@ mod dr_plans_db_tests {
         };
         let suffix = uuid::Uuid::new_v4().to_string();
         let name = format!("audit-dr-{suffix}");
+        let operator = dr_operator(pool, "dr-plan-create", "DEFRA").await;
         let res = super::dr_plan_create(
-            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::AuthExtractor(operator),
             super::Json(super::DrPlanCreateRequest {
                 name: name.clone(),
                 site: "DEFRA".into(),
@@ -102665,8 +103275,9 @@ mod dr_plans_db_tests {
             .expect("insert must succeed");
 
         let new_name = format!("updated-dr-{suffix}");
+        let operator = dr_operator(pool, "dr-plan-update", "DEFRA").await;
         let res = super::dr_plan_update(
-            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::AuthExtractor(operator),
             super::Path(id.clone()),
             super::Json(super::DrPlanUpdateRequest {
                 name: new_name.clone(),
@@ -102987,8 +103598,9 @@ mod dr_plans_db_tests {
             .expect("insert must succeed");
 
         // Re-PUT the exact same descriptive values.
+        let operator = dr_operator(pool, "dr-plan-noop-update", "DEFRA").await;
         let res = super::dr_plan_update(
-            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::AuthExtractor(operator),
             super::Path(id.clone()),
             super::Json(super::DrPlanUpdateRequest {
                 name: plan.name.clone(),
@@ -103024,11 +103636,9 @@ mod dr_plans_db_tests {
         // Mirror the create handler's write-through so the store resolves it.
         ryuki_engine::dr_testing::upsert_plan(&plan);
 
-        let res = super::dr_plan_delete(
-            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
-            super::Path(id.clone()),
-        )
-        .await;
+        let operator = dr_operator(pool, "dr-plan-delete", "DEFRA").await;
+        let res =
+            super::dr_plan_delete(super::AuthExtractor(operator), super::Path(id.clone())).await;
         let body = res.expect("delete of a runless plan must succeed");
         assert_eq!(
             body.0["deleted"].as_str(),

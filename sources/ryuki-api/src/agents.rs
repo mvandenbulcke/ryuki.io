@@ -360,6 +360,7 @@ struct AgentEnrollmentChallengeRow {
 struct AgentApprovalRow {
     id: Uuid,
     status: String,
+    principal_lifecycle_state: String,
     public_key: String,
     enrollment_expires_at: Option<DateTime<Utc>>,
     enrollment_challenge_id: Option<Uuid>,
@@ -1789,7 +1790,9 @@ pub async fn admin_approve_agent(
     // approving by that human-readable identifier alone would let a stale admin
     // page approve a replacement key.
     let prior: Option<AgentApprovalRow> = sqlx::query_as(
-        "SELECT agent.id, agent.status, agent.public_key, agent.enrollment_expires_at, \
+        "SELECT agent.id, agent.status, \
+                principal.lifecycle_state AS principal_lifecycle_state, \
+                agent.public_key, agent.enrollment_expires_at, \
                 agent.enrollment_challenge_id, challenge.status AS challenge_status, \
                 challenge.agent_id AS challenge_agent_id, \
                 challenge.platform AS challenge_platform, \
@@ -1799,7 +1802,6 @@ pub async fn admin_approve_agent(
          JOIN principals AS principal \
            ON principal.principal_id = agent.principal_id \
           AND principal.principal_kind = 'agent' \
-          AND principal.lifecycle_state = 'active' \
          LEFT JOIN agent_enrollment_challenges AS challenge \
            ON challenge.id = agent.enrollment_challenge_id \
          WHERE agent.agent_id = $1 \
@@ -1821,6 +1823,12 @@ pub async fn admin_approve_agent(
     if prior.status == "revoked" {
         return Err(conflict(format!(
             "agent '{}' is revoked and cannot be re-approved; it must re-enroll",
+            agent_id
+        )));
+    }
+    if prior.principal_lifecycle_state != "active" {
+        return Err(conflict(format!(
+            "agent '{}' principal authority is not active and cannot be approved",
             agent_id
         )));
     }
@@ -6473,6 +6481,29 @@ pub async fn create_live_apply_job(
     // future operator endpoint can surface a 4xx instead of crashing the request.
     validate_live_apply_params(spec, request_id).map_err(CreateLiveApplyJobError::Invalid)?;
 
+    // Reject caller-controlled grant fields before request or plan-lineage
+    // lookup. These are pure shape/bounds checks, so malformed input must not
+    // be able to select a later 404/409-style lineage error instead of the
+    // canonical invalid-request response.
+    if approved_plan_digest.len() != 64
+        || !approved_plan_digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approved_plan_digest must be a 64-character SHA-256 hex string",
+        ));
+    }
+    let now = Utc::now();
+    if expiry <= now {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry must be in the future",
+        ));
+    }
+    if expiry > now + chrono::Duration::hours(MAX_GRANT_TTL_HOURS) {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry exceeds the maximum allowed TTL",
+        ));
+    }
+
     // Fail closed: never mint a LiveApply grant for a request that has CONCLUDED
     // (Completed, the post-completion lifecycle Protecting/Operational/Retired, or
     // any terminal state). This gate lives in the SHARED minting choke point so it
@@ -6584,29 +6615,6 @@ pub async fn create_live_apply_job(
         return Err(CreateLiveApplyJobError::HasStepPlan);
     }
 
-    // Validate the grant fields before signing — a signed grant is authoritative,
-    // so it must never carry a bogus digest, an empty approver, or an abusive
-    // expiry. (digest = lowercase SHA-256 hex; expiry must be in the future and
-    // within MAX_GRANT_TTL.)
-    if approved_plan_digest.len() != 64
-        || !approved_plan_digest.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return Err(CreateLiveApplyJobError::Invalid(
-            "approved_plan_digest must be a 64-character SHA-256 hex string",
-        ));
-    }
-    let now = Utc::now();
-    if expiry <= now {
-        return Err(CreateLiveApplyJobError::Invalid(
-            "grant expiry must be in the future",
-        ));
-    }
-    if expiry > now + chrono::Duration::hours(MAX_GRANT_TTL_HOURS) {
-        return Err(CreateLiveApplyJobError::Invalid(
-            "grant expiry exceeds the maximum allowed TTL",
-        ));
-    }
-
     let execution_authority = successful_plan_execution_authority(
         &mut tx,
         &approved_plan,
@@ -6626,6 +6634,15 @@ pub async fn create_live_apply_job(
         crate::repos::degradation::acquire_live_site_execution_fence(&mut tx, platform)
             .await?
             .ok_or(CreateLiveApplyJobError::SiteExecutionUnavailable)?;
+
+    // The early expiry check establishes deterministic validation precedence.
+    // Recheck the moving time bound after the locked lineage work so a grant
+    // that expired during validation is never signed or persisted.
+    if expiry <= Utc::now() {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry must be in the future",
+        ));
+    }
 
     // Build and sign the VerifiedLiveContext grant. This whole-request path
     // mints a legacy/single-job grant (step_job_id: None) — #42 slice B adds
@@ -10805,6 +10822,108 @@ mod tests {
             .await
     }
 
+    const DURABLE_TEST_JOB_AGENT_PREFIX: &str = "durable-job-fixture-agent-";
+
+    /// Seed an approved, challenge-admitted agent for a synthetic job that is
+    /// driven directly through a lower-level lifecycle helper. The production
+    /// result path always has this durable attribution because it can only run
+    /// after a real lease; direct DB fixtures must model the same invariant.
+    async fn seed_durable_test_job_agent(pool: &PgPool, platform: &str) -> String {
+        let agent_id = format!("{DURABLE_TEST_JOB_AGENT_PREFIX}{}", Uuid::new_v4().simple());
+        seed_agent(pool, &agent_id, platform, "approved").await;
+        agent_id
+    }
+
+    /// Reuse one admitted fixture agent for repeated lease-expiry cycles on a
+    /// test-unique platform. Offline redispatch deliberately clears agent_id, so
+    /// every synthetic re-lease must restore a real enrollment rather than the
+    /// old display-only `some-agent` sentinel.
+    async fn ensure_durable_test_job_agent_for_platform(pool: &PgPool, platform: &str) -> String {
+        let pattern = format!("{DURABLE_TEST_JOB_AGENT_PREFIX}%");
+        if let Some(agent_id) = sqlx::query_scalar::<_, String>(
+            "SELECT agent.agent_id FROM agents AS agent \
+             JOIN principals AS principal \
+               ON principal.principal_id = agent.principal_id \
+              AND principal.principal_kind = 'agent' \
+              AND principal.lifecycle_state = 'active' \
+             WHERE agent.platform = $1 AND agent.status = 'approved' \
+               AND agent.agent_id LIKE $2 \
+             ORDER BY agent.created_at, agent.id LIMIT 1",
+        )
+        .bind(platform)
+        .bind(&pattern)
+        .fetch_optional(pool)
+        .await
+        .expect("find durable test job agent")
+        {
+            return agent_id;
+        }
+        seed_durable_test_job_agent(pool, platform).await
+    }
+
+    /// Ensure one exact synthetic job has an admitted durable agent. Preserve
+    /// an existing assignment: auto-teardown jobs already bind their signed
+    /// execution authority to that exact agent, so replacing it would corrupt
+    /// the fixture. A fresh identity is used only for an unassigned raw job.
+    async fn attribute_test_job_to_durable_agent(pool: &PgPool, job_id: Uuid) -> String {
+        let (platform, assigned_agent_id): (String, Option<String>) =
+            sqlx::query_as("SELECT platform, agent_id FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .expect("read synthetic job attribution");
+        if let Some(agent_id) = assigned_agent_id {
+            let admitted: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM agents AS agent \
+                     JOIN principals AS principal \
+                       ON principal.principal_id = agent.principal_id \
+                      AND principal.principal_kind = 'agent' \
+                     WHERE agent.agent_id = $1 \
+                 )",
+            )
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("validate existing synthetic job attribution");
+            assert!(
+                admitted,
+                "synthetic job assignment must be challenge-admitted"
+            );
+            return agent_id;
+        }
+        let agent_id = seed_durable_test_job_agent(pool, &platform).await;
+        sqlx::query("UPDATE agent_jobs SET agent_id = $1 WHERE id = $2")
+            .bind(&agent_id)
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .expect("bind synthetic job to durable test agent");
+        agent_id
+    }
+
+    /// Seed the real current-version job row required by the backlink CAS, then
+    /// attach the admitted agent required by execution-audit attribution.
+    async fn seed_attributed_backlink_job(
+        pool: &PgPool,
+        request_id: Uuid,
+        platform: &str,
+        mode: JobMode,
+    ) -> Uuid {
+        let mode_label = match &mode {
+            JobMode::OfflineDryRun => "OfflineDryRun",
+            JobMode::LivePlan => "LivePlan",
+            JobMode::LiveApply => "LiveApply",
+            JobMode::LiveDestroy => "LiveDestroy",
+        };
+        let spec = request_bound_job_spec(pool, request_id, mode).await;
+        let job_id = create_agent_job(pool, request_id, platform, &spec, mode_label)
+            .await
+            .expect("seed current-version backlink job");
+        attribute_test_job_to_durable_agent(pool, job_id).await;
+        job_id
+    }
+
     async fn seed_pending_job_for_iac(pool: &PgPool, platform: &str, iac_ref: &str) -> Uuid {
         use std::collections::BTreeMap;
         let spec = ryuki_protocol::JobSpec {
@@ -10870,6 +10989,12 @@ mod tests {
             .ok();
     }
 
+    async fn cleanup_durable_test_job_agents(pool: &PgPool, agent_ids: Vec<String>) {
+        for agent_id in agent_ids {
+            cleanup_agent(pool, &agent_id).await;
+        }
+    }
+
     async fn cleanup_agent_liveness_fixture(pool: &PgPool, agent_id: &str) {
         let offline_body = format!("agent.offline for {agent_id}; review the alert feed.");
         let online_body = format!("agent.online for {agent_id}; review the alert feed.");
@@ -10927,6 +11052,16 @@ mod tests {
             .execute(pool)
             .await
             .ok();
+        let pattern = format!("{DURABLE_TEST_JOB_AGENT_PREFIX}%");
+        let fixture_agent_ids = sqlx::query_scalar::<_, String>(
+            "SELECT agent_id FROM agents WHERE platform = $1 AND agent_id LIKE $2",
+        )
+        .bind(platform)
+        .bind(&pattern)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        cleanup_durable_test_job_agents(pool, fixture_agent_ids).await;
         if !test_request_ids.is_empty() {
             sqlx::query(
                 "DELETE FROM requests \
@@ -11458,6 +11593,20 @@ mod tests {
         cleanup_agent(pool, &attacker).await;
     }
 
+    /// Advance a locked request through the canonical rework transition. This
+    /// changes the database-managed resource version without mutating reviewed
+    /// authority in place, which migration 199 correctly forbids.
+    async fn rework_locked_request_for_stale_job_test(pool: &PgPool, request_id: Uuid) {
+        sqlx::query(
+            "UPDATE requests SET status = 'intake', stage = 'intake' \
+             WHERE id = $1 AND status = 'locked'",
+        )
+        .bind(request_id)
+        .execute(pool)
+        .await
+        .expect("canonically rework stale-job parent request");
+    }
+
     /// Every transition that keeps dispatched work executable is fenced by the
     /// immutable request version captured in the job. A later request mutation
     /// leaves the job stale: it cannot be leased, acknowledged, renewed, or
@@ -11480,11 +11629,7 @@ mod tests {
                 .fetch_one(pool)
                 .await
                 .expect("read pending job request binding");
-        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
-            .bind(stale_pending_request)
-            .execute(pool)
-            .await
-            .expect("advance pending job parent version");
+        rework_locked_request_for_stale_job_test(pool, stale_pending_request).await;
         assert!(
             lease_pending_job(pool, &agent_id)
                 .await
@@ -11499,11 +11644,7 @@ mod tests {
             .expect("ack lease query")
             .expect("fresh job must lease");
         assert_eq!(ack_lease.row.id, ack_job_id);
-        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
-            .bind(ack_lease.row.request_id)
-            .execute(pool)
-            .await
-            .expect("advance leased job parent version");
+        rework_locked_request_for_stale_job_test(pool, ack_lease.row.request_id).await;
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let Err((ack_status, ack_body)) = ack_job(
@@ -11554,11 +11695,7 @@ mod tests {
         )
         .await
         .expect("fresh job acknowledgement");
-        sqlx::query("UPDATE requests SET name = name || '-changed' WHERE id = $1")
-            .bind(renew_lease.row.request_id)
-            .execute(pool)
-            .await
-            .expect("advance running job parent version");
+        rework_locked_request_for_stale_job_test(pool, renew_lease.row.request_id).await;
         let mut renew_tx = pool.begin().await.expect("begin stale renewal check");
         let renewed = renew_running_job_lease(
             &mut renew_tx,
@@ -13367,6 +13504,7 @@ mod tests {
         seed_agent(pool, &agent_b, &platform, "approved").await;
 
         let request_id = Uuid::new_v4();
+        seed_active_request(pool, request_id, &platform).await;
         let state_key = format!("capability-affinity-{request_id}");
         let plan_spec = stateful_test_spec(request_id, &state_key, JobMode::LivePlan);
         let plan_id = create_agent_job(pool, request_id, &platform, &plan_spec, "LivePlan")
@@ -13597,6 +13735,7 @@ mod tests {
         seed_agent(&pool, &agent_b, &platform, "approved").await;
 
         let request_id = Uuid::new_v4();
+        seed_active_request(&pool, request_id, &platform).await;
         let state_key = format!("request-{request_id}");
         let plan_spec = stateful_test_spec(request_id, &state_key, JobMode::LivePlan);
         let plan_id = create_agent_job(&pool, request_id, &platform, &plan_spec, "LivePlan")
@@ -14078,12 +14217,13 @@ mod tests {
         );
         let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::OfflineDryRun).await;
         let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
+        let agent_id = ensure_durable_test_job_agent_for_platform(&pool, &platform).await;
 
         // Seed a Leased OfflineDryRun job with a deadline in the past.
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
-             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', 'some-agent', \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', $5, \
              gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
              RETURNING id",
         )
@@ -14091,6 +14231,7 @@ mod tests {
         .bind(job_spec_resource_version(&spec))
         .bind(&platform)
         .bind(&spec_json)
+        .bind(&agent_id)
         .fetch_one(&pool)
         .await
         .expect("seed");
@@ -14131,12 +14272,13 @@ mod tests {
         );
         let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
         let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
+        let agent_id = ensure_durable_test_job_agent_for_platform(&pool, &platform).await;
 
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              site_status_authority_epoch) \
-             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', $5, \
              gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', \
              public.ryuki_acquire_live_site_execution_epoch($3)) \
              RETURNING id",
@@ -14145,6 +14287,7 @@ mod tests {
         .bind(job_spec_resource_version(&spec))
         .bind(&platform)
         .bind(&spec_json)
+        .bind(&agent_id)
         .fetch_one(&pool)
         .await
         .expect("seed");
@@ -14172,18 +14315,20 @@ mod tests {
     async fn seed_expired_leased_job(pool: &PgPool, platform: &str, attempts: i32) -> Uuid {
         let spec = seed_request_bound_job_spec(pool, platform, JobMode::OfflineDryRun).await;
         let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
+        let agent_id = ensure_durable_test_job_agent_for_platform(pool, platform).await;
         sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              delivery_attempts) \
-             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', $5, \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $6) \
              RETURNING id",
         )
         .bind(spec.request_id)
         .bind(job_spec_resource_version(&spec))
         .bind(platform)
         .bind(&spec_json)
+        .bind(&agent_id)
         .bind(attempts)
         .fetch_one(pool)
         .await
@@ -14200,18 +14345,20 @@ mod tests {
     ) -> Uuid {
         let spec = request_bound_job_spec(pool, request_id, JobMode::OfflineDryRun).await;
         let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
+        let agent_id = ensure_durable_test_job_agent_for_platform(pool, platform).await;
         sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              delivery_attempts) \
-             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5) \
+             VALUES ($1, $2, $3, $4, 'OfflineDryRun', 'Leased', $5, \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $6) \
              RETURNING id",
         )
         .bind(spec.request_id)
         .bind(job_spec_resource_version(&spec))
         .bind(platform)
         .bind(&spec_json)
+        .bind(&agent_id)
         .bind(attempts)
         .fetch_one(pool)
         .await
@@ -14220,14 +14367,21 @@ mod tests {
 
     /// Re-Lease a job with a past deadline so the next sweep sees it expired.
     async fn release_expired(pool: &PgPool, job_id: Uuid) {
+        let platform: String = sqlx::query_scalar("SELECT platform FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read re-lease fixture platform");
+        let agent_id = ensure_durable_test_job_agent_for_platform(pool, &platform).await;
         let mut tx = begin_agent_job_lease_fixture_tx(pool).await;
         sqlx::query(
-            "UPDATE agent_jobs SET status = 'Leased', agent_id = 'some-agent', \
+            "UPDATE agent_jobs SET status = 'Leased', agent_id = $2, \
              attempt_id = gen_random_uuid(), fencing_token = 'fence', cp_nonce = 'nonce', \
              lease_deadline = NOW() - INTERVAL '1 minute', updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(job_id)
+        .bind(&agent_id)
         .execute(&mut *tx)
         .await
         .expect("re-lease");
@@ -14470,12 +14624,13 @@ mod tests {
         );
         let spec = seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
         let spec_json = serde_json::to_value(&spec).expect("serialize agent-job fixture spec");
+        let agent_id = ensure_durable_test_job_agent_for_platform(&pool, &platform).await;
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              delivery_attempts, site_status_authority_epoch) \
-             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
-             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $5, \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', $5, \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $6, \
              public.ryuki_acquire_live_site_execution_epoch($3)) \
              RETURNING id",
         )
@@ -14483,6 +14638,7 @@ mod tests {
         .bind(job_spec_resource_version(&spec))
         .bind(&platform)
         .bind(&spec_json)
+        .bind(&agent_id)
         .bind(MAX_REDISPATCHES + 1)
         .fetch_one(&pool)
         .await
@@ -14744,11 +14900,12 @@ mod tests {
             seed_request_bound_job_spec(&pool, &platform, JobMode::LiveApply).await;
         let reconcile_spec_json = serde_json::to_value(&reconcile_spec)
             .expect("serialize live-apply agent-job fixture spec");
+        let agent_id = ensure_durable_test_job_agent_for_platform(&pool, &platform).await;
         let reconcile: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, request_resource_version, platform, spec, mode, status, agent_id, \
              attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
              site_status_authority_epoch) \
-             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', 'some-agent', \
+             VALUES ($1, $2, $3, $4, 'LiveApply', 'Running', $5, \
              gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', \
              public.ryuki_acquire_live_site_execution_epoch($3)) \
              RETURNING id",
@@ -14757,6 +14914,7 @@ mod tests {
         .bind(job_spec_resource_version(&reconcile_spec))
         .bind(&platform)
         .bind(&reconcile_spec_json)
+        .bind(&agent_id)
         .fetch_one(&pool)
         .await
         .expect("seed live-apply");
@@ -15927,6 +16085,7 @@ mod tests {
         let (token, key, _agent_enrollment_id) =
             seed_agent_with_key(&pool, &agent_id, &platform).await;
         let spec = reviewable_live_plan_spec();
+        seed_active_request(&pool, spec.request_id, &platform).await;
         let job_id = create_agent_job(&pool, spec.request_id, &platform, &spec, "LivePlan")
             .await
             .expect("seed LivePlan job");
@@ -20528,6 +20687,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         let platform = format!("b1b-plt-{}", &Uuid::new_v4().to_string()[..8]);
         let digest = proto_sha256(b"step-approved-plan");
+        seed_live_site_execution_authority(&pool, &platform).await;
 
         let principal_id = crate::principal_registry::seed_request_fixture_principal(&pool).await;
         sqlx::query(
@@ -21797,6 +21957,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert executing request");
+        let job_id =
+            seed_attributed_backlink_job(&pool, req_id, "DEFRA", JobMode::OfflineDryRun).await;
+        let (expected_actor_principal, expected_agent_id): (Uuid, String) = sqlx::query_as(
+            "SELECT agent.principal_id, agent.agent_id \
+             FROM agent_jobs AS job \
+             JOIN agents AS agent ON agent.agent_id = job.agent_id \
+             WHERE job.id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read durable backlink agent attribution");
 
         // Success result: executing -> verifying, execute stage Completed.
         let mut tx = pool.begin().await.unwrap();
@@ -21807,7 +21979,7 @@ mod tests {
             &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
-            Uuid::new_v4(),
+            job_id,
         )
         .await
         .expect("backlink");
@@ -21833,19 +22005,38 @@ mod tests {
         );
 
         // The agent-driven hop must land in the hash-chained audit trail with
-        // machine-actor attribution (QA finding: this transition was the one
-        // unaudited status change in the whole lifecycle).
-        let (actor, from_status, to_status, outcome): (String, String, String, String) =
-            sqlx::query_as(
-                "SELECT actor_principal, from_status, to_status, outcome FROM audit_log \
+        // opaque machine-principal attribution (QA finding: this transition
+        // was the one unaudited status change in the whole lifecycle). The
+        // readable agent label is display evidence only and must not become
+        // principal authority.
+        let (actor, actor_display, provider_mode, from_status, to_status, outcome): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT actor_principal, actor_display, provider_mode, \
+                        from_status, to_status, outcome FROM audit_log \
                  WHERE request_id = $1 AND action = 'request.execution-result' \
                  ORDER BY id DESC LIMIT 1",
-            )
-            .bind(req_id)
-            .fetch_one(&pool)
-            .await
-            .expect("audit row for the executing -> verifying hop");
-        assert!(actor.starts_with("agent:"), "machine actor, got {actor}");
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row for the executing -> verifying hop");
+        assert_eq!(
+            actor,
+            expected_actor_principal.to_string(),
+            "audit authority must be the exact durable opaque agent principal"
+        );
+        assert_eq!(
+            actor_display,
+            format!("Execution agent {expected_agent_id} (signed job result)"),
+            "the readable agent identity remains display-only evidence"
+        );
+        assert_eq!(provider_mode, "agent-result");
         assert_eq!(from_status, "executing");
         assert_eq!(to_status, "verifying");
         assert_eq!(outcome, "applied");
@@ -21876,11 +22067,7 @@ mod tests {
             .unwrap();
         assert_eq!(status2, "completed", "non-executing request is not mutated");
 
-        sqlx::query("DELETE FROM requests WHERE id = $1")
-            .bind(req_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_step_2b_request(&pool, req_id).await;
         pool.close().await;
     }
 
@@ -21911,6 +22098,8 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert executing request with unparseable stages");
+        let job_id =
+            seed_attributed_backlink_job(&pool, req_id, "DEFRA", JobMode::OfflineDryRun).await;
 
         let mut tx = pool.begin().await.unwrap();
         backlink_request_execution(
@@ -21920,7 +22109,7 @@ mod tests {
             &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
-            Uuid::new_v4(),
+            job_id,
         )
         .await
         .expect("backlink must not error on unparseable stages");
@@ -21932,11 +22121,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("read back");
-        sqlx::query("DELETE FROM requests WHERE id = $1")
-            .bind(req_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_step_2b_request(&pool, req_id).await;
         pool.close().await;
 
         assert_eq!(
@@ -22033,6 +22218,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("insert synthetic agent_job");
+        attribute_test_job_to_durable_agent(pool, job_id).await;
         crate::repos::job_steps::mark_running(pool, step_id, job_id)
             .await
             .expect("mark_running");
@@ -22058,6 +22244,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("insert synthetic LivePlan agent_job");
+        attribute_test_job_to_durable_agent(pool, job_id).await;
         crate::repos::job_steps::mark_planning(pool, step_id, job_id)
             .await
             .expect("mark_planning");
@@ -22065,6 +22252,16 @@ mod tests {
     }
 
     async fn cleanup_step_2b_request(pool: &PgPool, id: Uuid) {
+        let pattern = format!("{DURABLE_TEST_JOB_AGENT_PREFIX}%");
+        let fixture_agent_ids = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT agent_id FROM agent_jobs \
+             WHERE request_id = $1 AND agent_id LIKE $2",
+        )
+        .bind(id)
+        .bind(&pattern)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
         sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
             .bind(id)
             .execute(pool)
@@ -22075,6 +22272,7 @@ mod tests {
             .execute(pool)
             .await
             .ok();
+        cleanup_durable_test_job_agents(pool, fixture_agent_ids).await;
         sqlx::query("DELETE FROM requests WHERE id = $1")
             .bind(id)
             .execute(pool)
@@ -22146,6 +22344,7 @@ mod tests {
         let job_b = b_mid
             .agent_job_id
             .expect("b must have a dispatched agent_job");
+        attribute_test_job_to_durable_agent(&pool, job_b).await;
 
         // Complete 'b' (the final step) with success.
         let mut tx2 = pool.begin().await.unwrap();
@@ -22615,6 +22814,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        attribute_test_job_to_durable_agent(&pool, job_a).await;
         sqlx::query("UPDATE job_steps SET status = 'Applying', agent_job_id = $2 WHERE id = $1")
             .bind(step_a.id)
             .bind(job_a)
@@ -22671,6 +22871,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        attribute_test_job_to_durable_agent(&pool, job_b).await;
         sqlx::query("UPDATE job_steps SET status = 'Applying', agent_job_id = $2 WHERE step_key = 'b' AND request_id = $1")
             .bind(req_id)
             .bind(job_b)
@@ -22756,6 +22957,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+            attribute_test_job_to_durable_agent(&pool, jid).await;
             sqlx::query(
                 "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 WHERE id = $1",
             )
@@ -22940,14 +23142,15 @@ mod tests {
         let job_c: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs \
                  (request_id, request_resource_version, platform, spec, mode, step_scoped, \
-                  site_status_authority_epoch) \
-             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE, \
+                  agent_id, site_status_authority_epoch) \
+             VALUES ($1, $2, 'DEFRA', $3, 'LiveApply', TRUE, $4, \
                      public.ryuki_acquire_live_site_execution_epoch('DEFRA')) \
              RETURNING id",
         )
         .bind(req_id)
         .bind(request_resource_version)
         .bind(&spec)
+        .bind(&agent_id)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -23025,6 +23228,7 @@ mod tests {
 
         // b's LiveDestroy succeeds -> b ToreDown, a now ready -> a TearingDown.
         let job_b = step_of(&plan, "b").await.agent_job_id.unwrap();
+        attribute_test_job_to_durable_agent(&pool, job_b).await;
         let mut tx = pool.begin().await.unwrap();
         backlink_request_execution(
             &mut tx,
@@ -23051,6 +23255,7 @@ mod tests {
 
         // a's LiveDestroy succeeds -> a ToreDown, nothing left -> request failed.
         let job_a = step_of(&plan, "a").await.agent_job_id.unwrap();
+        attribute_test_job_to_durable_agent(&pool, job_a).await;
         let mut tx = pool.begin().await.unwrap();
         backlink_request_execution(
             &mut tx,
@@ -23327,6 +23532,7 @@ mod tests {
             .await
             .unwrap();
         let job_b = step_of(&plan, "b").await.agent_job_id.unwrap();
+        attribute_test_job_to_durable_agent(&pool, job_b).await;
 
         // b's LiveDestroy FAILS -> halt: request failed, a left Applied.
         let mut tx = pool.begin().await.unwrap();
@@ -23480,6 +23686,7 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
         let req_id = seed_executing_request(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
         crate::repos::job_steps::insert_plan(
@@ -23508,6 +23715,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        attribute_test_job_to_durable_agent(&pool, job_a).await;
         sqlx::query(
             "UPDATE job_steps SET status = 'TearingDown', agent_job_id = $2 \
              WHERE request_id = $1 AND step_key = 'a'",
@@ -23808,6 +24016,8 @@ mod tests {
         assert_eq!(d1.status, "Pending", "d not ready yet (b,c pending)");
         let job_b = b1.agent_job_id.expect("b has a dispatched job");
         let job_c = c1.agent_job_id.expect("c has a dispatched job");
+        attribute_test_job_to_durable_agent(&pool, job_b).await;
+        attribute_test_job_to_durable_agent(&pool, job_c).await;
 
         // Complete only 'b' -> 'd' must NOT be dispatched (c still Running).
         let mut tx2 = pool.begin().await.unwrap();
@@ -23871,6 +24081,7 @@ mod tests {
             "d dispatched once both b and c have succeeded"
         );
         let job_d = d_after_c.agent_job_id.expect("d has a dispatched job");
+        attribute_test_job_to_durable_agent(&pool, job_d).await;
 
         let status_after_c: String =
             sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
@@ -23922,6 +24133,8 @@ mod tests {
         };
         let req_id = seed_executing_request(&pool).await;
         // No job_steps rows are inserted for this request.
+        let job_id =
+            seed_attributed_backlink_job(&pool, req_id, "DEFRA", JobMode::OfflineDryRun).await;
 
         let mut tx = pool.begin().await.unwrap();
         backlink_request_execution(
@@ -23931,7 +24144,7 @@ mod tests {
             &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
-            Uuid::new_v4(),
+            job_id,
         )
         .await
         .expect("backlink no-plan");
@@ -23961,7 +24174,7 @@ mod tests {
             return;
         };
         let req_id = seed_executing_request(&pool).await;
-        let job_id = Uuid::new_v4();
+        let job_id = seed_attributed_backlink_job(&pool, req_id, "DEFRA", JobMode::LivePlan).await;
         let evidence_digest = "b".repeat(64);
         let raw_plan_digest = "a".repeat(64);
 
@@ -25179,6 +25392,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("seed reconcile-required destroy");
+        attribute_test_job_to_durable_agent(pool, job).await;
         sqlx::query(
             "UPDATE job_steps SET status = 'TearingDown', agent_job_id = $2 \
              WHERE request_id = $1 AND step_key = 'destroy-me'",

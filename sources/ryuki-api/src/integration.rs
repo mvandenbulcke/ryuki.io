@@ -5629,10 +5629,11 @@ pub mod integration_db_tests {
             b"test-fixture-value".to_vec(),
             "resolved value must match env var"
         );
-        // The descriptor must NOT contain the actual value — only the key name.
+        // The Debug-visible descriptor must be canonical and locator-free.
+        assert_eq!(creds.descriptor, "env-var:resolved");
         assert!(
-            creds.descriptor.contains(test_key_name),
-            "descriptor should show key name"
+            !creds.descriptor.contains(test_key_name),
+            "descriptor must not expose the environment key name"
         );
         assert!(
             !creds.descriptor.contains("test-fixture-value"),
@@ -5679,11 +5680,19 @@ pub mod integration_db_tests {
             "missing env var must produce EnvVarMissing error, got: {:?}",
             result
         );
-        // The error must not leak the (non-existent) value.
-        let err_msg = result.unwrap_err().to_string();
+        // Both Display and Debug must stay on the canonical locator-free surface.
+        let error = result.unwrap_err();
+        let err_msg = error.to_string();
+        let debug_msg = format!("{error:?}");
+        assert_eq!(err_msg, "env-var credential is unavailable");
+        assert_eq!(debug_msg, "env-var credential is unavailable");
         assert!(
-            err_msg.contains(nonexistent),
-            "error should name the missing key: {err_msg}"
+            !err_msg.contains(nonexistent),
+            "Display must not expose the missing environment key: {err_msg}"
+        );
+        assert!(
+            !debug_msg.contains(nonexistent),
+            "Debug must not expose the missing environment key: {debug_msg}"
         );
     }
 

@@ -2112,11 +2112,11 @@ async fn attest_sqlx_migrations_table(
              AND default_value.adnum = attribute.attnum
         ),
         primary_key AS (
-            SELECT constraint.*
+            SELECT constraint_catalog.*
             FROM ledger
-            JOIN pg_catalog.pg_constraint AS constraint
-              ON constraint.conrelid = ledger.oid
-             AND constraint.contype = 'p'
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = ledger.oid
+             AND constraint_catalog.contype = 'p'
         )
         SELECT COALESCE((
             SELECT ledger.relkind = 'r'
@@ -2166,9 +2166,9 @@ async fn attest_sqlx_migrations_table(
                AND (SELECT convalidated FROM primary_key)
                AND NOT EXISTS (
                     SELECT 1
-                    FROM pg_catalog.pg_constraint AS constraint
-                    WHERE constraint.conrelid = ledger.oid
-                      AND constraint.contype <> 'p'
+                    FROM pg_catalog.pg_constraint AS constraint_catalog
+                    WHERE constraint_catalog.conrelid = ledger.oid
+                      AND constraint_catalog.contype <> 'p'
                )
                AND NOT EXISTS (
                     SELECT 1
@@ -4189,7 +4189,7 @@ async fn attest_request_authority_version_binding_triggers(
                     'public.bind_agent_job_request_resource_version()'::text,
                     7::smallint,
                     ARRAY[]::text[],
-                    'd26216065dfbd4f9fcdc00a5a9cfd1d0422499863109a05fc4690c5413d59d58'::text,
+                    'a6e397920e2fb72401f6f2e9ee379d465560d246fe8bd8340ced30e596dcfee3'::text,
                     FALSE,
                     NULL::text[]
                 ),
@@ -5197,28 +5197,28 @@ async fn attest_principal_registry_authority_chain(
         matching_keys AS (
             SELECT DISTINCT expected.expected_id
             FROM resolved_keys AS expected
-            JOIN pg_catalog.pg_constraint AS constraint
-              ON constraint.conrelid = expected.table_oid
-             AND constraint.contype::text = expected.constraint_kind
-             AND constraint.conkey = expected.source_attnums
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = expected.table_oid
+             AND constraint_catalog.contype::text = expected.constraint_kind
+             AND constraint_catalog.conkey = expected.source_attnums
              AND (expected.constraint_name IS NULL
-                  OR constraint.conname = expected.constraint_name)
+                  OR constraint_catalog.conname = expected.constraint_name)
             LEFT JOIN pg_catalog.pg_index AS backing_index
-              ON backing_index.indexrelid = constraint.conindid
+              ON backing_index.indexrelid = constraint_catalog.conindid
             WHERE expected.source_count = pg_catalog.cardinality(expected.column_names)
-              AND constraint.conenforced
-              AND constraint.convalidated
-              AND NOT constraint.condeferrable
-              AND NOT constraint.condeferred
-              AND constraint.connoinherit
-              AND constraint.conislocal
-              AND constraint.coninhcount = 0
-              AND constraint.conparentid = 0
-              AND NOT constraint.conperiod
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND constraint_catalog.connoinherit
+              AND constraint_catalog.conislocal
+              AND constraint_catalog.coninhcount = 0
+              AND constraint_catalog.conparentid = 0
+              AND NOT constraint_catalog.conperiod
               AND (
                   (
                       expected.constraint_kind IN ('p', 'u')
-                      AND constraint.confrelid = 0
+                      AND constraint_catalog.confrelid = 0
                       AND backing_index.indrelid = expected.table_oid
                       AND backing_index.indisvalid
                       AND backing_index.indisready
@@ -5240,11 +5240,11 @@ async fn attest_principal_registry_authority_chain(
                       AND expected.referenced_table_oid IS NOT NULL
                       AND expected.referenced_count =
                           pg_catalog.cardinality(expected.referenced_column_names)
-                      AND constraint.confrelid = expected.referenced_table_oid
-                      AND constraint.confkey = expected.referenced_attnums
-                      AND constraint.confupdtype = 'r'
-                      AND constraint.confdeltype = 'r'
-                      AND constraint.confmatchtype = 's'
+                      AND constraint_catalog.confrelid = expected.referenced_table_oid
+                      AND constraint_catalog.confkey = expected.referenced_attnums
+                      AND constraint_catalog.confupdtype = 'r'
+                      AND constraint_catalog.confdeltype = 'r'
+                      AND constraint_catalog.confmatchtype = 's'
                   )
               )
         ),
@@ -5263,6 +5263,7 @@ async fn attest_principal_registry_authority_chain(
                 ('principals', ARRAY['principal_kind']::text[], 1),
                 ('principals', ARRAY['lifecycle_version'], 1),
                 ('principals', ARRAY['authority_version'], 1),
+                ('principals', ARRAY['lifecycle_state'], 1),
                 ('principals', ARRAY['principal_id'], 1),
                 ('principals', ARRAY['created_by'], 1),
                 ('principals', ARRAY['role_allowlist'], 1),
@@ -5335,23 +5336,23 @@ async fn attest_principal_registry_authority_chain(
             SELECT class.relname::text AS table_name,
                    ARRAY(
                        SELECT item
-                       FROM pg_catalog.unnest(constraint.conkey) AS item
+                       FROM pg_catalog.unnest(constraint_catalog.conkey) AS item
                        ORDER BY item
                    )::smallint[] AS attnums,
                    COUNT(*)::integer AS multiplicity
-            FROM pg_catalog.pg_constraint AS constraint
-            JOIN pg_catalog.pg_class AS class ON class.oid = constraint.conrelid
+            FROM pg_catalog.pg_constraint AS constraint_catalog
+            JOIN pg_catalog.pg_class AS class ON class.oid = constraint_catalog.conrelid
             JOIN pg_catalog.pg_namespace AS namespace
               ON namespace.oid = class.relnamespace
             JOIN exact_new_key_counts AS target ON target.table_name = class.relname
             WHERE namespace.nspname = 'public'
-              AND constraint.contype = 'c'
-              AND constraint.conenforced
-              AND constraint.convalidated
-              AND NOT constraint.condeferrable
-              AND NOT constraint.condeferred
-              AND NOT constraint.connoinherit
-            GROUP BY class.relname, constraint.conkey
+              AND constraint_catalog.contype = 'c'
+              AND constraint_catalog.conenforced
+              AND constraint_catalog.convalidated
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND NOT constraint_catalog.connoinherit
+            GROUP BY class.relname, constraint_catalog.conkey
         ),
         expected_named_checks(constraint_name, table_name, column_names) AS (
             VALUES
@@ -5376,10 +5377,10 @@ async fn attest_principal_registry_authority_chain(
             JOIN pg_catalog.pg_class AS class
               ON class.relnamespace = namespace.oid
              AND class.relname = expected.table_name
-            JOIN pg_catalog.pg_constraint AS constraint
-              ON constraint.conrelid = class.oid
-             AND constraint.conname = expected.constraint_name
-             AND constraint.contype = 'c'
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = class.oid
+             AND constraint_catalog.conname = expected.constraint_name
+             AND constraint_catalog.contype = 'c'
             CROSS JOIN LATERAL (
                 SELECT pg_catalog.array_agg(attribute.attnum ORDER BY attribute.attnum) AS attnums
                 FROM pg_catalog.unnest(expected.column_names) AS requested(name)
@@ -5389,14 +5390,14 @@ async fn attest_principal_registry_authority_chain(
                  AND attribute.attnum > 0
                  AND NOT attribute.attisdropped
             ) AS resolved
-            WHERE constraint.convalidated
-              AND constraint.conenforced
-              AND NOT constraint.condeferrable
-              AND NOT constraint.condeferred
-              AND NOT constraint.connoinherit
+            WHERE constraint_catalog.convalidated
+              AND constraint_catalog.conenforced
+              AND NOT constraint_catalog.condeferrable
+              AND NOT constraint_catalog.condeferred
+              AND NOT constraint_catalog.connoinherit
               AND ARRAY(
                     SELECT item
-                    FROM pg_catalog.unnest(constraint.conkey) AS item
+                    FROM pg_catalog.unnest(constraint_catalog.conkey) AS item
                     ORDER BY item
                   )::smallint[] = resolved.attnums
         ),
@@ -5473,9 +5474,9 @@ async fn attest_principal_registry_authority_chain(
                 AND class.relname = expected.table_name
                WHERE (
                    SELECT COUNT(*)
-                   FROM pg_catalog.pg_constraint AS constraint
-                   WHERE constraint.conrelid = class.oid
-                     AND constraint.contype IN ('p', 'u', 'f')
+                   FROM pg_catalog.pg_constraint AS constraint_catalog
+                   WHERE constraint_catalog.conrelid = class.oid
+                     AND constraint_catalog.contype IN ('p', 'u', 'f')
                ) <> expected.constraint_count
            )
            AND NOT EXISTS (
@@ -8759,11 +8760,11 @@ async fn attest_production_migration_operations_table(
              AND default_value.adnum = attribute.attnum
         ),
         primary_key AS (
-            SELECT constraint.*
+            SELECT constraint_catalog.*
             FROM marker
-            JOIN pg_catalog.pg_constraint AS constraint
-              ON constraint.conrelid = marker.oid
-             AND constraint.contype = 'p'
+            JOIN pg_catalog.pg_constraint AS constraint_catalog
+              ON constraint_catalog.conrelid = marker.oid
+             AND constraint_catalog.contype = 'p'
         ),
         expected_triggers(name, trigger_type) AS (
             VALUES
@@ -8844,9 +8845,9 @@ async fn attest_production_migration_operations_table(
                AND (SELECT convalidated FROM primary_key)
                AND NOT EXISTS (
                     SELECT 1
-                    FROM pg_catalog.pg_constraint AS constraint
-                    WHERE constraint.conrelid = marker.oid
-                      AND constraint.contype <> 'p'
+                    FROM pg_catalog.pg_constraint AS constraint_catalog
+                    WHERE constraint_catalog.conrelid = marker.oid
+                      AND constraint_catalog.contype <> 'p'
                )
                AND (SELECT count(*) FROM actual_triggers) = 2
                AND NOT EXISTS (
@@ -9728,6 +9729,29 @@ mod tests {
     use ryuki_engine::health_monitor::{HealthSource, HealthStatus};
     use sha2::Digest as _;
     use sqlx::{Connection, PgConnection};
+
+    async fn seed_request_fixture_principal(
+        connection: &mut PgConnection,
+        created_by: &str,
+    ) -> uuid::Uuid {
+        let principal_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO public.principals ( \
+                 principal_id, principal_kind, lifecycle_state, role_allowlist, \
+                 site_authority_mode, site_scope, environment_authority_mode, \
+                 environment_scope, created_by \
+             ) VALUES ( \
+                 $1, 'system', 'active', ARRAY['PlatformAdmin']::text[], \
+                 'global', ARRAY[]::text[], 'global', ARRAY[]::text[], $2 \
+             )",
+        )
+        .bind(principal_id)
+        .bind(created_by)
+        .execute(&mut *connection)
+        .await
+        .expect("seed active opaque principal for request fixture");
+        principal_id
+    }
 
     struct TestVerifiedPostgresqlInfrastructureEvidence {
         valid: std::sync::atomic::AtomicBool,
@@ -11259,7 +11283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_resource_version_triggers_are_attested_and_fire_in_replica_mode() {
+    async fn db_request_resource_version_triggers_are_attested_and_fire_in_replica_mode() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -11303,6 +11327,11 @@ mod tests {
             .execute(&mut connection)
             .await
             .expect("begin replica-mode trigger fixture");
+        let principal_id = seed_request_fixture_principal(
+            &mut connection,
+            "request-resource-version-replica-fixture",
+        )
+        .await;
         sqlx::query("SET LOCAL session_replication_role = 'replica'")
             .execute(&mut connection)
             .await
@@ -11311,12 +11340,15 @@ mod tests {
         let (request_id, inserted_version): (uuid::Uuid, i64) = sqlx::query_as(
             "INSERT INTO public.requests (\
                  request_type, status, stage, site, environment, name, \
-                 cpu, memory_gb, resource_version\
+                 cpu, memory_gb, resource_version, principal_binding_state, \
+                 created_by_principal_id, requester_principal_id, owner_principal_id\
              ) VALUES (\
                  'server-deployment', 'intake', 'intake', \
-                 'resource-version-test', 'test', 'replica insert', 1, 1, 41\
+                 'resource-version-test', 'test', 'replica insert', 1, 1, 41, \
+                 'exact-v1', $1, $1, $1\
              ) RETURNING id, resource_version",
         )
+        .bind(principal_id)
         .fetch_one(&mut connection)
         .await
         .expect("insert request while origin triggers are suppressed");
@@ -11599,7 +11631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn principal_registry_authority_chain_rejects_catalog_drift() {
+    async fn db_principal_registry_authority_chain_rejects_catalog_drift() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -11714,7 +11746,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_authority_version_binding_triggers_are_attested_and_must_stay_enabled() {
+    async fn db_request_authority_version_binding_triggers_are_attested_and_must_stay_enabled() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -11763,6 +11795,11 @@ mod tests {
             .execute(&mut connection)
             .await
             .expect("begin request authority-version binding fixture");
+        let principal_id = seed_request_fixture_principal(
+            &mut connection,
+            "request-authority-version-replica-fixture",
+        )
+        .await;
         sqlx::query("SET LOCAL session_replication_role = 'replica'")
             .execute(&mut connection)
             .await
@@ -11771,12 +11808,15 @@ mod tests {
         let (request_id, request_resource_version): (uuid::Uuid, i64) = sqlx::query_as(
             "INSERT INTO public.requests (\
                  request_type, status, stage, site, environment, name, \
-                 cpu, memory_gb, resource_version\
+                 cpu, memory_gb, resource_version, principal_binding_state, \
+                 created_by_principal_id, requester_principal_id, owner_principal_id\
              ) VALUES (\
                  'server-deployment', 'intake', 'intake', \
-                 'authority-version-test', 'test', 'binding fixture', 1, 1, 41\
+                 'authority-version-test', 'test', 'binding fixture', 1, 1, 41, \
+                 'exact-v1', $1, $1, $1\
              ) RETURNING id, resource_version",
         )
+        .bind(principal_id)
         .fetch_one(&mut connection)
         .await
         .expect("insert request for authority-version binding fixture");

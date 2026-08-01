@@ -472,6 +472,13 @@
       "waivable": false
     },
     {
+      "control_id": "SB-AZ-09B",
+      "title": "Global recertification control and bounded collection reads",
+      "owning_work_package": "SB-2",
+      "owning_team": "authorization-platform",
+      "waivable": false
+    },
+    {
       "control_id": "SB-AZ-10",
       "title": "Monitoring configuration and alerts retain resource authority",
       "owning_work_package": "SB-2",
@@ -913,6 +920,20 @@
       "waivable": false
     },
     {
+      "control_id": "SB-AUD-05",
+      "title": "Current-state transition claims",
+      "owning_work_package": "SB-3",
+      "owning_team": "approval-and-audit-platform",
+      "waivable": false
+    },
+    {
+      "control_id": "SB-AUD-06",
+      "title": "Typed representation redaction",
+      "owning_work_package": "SB-3",
+      "owning_team": "approval-and-audit-platform",
+      "waivable": false
+    },
+    {
       "control_id": "SB-SC-01",
       "title": "Immutable privileged build inputs",
       "owning_work_package": "SB-6",
@@ -950,6 +971,20 @@
     {
       "control_id": "SB-SC-06",
       "title": "Trusted artifact promotion",
+      "owning_work_package": "SB-6",
+      "owning_team": "supply-chain-security",
+      "waivable": false
+    },
+    {
+      "control_id": "SB-SC-07",
+      "title": "Exact signed release reference",
+      "owning_work_package": "SB-6",
+      "owning_team": "supply-chain-security",
+      "waivable": false
+    },
+    {
+      "control_id": "SB-SC-08",
+      "title": "Closed build-tool install-to-use lifecycle",
       "owning_work_package": "SB-6",
       "owning_team": "supply-chain-security",
       "waivable": false
@@ -3555,6 +3590,40 @@
       "supersedes_trace_id": null
     },
     {
+      "trace_id": "TRACE-SB-AZ-09B-AC-007",
+      "control_id": "SB-AZ-09B",
+      "acceptance_case_id": "AC-007",
+      "owning_work_package": "SB-2",
+      "owning_team": "authorization-platform",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": []
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": null
+      },
+      "fixture_or_probe_id": "security_conformance::ac_007",
+      "pass_condition": "Authorization matrix tests cover every actor kind, registered action and resource resolver, role, site, environment, owner, lifecycle state, assurance level, collection-versus-instance path, and DB/no-DB mode.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
       "trace_id": "TRACE-SB-AZ-10-AC-007",
       "control_id": "SB-AZ-10",
       "acceptance_case_id": "AC-007",
@@ -5697,6 +5766,74 @@
       "supersedes_trace_id": null
     },
     {
+      "trace_id": "TRACE-SB-AUD-05-AC-008",
+      "control_id": "SB-AUD-05",
+      "acceptance_case_id": "AC-008",
+      "owning_work_package": "SB-3",
+      "owning_team": "approval-and-audit-platform",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": []
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": null
+      },
+      "fixture_or_probe_id": "security_conformance::ac_008",
+      "pass_condition": "Concurrency tests prove login throttles, quorum, approval consumption, idempotency, replay recording, transitions, and audit cannot race past their invariants.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-06-AC-036",
+      "control_id": "SB-AUD-06",
+      "acceptance_case_id": "AC-036",
+      "owning_work_package": "SB-3",
+      "owning_team": "approval-and-audit-platform",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": []
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": null
+      },
+      "fixture_or_probe_id": "security_conformance::ac_036",
+      "pass_condition": "With privileged database access, audit tests alter, delete, reorder, and rehash a closed segment and prove external checkpoint verification fails. Under concurrent commit, crash, retry, and failover, export has no silent gaps, resumes from its acknowledged checkpoint, handles duplicates idempotently, and alerts before maximum delivery lag.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
       "trace_id": "TRACE-SB-SC-01-AC-014",
       "control_id": "SB-SC-01",
       "acceptance_case_id": "AC-014",
@@ -5897,6 +6034,74 @@
       },
       "fixture_or_probe_id": "security_conformance::ac_037",
       "pass_condition": "Release tests substitute artifact digest, SBOM, provenance subject, source revision, builder, and signer and reject every mismatch. Seeded dependency and base-image advisories block at the configured threshold; stale advisory data and expired exceptions fail policy; rollback artifacts pass the same admission and remain retrievable.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
+      "trace_id": "TRACE-SB-SC-07-AC-037",
+      "control_id": "SB-SC-07",
+      "acceptance_case_id": "AC-037",
+      "owning_work_package": "SB-6",
+      "owning_team": "supply-chain-security",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": []
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": null
+      },
+      "fixture_or_probe_id": "security_conformance::ac_037",
+      "pass_condition": "Release tests substitute artifact digest, SBOM, provenance subject, source revision, builder, and signer and reject every mismatch. Seeded dependency and base-image advisories block at the configured threshold; stale advisory data and expired exceptions fail policy; rollback artifacts pass the same admission and remain retrievable.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
+      "trace_id": "TRACE-SB-SC-08-AC-014",
+      "control_id": "SB-SC-08",
+      "acceptance_case_id": "AC-014",
+      "owning_work_package": "SB-6",
+      "owning_team": "supply-chain-security",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": []
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": null
+      },
+      "fixture_or_probe_id": "security_conformance::ac_014",
+      "pass_condition": "Release verification proves immutable privileged inputs, complete scan scope, safe build contexts, SBOM/provenance generation, and production manifests with no development fallback.",
       "trace_lifecycle": "active",
       "supersedes_trace_id": null
     }
