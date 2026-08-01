@@ -10,6 +10,14 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-cargo-guard.XXXXXX")"
 TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 TARGET="$TEST_ROOT/target"
 OUT_DIR="$TARGET/debug/deps"
+# This harness invokes the rustc guard directly with explicit fake compilers
+# and fixture targets. Ambient Cargo compiler/build ownership belongs to the
+# caller's checkout and must not be coupled to these standalone fixtures.
+unset CARGO_BUILD_BUILD_DIR
+unset RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER
+unset CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+unset RYUKI_CARGO_OUTER_CONTROL_FILE
 export CARGO_TARGET_DIR="$TARGET"
 MARKER="$TEST_ROOT/rustc-called"
 FAKE_RUSTC="$TEST_ROOT/fake-rustc"

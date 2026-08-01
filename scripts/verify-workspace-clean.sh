@@ -1026,11 +1026,17 @@ apply_file_size_limit() {
 run_gate_command() {
   local wrapper_pid="$1"
   local label="$2"
+  local process_group_policy="$3"
   local command_pid command_pgid command_status command_wait_status guard_status
   local regroup_status
   local command_status_file command_status_tmp stop_status
   local release_attempt released supervisor_pid_probe
-  shift 2
+  shift 3
+
+  case "$process_group_policy" in
+    strict|containment-regression) ;;
+    *) return 75 ;;
+  esac
 
   # This supervisor retains the repository lock and the disk watcher if the
   # outer wrapper is killed. It then stops the actual gate within one watch
@@ -1072,10 +1078,20 @@ run_gate_command() {
       sleep 0.05
     done
     (( released == 1 )) || exit 75
-    # Cargo propagates this private, target-local ownership record to rustc.
-    # The rustc guard validates it before inheriting this process group, which
-    # keeps the durable root PGID as the only compiler/linker boundary.
-    export RYUKI_CARGO_OUTER_CONTROL_FILE="$VERIFY_GATE_CONTROL_FILE"
+    if [[ "$process_group_policy" == "containment-regression" ]]; then
+      # These fixed test harnesses create their own disposable targets and
+      # supervision records. Do not let the outer Cargo environment turn a
+      # standalone guard fixture into a forged nested-verifier invocation.
+      unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
+      unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+      unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+      unset RYUKI_CARGO_OUTER_CONTROL_FILE
+    else
+      # Cargo propagates this private, target-local ownership record to rustc.
+      # The rustc guard validates it before inheriting this process group,
+      # which keeps the durable root PGID as the only compiler/linker boundary.
+      export RYUKI_CARGO_OUTER_CONTROL_FILE="$VERIFY_GATE_CONTROL_FILE"
+    fi
     if ! apply_file_size_limit; then
       echo "error: unable to enforce the ${FILE_LIMIT_KIB} KiB file-size limit" >&2
       exit 75
@@ -1124,22 +1140,32 @@ run_gate_command() {
       clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
       return 75
     fi
-    if disk_guard_while_frozen; then
-      continue
+    guard_status=0
+    if [[ "$process_group_policy" == "containment-regression" ]]; then
+      # The fixed containment regressions intentionally establish subordinate
+      # process groups. Keep the outer supervisor, global free-space watcher,
+      # and inherited file-size limit; each harness enforces its own fixture
+      # target caps and cleanup contract. Do not mistake its test-owned groups
+      # for escaping Cargo descendants or freeze only their parent group.
+      disk_guard 0 || guard_status=$?
     else
-      guard_status=$?
-      echo "error: stopping ${label} before it can exhaust the disk" >&2
-      stop_status=0
-      supervisor_stop_command || stop_status=$?
-      (( stop_status == 0 )) || return "$stop_status"
-      run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
-      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
-      return "$guard_status"
+      disk_guard_while_frozen || guard_status=$?
     fi
+    if (( guard_status == 0 )); then
+      continue
+    fi
+    echo "error: stopping ${label} before it can exhaust the disk" >&2
+    stop_status=0
+    supervisor_stop_command || stop_status=$?
+    (( stop_status == 0 )) || return "$stop_status"
+    run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
+    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
+    return "$guard_status"
   done
 
   regroup_status=0
-  if process_group_alive "$command_pgid"; then
+  if [[ "$process_group_policy" == "strict" ]] \
+    && process_group_alive "$command_pgid"; then
     reject_regrouped_descendants || regroup_status=$?
   fi
   if (( regroup_status != 0 )); then
@@ -1182,14 +1208,19 @@ run_gate_command() {
   return "$command_status"
 }
 
-run_gate() {
-  local label="$1"
+run_gate_with_process_group_policy() {
+  local process_group_policy="$1"
+  local label="$2"
   local command_pid command_status recovery_status control_remained
-  shift
+  shift 2
+  case "$process_group_policy" in
+    strict|containment-regression) ;;
+    *) return 75 ;;
+  esac
   disk_guard
   echo "==> ${label}"
 
-  run_gate_command "$WRAPPER_PID" "$label" "$@" &
+  run_gate_command "$WRAPPER_PID" "$label" "$process_group_policy" "$@" &
   command_pid=$!
   ACTIVE_GATE_PID="$command_pid"
   if wait "$command_pid"; then
@@ -1214,6 +1245,45 @@ run_gate() {
     return "$command_status"
   fi
   disk_guard
+}
+
+run_gate() {
+  local label="$1"
+  shift
+  run_gate_with_process_group_policy strict "$label" "$@"
+}
+
+run_containment_regression_gate() {
+  local regression="$1" label script
+
+  # This policy is deliberately not selectable through the environment, a
+  # label, a path, or a focused command. Only this closed list of checked-in
+  # containment harnesses may establish subordinate test process groups.
+  case "$regression" in
+    verifier)
+      label="verification cleanup regression"
+      script="./scripts/regressions/verify-workspace-clean.sh"
+      ;;
+    rustc-guard)
+      label="repository Cargo disk guard regression"
+      script="./scripts/regressions/cargo-rustc-disk-guard.sh"
+      ;;
+    dev-guard)
+      label="persistent Cargo dev guard regression"
+      script="./scripts/regressions/cargo-dev-guard.sh"
+      ;;
+    proving-ground)
+      label="proving-ground build cleanup regression"
+      script="./scripts/regressions/proving-ground-build-cleanup.sh"
+      ;;
+    *) return 75 ;;
+  esac
+  [[ -f "$script" && ! -L "$script" && -x "$script" && -O "$script" ]] || {
+    echo "error: containment regression is missing or unsafe: ${script}" >&2
+    return 75
+  }
+  run_gate_with_process_group_policy containment-regression \
+    "$label" "$script"
 }
 
 validate_focused_cargo_command() {
@@ -1282,10 +1352,10 @@ if (( $# > 0 )); then
   exit 0
 fi
 
-run_gate "verification cleanup regression" ./scripts/regressions/verify-workspace-clean.sh
-run_gate "repository Cargo disk guard regression" ./scripts/regressions/cargo-rustc-disk-guard.sh
-run_gate "persistent Cargo dev guard regression" ./scripts/regressions/cargo-dev-guard.sh
-run_gate "proving-ground build cleanup regression" ./scripts/regressions/proving-ground-build-cleanup.sh
+run_containment_regression_gate verifier
+run_containment_regression_gate rustc-guard
+run_containment_regression_gate dev-guard
+run_containment_regression_gate proving-ground
 run_gate "format" cargo fmt --check --all
 run_gate "workspace build" cargo build --workspace
 run_gate "workspace tests" cargo test --workspace

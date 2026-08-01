@@ -4403,7 +4403,7 @@ pub mod tests {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-            assert_eq!(traces.len(), 135);
+            assert_eq!(traces.len(), 140);
 
             let mut first_control_by_package = BTreeMap::new();
             for trace in traces.values() {
@@ -7024,11 +7024,11 @@ pub mod tests {
     }
 
     #[test]
-    fn complete_semantic_closure_accepts_all_135_checked_in_trace_instances() {
+    fn complete_semantic_closure_accepts_all_140_checked_in_trace_instances() {
         let fixture = SyntheticClosure::complete();
         let closure = fixture.verify().unwrap();
-        assert_eq!(fixture.applicability.instances.len(), 135);
-        assert_eq!(closure.evidence_digests.len(), 135);
+        assert_eq!(fixture.applicability.instances.len(), 140);
+        assert_eq!(closure.evidence_digests.len(), 140);
         assert_eq!(closure.receipt_digests.len(), 10);
         assert_eq!(closure.runtime_guard_requirements.len(), 8);
     }
