@@ -1101,6 +1101,29 @@ pub fn is_valid_site(code: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Execute one in-memory mutation while retaining the exact active-site
+/// authority lock. Callers that also lock domain state must always acquire it
+/// inside `operation`, establishing the shared site-registry → domain-store
+/// order and preventing deactivation from linearizing between admission and
+/// mutation.
+pub(crate) fn with_active_site_admission<T>(
+    code: &str,
+    operation: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let code = normalize_site_code_for_lookup(code)?;
+    let store = site_store().lock().map_err(|error| error.to_string())?;
+    if !store
+        .iter()
+        .any(|entry| entry.site.unlocode == code && entry.site.active)
+    {
+        return Err(format!("Site '{code}' is unknown or inactive"));
+    }
+
+    let result = operation(&code);
+    drop(store);
+    result
+}
+
 /// True when `code` is a RECOGNISED site in the registry, regardless of its
 /// active status — i.e. membership only. Unlike [`is_valid_site`] (which also
 /// requires the site to be ACTIVE/operational), this answers "is this a known,

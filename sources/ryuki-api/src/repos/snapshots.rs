@@ -6,7 +6,7 @@
 //! locked, or decoded. A legacy row without a resolvable relation is therefore
 //! invisible and immutable through this repository (fail closed).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ryuki_engine::models::{SnapshotRecord, SnapshotStatus};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -25,7 +25,7 @@ pub const AUTHORIZED_COLUMNS: &str = "s.id::text AS id, \
      s.created_by, \
      s.scope_provenance, \
      s.snapshot_purpose, \
-     s.requested_expiry, \
+     s.requested_expiry_at, \
      s.owner, \
      s.support_group, \
      s.change_context, \
@@ -48,7 +48,8 @@ const AUTHORIZED_FROM: &str = "snapshots AS s \
 const AUTHORIZED_PREDICATE: &str = "(cardinality($1::text[]) = 0 OR ci.site = ANY($1)) \
      AND (cardinality($2::text[]) = 0 \
           OR (NULLIF(btrim(ci.environment), '') IS NOT NULL \
-              AND ci.environment = ANY($2)))";
+              AND ci.environment = ANY($2))) \
+     AND s.requested_expiry_at IS NOT NULL";
 
 /// One stale-flag request may claim at most this many eligible rows. Claimed
 /// rows transition out of the eligible states, so repeated calls advance the
@@ -75,7 +76,7 @@ pub struct SnapshotRow {
     pub created_by: Option<String>,
     pub scope_provenance: String,
     pub snapshot_purpose: String,
-    pub requested_expiry: String,
+    pub requested_expiry_at: DateTime<Utc>,
     pub owner: String,
     pub support_group: String,
     pub change_context: String,
@@ -128,7 +129,9 @@ impl SnapshotRow {
             created_by: self.created_by,
             scope_provenance: Some(self.scope_provenance),
             snapshot_purpose: self.snapshot_purpose,
-            requested_expiry: self.requested_expiry,
+            requested_expiry: self
+                .requested_expiry_at
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
             owner: self.owner,
             support_group: self.support_group,
             change_context: self.change_context,
@@ -179,6 +182,10 @@ pub async fn insert_authorized(
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
     let configuration_item_id =
         Uuid::parse_str(configuration_item_id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let (requested_expiry, requested_expiry_at) =
+        ryuki_engine::snapshot_engine::canonicalize_requested_expiry(&r.requested_expiry).map_err(
+            |error| sqlx::Error::Decode(format!("snapshots.requested_expiry: {error}").into()),
+        )?;
 
     let meta = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
 
@@ -186,10 +193,10 @@ pub async fn insert_authorized(
         "WITH inserted AS ( \
              INSERT INTO snapshots \
              (id, configuration_item_id, platform_ci_key, created_by, scope_provenance, \
-              snapshot_purpose, requested_expiry, owner, support_group, change_context, \
+              snapshot_purpose, requested_expiry, requested_expiry_at, owner, support_group, change_context, \
               status, policy_decision, backup_impact, remediation_plan, metadata) \
              SELECT $1, ci.id, ci.ci_name, $6, 'cmdb-configuration-item', \
-                    $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb \
+                    $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb \
              FROM configuration_items AS ci \
              INNER JOIN site_registry AS sr \
                      ON sr.unlocode = ci.site AND sr.active = true \
@@ -212,7 +219,8 @@ pub async fn insert_authorized(
     .bind(environment_scopes)
     .bind(created_by)
     .bind(&r.snapshot_purpose)
-    .bind(&r.requested_expiry)
+    .bind(&requested_expiry)
+    .bind(requested_expiry_at)
     .bind(&r.owner)
     .bind(&r.support_group)
     .bind(&r.change_context)
@@ -225,6 +233,19 @@ pub async fn insert_authorized(
     .await?;
 
     row.into_model()
+}
+
+fn stale_candidates_sql() -> String {
+    format!(
+        "SELECT {AUTHORIZED_COLUMNS} FROM {AUTHORIZED_FROM} \
+         WHERE {AUTHORIZED_PREDICATE} \
+           AND s.configuration_item_id IS NOT NULL \
+           AND s.status IN ('Draft', 'ReviewRequested', 'ExpiryApproved') \
+           AND s.requested_expiry_at < NOW() \
+         ORDER BY s.requested_expiry_at ASC, s.created_at ASC, s.id ASC \
+         LIMIT $3 \
+         FOR UPDATE OF s SKIP LOCKED FOR SHARE OF ci, sr"
+    )
 }
 
 /// Fetch one snapshot only when its authoritative CMDB relation is inside the
@@ -292,24 +313,12 @@ pub async fn list_stale_candidates_for_update(
     limit: i64,
 ) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
     let limit = limit.clamp(1, MAX_STALE_SNAPSHOT_BATCH);
-    let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
-        "SELECT {AUTHORIZED_COLUMNS} FROM {AUTHORIZED_FROM} \
-         WHERE {AUTHORIZED_PREDICATE} \
-           AND s.status IN ('Draft', 'ReviewRequested', 'ExpiryApproved') \
-           AND CASE \
-                 WHEN pg_input_is_valid(s.requested_expiry, 'timestamptz') \
-                 THEN s.requested_expiry::timestamptz < NOW() \
-                 ELSE false \
-               END \
-         ORDER BY s.created_at ASC, s.id ASC \
-         LIMIT $3 \
-         FOR UPDATE OF s SKIP LOCKED FOR SHARE OF ci, sr"
-    ))
-    .bind(site_scopes)
-    .bind(environment_scopes)
-    .bind(limit)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<SnapshotRow> = sqlx::query_as(&stale_candidates_sql())
+        .bind(site_scopes)
+        .bind(environment_scopes)
+        .bind(limit)
+        .fetch_all(executor)
+        .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
 }
@@ -412,4 +421,39 @@ pub async fn transition_authorized(
     .await?;
 
     row.map(|row| row.into_model()).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_claim_uses_typed_expiry_predicate_and_deterministic_index_order() {
+        let sql = stale_candidates_sql();
+        let typed_predicate = sql
+            .find("s.requested_expiry_at < NOW()")
+            .expect("typed stale predicate");
+        let deterministic_order = sql
+            .find("ORDER BY s.requested_expiry_at ASC, s.created_at ASC, s.id ASC")
+            .expect("deterministic expiry order");
+        let limit = sql.find("LIMIT $3").expect("bounded claim limit");
+
+        assert!(typed_predicate < deterministic_order);
+        assert!(deterministic_order < limit);
+        assert!(!sql.contains("pg_input_is_valid"));
+        assert!(!sql.contains("requested_expiry::timestamptz"));
+    }
+
+    #[test]
+    fn migration_204_establishes_typed_expiry_quarantine_and_matching_index() {
+        let migration = include_str!("../../../../migrations/204_snapshot_expiry_typed.sql");
+
+        assert!(migration.contains("ADD COLUMN IF NOT EXISTS requested_expiry_at TIMESTAMPTZ"));
+        assert!(migration.contains("ELSE NULL"));
+        assert!(migration.contains("snapshots_requested_expiry_typed_check"));
+        assert!(migration.contains("ON snapshots(requested_expiry_at ASC, created_at ASC, id ASC)"));
+        assert!(migration.contains(
+            "WHERE configuration_item_id IS NOT NULL\n      AND requested_expiry_at IS NOT NULL"
+        ));
+    }
 }

@@ -19,6 +19,9 @@ pub fn plan_vm_day2_change(
     if site.is_empty() {
         return Err("site cannot be empty".into());
     }
+    if environment.is_empty() {
+        return Err("environment cannot be empty".into());
+    }
     if owner.is_empty() {
         return Err("owner cannot be empty".into());
     }
@@ -91,6 +94,7 @@ pub fn plan_vm_day2_change(
     Ok(VmDay2ChangeRequest {
         id,
         target_ci_key: target_ci_key.to_string(),
+        target_authority: None,
         change_type,
         target_value,
         site: site.to_string(),
@@ -113,6 +117,7 @@ pub fn vm_day2_plan_digest(change: &VmDay2ChangeRequest) -> Result<String, Strin
     let material = serde_json::json!({
         "id": change.id,
         "target_ci_key": change.target_ci_key,
+        "target_authority": change.target_authority,
         "change_type": change.change_type,
         "target_value": change.target_value,
         "site": change.site,
@@ -126,6 +131,27 @@ pub fn vm_day2_plan_digest(change: &VmDay2ChangeRequest) -> Result<String, Strin
         .map_err(|error| format!("cannot encode VM Day-2 plan digest material: {error}"))?;
     let digest = Sha256::digest(encoded);
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Bind the immutable CMDB UUID selected by the repository's typed authorized
+/// target. Callers cannot select another provenance kind.
+pub fn bind_vm_day2_target_authority(
+    change: &mut VmDay2ChangeRequest,
+    configuration_item_id: &str,
+) -> Result<(), String> {
+    if change.status != VmChangeStatus::Planned {
+        return Err("VM Day-2 target authority can only be bound while Planned".into());
+    }
+    if change.governance.is_some() || change.target_authority.is_some() {
+        return Err("VM Day-2 target authority is already bound".into());
+    }
+    let configuration_item_id = Uuid::parse_str(configuration_item_id)
+        .map_err(|_| "VM Day-2 CMDB target identity must be a UUID")?;
+    change.target_authority = Some(VmDay2TargetAuthority {
+        configuration_item_id: configuration_item_id.to_string(),
+        provenance: VmDay2TargetProvenance::CmdbConfigurationItem,
+    });
+    Ok(())
 }
 
 /// Bind a newly planned operation to its verified maker after the API has
@@ -143,6 +169,12 @@ pub fn bind_vm_day2_governance(
     if change.governance.is_some() {
         return Err("VM Day-2 governance is already bound".into());
     }
+    let authority = change
+        .target_authority
+        .as_ref()
+        .ok_or_else(|| "VM Day-2 operation has no authoritative CMDB target".to_string())?;
+    Uuid::parse_str(&authority.configuration_item_id)
+        .map_err(|_| "VM Day-2 CMDB target identity must be a UUID")?;
     let plan_digest = vm_day2_plan_digest(change)?;
     change.governance = Some(VmDay2Governance {
         plan_digest,
@@ -154,6 +186,12 @@ pub fn bind_vm_day2_governance(
 }
 
 fn current_governance(change: &VmDay2ChangeRequest) -> Result<&VmDay2Governance, String> {
+    let authority = change
+        .target_authority
+        .as_ref()
+        .ok_or_else(|| "VM Day-2 operation has no authoritative CMDB target".to_string())?;
+    Uuid::parse_str(&authority.configuration_item_id)
+        .map_err(|_| "VM Day-2 CMDB target identity must be a UUID")?;
     let governance = change
         .governance
         .as_ref()
@@ -371,6 +409,30 @@ pub fn execute_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<VmDay2Chan
 }
 
 pub fn verify_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<Vec<EvidenceItem>, String> {
+    if change.status != VmChangeStatus::Executed {
+        return Err(format!(
+            "Cannot verify VM Day-2 operation in status {:?}. Must be Executed first.",
+            change.status
+        ));
+    }
+    let governance = current_governance(change)?;
+    current_approval(governance)?;
+    let operation_lock = governance
+        .operation_lock
+        .as_ref()
+        .ok_or_else(|| "VM Day-2 operation lock is missing".to_string())?;
+    let acquired_at = DateTime::parse_from_rfc3339(&operation_lock.acquired_at)
+        .map_err(|_| "VM Day-2 operation lock acquisition time is invalid".to_string())?;
+    let expires_at = DateTime::parse_from_rfc3339(&operation_lock.expires_at)
+        .map_err(|_| "VM Day-2 operation lock expiry is invalid".to_string())?;
+    if Uuid::parse_str(&operation_lock.lock_id).is_err()
+        || operation_lock.locked_by.trim().is_empty()
+        || operation_lock.plan_digest != governance.plan_digest
+        || expires_at <= acquired_at
+    {
+        return Err("VM Day-2 operation lock is invalid or stale".into());
+    }
+
     let mut evidence: Vec<EvidenceItem> = Vec::new();
 
     evidence.push(EvidenceItem {
@@ -422,6 +484,7 @@ mod tests {
         )
         .unwrap();
         change.id = Uuid::new_v4().to_string();
+        bind_vm_day2_target_authority(&mut change, &Uuid::new_v4().to_string()).unwrap();
         bind_vm_day2_governance(&mut change, "stable.vm.planner").unwrap();
         change
     }
@@ -494,6 +557,41 @@ mod tests {
     }
 
     #[test]
+    fn governance_requires_and_digests_cmdb_target_authority() {
+        let mut change = plan_vm_day2_change(
+            "ci-vm-001",
+            VmChangeType::ResizeCpu,
+            4,
+            "DEFRA",
+            "production",
+            "owner",
+            "window",
+        )
+        .unwrap();
+        change.id = Uuid::new_v4().to_string();
+
+        let missing = bind_vm_day2_governance(&mut change, "stable.vm.planner")
+            .expect_err("an arbitrary target string cannot be governed");
+        assert!(missing.contains("no authoritative CMDB target"));
+
+        bind_vm_day2_target_authority(&mut change, &Uuid::new_v4().to_string()).unwrap();
+        bind_vm_day2_governance(&mut change, "stable.vm.planner").unwrap();
+        change
+            .target_authority
+            .as_mut()
+            .expect("bound target")
+            .configuration_item_id = Uuid::new_v4().to_string();
+        let stale = validate_vm_day2_change(&change).unwrap();
+        assert!(!stale.passed);
+        assert!(
+            stale
+                .errors
+                .iter()
+                .any(|error| error.contains("changed after governance binding"))
+        );
+    }
+
+    #[test]
     fn test_validate_vm_change_passes() {
         let change = governed_change(VmChangeType::ResizeMemory, 32);
         let result = validate_vm_day2_change(&change).unwrap();
@@ -513,6 +611,7 @@ mod tests {
         )
         .unwrap();
         change.id = Uuid::new_v4().to_string();
+        bind_vm_day2_target_authority(&mut change, &Uuid::new_v4().to_string()).unwrap();
         bind_vm_day2_governance(&mut change, "stable.vm.planner").unwrap();
         change.site = "INVALID".into();
         let result = validate_vm_day2_change(&change).unwrap();
@@ -579,8 +678,21 @@ mod tests {
 
     #[test]
     fn test_verify_vm_change() {
-        let change = plan_vm_day2_change(
-            "ci-vm-001",
+        let mut change = governed_change(VmChangeType::ResizeCpu, 8);
+        change.status = VmChangeStatus::Validated;
+        let approved = approve_vm_day2_change(&change, "stable.vm.approver").unwrap();
+        let locked = lock_vm_day2_change(&approved, "stable.vm.executor").unwrap();
+        let executed = execute_vm_day2_change(&locked).unwrap();
+        let evidence = verify_vm_day2_change(&executed).unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert!(evidence.iter().any(|e| e.key == "vm-pre-change-state"));
+        assert!(evidence.iter().any(|e| e.key == "vm-service-health"));
+    }
+
+    #[test]
+    fn verify_rejects_ungoverned_arbitrary_target() {
+        let mut change = plan_vm_day2_change(
+            "attacker-selected-target",
             VmChangeType::ResizeCpu,
             8,
             "DEFRA",
@@ -589,10 +701,10 @@ mod tests {
             "EU-Overnight",
         )
         .unwrap();
-        let evidence = verify_vm_day2_change(&change).unwrap();
-        assert_eq!(evidence.len(), 3);
-        assert!(evidence.iter().any(|e| e.key == "vm-pre-change-state"));
-        assert!(evidence.iter().any(|e| e.key == "vm-service-health"));
+        change.status = VmChangeStatus::Executed;
+        let error = verify_vm_day2_change(&change)
+            .expect_err("an arbitrary ungoverned target cannot produce evidence");
+        assert!(error.contains("no authoritative CMDB target"));
     }
 
     #[test]

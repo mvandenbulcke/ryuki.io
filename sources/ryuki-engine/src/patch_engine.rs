@@ -1,4 +1,5 @@
 use crate::{models::*, site_registry};
+use ryuki_core::PrincipalId;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -593,13 +594,23 @@ pub fn validate_patch_wave(wave: &PatchWave) -> Result<(PatchWave, ValidationRes
 /// Approve a patch wave that is in Validated status.
 ///
 /// Returns the updated wave with status Approved and approver/approved_at
-/// metadata set.
-pub fn approve_patch_wave(wave: &PatchWave, approver: &str) -> Result<PatchWave, String> {
+/// metadata set. The persisted maker is supplied separately because it is
+/// immutable repository provenance rather than caller-editable wave content.
+pub fn approve_patch_wave(
+    wave: &PatchWave,
+    maker_principal_id: PrincipalId,
+    approver_principal_id: PrincipalId,
+) -> Result<PatchWave, String> {
     if wave.status != PatchWaveStatus::Validated {
         return Err(format!(
             "Cannot approve patch wave in status {:?}. Must pass validation first.",
             wave.status
         ));
+    }
+    if maker_principal_id == approver_principal_id {
+        return Err(
+            "Patch wave approval requires a checker distinct from the planning maker".into(),
+        );
     }
 
     let mut approved = wave.clone();
@@ -608,7 +619,7 @@ pub fn approve_patch_wave(wave: &PatchWave, approver: &str) -> Result<PatchWave,
     // a hardcoded string — the approval audit trail must name the real principal.
     approved
         .metadata
-        .insert("approver".into(), approver.to_string());
+        .insert("approver".into(), approver_principal_id.to_string());
     approved
         .metadata
         .insert("approved_at".into(), chrono::Utc::now().to_rfc3339());
@@ -780,6 +791,16 @@ pub fn get_pending_reboots() -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn patch_maker() -> PrincipalId {
+        PrincipalId::from_uuid(Uuid::from_u128(0x018f3f548f5e7bb79f061f3cc6f819d1))
+            .expect("non-nil maker principal")
+    }
+
+    fn patch_checker() -> PrincipalId {
+        PrincipalId::from_uuid(Uuid::from_u128(0x018f3f548f5e7bb79f061f3cc6f819d2))
+            .expect("non-nil checker principal")
+    }
 
     fn make_test_server(id: &str, name: &str, site: &str, env: &str, criticality: &str) -> Server {
         Server {
@@ -1362,14 +1383,14 @@ mod tests {
         assert_eq!(updated.metadata.get("validation_dry_run").unwrap(), "true");
         assert!(!updated.validation_errors.is_empty());
         // Approving a still-Draft wave must fail
-        assert!(approve_patch_wave(&updated, "patch-approver").is_err());
+        assert!(approve_patch_wave(&updated, patch_maker(), patch_checker()).is_err());
     }
 
     #[test]
     fn test_validate_patch_wave_refuses_completed_wave() {
         let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
         let (validated, _) = validate_patch_wave(&wave).unwrap();
-        let approved = approve_patch_wave(&validated, "patch-approver").unwrap();
+        let approved = approve_patch_wave(&validated, patch_maker(), patch_checker()).unwrap();
         let (completed, _) = execute_patch_wave(&approved).unwrap();
 
         let err = validate_patch_wave(&completed).unwrap_err();
@@ -1391,17 +1412,33 @@ mod tests {
         let wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
         let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-        let approved = approve_patch_wave(&validated, "patch-approver").unwrap();
+        let approved = approve_patch_wave(&validated, patch_maker(), patch_checker()).unwrap();
         assert_eq!(approved.status, PatchWaveStatus::Approved);
         // The approver recorded is the one passed in (the real session principal),
         // not a hardcoded string.
-        assert_eq!(approved.metadata.get("approver").unwrap(), "patch-approver");
+        assert_eq!(
+            approved.metadata.get("approver").unwrap(),
+            &patch_checker().to_string()
+        );
+    }
+
+    #[test]
+    fn test_approve_patch_wave_rejects_maker_as_checker() {
+        let wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
+        let (validated, validation) = validate_patch_wave(&wave).unwrap();
+        assert!(validation.passed);
+
+        let result = approve_patch_wave(&validated, patch_maker(), patch_maker()).unwrap_err();
+
+        assert!(result.contains("checker distinct from the planning maker"));
+        assert_eq!(validated.status, PatchWaveStatus::Validated);
+        assert!(!validated.metadata.contains_key("approver"));
     }
 
     #[test]
     fn test_approve_patch_wave_draft_fails() {
         let wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
-        let result = approve_patch_wave(&wave, "patch-approver").unwrap_err();
+        let result = approve_patch_wave(&wave, patch_maker(), patch_checker()).unwrap_err();
         assert!(result.contains("Must pass validation first"));
         assert_eq!(wave.status, PatchWaveStatus::Draft);
     }
@@ -1411,7 +1448,7 @@ mod tests {
         let wave = plan_patch_wave("DEFRA", "windows", "high").unwrap();
         let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-        let approved = approve_patch_wave(&validated, "patch-approver").unwrap();
+        let approved = approve_patch_wave(&validated, patch_maker(), patch_checker()).unwrap();
         let (completed, evidence) = execute_patch_wave(&approved).unwrap();
         assert!(evidence.len() >= 5);
         assert!(evidence.iter().any(|e| e.key == "pre-patch-backup-check"));
@@ -1442,7 +1479,7 @@ mod tests {
         let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
         let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-        let approved = approve_patch_wave(&validated, "patch-approver").unwrap();
+        let approved = approve_patch_wave(&validated, patch_maker(), patch_checker()).unwrap();
         let (completed, _) = execute_patch_wave(&approved).unwrap();
         let result = verify_patch_wave(&completed).unwrap();
         assert!(result.passed);
@@ -1463,7 +1500,7 @@ mod tests {
             "true"
         );
 
-        let approved = approve_patch_wave(&validated, "patch-approver").unwrap();
+        let approved = approve_patch_wave(&validated, patch_maker(), patch_checker()).unwrap();
         assert_eq!(approved.status, PatchWaveStatus::Approved);
 
         let (completed, evidence) = execute_patch_wave(&approved).unwrap();

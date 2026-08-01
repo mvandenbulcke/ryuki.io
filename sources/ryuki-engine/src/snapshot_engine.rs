@@ -1,6 +1,82 @@
 use crate::models::*;
+use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Maximum encoded size accepted for a caller-supplied snapshot expiry.
+/// RFC3339 timestamps are short; this leaves ample room for fractional seconds
+/// and an explicit offset while preventing the expiry field from becoming an
+/// attacker-controlled unbounded text value.
+pub const MAX_REQUESTED_EXPIRY_BYTES: usize = 64;
+
+fn has_strict_rfc3339_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if !(20..=MAX_REQUESTED_EXPIRY_BYTES).contains(&bytes.len())
+        || !value.is_ascii()
+        || bytes.starts_with(b"0000")
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !bytes[index].is_ascii_digit() {
+            return false;
+        }
+    }
+
+    let zone_start = if bytes[19] == b'.' {
+        let Some(relative_end) = bytes[20..].iter().position(|byte| !byte.is_ascii_digit()) else {
+            return false;
+        };
+        if relative_end == 0 {
+            return false;
+        }
+        20 + relative_end
+    } else {
+        19
+    };
+
+    let zone = &bytes[zone_start..];
+    zone == b"Z"
+        || (zone.len() == 6
+            && matches!(zone[0], b'+' | b'-')
+            && zone[1].is_ascii_digit()
+            && zone[2].is_ascii_digit()
+            && zone[3] == b':'
+            && zone[4].is_ascii_digit()
+            && zone[5].is_ascii_digit())
+}
+
+/// Validate and normalize a caller-controlled expiry at the domain boundary.
+/// The returned UTC value is within the four-digit RFC3339 year range and can
+/// therefore be represented safely by PostgreSQL `TIMESTAMPTZ`.
+pub fn canonicalize_requested_expiry(value: &str) -> Result<(String, DateTime<Utc>), String> {
+    if value.is_empty() {
+        return Err("requested_expiry cannot be empty".into());
+    }
+    if value.len() > MAX_REQUESTED_EXPIRY_BYTES {
+        return Err(format!(
+            "requested_expiry must be at most {MAX_REQUESTED_EXPIRY_BYTES} bytes"
+        ));
+    }
+    if !has_strict_rfc3339_shape(value) {
+        return Err("requested_expiry must be a canonical RFC3339 timestamp".into());
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| "requested_expiry must be a canonical RFC3339 timestamp".to_string())?
+        .with_timezone(&Utc);
+    if !(1..=9999).contains(&parsed.year()) {
+        return Err("requested_expiry is outside the supported timestamp range".into());
+    }
+
+    Ok((parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true), parsed))
+}
 
 pub fn plan_snapshot(
     platform_ci_key: &str,
@@ -16,9 +92,7 @@ pub fn plan_snapshot(
     if owner.is_empty() {
         return Err("owner cannot be empty".into());
     }
-    if requested_expiry.is_empty() {
-        return Err("requested_expiry cannot be empty".into());
-    }
+    let (requested_expiry, _) = canonicalize_requested_expiry(requested_expiry)?;
 
     let id = format!(
         "snap-{}",
@@ -40,7 +114,7 @@ pub fn plan_snapshot(
         created_by: None,
         scope_provenance: None,
         snapshot_purpose: snapshot_purpose.to_string(),
-        requested_expiry: requested_expiry.to_string(),
+        requested_expiry: requested_expiry.clone(),
         owner: owner.to_string(),
         support_group: support_group.to_string(),
         change_context: change_context.to_string(),
@@ -85,6 +159,12 @@ pub fn validate_snapshot(record: &SnapshotRecord) -> Result<ValidationResult, St
         errors.push("Missing expiry date".into());
         failed_rules.push("p0-expiry-required".into());
         remediation.push("Provide an approved expiry date for the snapshot.".into());
+    } else if canonicalize_requested_expiry(&record.requested_expiry).is_err() {
+        errors.push("Invalid expiry date".into());
+        failed_rules.push("p0-expiry-rfc3339".into());
+        remediation.push(format!(
+            "Provide a canonical RFC3339 expiry no longer than {MAX_REQUESTED_EXPIRY_BYTES} bytes."
+        ));
     }
 
     warnings.push("DRY-RUN: Backup conflict check simulated".into());
@@ -139,7 +219,7 @@ pub fn flag_stale_snapshots(records: &[SnapshotRecord]) -> Result<Vec<SnapshotRe
         if !eligible {
             continue;
         }
-        if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(&record.requested_expiry)
+        if let Ok((_, expiry)) = canonicalize_requested_expiry(&record.requested_expiry)
             && expiry < now
         {
             let mut stale = record.clone();
@@ -214,6 +294,66 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_snapshot_rejects_non_rfc3339_and_relaxed_timestamps() {
+        for invalid in [
+            "not-a-timestamp",
+            "infinity",
+            "2026-07-01 00:00:00Z",
+            "2026-07-01T00:00:00z",
+            "0000-01-01T00:00:00Z",
+        ] {
+            let error = plan_snapshot("ci-001", "purpose", invalid, "owner", "sg", "ctx")
+                .expect_err("non-canonical expiry must be rejected");
+            assert!(
+                error.contains("RFC3339") || error.contains("timestamp range"),
+                "unexpected error for {invalid}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_snapshot_enforces_exact_64_byte_expiry_boundary() {
+        let maximum = format!("2026-07-01T00:00:00.{}Z", "1".repeat(43));
+        assert_eq!(maximum.len(), MAX_REQUESTED_EXPIRY_BYTES);
+        assert!(plan_snapshot("ci-001", "purpose", &maximum, "owner", "sg", "ctx").is_ok());
+
+        let oversized = format!("2026-07-01T00:00:00.{}Z", "1".repeat(44));
+        assert_eq!(oversized.len(), MAX_REQUESTED_EXPIRY_BYTES + 1);
+        let error = plan_snapshot("ci-001", "purpose", &oversized, "owner", "sg", "ctx")
+            .expect_err("oversized expiry must be rejected");
+        assert!(error.contains("at most 64 bytes"));
+    }
+
+    #[test]
+    fn test_plan_snapshot_canonicalizes_valid_offset_to_utc() {
+        let record = plan_snapshot(
+            "ci-001",
+            "purpose",
+            "2026-07-01T02:30:00+02:30",
+            "owner",
+            "sg",
+            "ctx",
+        )
+        .expect("valid RFC3339 offset must be accepted");
+        assert_eq!(record.requested_expiry, "2026-07-01T00:00:00Z");
+
+        let fractional = plan_snapshot(
+            "ci-001",
+            "purpose",
+            "2026-07-01T00:00:00.123456789123Z",
+            "owner",
+            "sg",
+            "ctx",
+        )
+        .expect("bounded RFC3339 fractional seconds must be accepted");
+        assert_eq!(
+            fractional.requested_expiry,
+            "2026-07-01T00:00:00.123456789Z"
+        );
+        assert!(canonicalize_requested_expiry("9999-12-31T23:59:59Z").is_ok());
+    }
+
+    #[test]
     fn test_validate_snapshot_passes() {
         let record = make_test_snapshot();
         let result = validate_snapshot(&record).unwrap();
@@ -226,6 +366,15 @@ mod tests {
         record.owner = "".into();
         let result = validate_snapshot(&record).unwrap();
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn test_validate_snapshot_detects_invalid_expiry() {
+        let mut record = make_test_snapshot();
+        record.requested_expiry = "2026-07-01 00:00:00Z".into();
+        let result = validate_snapshot(&record).unwrap();
+        assert!(!result.passed);
+        assert_eq!(result.failed_rules, vec!["p0-expiry-rfc3339".to_string()]);
     }
 
     #[test]

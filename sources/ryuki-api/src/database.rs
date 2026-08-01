@@ -510,6 +510,9 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("audit_log", false, false, false),
     TablePolicy::new("backup_coverage_reports", true, true, true),
     TablePolicy::new("backup_repositories", true, true, true),
+    // Restore points are admitted only by the migration/provider authority;
+    // serving paths may resolve them but cannot mint, reactivate, or delete one.
+    TablePolicy::new("backup_restore_points", false, false, false),
     TablePolicy::new("baseline_checks", true, true, true),
     TablePolicy::new("baseline_results", true, true, true),
     TablePolicy::new("build_test_results", true, true, true),
@@ -10767,6 +10770,7 @@ mod tests {
         assert!(!policies.contains_key("oidc_login_states"));
         for name in [
             "audit_log",
+            "backup_restore_points",
             "certificate_site_authority_quarantine",
             "first_owner_closure_records",
             "first_owner_privileged_domain_assignments",

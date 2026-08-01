@@ -62,6 +62,13 @@ type IncidentContextStore = Vec<IncidentContext>;
 
 static INCIDENT_CONTEXT_STORE: OnceLock<Mutex<IncidentContextStore>> = OnceLock::new();
 
+/// Maximum number of authoritative CMDB bindings retained in one incident.
+///
+/// The API and database trigger enforce the same bound. Keeping the pure model
+/// transition bounded as well makes repeated add-CI calls cumulative instead
+/// of treating each one-item request as independently safe.
+pub const MAX_INCIDENT_AFFECTED_CIS: usize = 100;
+
 fn incident_context_store() -> &'static Mutex<IncidentContextStore> {
     INCIDENT_CONTEXT_STORE.get_or_init(|| Mutex::new(seed_data()))
 }
@@ -208,8 +215,10 @@ pub fn build_incident_context(
     if severity.trim().is_empty() {
         return Err("severity cannot be empty".into());
     }
-    if affected_ci_names.is_empty() {
-        return Err("affected_ci_names cannot be empty".into());
+    if affected_ci_names.is_empty() || affected_ci_names.len() > MAX_INCIDENT_AFFECTED_CIS {
+        return Err(format!(
+            "affected_ci_names must contain between 1 and {MAX_INCIDENT_AFFECTED_CIS} entries"
+        ));
     }
     if site.trim().is_empty() {
         return Err("site cannot be empty".into());
@@ -267,8 +276,10 @@ pub fn build_incident_context_from_bindings(
     if severity.trim().is_empty() {
         return Err("severity cannot be empty".into());
     }
-    if affected_ci.is_empty() {
-        return Err("affected CI bindings cannot be empty".into());
+    if affected_ci.is_empty() || affected_ci.len() > MAX_INCIDENT_AFFECTED_CIS {
+        return Err(format!(
+            "affected CI bindings must contain between 1 and {MAX_INCIDENT_AFFECTED_CIS} entries"
+        ));
     }
     let normalized_site = crate::site_registry::normalize_site_code_for_lookup(site)
         .map_err(|_| "incident site binding is not canonical".to_string())?;
@@ -355,6 +366,11 @@ pub fn add_affected_ci_pure(
         return Err(format!(
             "cannot add a CI to a non-active incident (status is '{}')",
             ctx.status
+        ));
+    }
+    if ctx.affected_ci.len() >= MAX_INCIDENT_AFFECTED_CIS {
+        return Err(format!(
+            "incident cannot contain more than {MAX_INCIDENT_AFFECTED_CIS} affected CIs"
         ));
     }
     let mut updated = ctx.clone();
@@ -626,6 +642,65 @@ mod tests {
         assert!(
             add_affected_ci_pure(&ctx, "san-gblon", "Storage", "GBLON").is_err(),
             "a foreign-site CI must never be appended"
+        );
+    }
+
+    #[test]
+    fn test_incident_affected_ci_cap_is_cumulative_across_repeated_adds() {
+        let mut ctx = build_incident_context_from_bindings(
+            "bounded incident",
+            "sev2",
+            vec![AffectedCI {
+                ci_name: "ci-000".into(),
+                ci_type: "Server".into(),
+                site: "DEFRA".into(),
+                status: "impacted".into(),
+            }],
+            "DEFRA",
+        )
+        .expect("the first authoritative CI must be accepted");
+
+        for index in 1..MAX_INCIDENT_AFFECTED_CIS {
+            ctx = add_affected_ci_pure(&ctx, &format!("ci-{index:03}"), "Server", "DEFRA")
+                .expect("every append through the boundary must remain valid");
+        }
+        assert_eq!(ctx.affected_ci.len(), MAX_INCIDENT_AFFECTED_CIS);
+
+        let error = add_affected_ci_pure(&ctx, "ci-over-limit", "Server", "DEFRA")
+            .expect_err("the first append beyond the cumulative cap must fail");
+        assert!(
+            error.contains("cannot contain more than 100"),
+            "the cap failure must be explicit and stable: {error}"
+        );
+        assert_eq!(
+            ctx.affected_ci.len(),
+            MAX_INCIDENT_AFFECTED_CIS,
+            "a rejected append must not mutate the persisted model candidate"
+        );
+    }
+
+    #[test]
+    fn test_incident_builders_reject_initial_state_above_ci_cap() {
+        let names = (0..=MAX_INCIDENT_AFFECTED_CIS)
+            .map(|index| format!("ci-{index:03}"))
+            .collect::<Vec<_>>();
+        assert!(
+            build_incident_context("oversized", "sev2", names.clone(), "DEFRA").is_err(),
+            "the dry-run constructor must not create an over-limit incident"
+        );
+
+        let bindings = names
+            .into_iter()
+            .map(|ci_name| AffectedCI {
+                ci_name,
+                ci_type: "Server".into(),
+                site: "DEFRA".into(),
+                status: "impacted".into(),
+            })
+            .collect();
+        assert!(
+            build_incident_context_from_bindings("oversized", "sev2", bindings, "DEFRA").is_err(),
+            "the authoritative constructor must not create an over-limit incident"
         );
     }
 

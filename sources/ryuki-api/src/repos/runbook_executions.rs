@@ -87,7 +87,9 @@ fn decode_status(s: &str) -> Result<ExecutionStatus, String> {
 // ─── Repository functions ─────────────────────────────────────────────────────
 
 /// Insert a new runbook execution. The caller supplies the model with an
-/// already-generated text id (e.g. "rbx-defra-abc1234").
+/// already-generated text id (e.g. "rbx-defra-abc1234"). The statement locks
+/// the exact current active-site authority; unknown or inactive sites fail
+/// without inserting a row.
 pub async fn insert(
     executor: impl sqlx::PgExecutor<'_>,
     exec: &RunbookExecution,
@@ -99,11 +101,17 @@ pub async fn insert(
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
 
-    sqlx::query(
-        "INSERT INTO runbook_executions \
+    let result = sqlx::query(
+        "WITH active_site AS ( \
+             SELECT unlocode FROM site_registry \
+             WHERE unlocode COLLATE \"C\" = $4::text COLLATE \"C\" AND active = TRUE \
+             FOR SHARE \
+         ) \
+         INSERT INTO runbook_executions \
          (id, runbook_id, status, site, started_by, execution_json, \
           invariant_state, invariant_reason) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'Verified', NULL)",
+         SELECT $1, $2, $3, active_site.unlocode, $5, $6, 'Verified', NULL \
+         FROM active_site",
     )
     .bind(&exec.id)
     .bind(&exec.runbook_id)
@@ -113,6 +121,12 @@ pub async fn insert(
     .bind(execution_json)
     .execute(executor)
     .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "runbook execution requires a current active canonical site".into(),
+        ));
+    }
 
     Ok(())
 }
@@ -164,8 +178,12 @@ pub async fn list(
 /// Atomically transition a runbook execution to its new state IFF the row has
 /// NOT been written since it was read — guarded on the `xmin` row version
 /// (`expected_version`, the token returned by `get`). Returns `Ok(false)` when
-/// the row is absent or was modified concurrently (caller → 409), `Ok(true)` on
-/// success.
+/// the row is absent, was modified concurrently, or a forward transition's
+/// exact site is no longer active (caller → 409), and `Ok(true)` on success.
+/// The active-site row is held `FOR SHARE` until the caller-owned transaction
+/// ends, so a concurrent deactivation cannot race an admitted transition.
+/// Protective terminalization to Failed or RolledBack remains available after
+/// deactivation so operators can stop or unwind work safely.
 ///
 /// Guarding on `xmin` rather than the `status` value is deliberate: some
 /// transitions (e.g. step execution) keep the SAME status while mutating
@@ -189,16 +207,32 @@ pub async fn transition(
     })?;
 
     let res = sqlx::query(
-        "UPDATE runbook_executions SET \
+        "WITH active_site AS ( \
+             SELECT unlocode FROM site_registry \
+             WHERE unlocode COLLATE \"C\" = $5::text COLLATE \"C\" AND active = TRUE \
+             FOR SHARE \
+         ) \
+         UPDATE runbook_executions AS execution SET \
          status = $2, \
          execution_json = $3, \
          updated_at = NOW() \
-         WHERE id = $1 AND xmin = $4::xid AND invariant_state = 'Verified'",
+         WHERE execution.id = $1 \
+           AND execution.xmin = $4::xid \
+           AND execution.invariant_state = 'Verified' \
+           AND execution.site COLLATE \"C\" = $5::text COLLATE \"C\" \
+           AND ( \
+               $2 IN ('failed', 'rolled-back') \
+               OR EXISTS ( \
+                   SELECT 1 FROM active_site \
+                   WHERE active_site.unlocode COLLATE \"C\" = execution.site COLLATE \"C\" \
+               ) \
+           )",
     )
     .bind(id)
     .bind(status_str(&updated.status))
     .bind(execution_json)
     .bind(expected_version)
+    .bind(&updated.site)
     .execute(&mut *executor)
     .await?;
 

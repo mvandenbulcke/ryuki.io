@@ -588,10 +588,31 @@ pub struct VmDay2Governance {
     pub operation_lock: Option<VmDay2LockEvidence>,
 }
 
+/// Durable provenance for a VM Day-2 target. The only accepted classified
+/// source is the authoritative CMDB relation resolved by the API while the
+/// configuration item and its active site are locked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VmDay2TargetProvenance {
+    CmdbConfigurationItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2TargetAuthority {
+    /// Immutable UUID of the authoritative CMDB configuration item.
+    pub configuration_item_id: String,
+    pub provenance: VmDay2TargetProvenance,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VmDay2ChangeRequest {
     pub id: String,
     pub target_ci_key: String,
+    /// `None` identifies an unresolved legacy or in-memory-only plan. Durable
+    /// lifecycle transitions fail closed until a new operation is planned from
+    /// an authorized CMDB target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_authority: Option<VmDay2TargetAuthority>,
     pub change_type: VmChangeType,
     pub target_value: u32,
     pub site: String,

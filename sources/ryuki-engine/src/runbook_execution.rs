@@ -271,10 +271,6 @@ fn runbook_catalog() -> Vec<Runbook> {
     ]
 }
 
-fn valid_site(site: &str) -> bool {
-    matches!(site, "DEFRA" | "GBLON" | "DEBER")
-}
-
 fn find_runbook(runbook_id: &str) -> Option<Runbook> {
     runbook_catalog().into_iter().find(|r| r.id == runbook_id)
 }
@@ -429,22 +425,18 @@ pub fn validate_execution_invariants(exec: &RunbookExecution) -> Result<(), Stri
 
 // ─── Pure constructors and transition functions ────────────────────────────────
 
-/// Pure constructor: validates inputs and builds a new `RunbookExecution`
-/// without touching any shared state. Approval-required runbooks start in
-/// `Draft`; explicitly no-approval runbooks start ready in `Approved` so the
-/// lifecycle gate does not turn their documented fast path into an unusable
-/// workflow.
+/// Pure constructor: validates and canonicalizes inputs and builds a new
+/// `RunbookExecution` without touching shared state. Stateful callers must
+/// separately admit the canonical site against their current authority source;
+/// the in-memory API uses the engine registry and the persisted API uses the
+/// durable registry in its write transaction. Approval-required runbooks start
+/// in `Draft`; explicitly no-approval runbooks start ready in `Approved`.
 pub fn build_execution(
     runbook_id: &str,
     site: &str,
     started_by: &str,
 ) -> Result<RunbookExecution, String> {
-    if !valid_site(site) {
-        return Err(format!(
-            "Unsupported site '{}'. Must be DEFRA, GBLON, or DEBER",
-            site
-        ));
-    }
+    let site = crate::site_registry::normalize_site_code_for_lookup(site)?;
     if started_by.trim().is_empty() {
         return Err("started_by cannot be empty".into());
     }
@@ -459,10 +451,10 @@ pub fn build_execution(
     };
 
     Ok(RunbookExecution {
-        id: make_execution_id(site),
+        id: make_execution_id(&site),
         runbook_id: runbook.id.clone(),
         status: initial_status,
-        site: site.into(),
+        site,
         started_by: started_by.into(),
         steps_results: runbook
             .steps
@@ -642,12 +634,46 @@ pub fn list_runbooks() -> Result<Value, String> {
 
 pub fn start_runbook(runbook_id: &str, site: &str, started_by: &str) -> Result<Value, String> {
     let execution = build_execution(runbook_id, site, started_by)?;
-    execution_store().lock().unwrap().push(execution.clone());
+    let canonical_site = execution.site.clone();
+    crate::site_registry::with_active_site_admission(&canonical_site, |_| {
+        execution_store().lock().unwrap().push(execution.clone());
+        Ok(json!({
+            "source": "dry-run",
+            "execution": execution
+        }))
+    })
+}
 
-    Ok(json!({
-        "source": "dry-run",
-        "execution": execution
-    }))
+fn with_active_execution_mutation<T>(
+    execution_id: &str,
+    operation: impl FnOnce(&mut RunbookExecution) -> Result<T, String>,
+) -> Result<T, String> {
+    let site = {
+        let store = execution_store()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        store
+            .iter()
+            .find(|execution| execution.id == execution_id)
+            .map(|execution| execution.site.clone())
+            .ok_or_else(|| format!("Execution '{execution_id}' not found"))?
+    };
+
+    crate::site_registry::with_active_site_admission(&site, |canonical_site| {
+        let mut store = execution_store()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let execution = store
+            .iter_mut()
+            .find(|execution| execution.id == execution_id)
+            .ok_or_else(|| format!("Execution '{execution_id}' not found"))?;
+        if execution.site != canonical_site {
+            return Err(format!(
+                "Execution '{execution_id}' changed site authority while awaiting mutation"
+            ));
+        }
+        operation(execution)
+    })
 }
 
 pub fn get_execution(id: &str) -> Result<Value, String> {
@@ -664,61 +690,49 @@ pub fn get_execution(id: &str) -> Result<Value, String> {
 }
 
 pub fn execute_step(execution_id: &str, step_order: u32) -> Result<Value, String> {
-    let mut store = execution_store().lock().unwrap();
-    let execution = store
-        .iter_mut()
-        .find(|e| e.id == execution_id)
-        .ok_or_else(|| format!("Execution '{}' not found", execution_id))?;
+    with_active_execution_mutation(execution_id, |execution| {
+        let updated = execute_step_pure(execution, step_order)?;
+        let step_result = updated
+            .steps_results
+            .iter()
+            .find(|s| s.step_order == step_order)
+            .cloned();
+        *execution = updated;
 
-    let updated = execute_step_pure(execution, step_order)?;
-    let step_result = updated
-        .steps_results
-        .iter()
-        .find(|s| s.step_order == step_order)
-        .cloned();
-    *execution = updated;
-
-    Ok(json!({
-        "source": "dry-run",
-        "execution_id": execution.id,
-        "status": execution.status,
-        "step_result": step_result
-    }))
+        Ok(json!({
+            "source": "dry-run",
+            "execution_id": execution.id,
+            "status": execution.status,
+            "step_result": step_result
+        }))
+    })
 }
 
 pub fn approve_execution(id: &str, approver: &str) -> Result<Value, String> {
-    let mut store = execution_store().lock().unwrap();
-    let execution = store
-        .iter_mut()
-        .find(|e| e.id == id)
-        .ok_or_else(|| format!("Execution '{}' not found", id))?;
+    with_active_execution_mutation(id, |execution| {
+        let updated = approve_execution_pure(execution, approver)?;
+        *execution = updated;
 
-    let updated = approve_execution_pure(execution, approver)?;
-    *execution = updated;
-
-    Ok(json!({
-        "source": "dry-run",
-        "execution": execution,
-        "approved_by": approver,
-        "approved_at": now_iso()
-    }))
+        Ok(json!({
+            "source": "dry-run",
+            "execution": execution,
+            "approved_by": approver,
+            "approved_at": now_iso()
+        }))
+    })
 }
 
 pub fn complete_execution(id: &str) -> Result<Value, String> {
-    let mut store = execution_store().lock().unwrap();
-    let execution = store
-        .iter_mut()
-        .find(|e| e.id == id)
-        .ok_or_else(|| format!("Execution '{}' not found", id))?;
+    with_active_execution_mutation(id, |execution| {
+        let updated = complete_execution_pure(execution)?;
+        *execution = updated;
 
-    let updated = complete_execution_pure(execution)?;
-    *execution = updated;
-
-    Ok(json!({
-        "source": "dry-run",
-        "execution": execution,
-        "completed_at": now_iso()
-    }))
+        Ok(json!({
+            "source": "dry-run",
+            "execution": execution,
+            "completed_at": now_iso()
+        }))
+    })
 }
 
 pub fn fail_execution(id: &str, reason: &str) -> Result<Value, String> {
@@ -814,6 +828,93 @@ mod tests {
             .expect("a catalog runbook that explicitly needs no approval stays executable");
         assert_eq!(running.status, ExecutionStatus::Running);
         assert_eq!(ready.status, ExecutionStatus::Approved);
+    }
+
+    #[test]
+    fn unknown_or_inactive_sites_cannot_start_or_advance_in_memory_lifecycle() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let site = format!("RB-R11-{}", &suffix[..8]).to_ascii_uppercase();
+        crate::site_registry::upsert_site(
+            crate::site_registry::SiteEntry {
+                unlocode: site.clone(),
+                name: "Runbook R11 test site".into(),
+                country: "Test".into(),
+                country_code: "ZZ".into(),
+                timezone: "Etc/UTC".into(),
+                active: true,
+            },
+            crate::site_registry::SiteCodeSystem::Custom,
+        )
+        .expect("register active runbook test site");
+
+        let approval = build_execution("certificate-renewal", &site, "maker.approval").unwrap();
+        let step = build_execution("restart-service", &site, "maker.step").unwrap();
+        let complete_ready = build_execution("restart-service", &site, "maker.complete").unwrap();
+        let complete_step_1 = execute_step_pure(&complete_ready, 1).unwrap();
+        let complete_step_2 = execute_step_pure(&complete_step_1, 2).unwrap();
+        let complete = execute_step_pure(&complete_step_2, 3).unwrap();
+        let fail = build_execution("certificate-renewal", &site, "maker.fail").unwrap();
+        let rollback = build_execution("certificate-renewal", &site, "maker.rollback").unwrap();
+
+        execution_store().lock().unwrap().extend([
+            approval.clone(),
+            step.clone(),
+            complete.clone(),
+            fail.clone(),
+            rollback.clone(),
+        ]);
+        crate::site_registry::deactivate_site(&site).expect("deactivate runbook test site");
+
+        let inactive_start = start_runbook("restart-service", &site, "maker.start")
+            .expect_err("an inactive site cannot start a runbook");
+        assert!(inactive_start.contains("unknown or inactive"));
+        let unknown_site = format!("RB-UNKNOWN-{}", &suffix[..8]).to_ascii_uppercase();
+        let unknown_start = start_runbook("restart-service", &unknown_site, "maker.start")
+            .expect_err("an unknown site cannot start a runbook");
+        assert!(unknown_start.contains("unknown or inactive"));
+
+        for error in [
+            approve_execution(&approval.id, "checker.approval").unwrap_err(),
+            execute_step(&step.id, 1).unwrap_err(),
+            complete_execution(&complete.id).unwrap_err(),
+        ] {
+            assert!(
+                error.contains("unknown or inactive"),
+                "every forward lifecycle mutation must reject inactive authority: {error}"
+            );
+        }
+        let failed = fail_execution(&fail.id, "controlled failure")
+            .expect("protective failure remains available after site deactivation");
+        let rolled_back = rollback_execution(&rollback.id)
+            .expect("protective rollback remains available after site deactivation");
+        assert_eq!(failed["execution"]["status"], "failed");
+        assert_eq!(rolled_back["execution"]["status"], "rolled-back");
+
+        assert_eq!(
+            get_execution(&approval.id).unwrap()["execution"]["status"],
+            "draft"
+        );
+        assert_eq!(
+            get_execution(&step.id).unwrap()["execution"]["status"],
+            "approved"
+        );
+        assert_eq!(
+            get_execution(&complete.id).unwrap()["execution"]["status"],
+            "running"
+        );
+        assert_eq!(
+            get_execution(&fail.id).unwrap()["execution"]["status"],
+            "failed"
+        );
+        assert_eq!(
+            get_execution(&rollback.id).unwrap()["execution"]["status"],
+            "rolled-back"
+        );
+
+        crate::site_registry::activate_site(&site).expect("reactivate runbook test site");
+        let approved = approve_execution(&approval.id, "checker.approval")
+            .expect("the same mutation remains supported for an active site");
+        assert_eq!(approved["execution"]["status"], "approved");
     }
 
     #[test]

@@ -1720,10 +1720,11 @@ fn member_action_path(path: &str, collection: &str, action: &str) -> bool {
     !id.is_empty() && !id.contains('/')
 }
 
-/// Platform-global identity administration must stay on the exact interactive
+/// Platform-global administration must stay on the exact interactive
 /// Global-human authority path. API tokens may retain explicitly granted
-/// machine operations, but can neither administer peer credentials nor create
-/// or enumerate access-recertification campaigns whose counts span every site.
+/// machine operations, but can neither administer peer credentials, create or
+/// enumerate access-recertification campaigns whose counts span every site, nor
+/// change the active site set that fences every noisy-trigger classification.
 fn requires_global_verified_human_administration(path: &str) -> bool {
     let credential_administration = path == "/api/admin/tokens"
         || is_single_segment_member(path, "/api/admin/tokens")
@@ -1732,7 +1733,9 @@ fn requires_global_verified_human_administration(path: &str) -> bool {
     let access_campaign_administration = path == "/api/identity/access-review/campaign"
         || is_single_segment_member(path, "/api/identity/access-review/campaign")
         || path == "/api/identity/access-review/campaigns";
-    credential_administration || access_campaign_administration
+    let site_activation_administration = member_action_path(path, "/api/admin/sites", "activate")
+        || member_action_path(path, "/api/admin/sites", "deactivate");
+    credential_administration || access_campaign_administration || site_activation_administration
 }
 
 fn interactive_authority_matches_session(
@@ -8271,6 +8274,8 @@ mod tests {
             "/api/admin/tokens/t1",
             "/api/admin/sessions",
             "/api/admin/sessions/s1",
+            "/api/admin/sites/SITE-A/activate",
+            "/api/admin/sites/SITE-A/deactivate",
             "/api/identity/access-review/campaign",
             "/api/identity/access-review/campaign/c1",
             "/api/identity/access-review/campaigns",
@@ -8279,6 +8284,12 @@ mod tests {
         }
         assert!(!requires_global_verified_human_administration(
             "/api/admin/platform-settings"
+        ));
+        assert!(!requires_global_verified_human_administration(
+            "/api/admin/sites"
+        ));
+        assert!(!requires_global_verified_human_administration(
+            "/api/admin/sites/SITE-A/activate/extra"
         ));
         assert!(!requires_global_verified_human_administration(
             "/api/identity/access-review/campaign/c1/extra"

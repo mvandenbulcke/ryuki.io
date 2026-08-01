@@ -59,11 +59,14 @@ pub async fn set_active(
 /// `FOR SHARE` is intentional: `FOR KEY SHARE` would still allow an update of
 /// the non-key `active` column.
 pub async fn lock_active(conn: &mut PgConnection, unlocode: &str) -> Result<bool, sqlx::Error> {
-    let active: Option<bool> =
-        sqlx::query_scalar("SELECT active FROM site_registry WHERE unlocode = $1 FOR SHARE")
-            .bind(unlocode)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT active FROM site_registry \
+         WHERE unlocode COLLATE \"C\" = $1::text COLLATE \"C\" \
+         FOR SHARE",
+    )
+    .bind(unlocode)
+    .fetch_optional(&mut *conn)
+    .await?;
     Ok(active == Some(true))
 }
 

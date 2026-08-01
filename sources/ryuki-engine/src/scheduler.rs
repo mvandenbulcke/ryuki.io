@@ -154,7 +154,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "secret_rotation_due_scan_v2"
                 | "legal_hold_expiry_scan"
                 | "recertification_overdue_scan"
-                | "certificate_expiry_scan"
+                | "certificate_expiry_scan_v2"
                 | "gmsa_expiry_scan"
                 | "oob_cert_expiry_scan"
                 | "job_executions_prune"
@@ -261,8 +261,8 @@ mod tests {
         assert!(!job_is_read_only("legal_hold_expiry_scan"));
         assert!(job_is_schedulable("recertification_overdue_scan"));
         assert!(!job_is_read_only("recertification_overdue_scan"));
-        assert!(job_is_schedulable("certificate_expiry_scan"));
-        assert!(!job_is_read_only("certificate_expiry_scan"));
+        assert!(job_is_schedulable("certificate_expiry_scan_v2"));
+        assert!(!job_is_read_only("certificate_expiry_scan_v2"));
         assert!(job_is_schedulable("gmsa_expiry_scan"));
         assert!(!job_is_read_only("gmsa_expiry_scan"));
         assert!(job_is_schedulable("oob_cert_expiry_scan"));
@@ -303,11 +303,12 @@ mod tests {
         assert!(!job_is_schedulable("synthetic_health_run_live"));
         assert!(!job_is_schedulable("maintain_review_scan_live"));
         assert!(!job_is_schedulable("connection_health_sweep_live"));
-        // Migration 163 rejects these persisted v1 names. Keeping them out of
-        // this allowlist is the binary half of the rolling old-replica fence.
+        // Migrations 163 and 209 reject these persisted v1 names. Keeping them
+        // out of this allowlist is the binary half of the rolling replica fence.
         assert!(!job_is_schedulable("restore_overdue_scan"));
         assert!(!job_is_schedulable("golden_image_stale_scan"));
         assert!(!job_is_schedulable("secret_rotation_due_scan"));
+        assert!(!job_is_schedulable("certificate_expiry_scan"));
         assert!(!job_is_schedulable("restore_overdue_scan_live"));
         assert!(!job_is_schedulable("golden_image_stale_scan_live"));
         assert!(!job_is_schedulable("noise_suppression_expiry_scan_live"));

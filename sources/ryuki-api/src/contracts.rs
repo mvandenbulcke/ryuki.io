@@ -602,7 +602,7 @@ use ryuki_engine::image_factory;
 use ryuki_engine::immutability_compliance;
 use ryuki_engine::incident_context::{
     add_affected_ci_pure, build_incident_context_from_bindings, escalate_pure,
-    resolve_incident_pure, AffectedCI,
+    resolve_incident_pure, AffectedCI, MAX_INCIDENT_AFFECTED_CIS,
 };
 use ryuki_engine::incident_readiness;
 use ryuki_engine::inventory_sync;
@@ -2695,8 +2695,6 @@ struct VmDay2PlanRequest {
     change_type: String,
     #[serde(rename = "targetValue")]
     target_value: u32,
-    site: String,
-    environment: String,
     owner: String,
     #[serde(rename = "maintenanceWindow")]
     maintenance_window: String,
@@ -10779,6 +10777,7 @@ async fn patch_plan(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PatchPlanRequest>,
 ) -> ApiResult {
+    let maker_principal_id = authenticated_principal_id(&session)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let mut wave = patch_engine::plan_patch_wave(&body.site, &body.os_family, &body.criticality)
@@ -10800,7 +10799,7 @@ async fn patch_plan(
     wave.id = Uuid::new_v4().to_string();
 
     let mut tx = pool.begin().await.map_err(db_error)?;
-    crate::repos::patch_waves::insert(&mut *tx, &wave)
+    crate::repos::patch_waves::insert(&mut *tx, &wave, maker_principal_id)
         .await
         .map_err(db_error)?;
     audit::record_audit_tx(
@@ -10810,7 +10809,11 @@ async fn patch_plan(
             "patch-plan",
             None,
             "planned",
-            json!({ "wave_id": &wave.id, "site": wave.site_scope.first() }),
+            json!({
+                "wave_id": &wave.id,
+                "site": wave.site_scope.first(),
+                "maker_principal_id": maker_principal_id,
+            }),
         ),
     )
     .await
@@ -10871,13 +10874,15 @@ async fn patch_approve(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PatchActionRequest>,
 ) -> ApiResult {
-    let approver_principal = authenticated_principal_id(&session)?.to_string();
+    let approver_principal = authenticated_principal_id(&session)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
-    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+    let record = crate::repos::patch_waves::get_record(pool, &body.wave_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
+    let persisted_maker_principal_id = record.maker_principal_id;
+    let wave = record.wave;
 
     // #2: out-of-scope wave -> 404 before any state/transition leak.
     multi_scope_guard_or_404(
@@ -10886,18 +10891,22 @@ async fn patch_approve(
         &wave.environment_scope,
         &body.wave_id,
     )?;
+    let maker_principal_id = persisted_maker_principal_id.ok_or_else(|| {
+        status_409("patch wave predates verified maker capture and cannot be approved")
+    })?;
 
     let before = crate::repos::patch_waves::status_str(&wave.status);
 
     // approver = the authenticated caller, recorded in the wave's approval audit
     // trail (never a hardcoded string).
-    let approved =
-        patch_engine::approve_patch_wave(&wave, &approver_principal).map_err(|e| status_409(&e))?;
+    let approved = patch_engine::approve_patch_wave(&wave, maker_principal_id, approver_principal)
+        .map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
-    let ok = crate::repos::patch_waves::transition(&mut tx, before, &approved, None)
-        .await
-        .map_err(db_error)?;
+    let ok =
+        crate::repos::patch_waves::transition(&mut tx, before, &approved, Some(approver_principal))
+            .await
+            .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
@@ -10908,7 +10917,11 @@ async fn patch_approve(
             "patch-approve",
             Some(before),
             "approved",
-            json!({ "wave_id": &body.wave_id }),
+            json!({
+                "wave_id": &body.wave_id,
+                "maker_principal_id": maker_principal_id,
+                "checker_principal_id": approver_principal,
+            }),
         ),
     )
     .await
@@ -10924,10 +10937,13 @@ async fn patch_execute(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
-    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+    let record = crate::repos::patch_waves::get_record(pool, &body.wave_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
+    let persisted_maker_principal_id = record.maker_principal_id;
+    let persisted_checker_principal_id = record.approved_by_principal_id;
+    let wave = record.wave;
 
     // #2: out-of-scope wave -> 404 before any state/transition leak.
     multi_scope_guard_or_404(
@@ -10936,6 +10952,12 @@ async fn patch_execute(
         &wave.environment_scope,
         &body.wave_id,
     )?;
+    let maker_principal_id = persisted_maker_principal_id.ok_or_else(|| {
+        status_409("patch wave lacks verified maker/checker provenance and cannot execute")
+    })?;
+    let checker_principal_id = persisted_checker_principal_id.ok_or_else(|| {
+        status_409("patch wave lacks verified maker/checker provenance and cannot execute")
+    })?;
 
     let before = crate::repos::patch_waves::status_str(&wave.status);
 
@@ -10956,7 +10978,11 @@ async fn patch_execute(
             "patch-execute",
             Some(before),
             "executed",
-            json!({ "wave_id": &body.wave_id }),
+            json!({
+                "wave_id": &body.wave_id,
+                "maker_principal_id": maker_principal_id,
+                "checker_principal_id": checker_principal_id,
+            }),
         ),
     )
     .await
@@ -32579,13 +32605,6 @@ async fn vm_day2_plan(
 ) -> ApiResult {
     let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    // #2: scoped principals may only plan a day-2 op within their own site AND
-    // environment (vm_day2_operations is dual-axis).
-    enforce_scope_filters(
-        &session,
-        Some(body.site.clone()),
-        Some(body.environment.clone()),
-    )?;
 
     let change_type = match body.change_type.as_str() {
         "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
@@ -32597,16 +32616,28 @@ async fn vm_day2_plan(
         _ => return Err(status_400("Invalid change type")),
     };
 
-    let mut op = vm_operations::plan_vm_day2_change(
+    // Resolve the request's descriptive target key to an exact active Server
+    // CI inside the caller's verified scope. The target's canonical key, site,
+    // environment, UUID, and provenance remain locked through persistence.
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let target = crate::repos::vm_day2_operations::resolve_authorized_target_for_plan(
+        &mut tx,
         &body.target_ci_key,
-        change_type,
-        body.target_value,
-        &body.site,
-        &body.environment,
-        &body.owner,
-        &body.maintenance_window,
+        &session.site_scope,
+        &session.environment_scope,
     )
-    .map_err(|e| status_400(&e))?;
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.target_ci_key))?;
+
+    let mut op = target
+        .plan_change(
+            change_type,
+            body.target_value,
+            &body.owner,
+            &body.maintenance_window,
+        )
+        .map_err(|e| status_400(&e))?;
 
     // The engine generates a non-UUID id (e.g. "vmch-abc12345") suitable for
     // in-memory use but not for the UUID primary key column. Replace it with a
@@ -32615,9 +32646,10 @@ async fn vm_day2_plan(
     vm_operations::bind_vm_day2_governance(&mut op, &actor_principal)
         .map_err(|e| status_409(&e))?;
 
-    crate::repos::vm_day2_operations::insert(pool, &op)
+    crate::repos::vm_day2_operations::insert_authorized(&mut tx, &target, &op)
         .await
         .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&op).unwrap_or_default()))
 }
@@ -32631,13 +32663,15 @@ async fn vm_day2_validate(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
-    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&body.operation_id))?;
-
-    // #2: out-of-scope (dual-axis) -> 404 before the status-409 leak.
-    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
+    let op = crate::repos::vm_day2_operations::get_authorized(
+        pool,
+        &body.operation_id,
+        &session.site_scope,
+        &session.environment_scope,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.operation_id))?;
 
     // Forward-only lifecycle begins Planned -> Validated. Validate only from
     // Planned, never regressing a later state back to Validated.
@@ -32680,11 +32714,15 @@ async fn vm_day2_approve(
     }
     let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&body.operation_id))?;
-    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
+    let op = crate::repos::vm_day2_operations::get_authorized(
+        pool,
+        &body.operation_id,
+        &session.site_scope,
+        &session.environment_scope,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.operation_id))?;
 
     if op.status != ryuki_engine::models::VmChangeStatus::Validated {
         return Err(status_409("operation must be Validated before approval"));
@@ -32721,11 +32759,15 @@ async fn vm_day2_lock(
 ) -> ApiResult {
     let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&body.operation_id))?;
-    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
+    let op = crate::repos::vm_day2_operations::get_authorized(
+        pool,
+        &body.operation_id,
+        &session.site_scope,
+        &session.environment_scope,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.operation_id))?;
 
     if op.status != ryuki_engine::models::VmChangeStatus::Approved {
         return Err(status_409("operation must be Approved before lock"));
@@ -32753,13 +32795,15 @@ async fn vm_day2_execute(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
-    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&body.operation_id))?;
-
-    // #2: out-of-scope (dual-axis) -> 404 before the status-409 leak.
-    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
+    let op = crate::repos::vm_day2_operations::get_authorized(
+        pool,
+        &body.operation_id,
+        &session.site_scope,
+        &session.environment_scope,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.operation_id))?;
 
     // Execute only from the explicit Locked state. Both the engine and atomic
     // repository predicate re-check maker/checker evidence, digest, lock id,
@@ -32791,13 +32835,15 @@ async fn vm_day2_verify(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
-    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&body.operation_id))?;
-
-    // #2: out-of-scope (dual-axis) -> 404 before the status-409 leak.
-    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
+    let op = crate::repos::vm_day2_operations::get_authorized(
+        pool,
+        &body.operation_id,
+        &session.site_scope,
+        &session.environment_scope,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.operation_id))?;
 
     // Forward-only lifecycle: verify only from Executed.
     if op.status != ryuki_engine::models::VmChangeStatus::Executed {
@@ -32831,10 +32877,11 @@ async fn vm_day2_change_contract() -> Json<Value> {
         "liveChangeAllowed": false,
         "lifecycle": ["Planned","Validated","Approved","Locked","Executed","Verified"],
         "supportedActions": ["resize-cpu","resize-memory","add-disk","extend-disk","migrate-host","migrate-storage"],
-        "requiredInputs": ["targetCiKey","changeType","targetValue","site","environment","owner","maintenanceWindow"],
-        "requiredGuards": ["request-preflight-ready","capacity-admission-ready","cmdb-ci-known","backup-state-known","monitoring-impact-reviewed","approval-route-assigned","lock-scope-defined","rollback-plan-ready","evidence-redacted"],
-        "blockedReasons": ["provider-calls-disabled","live-change-disabled","stale-inventory","capacity-not-approved","cmdb-context-ambiguous","backup-state-unknown","maintenance-window-missing","approval-missing","planner-self-approval","operation-lock-missing","operation-lock-conflict","operation-lock-expired","plan-digest-stale"],
-        "requiredEvidence": ["VM change dry-run plan","Stable planner principal","Distinct approval decision","Exact plan digest","Active operation lock","Capacity impact","Backup and monitoring impact","Verification plan","Evidence references"]
+        "requiredInputs": ["targetCiKey","changeType","targetValue","owner","maintenanceWindow"],
+        "derivedTargetAuthority": ["configurationItemId","canonicalTargetCiKey","site","environment","targetProvenance"],
+        "requiredGuards": ["request-preflight-ready","capacity-admission-ready","active-server-cmdb-target","target-scope-authorized","backup-state-known","monitoring-impact-reviewed","approval-route-assigned","lock-scope-defined","rollback-plan-ready","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-change-disabled","target-not-found","target-not-server","target-site-inactive","target-environment-unclassified","target-out-of-scope","stale-inventory","capacity-not-approved","cmdb-context-ambiguous","backup-state-unknown","maintenance-window-missing","approval-missing","planner-self-approval","operation-lock-missing","operation-lock-conflict","operation-lock-expired","plan-digest-stale"],
+        "requiredEvidence": ["VM change dry-run plan","Authoritative CMDB target UUID and provenance","Canonical target site and environment","Stable planner principal","Distinct approval decision","Exact plan digest","Active operation lock","Capacity impact","Backup and monitoring impact","Verification plan","Evidence references"]
     }))
 }
 
@@ -32868,6 +32915,12 @@ async fn snapshot_plan(
     if !check_permission(&session, "execute") {
         return Err(status_403());
     }
+    // Reject malformed or oversized expiry input before acquiring a database
+    // connection or locking the authoritative CMDB row. The engine repeats the
+    // same check so non-HTTP callers cannot bypass the domain invariant.
+    let (requested_expiry, _) =
+        snapshot_engine::canonicalize_requested_expiry(&body.requested_expiry)
+            .map_err(|error| status_400(&error))?;
     let actor_principal = authenticated_principal_id(&session)?.to_string();
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
@@ -32901,7 +32954,7 @@ async fn snapshot_plan(
     let mut record = snapshot_engine::plan_snapshot(
         &body.platform_ci_key,
         &body.snapshot_purpose,
-        &body.requested_expiry,
+        &requested_expiry,
         &body.owner,
         &body.support_group,
         &body.change_context,
@@ -33309,10 +33362,31 @@ async fn backup_restore_plan(
         _ => return Err(status_400("Invalid restore type")),
     };
 
-    let mut restore = backup_engine::plan_restore(
+    let requested_restore_point = chrono::DateTime::parse_from_rfc3339(&body.restore_point)
+        .map_err(|_| status_400("restorePoint must be an RFC3339 timestamp"))?
+        .with_timezone(&chrono::Utc);
+
+    // Resolve caller text to one immutable CMDB UUID + persisted restore-point
+    // UUID under the caller's source scope. Keep those rows locked through
+    // insertion; foreign, missing, expired, and moved sources are deliberately
+    // indistinguishable at this object boundary and cannot acquire authority.
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let source = crate::repos::restore_requests::resolve_authorized_source_for_plan(
+        &mut tx,
         &body.source_ci_key,
+        requested_restore_point,
+        &session.site_scope,
+        &session.environment_scope,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404("authorized restore source or restore point"))?;
+    let canonical_restore_point = source.restore_point();
+
+    let mut restore = backup_engine::plan_restore(
+        source.source_ci_key(),
         restore_type,
-        &body.restore_point,
+        &canonical_restore_point,
         &body.target_site,
         &body.target_environment,
         &body.owner,
@@ -33328,14 +33402,13 @@ async fn backup_restore_plan(
     // The process-local engine registry is only an early validation cache. Lock
     // the durable active-site row in the same transaction as creation so a
     // concurrent deactivation cannot race a newly verified authority tuple.
-    let mut tx = pool.begin().await.map_err(db_error)?;
     if !crate::repos::site_registry::lock_active(&mut tx, &restore.target_site)
         .await
         .map_err(db_error)?
     {
         return Err(status_400("Unknown or inactive target site"));
     }
-    let persisted = crate::repos::restore_requests::insert(&mut *tx, &restore)
+    let persisted = crate::repos::restore_requests::insert(&mut *tx, &restore, &source)
         .await
         .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
@@ -33405,7 +33478,18 @@ async fn backup_restore_approve(
 
     let approved = backup_engine::approve_restore(&r, approver).map_err(|e| status_409(&e))?;
 
+    // Approval is operational authority for the immutable persisted target.
+    // Hold the current active-site row through the CAS and audit commit so a
+    // concurrent deactivation cannot leave a newly Approved restore behind.
     let mut tx = pool.begin().await.map_err(db_error)?;
+    if !crate::repos::site_registry::lock_active(&mut tx, &r.target_site)
+        .await
+        .map_err(db_error)?
+    {
+        return Err(status_409(
+            "restore target site is unknown or inactive; replan after activation",
+        ));
+    }
     let persisted = crate::repos::restore_requests::transition(&mut *tx, before, &approved, None)
         .await
         .map_err(db_error)?
@@ -33458,6 +33542,19 @@ async fn backup_restore_execute(
 
     let before = crate::repos::restore_requests::status_str(&r.status);
 
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // Re-establish current authority for the immutable persisted target before
+    // producing execution evidence. Keep the site row locked until the
+    // Approved -> Executed CAS and audit record commit together.
+    if !crate::repos::site_registry::lock_active(&mut tx, &r.target_site)
+        .await
+        .map_err(db_error)?
+    {
+        return Err(status_409(
+            "restore target site is unknown or inactive; replan after activation",
+        ));
+    }
+
     // Engine requires Approved; produces evidence without changing status.
     let evidence = backup_engine::execute_restore(&r).map_err(|e| status_409(&e))?;
 
@@ -33469,7 +33566,6 @@ async fn backup_restore_execute(
         evidence.len().to_string(),
     );
 
-    let mut tx = pool.begin().await.map_err(db_error)?;
     crate::repos::restore_requests::transition(&mut *tx, before, &executed, None)
         .await
         .map_err(db_error)?
@@ -40645,6 +40741,17 @@ async fn site_registry_create(
     if is_scoped(&session) {
         return Err(status_403());
     }
+    // An active registration changes the same platform-global active-code set
+    // as the explicit activation endpoint. Migration 181 advances one global
+    // noisy-trigger visibility generation for that set. Require the explicit
+    // activation ceremony instead of allowing this body field to bypass the
+    // middleware's exact InteractiveHumanAuthorityContext check. Inactive
+    // registration remains an unscoped administrative inventory operation.
+    if body.active {
+        return Err(status_400(
+            "sites must be registered inactive, then activated through the governed activation endpoint",
+        ));
+    }
 
     let code = site_registry::normalize_site_code(&body.code, body.code_system)
         .map_err(|error| status_400(&error))?;
@@ -40744,19 +40851,19 @@ async fn site_registry_set_active(
     active: bool,
     session: &AuthSession,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Keep the coarse capability check at the handler boundary as well as the
-    // central route gate, so a future router refactor cannot turn a matching
-    // site scope into site-registry mutation authority by itself.
-    if !check_permission(session, "admin") {
-        return Err(status_403());
-    }
-    // C164: canonicalize exactly once, then authorize that canonical target
-    // before either the database or in-memory registry can be mutated. This
-    // site-only resource cannot honor an environment scope; the shared guard
-    // therefore returns the same 404 as an absent/out-of-scope site.
+    // Migration 181 deliberately uses one platform-global visibility
+    // generation because activating or deactivating one code can reclassify a
+    // hostname currently assigned to another code (longest-token precedence).
+    // Consequently the active set itself is platform-global authority: admit
+    // only an exact verified-human admin with Global authority. Repeat this at
+    // the handler before canonicalization or storage so a router refactor cannot
+    // expose the generation bump to a scoped or standing machine credential.
+    require_global_verified_human_admin_permission(session).map_err(|_| status_403())?;
+
+    // Canonicalize exactly once after authorization and use that same value for
+    // both the durable registry and the write-through engine projection.
     let code =
         site_registry::normalize_site_code_for_lookup(code).map_err(|error| status_400(&error))?;
-    site_scope_guard_or_404(session, &code, &code)?;
 
     let engine_toggle = |code: &str| {
         if active {
@@ -40901,9 +41008,31 @@ mod site_registry_contract_tests {
     }
 
     fn scoped_admin(site: &[&str], environment: &[&str]) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
+        let principal_id =
+            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
+        let mut session = AuthSession {
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
+            display_name: "Verified site-registry test admin".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+            provider_mode: "test-verified-human".into(),
+            ..AuthSession::default()
+        };
         session.site_scope = site.iter().map(|value| value.to_string()).collect();
         session.environment_scope = environment.iter().map(|value| value.to_string()).collect();
+        session
+    }
+
+    fn global_verified_human_admin() -> AuthSession {
+        scoped_admin(&[], &[])
+    }
+
+    fn standing_machine_admin() -> AuthSession {
+        let mut session = global_verified_human_admin();
+        session.actor_class = ryuki_engine::auth::ActorClass::Workload;
+        session.provider_mode = "api-token".into();
         session
     }
 
@@ -41039,29 +41168,38 @@ mod site_registry_contract_tests {
             "a non-admin denial must not change the registry"
         );
 
-        for active in [false, true] {
-            let code = unique_custom_code(if active {
-                "CREATE-ACTIVE"
-            } else {
-                "CREATE-INACTIVE"
-            });
-            let Json(created) = site_registry_create(
-                AuthExtractor(AuthSession::static_dry_run()),
-                Json(custom_registration(&code, active)),
+        for session in [standing_machine_admin(), global_verified_human_admin()] {
+            let active_code = unique_custom_code("CREATE-ACTIVE-BYPASS");
+            let err = site_registry_create(
+                AuthExtractor(session),
+                Json(custom_registration(&active_code, true)),
             )
             .await
-            .expect("an unscoped admin may register a site");
-            assert_eq!(created["code"], code);
-            assert_eq!(site_is_active(&code), active);
+            .expect_err("active registration must not bypass the governed activation endpoint");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(
+                site_registry::get_site(&active_code).is_err(),
+                "denied active registration must not change the registry"
+            );
         }
+
+        let code = unique_custom_code("CREATE-INACTIVE");
+        let Json(created) = site_registry_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(custom_registration(&code, false)),
+        )
+        .await
+        .expect("an unscoped admin may register inactive inventory");
+        assert_eq!(created["code"], code);
+        assert!(!site_is_active(&code));
     }
 
-    /// C164: the canonical target is authorized before either persistence path
-    /// mutates. A matching site scope is permitted, a foreign or environment
-    /// scope receives a non-enumerating 404 with no state change, and an
-    /// unscoped admin keeps the existing platform-wide behavior.
+    /// R13: changing the active-code set advances one global noisy-trigger
+    /// generation. Neither a matching site scope nor a standing machine admin
+    /// may exercise that platform-wide side effect; an exact Global verified
+    /// human administrator retains the documented lifecycle operation.
     #[tokio::test]
-    async fn site_toggle_enforces_canonical_site_scope_before_mutation() {
+    async fn site_toggle_requires_global_verified_human_before_mutation() {
         let target = unique_custom_code("TOGGLE");
         seed_custom_site(&target, true);
 
@@ -41071,7 +41209,7 @@ mod site_registry_contract_tests {
         )
         .await
         .expect_err("a foreign site scope must not toggle the target");
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(site_is_active(&target), "foreign denial must not mutate");
 
         let inactive_target = unique_custom_code("TOGGLE-INACTIVE");
@@ -41082,7 +41220,7 @@ mod site_registry_contract_tests {
         )
         .await
         .expect_err("a foreign site scope must not activate the target");
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(
             !site_is_active(&inactive_target),
             "foreign activation denial must not mutate"
@@ -41094,7 +41232,7 @@ mod site_registry_contract_tests {
         )
         .await
         .expect_err("an environment scope cannot authorize a site-only resource");
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(
             site_is_active(&target),
             "environment denial must not mutate"
@@ -41106,7 +41244,7 @@ mod site_registry_contract_tests {
         )
         .await
         .expect_err("a dual-scoped principal cannot use a site-only resource");
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(site_is_active(&target), "dual-scope denial must not mutate");
 
         let mut non_admin = scoped_admin(&[target.as_str()], &[]);
@@ -41117,39 +41255,42 @@ mod site_registry_contract_tests {
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(site_is_active(&target), "capability denial must not mutate");
 
-        let Json(deactivated) = site_registry_deactivate(
+        let err = site_registry_deactivate(
             AuthExtractor(scoped_admin(&[target.as_str()], &[])),
             Path(target.to_ascii_lowercase()),
         )
         .await
-        .expect("a matching site scope may toggle its canonical target");
-        assert_eq!(deactivated["code"], target);
-        assert!(!site_is_active(&target));
+        .expect_err("even a matching site scope must not advance a global generation");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            site_is_active(&target),
+            "matching-scope denial must not mutate"
+        );
 
-        let Json(activated) = site_registry_activate(
-            AuthExtractor(scoped_admin(&[target.as_str()], &[])),
-            Path(target.to_ascii_lowercase()),
+        let err = site_registry_deactivate(
+            AuthExtractor(standing_machine_admin()),
+            Path(target.clone()),
         )
         .await
-        .expect("a matching site scope may activate its canonical target");
-        assert_eq!(activated["code"], target);
-        assert!(site_is_active(&target));
+        .expect_err("an unscoped standing machine/simulated admin must not toggle a site");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(site_is_active(&target), "machine denial must not mutate");
 
         let Json(deactivated) = site_registry_deactivate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(global_verified_human_admin()),
             Path(target.clone()),
         )
         .await
-        .expect("an unscoped admin retains platform-wide deactivation access");
+        .expect("a Global verified-human admin retains deactivation access");
         assert_eq!(deactivated["code"], target);
         assert!(!site_is_active(&target));
 
         let Json(activated) = site_registry_activate(
-            AuthExtractor(AuthSession::static_dry_run()),
+            AuthExtractor(global_verified_human_admin()),
             Path(target.clone()),
         )
         .await
-        .expect("an unscoped admin retains platform-wide activation access");
+        .expect("a Global verified-human admin retains activation access");
         assert_eq!(activated["code"], target);
         assert!(site_is_active(&target));
     }
@@ -41175,6 +41316,23 @@ struct RunbookFailRequest {
 #[allow(dead_code)]
 struct RunbookListQuery {
     site: Option<String>,
+}
+
+const RUNBOOK_SITE_AUTHORITY_CHANGED: &str =
+    "runbook site is unknown or inactive; reload and retry";
+
+async fn lock_runbook_active_site(
+    conn: &mut sqlx::PgConnection,
+    site: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if crate::repos::site_registry::lock_active(conn, site)
+        .await
+        .map_err(db_error)?
+    {
+        Ok(())
+    } else {
+        Err(status_409(RUNBOOK_SITE_AUTHORITY_CHANGED))
+    }
 }
 
 async fn runbook_catalog() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -41205,6 +41363,7 @@ async fn runbook_start(
         .map_err(|e| status_400(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
+    lock_runbook_active_site(&mut tx, &exec.site).await?;
     crate::repos::runbook_executions::insert(&mut *tx, &exec)
         .await
         .map_err(db_error)?;
@@ -41266,6 +41425,7 @@ async fn runbook_execute_step(
         runbook_execution::execute_step_pure(&exec, step_order).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
+    lock_runbook_active_site(&mut tx, &updated.site).await?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -41325,6 +41485,7 @@ async fn runbook_approve(
         runbook_execution::approve_execution_pure(&exec, &actor).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
+    lock_runbook_active_site(&mut tx, &updated.site).await?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -41371,6 +41532,7 @@ async fn runbook_complete(
     let updated = runbook_execution::complete_execution_pure(&exec).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
+    lock_runbook_active_site(&mut tx, &updated.site).await?;
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -41419,6 +41581,9 @@ async fn runbook_fail(
         runbook_execution::fail_execution_pure(&exec, &body.reason).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // Protective terminalization remains available after deactivation so an
+    // operator can stop work safely; the repository admits only Failed or
+    // RolledBack without current active-site authority.
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -41461,6 +41626,8 @@ async fn runbook_rollback(
     let updated = runbook_execution::rollback_execution_pure(&exec).map_err(|e| status_409(&e))?;
 
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // Rollback is the second protective terminal state and deliberately stays
+    // available when the site is inactive; forward states remain fenced.
     let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
@@ -42169,8 +42336,6 @@ struct IncidentAddCiRequest {
 struct IncidentEscalateRequest {
     reason: String,
 }
-
-const MAX_INCIDENT_AFFECTED_CIS: usize = 100;
 
 fn normalized_incident_ci_names(
     ci_names: Vec<String>,
@@ -64669,11 +64834,9 @@ mod db_lifecycle_tests {
         }
     }
 
-    /// #2 RBAC: the vm-day2 handlers are DUAL-AXIS (vm_day2_operations has site AND
-    /// environment). A GBLON principal gets 403 planning in DEFRA; an env-scoped
-    /// principal is denied on a foreign environment; a by-id validate on a DEFRA op
-    /// 404s. Own scope + unrestricted pass the gate. plan uses an invalid change
-    /// type so it 400s AFTER the scope gate (no insert).
+    /// VM Day-2 target authorization is dual-axis and derived from CMDB, never
+    /// from request-body scope strings. Foreign planning and by-id reads share a
+    /// non-enumerating 404, while own-scope and unrestricted planning succeed.
     #[tokio::test]
     async fn vm_day2_is_site_scoped() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -64681,12 +64844,25 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let plan_req = |site: &str, env: &str| VmDay2PlanRequest {
-            target_ci_key: "vm-rbac2-test".into(),
-            change_type: "bogus-change-type".into(),
+        let suffix = Uuid::new_v4().simple().to_string();
+        let defra_target = format!("vm-rbac2-defra-{suffix}");
+        let gblon_target = format!("vm-rbac2-gblon-{suffix}");
+        for (target, site) in [(&defra_target, "DEFRA"), (&gblon_target, "GBLON")] {
+            sqlx::query(
+                "INSERT INTO configuration_items \
+                 (ci_name, ci_type, criticality, site, environment, owner) \
+                 VALUES ($1, 'Server', 'High', $2, 'production', 'vm-rbac-owner')",
+            )
+            .bind(target)
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("seed scoped VM target");
+        }
+        let plan_req = |target: &str| VmDay2PlanRequest {
+            target_ci_key: target.into(),
+            change_type: "resize-cpu".into(),
             target_value: 4,
-            site: site.into(),
-            environment: env.into(),
             owner: "o".into(),
             maintenance_window: "2099-01-01T00:00:00Z".into(),
         };
@@ -64694,69 +64870,64 @@ mod db_lifecycle_tests {
         let mut gblon = AuthSession::static_dry_run();
         gblon.site_scope = vec!["GBLON".into()];
 
-        // plan in a foreign site -> 403.
-        let foreign = vm_day2_plan(
-            AuthExtractor(gblon.clone()),
-            Json(plan_req("DEFRA", "production")),
-        )
-        .await;
+        // Planning an authoritative target in a foreign site is non-enumerating.
+        let foreign =
+            vm_day2_plan(AuthExtractor(gblon.clone()), Json(plan_req(&defra_target))).await;
         assert!(
-            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
-            "out-of-scope vm_day2_plan must be forbidden: {foreign:?}"
+            matches!(foreign, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope vm_day2_plan must 404: {foreign:?}"
         );
 
-        // env-scoped principal denied on a foreign environment.
+        // Environment scope is applied to the CMDB row before it is decoded.
         let mut staging = AuthSession::static_dry_run();
         staging.environment_scope = vec!["staging".into()];
-        let env_denied = vm_day2_plan(
-            AuthExtractor(staging),
-            Json(plan_req("GBLON", "production")),
-        )
-        .await;
+        let env_denied = vm_day2_plan(AuthExtractor(staging), Json(plan_req(&gblon_target))).await;
         assert!(
-            matches!(env_denied, Err((StatusCode::FORBIDDEN, _))),
-            "env-scoped vm_day2_plan on a foreign env must be forbidden: {env_denied:?}"
+            matches!(env_denied, Err((StatusCode::NOT_FOUND, _))),
+            "env-scoped vm_day2_plan on a foreign env must 404: {env_denied:?}"
         );
 
-        // own scope + unrestricted pass the gate (then 400 on the bogus type, no insert).
-        let own = vm_day2_plan(
-            AuthExtractor(gblon.clone()),
-            Json(plan_req("GBLON", "production")),
-        )
-        .await;
-        assert!(
-            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
-            "in-scope vm_day2_plan must pass the scope gate: {own:?}"
-        );
+        // Own scope and unrestricted authority can plan their exact CMDB target.
+        let own = vm_day2_plan(AuthExtractor(gblon.clone()), Json(plan_req(&gblon_target))).await;
+        let own_id = own.expect("in-scope vm_day2_plan must succeed").0["id"]
+            .as_str()
+            .expect("own operation id")
+            .to_string();
         let any = vm_day2_plan(
             AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_req("DEFRA", "production")),
+            Json(plan_req(&defra_target)),
+        )
+        .await;
+        let any_id = any.expect("unrestricted vm_day2_plan must succeed").0["id"]
+            .as_str()
+            .expect("unrestricted operation id")
+            .to_string();
+
+        let validated = vm_day2_validate(
+            AuthExtractor(gblon),
+            Json(VmDay2ActionRequest {
+                operation_id: any_id.clone(),
+            }),
         )
         .await;
         assert!(
-            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
-            "unrestricted vm_day2_plan must pass the scope gate: {any:?}"
+            matches!(validated, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope vm_day2_validate must 404: {validated:?}"
         );
 
-        // by-id validate on a DEFRA op -> 404 (when present).
-        if let Some(op_id) = sqlx::query_scalar::<_, String>(
-            "SELECT id::text FROM vm_day2_operations WHERE site = 'DEFRA' LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None)
-        {
-            let validated = vm_day2_validate(
-                AuthExtractor(gblon),
-                Json(VmDay2ActionRequest {
-                    operation_id: op_id,
-                }),
-            )
-            .await;
-            assert!(
-                matches!(validated, Err((StatusCode::NOT_FOUND, _))),
-                "out-of-scope vm_day2_validate must 404: {validated:?}"
-            );
+        for operation_id in [&own_id, &any_id] {
+            sqlx::query("DELETE FROM vm_day2_operations WHERE id = $1::uuid")
+                .bind(operation_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        for target in [&defra_target, &gblon_target] {
+            sqlx::query("DELETE FROM configuration_items WHERE ci_name = $1")
+                .bind(target)
+                .execute(pool)
+                .await
+                .ok();
         }
     }
 
@@ -80746,6 +80917,29 @@ mod noise_remediation_db_tests {
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
+    fn verified_noise_admin(site_scope: &[&str]) -> AuthSession {
+        let principal_id =
+            PrincipalId::from_uuid(Uuid::new_v4()).expect("test UUID is a non-nil principal");
+        AuthSession {
+            display_user_id: principal_id.to_string(),
+            principal_id: Some(principal_id),
+            display_name: "Verified noise authority test admin".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+            provider_mode: "test-verified-human".into(),
+            site_scope: site_scope.iter().map(|site| (*site).to_string()).collect(),
+            environment_scope: vec![],
+        }
+    }
+
+    fn noise_machine_admin() -> AuthSession {
+        let mut session = verified_noise_admin(&[]);
+        session.actor_class = ryuki_engine::auth::ActorClass::Workload;
+        session.provider_mode = "api-token".into();
+        session
+    }
+
     async fn drain_noise_reconciliation(pool: &PgPool) {
         for _ in 0..1_000 {
             let repaired = reconcile_noisy_trigger_sites_once(pool)
@@ -81326,6 +81520,202 @@ mod noise_remediation_db_tests {
         .await
         .expect("evaluate exact delimiter-aware site matcher");
         assert_eq!(matches, (false, false, true, true, true));
+    }
+
+    /// R13: one site's activation changes the singleton generation used by all
+    /// noisy-trigger reads. A matching site-scoped admin and an unscoped
+    /// standing machine/simulated admin are denied before that generation can
+    /// move, so a trigger belonging to a second site remains visible. The
+    /// exact Global verified-human control may perform the lifecycle change;
+    /// after bounded reconciliation, only the deactivated site's trigger is
+    /// quarantined and the unrelated site's trigger is visible again.
+    #[tokio::test]
+    async fn site_activation_authority_preserves_unrelated_noise_visibility() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        drain_noise_reconciliation(pool).await;
+
+        let tag = Uuid::new_v4().simple().to_string().to_ascii_uppercase();
+        let site_a = format!("NA{}", &tag[..8]);
+        let site_b = format!("NB{}", &tag[8..16]);
+        let trigger_a = Uuid::new_v4();
+        let trigger_b = Uuid::new_v4();
+
+        for site in [&site_a, &site_b] {
+            sqlx::query(
+                "INSERT INTO site_registry \
+                 (unlocode, code_system, name, country, country_code, timezone, active) \
+                 VALUES ($1, 'custom', $2, 'Test country', 'ZZ', 'UTC', TRUE)",
+            )
+            .bind(site)
+            .bind(format!("R13 noise authority site {site}"))
+            .execute(pool)
+            .await
+            .expect("register R13 noise authority site");
+            site_registry::upsert_site(
+                site_registry::SiteEntry {
+                    unlocode: site.to_string(),
+                    name: format!("R13 noise authority site {site}"),
+                    country: "Test country".into(),
+                    country_code: "ZZ".into(),
+                    timezone: "UTC".into(),
+                    active: true,
+                },
+                site_registry::SiteCodeSystem::Custom,
+            )
+            .expect("seed write-through registry projection");
+        }
+        drain_noise_reconciliation(pool).await;
+
+        for (id, site) in [(trigger_a, &site_a), (trigger_b, &site_b)] {
+            sqlx::query(
+                "INSERT INTO noisy_triggers \
+                 (id, trigger_name, host, severity, event_count_last_24h, \
+                  avg_interval_minutes, flapping, suggested_action, status) \
+                 VALUES ($1, $2, $3, 'warning', 20, 5.0, FALSE, 'review', 'Active')",
+            )
+            .bind(id)
+            .bind(format!("R13 two-site visibility {site}"))
+            .bind(format!("srv-{}-app01", site.to_ascii_lowercase()))
+            .execute(pool)
+            .await
+            .expect("seed R13 two-site noise trigger");
+        }
+
+        let generation_before: i64 = sqlx::query_scalar(
+            "SELECT generation FROM noisy_trigger_site_authority WHERE singleton",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pre-denial noise generation");
+        let visible_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM noisy_triggers \
+             WHERE id = ANY($1) \
+               AND site_resolution_generation = ( \
+                   SELECT generation FROM noisy_trigger_site_authority WHERE singleton \
+               )",
+        )
+        .bind(vec![trigger_a, trigger_b])
+        .fetch_one(pool)
+        .await
+        .expect("count initially visible two-site triggers");
+        assert_eq!(visible_before, 2);
+
+        let scoped_denial = site_registry_deactivate(
+            AuthExtractor(verified_noise_admin(&[site_a.as_str()])),
+            Path(site_a.to_ascii_lowercase()),
+        )
+        .await
+        .expect_err("a matching site-scoped human must not advance the global generation");
+        assert_eq!(scoped_denial.0, StatusCode::FORBIDDEN);
+
+        let machine_denial =
+            site_registry_deactivate(AuthExtractor(noise_machine_admin()), Path(site_a.clone()))
+                .await
+                .expect_err("an unscoped machine/simulated admin must not advance the generation");
+        assert_eq!(machine_denial.0, StatusCode::FORBIDDEN);
+
+        let state_after_denial: (bool, bool, i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT active FROM site_registry WHERE unlocode = $1), \
+                 (SELECT active FROM site_registry WHERE unlocode = $2), \
+                 (SELECT generation FROM noisy_trigger_site_authority WHERE singleton), \
+                 (SELECT COUNT(*) FROM noisy_triggers \
+                  WHERE id = ANY($3) \
+                    AND site_resolution_generation = ( \
+                        SELECT generation FROM noisy_trigger_site_authority WHERE singleton \
+                    ))",
+        )
+        .bind(&site_a)
+        .bind(&site_b)
+        .bind(vec![trigger_a, trigger_b])
+        .fetch_one(pool)
+        .await
+        .expect("read state after denied generation attempts");
+        assert_eq!(
+            state_after_denial,
+            (true, true, generation_before, 2),
+            "denied actors must preserve both site state and two-site visibility"
+        );
+
+        let Json(deactivated) = site_registry_deactivate(
+            AuthExtractor(verified_noise_admin(&[])),
+            Path(site_a.to_ascii_lowercase()),
+        )
+        .await
+        .expect("the exact Global verified-human admin may deactivate a site");
+        assert_eq!(deactivated["code"], site_a);
+        assert_eq!(deactivated["active"], false);
+
+        let generation_after: i64 = sqlx::query_scalar(
+            "SELECT generation FROM noisy_trigger_site_authority WHERE singleton",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read authorized post-deactivation generation");
+        assert_eq!(generation_after, generation_before + 1);
+        let visible_during_reconciliation: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM noisy_triggers \
+             WHERE id = ANY($1) \
+               AND site_resolution_generation = ( \
+                   SELECT generation FROM noisy_trigger_site_authority WHERE singleton \
+               )",
+        )
+        .bind(vec![trigger_a, trigger_b])
+        .fetch_one(pool)
+        .await
+        .expect("count generation-fenced triggers during reconciliation");
+        assert_eq!(
+            visible_during_reconciliation, 0,
+            "the retained global generation briefly fences both sites, so only the strongest authority may advance it"
+        );
+
+        drain_noise_reconciliation(pool).await;
+        let repaired: Vec<(Uuid, Option<String>, i64)> = sqlx::query_as(
+            "SELECT id, site, site_resolution_generation FROM noisy_triggers \
+             WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(vec![trigger_a, trigger_b])
+        .fetch_all(pool)
+        .await
+        .expect("read reconciled two-site classifications");
+        assert_eq!(repaired.len(), 2);
+        let repaired_a = repaired
+            .iter()
+            .find(|(id, _, _)| *id == trigger_a)
+            .expect("site A trigger classification");
+        let repaired_b = repaired
+            .iter()
+            .find(|(id, _, _)| *id == trigger_b)
+            .expect("site B trigger classification");
+        assert_eq!(repaired_a, &(trigger_a, None, generation_after));
+        assert_eq!(
+            repaired_b,
+            &(trigger_b, Some(site_b.clone()), generation_after),
+            "the unrelated site's trigger must regain visibility after bounded repair"
+        );
+
+        site_registry_deactivate(
+            AuthExtractor(verified_noise_admin(&[])),
+            Path(site_b.clone()),
+        )
+        .await
+        .expect("deactivate the remaining active static test projection before cleanup");
+        drain_noise_reconciliation(pool).await;
+        sqlx::query("DELETE FROM noisy_triggers WHERE id = ANY($1)")
+            .bind(vec![trigger_a, trigger_b])
+            .execute(pool)
+            .await
+            .expect("clean R13 noise triggers");
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = ANY($1)")
+            .bind(vec![site_a, site_b])
+            .execute(pool)
+            .await
+            .expect("clean R13 sites");
+        drain_noise_reconciliation(pool).await;
     }
 
     /// C282: one reconciliation call never exceeds its requested page, stale
@@ -87235,8 +87625,11 @@ mod server_decommission_db_tests {
             return None;
         }
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
-        let pool = crate::database::get_db()?;
-        crate::database::run_migrations(pool).await.ok()?;
+        let pool = crate::database::get_db()
+            .expect("RYUKI_DATABASE_URL is set but runbook test connection failed");
+        crate::database::run_migrations(pool)
+            .await
+            .expect("runbook database migrations must apply cleanly");
         Some(pool)
     }
 
@@ -88160,16 +88553,19 @@ mod server_decommission_db_tests {
 mod patch_waves_db_tests {
     use super::*;
     use crate::database::DB_TEST_SERIAL;
+    use ryuki_engine::models::PatchWaveStatus;
     use sqlx::PgPool;
 
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
-        if url.is_empty() {
+        if url.trim().is_empty() {
             return None;
         }
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
-        let pool = crate::database::get_db()?;
-        crate::database::run_migrations(pool).await.ok()?;
+        let pool = crate::database::get_db().expect("configured DB must connect");
+        crate::database::run_migrations(pool)
+            .await
+            .expect("runbook lifecycle migrations must apply");
         Some(pool)
     }
 
@@ -88179,6 +88575,15 @@ mod patch_waves_db_tests {
             os_family: "linux".into(),
             criticality: format!("test-{suffix}"),
         }
+    }
+
+    fn verified_actor(label: &str) -> AuthSession {
+        let mut session = AuthSession::static_dry_run();
+        bind_test_principal(&mut session, label);
+        session.token_valid = true;
+        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
+        session.provider_mode = "test-verified-human".into();
+        session
     }
 
     async fn cleanup(pool: &PgPool, id: &str) {
@@ -88201,12 +88606,10 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let maker = verified_actor(&format!("patch-maker-{suffix}"));
+        let maker_principal_id = maker.principal_id.expect("bound maker principal");
 
-        let Ok(Json(created)) = patch_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
         else {
             panic!("patch_plan failed");
         };
@@ -88226,6 +88629,12 @@ mod patch_waves_db_tests {
             ryuki_engine::models::PatchWaveStatus::Draft,
             "status after plan must be Draft"
         );
+        let record = crate::repos::patch_waves::get_record(pool, &id)
+            .await
+            .expect("get provenance failed")
+            .expect("wave provenance missing");
+        assert_eq!(record.maker_principal_id, Some(maker_principal_id));
+        assert_eq!(record.approved_by_principal_id, None);
 
         cleanup(pool, &id).await;
     }
@@ -88241,13 +88650,11 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let maker = verified_actor(&format!("patch-maker-{suffix}"));
+        let maker_principal = maker.principal_id.expect("bound maker principal");
 
         // 1. plan
-        let Ok(Json(created)) = patch_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
         else {
             panic!("patch_plan failed");
         };
@@ -88299,6 +88706,11 @@ mod patch_waves_db_tests {
             approved["metadata"]["approver"], approver_principal,
             "the persisted approver must be the session principal, not a hardcoded string"
         );
+        assert_ne!(
+            maker_principal.to_string(),
+            approver_principal,
+            "test setup must preserve maker/checker separation"
+        );
 
         // #7 audit: the approve wrote a durable audit row attributing the
         // approver (atomic with the CAS transition).
@@ -88325,6 +88737,17 @@ mod patch_waves_db_tests {
             wave.status,
             ryuki_engine::models::PatchWaveStatus::Approved,
             "status after approve must be Approved"
+        );
+        let approval_record = crate::repos::patch_waves::get_record(pool, &id)
+            .await
+            .expect("get approval provenance failed")
+            .expect("approved wave missing");
+        assert_eq!(approval_record.maker_principal_id, Some(maker_principal));
+        assert_eq!(
+            approval_record
+                .approved_by_principal_id
+                .map(|principal| principal.to_string()),
+            Some(approver_principal.clone())
         );
 
         // 4. execute
@@ -88371,6 +88794,283 @@ mod patch_waves_db_tests {
         cleanup(pool, &id).await;
     }
 
+    /// The planning principal cannot approve its own wave. The denial leaves
+    /// the validated row and its canonical provenance unchanged, and the
+    /// database trigger also rejects a direct attempt to rebind the maker.
+    #[tokio::test]
+    async fn test_patch_wave_maker_cannot_self_approve_or_be_rebound() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let maker = verified_actor(&format!("patch-self-maker-{suffix}"));
+        let maker_principal = maker.principal_id.expect("bound maker principal");
+        let Ok(Json(created)) =
+            patch_plan(AuthExtractor(maker.clone()), Json(plan_body(&suffix))).await
+        else {
+            panic!("patch_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        patch_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("patch_validate failed");
+
+        let denied = patch_approve(
+            AuthExtractor(maker),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("the planning maker must not approve the same wave");
+        assert_eq!(denied.0, StatusCode::CONFLICT);
+
+        let record = crate::repos::patch_waves::get_record(pool, &id)
+            .await
+            .expect("get after denial failed")
+            .expect("wave missing after denial");
+        assert_eq!(record.wave.status, PatchWaveStatus::Validated);
+        assert_eq!(record.maker_principal_id, Some(maker_principal));
+        assert_eq!(record.approved_by_principal_id, None);
+
+        let replacement_maker = test_principal_id(&format!("replacement-maker-{suffix}"));
+        let rebind =
+            sqlx::query("UPDATE patch_waves SET maker_principal_id = $2 WHERE id = $1::uuid")
+                .bind(&id)
+                .bind(replacement_maker.into_uuid())
+                .execute(pool)
+                .await;
+        assert!(rebind.is_err(), "database must reject maker rebinding");
+
+        let after = crate::repos::patch_waves::get_record(pool, &id)
+            .await
+            .expect("get after rebind attempt failed")
+            .expect("wave missing after rebind attempt");
+        assert_eq!(after.wave.status, PatchWaveStatus::Validated);
+        assert_eq!(after.maker_principal_id, Some(maker_principal));
+        assert_eq!(after.approved_by_principal_id, None);
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Pre-migration rows retain read/validation compatibility but have no
+    /// trustworthy maker to compare. They therefore fail closed at approval
+    /// instead of receiving a fabricated backfill identity.
+    #[tokio::test]
+    async fn test_legacy_patch_wave_can_validate_but_cannot_be_approved() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO patch_waves \
+             (id, site, os_family, status, name, servers, site_scope, environment_scope, schedule) \
+             VALUES ($1::uuid, 'DEFRA', 'linux', 'Draft', 'legacy patch wave', \
+                     '[\"legacy-srv-01\"]'::jsonb, '[\"DEFRA\"]'::jsonb, \
+                     '[\"production\"]'::jsonb, \
+                     '{\"start\":\"2099-01-01T00:00:00Z\",\"end\":\"2099-01-01T04:00:00Z\",\
+                       \"maintenance_window\":\"Sat 00:00-04:00\",\"patch_group\":null}'::jsonb)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("seed unresolved legacy wave");
+
+        patch_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("legacy validation compatibility must remain");
+
+        let checker = verified_actor(&format!("legacy-checker-{id}"));
+        let denied = patch_approve(
+            AuthExtractor(checker),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("unresolved legacy wave must fail closed at approval");
+        assert_eq!(denied.0, StatusCode::CONFLICT);
+
+        let legacy_writer_approval =
+            sqlx::query("UPDATE patch_waves SET status = 'Approved' WHERE id = $1::uuid")
+                .bind(&id)
+                .execute(pool)
+                .await;
+        assert!(
+            legacy_writer_approval.is_err(),
+            "migration trigger must also stop a pre-migration writer from approving"
+        );
+
+        let record = crate::repos::patch_waves::get_record(pool, &id)
+            .await
+            .expect("get legacy provenance failed")
+            .expect("legacy wave missing");
+        assert_eq!(record.wave.status, PatchWaveStatus::Validated);
+        assert_eq!(record.maker_principal_id, None);
+        assert_eq!(record.approved_by_principal_id, None);
+
+        cleanup(pool, &id).await;
+    }
+
+    /// A row that was already Approved before maker capture is historical
+    /// evidence, not executable authority. Both the handler and migration
+    /// trigger reject moving it into Completed without canonical provenance.
+    #[tokio::test]
+    async fn test_legacy_approved_patch_wave_cannot_execute() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO patch_waves \
+             (id, site, os_family, status, name, servers, site_scope, environment_scope, schedule) \
+             VALUES ($1::uuid, 'DEFRA', 'linux', 'Approved', 'legacy approved patch wave', \
+                     '[\"legacy-srv-01\"]'::jsonb, '[\"DEFRA\"]'::jsonb, \
+                     '[\"production\"]'::jsonb, \
+                     '{\"start\":\"2099-01-01T00:00:00Z\",\"end\":\"2099-01-01T04:00:00Z\",\
+                       \"maintenance_window\":\"Sat 00:00-04:00\",\"patch_group\":null}'::jsonb)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("seed unresolved approved legacy wave");
+
+        let denied = patch_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("legacy Approved wave must not execute");
+        assert_eq!(denied.0, StatusCode::CONFLICT);
+
+        let legacy_writer_execute =
+            sqlx::query("UPDATE patch_waves SET status = 'Completed' WHERE id = $1::uuid")
+                .bind(&id)
+                .execute(pool)
+                .await;
+        assert!(
+            legacy_writer_execute.is_err(),
+            "migration trigger must stop a pre-migration writer from executing"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM patch_waves WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(pool)
+                .await
+                .expect("read legacy Approved status");
+        assert_eq!(status, "Approved");
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Two distinct checkers racing on one validated wave cannot both win.
+    /// The status CAS and canonical checker write are one SQL statement, so the
+    /// durable checker and the single audit row identify the sole winner.
+    #[tokio::test]
+    async fn test_concurrent_patch_wave_approvals_record_exactly_one_checker() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let maker = verified_actor(&format!("patch-race-maker-{suffix}"));
+        let maker_principal = maker.principal_id.expect("bound maker principal");
+        let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
+        else {
+            panic!("patch_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+        patch_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("patch_validate failed");
+
+        let checker_a = verified_actor(&format!("patch-race-checker-a-{suffix}"));
+        let checker_b = verified_actor(&format!("patch-race-checker-b-{suffix}"));
+        let checker_a_principal = checker_a.principal_id.expect("checker A principal");
+        let checker_b_principal = checker_b.principal_id.expect("checker B principal");
+        let (result_a, result_b) = tokio::join!(
+            patch_approve(
+                AuthExtractor(checker_a),
+                Json(PatchActionRequest {
+                    wave_id: id.clone(),
+                }),
+            ),
+            patch_approve(
+                AuthExtractor(checker_b),
+                Json(PatchActionRequest {
+                    wave_id: id.clone(),
+                }),
+            )
+        );
+
+        let mut winner = None;
+        let mut conflicts = 0;
+        for result in [result_a, result_b] {
+            match result {
+                Ok(Json(value)) => {
+                    assert!(winner.is_none(), "only one approval may succeed");
+                    winner = value["metadata"]["approver"]
+                        .as_str()
+                        .and_then(|value| value.parse::<PrincipalId>().ok());
+                }
+                Err((StatusCode::CONFLICT, _)) => conflicts += 1,
+                Err(other) => panic!("unexpected concurrent approval result: {other:?}"),
+            }
+        }
+        let winner = winner.expect("one checker must win the approval race");
+        assert_eq!(conflicts, 1, "exactly one racing checker must conflict");
+        assert!(winner == checker_a_principal || winner == checker_b_principal);
+
+        let record = crate::repos::patch_waves::get_record(pool, &id)
+            .await
+            .expect("get race result failed")
+            .expect("approved wave missing");
+        assert_eq!(record.wave.status, PatchWaveStatus::Approved);
+        assert_eq!(record.maker_principal_id, Some(maker_principal));
+        assert_eq!(record.approved_by_principal_id, Some(winner));
+
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'patch-approve' AND detail->>'wave_id' = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("count approval audits");
+        assert_eq!(audit_count, 1, "only the winning checker may commit audit");
+
+        cleanup(pool, &id).await;
+    }
+
     /// Optimistic-lock CAS: `transition` must return `Ok(false)` when the row's
     /// DB status no longer matches the expected `before` value. We capture the
     /// wave while Draft, advance it to Validated through the normal path, then
@@ -88387,12 +89087,9 @@ mod patch_waves_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
+        let maker = verified_actor(&format!("patch-maker-{suffix}"));
 
-        let Ok(Json(created)) = patch_plan(
-            AuthExtractor(AuthSession::static_dry_run()),
-            Json(plan_body(&suffix)),
-        )
-        .await
+        let Ok(Json(created)) = patch_plan(AuthExtractor(maker), Json(plan_body(&suffix))).await
         else {
             panic!("patch_plan failed");
         };
@@ -88634,6 +89331,34 @@ mod patch_waves_db_tests {
     }
 }
 
+#[cfg(test)]
+mod snapshot_expiry_input_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_and_oversized_expiry_fail_before_database_work() {
+        let request = |requested_expiry: String| SnapshotPlanRequest {
+            platform_ci_key: "input-boundary-ci".into(),
+            snapshot_purpose: "input boundary".into(),
+            requested_expiry,
+            owner: "input-boundary-owner".into(),
+            support_group: "input-boundary-group".into(),
+            change_context: "input boundary regression".into(),
+        };
+
+        let oversized = format!("2026-07-01T00:00:00.{}Z", "1".repeat(44));
+        for expiry in ["2026-07-01 00:00:00Z".to_string(), oversized] {
+            let error = snapshot_plan(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Json(request(expiry)),
+            )
+            .await
+            .expect_err("invalid expiry must fail before database lookup");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
+    }
+}
+
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api snapshots_db_tests
 #[cfg(test)]
 mod snapshots_db_tests {
@@ -88863,8 +89588,165 @@ mod snapshots_db_tests {
             ryuki_engine::models::SnapshotStatus::Draft,
             "status after plan must be Draft"
         );
+        let (expiry_text, expiry_at): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "SELECT requested_expiry, requested_expiry_at FROM snapshots WHERE id = $1",
+        )
+        .bind(uuid::Uuid::parse_str(&id).expect("snapshot UUID"))
+        .fetch_one(pool)
+        .await
+        .expect("read typed snapshot expiry");
+        assert_eq!(expiry_text, "2099-01-01T00:00:00Z");
+        assert_eq!(expiry_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
 
         cleanup(pool, &id, &format!("ci-test-{suffix}")).await;
+    }
+
+    #[tokio::test]
+    async fn migration_quarantines_untyped_expiry_and_rejects_mismatched_typed_values() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL is absent");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let ci_name = format!("ci-expiry-quarantine-{suffix}");
+        let site = format!("SEQ-{}", &suffix[..8]);
+        seed_ci(pool, &ci_name, &site, Some("production")).await;
+        let quarantined_id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO snapshots \
+             (id, configuration_item_id, platform_ci_key, created_by, scope_provenance, \
+              snapshot_purpose, requested_expiry, owner, support_group, change_context, status) \
+             SELECT $1, ci.id, ci.ci_name, 'expiry-migration-test', \
+                    'cmdb-configuration-item', 'legacy invalid expiry', 'infinity', \
+                    'legacy-owner', 'legacy-group', 'legacy-row', 'Draft' \
+             FROM configuration_items AS ci WHERE ci.ci_name = $2",
+        )
+        .bind(quarantined_id)
+        .bind(&ci_name)
+        .execute(pool)
+        .await
+        .expect("stale writer row must fail closed into expiry quarantine");
+
+        let typed_expiry: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT requested_expiry_at FROM snapshots WHERE id = $1")
+                .bind(quarantined_id)
+                .fetch_one(pool)
+                .await
+                .expect("read quarantined typed expiry");
+        assert!(typed_expiry.is_none());
+        assert!(
+            crate::repos::snapshots::get_authorized(pool, &quarantined_id.to_string(), &[], &[],)
+                .await
+                .expect("query quarantined snapshot")
+                .is_none(),
+            "a NULL typed expiry must quarantine the row from application reads"
+        );
+
+        let mismatch_id = uuid::Uuid::new_v4();
+        let mismatch = sqlx::query(
+            "INSERT INTO snapshots \
+             (id, configuration_item_id, platform_ci_key, created_by, scope_provenance, \
+              snapshot_purpose, requested_expiry, requested_expiry_at, owner, support_group, \
+              change_context, status) \
+             SELECT $1, ci.id, ci.ci_name, 'expiry-migration-test', \
+                    'cmdb-configuration-item', 'mismatched expiry', \
+                    '2020-01-01T00:00:00Z', '2099-01-01T00:00:00Z'::timestamptz, \
+                    'legacy-owner', 'legacy-group', 'mismatched-row', 'Draft' \
+             FROM configuration_items AS ci WHERE ci.ci_name = $2",
+        )
+        .bind(mismatch_id)
+        .bind(&ci_name)
+        .execute(pool)
+        .await
+        .expect_err("typed expiry must match its bounded RFC3339 evidence");
+        assert!(mismatch
+            .to_string()
+            .contains("snapshots_requested_expiry_typed_check"));
+
+        let index_definition: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = current_schema() AND indexname = 'idx_snapshots_stale_claim'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("typed stale-claim index must exist");
+        assert!(index_definition.contains("requested_expiry_at, created_at, id"));
+
+        sqlx::query("DELETE FROM snapshots WHERE id = $1")
+            .bind(quarantined_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup(pool, "", &ci_name).await;
+    }
+
+    #[tokio::test]
+    async fn stale_claim_orders_by_typed_expiry_before_limit() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL is absent");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let ci_name = format!("ci-expiry-order-{suffix}");
+        let site = format!("SEO-{}", &suffix[..8]);
+        seed_ci(pool, &ci_name, &site, Some("production")).await;
+        let plan = |purpose: &str, expiry: &str| SnapshotPlanRequest {
+            platform_ci_key: ci_name.clone(),
+            snapshot_purpose: purpose.into(),
+            requested_expiry: expiry.into(),
+            owner: "expiry-order-owner".into(),
+            support_group: "expiry-order-group".into(),
+            change_context: "typed expiry ordering regression".into(),
+        };
+
+        let Json(later_expiry) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan("created first", "2021-01-01T00:00:00Z")),
+        )
+        .await
+        .expect("plan later-expiry snapshot first");
+        let Json(earlier_expiry) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan("created second", "2020-01-01T00:00:00Z")),
+        )
+        .await
+        .expect("plan earlier-expiry snapshot second");
+        let later_id = later_expiry["id"].as_str().expect("later id").to_string();
+        let earlier_id = earlier_expiry["id"]
+            .as_str()
+            .expect("earlier id")
+            .to_string();
+
+        let mut tx = pool.begin().await.expect("begin typed stale claim");
+        let claimed = crate::repos::snapshots::list_stale_candidates_for_update(
+            &mut *tx,
+            std::slice::from_ref(&site),
+            &["production".to_string()],
+            1,
+        )
+        .await
+        .expect("claim typed stale candidate");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].id, earlier_id,
+            "LIMIT must apply after deterministic typed-expiry ordering"
+        );
+        tx.rollback().await.expect("release typed stale claim");
+
+        sqlx::query("DELETE FROM snapshots WHERE id = ANY($1)")
+            .bind(vec![
+                uuid::Uuid::parse_str(&later_id).expect("later UUID"),
+                uuid::Uuid::parse_str(&earlier_id).expect("earlier UUID"),
+            ])
+            .execute(pool)
+            .await
+            .ok();
+        cleanup(pool, "", &ci_name).await;
     }
 
     /// review transition: DB row must show ReviewRequested after snapshot_review.
@@ -90065,12 +90947,147 @@ mod backup_restore_db_tests {
 
     async fn cleanup_restore(pool: &PgPool, id: &str) {
         if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            let authority: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+                "SELECT source_configuration_item_id, restore_point_id \
+                 FROM restore_requests WHERE id = $1",
+            )
+            .bind(uid)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
             sqlx::query("DELETE FROM restore_requests WHERE id = $1")
                 .bind(uid)
                 .execute(pool)
                 .await
                 .ok();
+            if let Some((configuration_item_id, restore_point_id)) = authority {
+                if let Some(restore_point_id) = restore_point_id {
+                    sqlx::query("DELETE FROM backup_restore_points WHERE id = $1")
+                        .bind(restore_point_id)
+                        .execute(pool)
+                        .await
+                        .ok();
+                }
+                if let Some(configuration_item_id) = configuration_item_id {
+                    sqlx::query("DELETE FROM configuration_items WHERE id = $1")
+                        .bind(configuration_item_id)
+                        .execute(pool)
+                        .await
+                        .ok();
+                }
+            }
         }
+    }
+
+    struct RestoreSourceFixture {
+        configuration_item_id: Uuid,
+        restore_point_id: Uuid,
+    }
+
+    async fn seed_authorized_restore_source(
+        pool: &PgPool,
+        source_ci_key: &str,
+        restore_point: &str,
+        site: &str,
+        environment: &str,
+    ) -> RestoreSourceFixture {
+        let captured_at = chrono::DateTime::parse_from_rfc3339(restore_point)
+            .expect("test restore point is RFC3339")
+            .with_timezone(&chrono::Utc);
+        let configuration_item_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO configuration_items \
+             (ci_name, ci_type, criticality, site, environment, owner) \
+             VALUES ($1, 'Server', 'High', $2, $3, 'restore-authority-test') \
+             ON CONFLICT (ci_name) DO UPDATE \
+             SET site = EXCLUDED.site, environment = EXCLUDED.environment, \
+                 updated_at = NOW() \
+             RETURNING id",
+        )
+        .bind(source_ci_key)
+        .bind(site)
+        .bind(environment)
+        .fetch_one(pool)
+        .await
+        .expect("seed authoritative restore source CI");
+        let restore_point_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO backup_restore_points \
+             (configuration_item_id, captured_at, status, source_system, source_reference) \
+             VALUES ($1, $2, 'Available', 'test-fixture', $3) \
+             ON CONFLICT (configuration_item_id, captured_at) DO UPDATE \
+             SET status = 'Available' \
+             RETURNING id",
+        )
+        .bind(configuration_item_id)
+        .bind(captured_at)
+        .bind(format!("test:{source_ci_key}:{restore_point}"))
+        .fetch_one(pool)
+        .await
+        .expect("seed authoritative backup restore point");
+        RestoreSourceFixture {
+            configuration_item_id,
+            restore_point_id,
+        }
+    }
+
+    async fn cleanup_restore_source(pool: &PgPool, fixture: &RestoreSourceFixture) {
+        sqlx::query("DELETE FROM backup_restore_points WHERE id = $1")
+            .bind(fixture.restore_point_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM configuration_items WHERE id = $1")
+            .bind(fixture.configuration_item_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    async fn seed_active_restore_site(pool: &PgPool) -> String {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("RST-{}", &suffix[..12]).to_ascii_uppercase();
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', $2, 'Test', 'TS', 'UTC', TRUE)",
+        )
+        .bind(&site)
+        .bind(format!("Restore authority test {suffix}"))
+        .execute(pool)
+        .await
+        .expect("insert active restore test site");
+        ryuki_engine::site_registry::upsert_site(
+            ryuki_engine::site_registry::SiteEntry {
+                unlocode: site.clone(),
+                name: format!("Restore authority test {suffix}"),
+                country: "Test".into(),
+                country_code: "TS".into(),
+                timezone: "UTC".into(),
+                active: true,
+            },
+            ryuki_engine::site_registry::SiteCodeSystem::Custom,
+        )
+        .expect("register restore test site in the process-local validation cache");
+        site
+    }
+
+    async fn set_restore_site_active(pool: &PgPool, site: &str, active: bool) {
+        let changed = sqlx::query("UPDATE site_registry SET active = $1 WHERE unlocode = $2")
+            .bind(active)
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("toggle restore test site")
+            .rows_affected();
+        assert_eq!(changed, 1, "restore test site must still exist");
+    }
+
+    async fn cleanup_restore_site(pool: &PgPool, site: &str) {
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(site)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #47: restore-test recency classifies each system from its last successful
@@ -90093,16 +91110,28 @@ mod backup_restore_db_tests {
             ("never", "Draft", -1),    // never reached success -> never_tested
         ];
         let mut keys = Vec::new();
+        let mut source_fixtures = Vec::new();
         for (label, status, off) in fixtures {
             let key = format!("ci-rtr-{label}-{suffix}");
             let updated = now + chrono::Duration::days(off);
+            let source = seed_authorized_restore_source(
+                pool,
+                &key,
+                "2026-06-10T02:00:00Z",
+                "GBLON",
+                "production",
+            )
+            .await;
             sqlx::query(
                 "INSERT INTO restore_requests \
                  (source_ci_key, restore_type, restore_point, target_site, \
                   target_environment, owner, status, updated_at, approver, metadata, \
-                  authority_state, authority_reason) \
+                  authority_state, authority_reason, source_configuration_item_id, \
+                  restore_point_id, source_site, source_environment, \
+                  source_scope_provenance) \
                  VALUES ( \
-                    $1, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $2, $3, \
+                    $1, 'FullVm', '2026-06-10T02:00:00Z', 'GBLON', 'production', \
+                    'sys', $2, $3, \
                     CASE WHEN $2 IN ('Approved', 'Locked', 'Executed', 'Verified', \
                                      'Completed', 'Failed') \
                          THEN 'recency.checker' END, \
@@ -90111,16 +91140,20 @@ mod backup_restore_db_tests {
                                      'Completed', 'Failed') \
                          THEN jsonb_build_object('approver', 'recency.checker') \
                          ELSE '{}'::jsonb END, \
-                    'Verified', NULL \
+                    'Verified', NULL, $4, $5, 'GBLON', 'production', \
+                    'backup-restore-point' \
                  )",
             )
             .bind(&key)
             .bind(status)
             .bind(updated)
+            .bind(source.configuration_item_id)
+            .bind(source.restore_point_id)
             .execute(pool)
             .await
             .expect("insert restore request");
             keys.push(key);
+            source_fixtures.push(source);
         }
 
         let Ok(Json(body)) = backup_restore_test_recency(
@@ -90158,6 +91191,9 @@ mod backup_restore_db_tests {
                 .execute(pool)
                 .await
                 .ok();
+        }
+        for source in &source_fixtures {
+            cleanup_restore_source(pool, source).await;
         }
     }
 
@@ -90210,6 +91246,15 @@ mod backup_restore_db_tests {
             return;
         };
 
+        seed_authorized_restore_source(
+            pool,
+            "ci-db-test-001",
+            "2026-06-10T02:00:00Z",
+            "GBLON",
+            "production",
+        )
+        .await;
+
         let Ok(Json(created)) = backup_restore_plan(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(RestorePlanRequest {
@@ -90251,6 +91296,240 @@ mod backup_restore_db_tests {
     }
 
     #[tokio::test]
+    async fn restore_plan_requires_scoped_persisted_source_and_restore_point_authority() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let source_ci_key = format!("restore-source-authority-{}", Uuid::new_v4());
+        let restore_point = "2026-06-10T02:00:00Z";
+        let source_site = seed_active_restore_site(pool).await;
+        let source = seed_authorized_restore_source(
+            pool,
+            &source_ci_key,
+            restore_point,
+            &source_site,
+            "production",
+        )
+        .await;
+        let body = |source_ci_key: String, restore_point: &str| RestorePlanRequest {
+            source_ci_key,
+            restore_type: "full-vm".into(),
+            restore_point: restore_point.into(),
+            target_site: "GBLON".into(),
+            target_environment: "production".into(),
+            owner: "source-authority-owner".into(),
+        };
+
+        let mut target_only = AuthSession::static_dry_run();
+        target_only.site_scope = vec!["GBLON".into()];
+        target_only.environment_scope = vec!["production".into()];
+        let foreign_source = backup_restore_plan(
+            AuthExtractor(target_only),
+            Json(body(source_ci_key.clone(), restore_point)),
+        )
+        .await
+        .expect_err("target authority must not authorize a foreign source asset");
+        assert_eq!(foreign_source.0, StatusCode::NOT_FOUND);
+
+        let missing_source = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(body(
+                format!("missing-restore-source-{}", Uuid::new_v4()),
+                restore_point,
+            )),
+        )
+        .await
+        .expect_err("caller text cannot manufacture a source asset");
+        assert_eq!(missing_source.0, StatusCode::NOT_FOUND);
+
+        let missing_point = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(body(source_ci_key.clone(), "2026-06-11T02:00:00Z")),
+        )
+        .await
+        .expect_err("caller timestamp cannot manufacture a restore point");
+        assert_eq!(missing_point.0, StatusCode::NOT_FOUND);
+
+        sqlx::query("UPDATE backup_restore_points SET status = 'Expired' WHERE id = $1")
+            .bind(source.restore_point_id)
+            .execute(pool)
+            .await
+            .expect("expire source restore point");
+        let expired_point = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(body(source_ci_key.clone(), restore_point)),
+        )
+        .await
+        .expect_err("expired restore point cannot authorize a plan");
+        assert_eq!(expired_point.0, StatusCode::NOT_FOUND);
+        sqlx::query("UPDATE backup_restore_points SET status = 'Available' WHERE id = $1")
+            .bind(source.restore_point_id)
+            .execute(pool)
+            .await
+            .expect("restore point availability for positive control");
+
+        set_restore_site_active(pool, &source_site, false).await;
+        let inactive_source = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(body(source_ci_key.clone(), restore_point)),
+        )
+        .await
+        .expect_err("inactive source authority cannot authorize a restore plan");
+        assert_eq!(inactive_source.0, StatusCode::NOT_FOUND);
+        set_restore_site_active(pool, &source_site, true).await;
+
+        let second_source = seed_authorized_restore_source(
+            pool,
+            &format!("other-restore-source-{}", Uuid::new_v4()),
+            restore_point,
+            &source_site,
+            "production",
+        )
+        .await;
+        let mut source_and_target = AuthSession::static_dry_run();
+        source_and_target.site_scope = vec![source_site.clone(), "GBLON".into()];
+        source_and_target.environment_scope = vec!["production".into()];
+        let Json(created) = backup_restore_plan(
+            AuthExtractor(source_and_target),
+            Json(body(source_ci_key.clone(), restore_point)),
+        )
+        .await
+        .expect("authorized source and target retain legitimate planning");
+        let id = created["id"].as_str().expect("restore id").to_string();
+        let binding: (Uuid, Uuid, String, String, String) = sqlx::query_as(
+            "SELECT source_configuration_item_id, restore_point_id, \
+                    source_site, source_environment, source_scope_provenance \
+             FROM restore_requests WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("read persisted source authority");
+        assert_eq!(binding.0, source.configuration_item_id);
+        assert_eq!(binding.1, source.restore_point_id);
+        assert_eq!(binding.2, source_site);
+        assert_eq!(binding.3, "production");
+        assert_eq!(binding.4, "backup-restore-point");
+
+        let forged_rebind = sqlx::query(
+            "UPDATE restore_requests \
+             SET source_configuration_item_id = $2, restore_point_id = $3 \
+             WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .bind(second_source.configuration_item_id)
+        .bind(second_source.restore_point_id)
+        .execute(pool)
+        .await
+        .expect_err("persisted source authority must be immutable");
+        assert!(forged_rebind
+            .to_string()
+            .contains("restore source authority provenance is immutable"));
+
+        sqlx::query("UPDATE configuration_items SET site = 'GBLON' WHERE id = $1")
+            .bind(source.configuration_item_id)
+            .execute(pool)
+            .await
+            .expect("move source CI after planning");
+        let moved_source = backup_restore_approve(
+            Extension(approver_session("source-drift-checker")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("source scope drift must invalidate the persisted plan");
+        assert_eq!(moved_source.0, StatusCode::CONFLICT);
+        sqlx::query("UPDATE configuration_items SET site = $2 WHERE id = $1")
+            .bind(source.configuration_item_id)
+            .bind(&source_site)
+            .execute(pool)
+            .await
+            .expect("restore source CI scope for cleanup");
+
+        backup_restore_approve(
+            Extension(approver_session("source-restored-checker")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("restored source authority permits approval");
+        sqlx::query("UPDATE backup_restore_points SET status = 'Expired' WHERE id = $1")
+            .bind(source.restore_point_id)
+            .execute(pool)
+            .await
+            .expect("expire source point after approval");
+        let expired_execution = backup_restore_execute(
+            AuthExtractor(approver_session("expired-source-executor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("expired source point must block execution");
+        assert_eq!(expired_execution.0, StatusCode::CONFLICT);
+        let still_approved = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read source-revoked restore")
+            .expect("source-revoked restore remains present");
+        assert_eq!(
+            still_approved.status,
+            ryuki_engine::models::RestoreStatus::Approved
+        );
+        let recency = crate::repos::restore_requests::restore_test_recency(
+            pool,
+            Some("GBLON"),
+            Some("production"),
+        )
+        .await
+        .expect("read recency after source expiry");
+        assert!(
+            recency.iter().all(|row| row.source_ci_key != source_ci_key),
+            "expired source points must not contribute trusted recency evidence"
+        );
+        let scan_seq: i64 = sqlx::query_scalar(
+            "SELECT scan_seq FROM restore_scheduler_system_summary \
+             WHERE source_ci_key = $1 AND target_site = 'GBLON' \
+               AND target_environment = 'production'",
+        )
+        .bind(&source_ci_key)
+        .fetch_one(pool)
+        .await
+        .expect("read source-authority scheduler sequence");
+        let scheduler_row =
+            crate::repos::restore_requests::scheduler_scan_page(pool, scan_seq - 1, scan_seq, 1)
+                .await
+                .expect("read source-authority scheduler row")
+                .into_iter()
+                .next()
+                .expect("source-authority scheduler row exists");
+        assert!(
+            scheduler_row.authority_quarantined,
+            "expired source point must flag the scheduler tuple as non-operational"
+        );
+        sqlx::query("UPDATE backup_restore_points SET status = 'Available' WHERE id = $1")
+            .bind(source.restore_point_id)
+            .execute(pool)
+            .await
+            .expect("reactivate source point for positive control");
+        backup_restore_execute(
+            AuthExtractor(approver_session("restored-source-executor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("reactivated source point permits legitimate execution");
+
+        cleanup_restore(pool, &id).await;
+        cleanup_restore_source(pool, &second_source).await;
+        cleanup_restore_site(pool, &source_site).await;
+    }
+
+    #[tokio::test]
     async fn restore_planner_self_approval_is_forbidden_and_makerless_rows_fail_closed() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
@@ -90258,6 +91537,14 @@ mod backup_restore_db_tests {
             return;
         };
         let actor = "same-stable-restore-subject";
+        seed_authorized_restore_source(
+            pool,
+            "ci-self-approval-test",
+            "2026-06-10T02:00:00Z",
+            "DEFRA",
+            "production",
+        )
+        .await;
         let Ok(Json(created)) = backup_restore_plan(
             AuthExtractor(approver_session(actor)),
             Json(RestorePlanRequest {
@@ -90369,6 +91656,15 @@ mod backup_restore_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+
+        seed_authorized_restore_source(
+            pool,
+            "ci-scope-test-001",
+            "2026-06-10T02:00:00Z",
+            "GBLON",
+            "production",
+        )
+        .await;
 
         // Plan a GBLON/production restore as an unrestricted admin.
         let Ok(Json(created)) = backup_restore_plan(
@@ -90530,6 +91826,14 @@ mod backup_restore_db_tests {
 
         // Seed a DEFRA restore; the GBLON principal's recency must exclude its ci_key.
         let defra_ci = format!("ci-recency-defra-{}", uuid::Uuid::new_v4());
+        let defra_source = seed_authorized_restore_source(
+            pool,
+            &defra_ci,
+            "2026-06-10T02:00:00Z",
+            "DEFRA",
+            "production",
+        )
+        .await;
         let _ = backup_restore_plan(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(RestorePlanRequest {
@@ -90570,6 +91874,7 @@ mod backup_restore_db_tests {
             .execute(pool)
             .await
             .ok();
+        cleanup_restore_source(pool, &defra_source).await;
     }
 
     /// restore approve transition: plan → approve → DB shows Approved + metadata.approver set.
@@ -90580,6 +91885,15 @@ mod backup_restore_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+
+        seed_authorized_restore_source(
+            pool,
+            "ci-approve-test",
+            "2026-06-10T02:00:00Z",
+            "DEFRA",
+            "production",
+        )
+        .await;
 
         // Plan first.
         let Ok(Json(created)) = backup_restore_plan(
@@ -90655,6 +91969,15 @@ mod backup_restore_db_tests {
             return;
         };
 
+        seed_authorized_restore_source(
+            pool,
+            "ci-double-approve",
+            "2026-06-10T02:00:00Z",
+            "GBLON",
+            "production",
+        )
+        .await;
+
         // Plan then approve once.
         let Ok(Json(created)) = backup_restore_plan(
             AuthExtractor(AuthSession::static_dry_run()),
@@ -90715,6 +92038,15 @@ mod backup_restore_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+
+        seed_authorized_restore_source(
+            pool,
+            "ci-execute-test",
+            "2026-06-10T02:00:00Z",
+            "DEFRA",
+            "production",
+        )
+        .await;
 
         let Ok(Json(created)) = backup_restore_plan(
             AuthExtractor(AuthSession::static_dry_run()),
@@ -90806,6 +92138,15 @@ mod backup_restore_db_tests {
             return;
         };
 
+        seed_authorized_restore_source(
+            pool,
+            "ci-no-approve-execute",
+            "2026-06-10T02:00:00Z",
+            "GBLON",
+            "production",
+        )
+        .await;
+
         let Ok(Json(created)) = backup_restore_plan(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(RestorePlanRequest {
@@ -90851,6 +92192,15 @@ mod backup_restore_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
+
+        seed_authorized_restore_source(
+            pool,
+            "ci-cas-test",
+            "2026-06-10T02:00:00Z",
+            "GBLON",
+            "staging",
+        )
+        .await;
 
         let Ok(Json(created)) = backup_restore_plan(
             AuthExtractor(AuthSession::static_dry_run()),
@@ -90904,6 +92254,317 @@ mod backup_restore_db_tests {
             applied.is_none(),
             "transition with stale expected status must return None (CAS mismatch)"
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_restore_site_blocks_approval_execution_and_authority_reports() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let site = seed_active_restore_site(pool).await;
+        let source_ci_key = format!("restore-active-authority-{}", Uuid::new_v4());
+        seed_authorized_restore_source(
+            pool,
+            &source_ci_key,
+            "2026-06-10T02:00:00Z",
+            &site,
+            "production",
+        )
+        .await;
+        let Json(created) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: source_ci_key.clone(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: site.clone(),
+                target_environment: "production".into(),
+                owner: "restore-authority-owner".into(),
+            }),
+        )
+        .await
+        .expect("plan restore at active durable site");
+        let id = created["id"].as_str().expect("restore id").to_string();
+
+        let target_rebind =
+            sqlx::query("UPDATE restore_requests SET target_site = 'GBLON' WHERE id = $1::uuid")
+                .bind(&id)
+                .execute(pool)
+                .await
+                .expect_err("verified restore target provenance must be immutable");
+        assert!(target_rebind
+            .to_string()
+            .contains("verified restore authority tuple and planner are immutable"));
+
+        set_restore_site_active(pool, &site, false).await;
+        let approval_denial = backup_restore_approve(
+            Extension(approver_session("inactive-site-approver")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("inactive target must block restore approval");
+        assert_eq!(approval_denial.0, StatusCode::CONFLICT);
+        let still_planned = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read denied restore")
+            .expect("restore remains present");
+        assert_eq!(
+            still_planned.status,
+            ryuki_engine::models::RestoreStatus::Planned
+        );
+        let approval_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'backup-restore-approve' AND detail->>'restore_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query denied approval audit");
+        assert!(!approval_audited, "denied approval must create no audit");
+
+        let direct_approved =
+            backup_engine::approve_restore(&still_planned, "direct-restore-checker")
+                .expect("construct direct approval attempt");
+        let direct_applied =
+            crate::repos::restore_requests::transition(pool, "Planned", &direct_approved, None)
+                .await
+                .expect("inactive-site transition predicate is evaluated");
+        assert!(
+            direct_applied.is_none(),
+            "repository transition must independently require current active-site authority"
+        );
+
+        let recency = crate::repos::restore_requests::restore_test_recency(
+            pool,
+            Some(&site),
+            Some("production"),
+        )
+        .await
+        .expect("read inactive-site recency");
+        assert!(
+            recency.iter().all(|row| row.source_ci_key != source_ci_key),
+            "inactive-site history must not contribute trusted recency evidence"
+        );
+        let scan_seq: i64 = sqlx::query_scalar(
+            "SELECT scan_seq FROM restore_scheduler_system_summary \
+             WHERE source_ci_key = $1 AND target_site = $2 \
+               AND target_environment = 'production'",
+        )
+        .bind(&source_ci_key)
+        .bind(&site)
+        .fetch_one(pool)
+        .await
+        .expect("read restore scheduler summary sequence");
+        let scheduler_row =
+            crate::repos::restore_requests::scheduler_scan_page(pool, scan_seq - 1, scan_seq, 1)
+                .await
+                .expect("read exact restore scheduler summary")
+                .into_iter()
+                .next()
+                .expect("restore scheduler row");
+        assert!(
+            scheduler_row.authority_quarantined,
+            "inactive target must be reported as non-operational authority"
+        );
+
+        set_restore_site_active(pool, &site, true).await;
+        backup_restore_approve(
+            Extension(approver_session("active-site-approver")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("reactivation restores legitimate approval");
+
+        set_restore_site_active(pool, &site, false).await;
+        let execution_denial = backup_restore_execute(
+            AuthExtractor(approver_session("inactive-site-executor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect_err("inactive target must block restore execution");
+        assert_eq!(execution_denial.0, StatusCode::CONFLICT);
+        let still_approved = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read denied execution")
+            .expect("restore remains present");
+        assert_eq!(
+            still_approved.status,
+            ryuki_engine::models::RestoreStatus::Approved
+        );
+        let execution_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'backup-restore-execute' AND detail->>'restore_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query denied execution audit");
+        assert!(!execution_audited, "denied execution must create no audit");
+
+        set_restore_site_active(pool, &site, true).await;
+        let Json(evidence) = backup_restore_execute(
+            AuthExtractor(approver_session("active-site-executor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
+        .await
+        .expect("reactivation restores legitimate execution");
+        assert!(
+            evidence.as_array().is_some_and(|items| !items.is_empty()),
+            "successful dry-run execution keeps its evidence response"
+        );
+        let executed = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read executed restore")
+            .expect("restore remains present");
+        assert_eq!(
+            executed.status,
+            ryuki_engine::models::RestoreStatus::Executed
+        );
+
+        cleanup_restore(pool, &id).await;
+        cleanup_restore_site(pool, &site).await;
+    }
+
+    #[tokio::test]
+    async fn restore_approval_and_execution_serialize_against_site_deactivation() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let site = seed_active_restore_site(pool).await;
+        let source_ci_key = format!("restore-site-race-{}", Uuid::new_v4());
+        seed_authorized_restore_source(
+            pool,
+            &source_ci_key,
+            "2026-06-10T02:00:00Z",
+            &site,
+            "production",
+        )
+        .await;
+        let Json(created) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key,
+                restore_type: "application-item".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: site.clone(),
+                target_environment: "production".into(),
+                owner: "restore-race-owner".into(),
+            }),
+        )
+        .await
+        .expect("plan restore race fixture");
+        let id = created["id"].as_str().expect("restore id").to_string();
+        let planned = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read planned restore")
+            .expect("planned restore exists");
+        let approved = backup_engine::approve_restore(&planned, "race-restore-checker")
+            .expect("construct approved restore");
+
+        let mut approval_tx = pool.begin().await.expect("begin approval transaction");
+        assert!(
+            crate::repos::site_registry::lock_active(&mut approval_tx, &site)
+                .await
+                .expect("lock approval target")
+        );
+        let approval_race_pool = (*pool).clone();
+        let approval_race_site = site.clone();
+        let mut approval_deactivation = tokio::spawn(async move {
+            sqlx::query("UPDATE site_registry SET active = FALSE WHERE unlocode = $1")
+                .bind(approval_race_site)
+                .execute(&approval_race_pool)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                &mut approval_deactivation,
+            )
+            .await
+            .is_err(),
+            "deactivation must wait while approval holds the site FOR SHARE"
+        );
+        crate::repos::restore_requests::transition(&mut *approval_tx, "Planned", &approved, None)
+            .await
+            .expect("apply approval while site lock is held")
+            .expect("approval CAS applies");
+        approval_tx.commit().await.expect("commit approval");
+        tokio::time::timeout(std::time::Duration::from_secs(5), approval_deactivation)
+            .await
+            .expect("approval deactivation finishes after commit")
+            .expect("approval deactivation task joins")
+            .expect("approval deactivation succeeds");
+
+        set_restore_site_active(pool, &site, true).await;
+        let approved = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read approved restore")
+            .expect("approved restore exists");
+        let evidence = backup_engine::execute_restore(&approved)
+            .expect("construct dry-run execution evidence");
+        let mut executed = approved.clone();
+        executed.status = ryuki_engine::models::RestoreStatus::Executed;
+        executed.metadata.insert(
+            "execution_evidence_count".into(),
+            evidence.len().to_string(),
+        );
+
+        let mut execution_tx = pool.begin().await.expect("begin execution transaction");
+        assert!(
+            crate::repos::site_registry::lock_active(&mut execution_tx, &site)
+                .await
+                .expect("lock execution target")
+        );
+        let execution_race_pool = (*pool).clone();
+        let execution_race_site = site.clone();
+        let mut execution_deactivation = tokio::spawn(async move {
+            sqlx::query("UPDATE site_registry SET active = FALSE WHERE unlocode = $1")
+                .bind(execution_race_site)
+                .execute(&execution_race_pool)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                &mut execution_deactivation,
+            )
+            .await
+            .is_err(),
+            "deactivation must wait while execution holds the site FOR SHARE"
+        );
+        crate::repos::restore_requests::transition(&mut *execution_tx, "Approved", &executed, None)
+            .await
+            .expect("apply execution while site lock is held")
+            .expect("execution CAS applies");
+        execution_tx.commit().await.expect("commit execution");
+        tokio::time::timeout(std::time::Duration::from_secs(5), execution_deactivation)
+            .await
+            .expect("execution deactivation finishes after commit")
+            .expect("execution deactivation task joins")
+            .expect("execution deactivation succeeds");
+
+        let final_restore = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("read final restore")
+            .expect("final restore exists");
+        assert_eq!(
+            final_restore.status,
+            ryuki_engine::models::RestoreStatus::Executed
+        );
+        cleanup_restore(pool, &id).await;
+        cleanup_restore_site(pool, &site).await;
     }
 
     /// #14: `backup_restores_list` pushes the dual-axis `row_scope_permits`
@@ -91259,12 +92920,14 @@ mod certificates_db_tests {
 
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
-        if url.is_empty() {
+        if url.trim().is_empty() {
             return None;
         }
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
-        let pool = crate::database::get_db()?;
-        crate::database::run_migrations(pool).await.ok()?;
+        let pool = crate::database::get_db().expect("configured runbook DB must connect");
+        crate::database::run_migrations(pool)
+            .await
+            .expect("runbook execution migrations must apply");
         Some(pool)
     }
 
@@ -95476,8 +97139,6 @@ mod vm_day2_no_db_tests {
             target_ci_key: "ci-vm-001".into(),
             change_type: "resize-cpu".into(),
             target_value: 4,
-            site: "DEFRA".into(),
-            environment: "production".into(),
             owner: "test-owner".into(),
             maintenance_window: "EU-Overnight".into(),
         };
@@ -95556,6 +97217,8 @@ mod vm_day2_operations_db_tests {
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
+    const VM_DAY2_TARGET: &str = "vm-day2-authority-fixture";
+
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         if url.is_empty() {
@@ -95564,16 +97227,27 @@ mod vm_day2_operations_db_tests {
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
         let pool = crate::database::get_db()?;
         crate::database::run_migrations(pool).await.ok()?;
+        sqlx::query(
+            "INSERT INTO configuration_items \
+             (ci_name, ci_type, criticality, site, environment, owner) \
+             VALUES ($1, 'Server', 'High', 'DEFRA', 'production', 'vm-fixture-owner') \
+             ON CONFLICT (ci_name) DO UPDATE SET \
+                 ci_type = EXCLUDED.ci_type, criticality = EXCLUDED.criticality, \
+                 site = EXCLUDED.site, environment = EXCLUDED.environment, \
+                 owner = EXCLUDED.owner",
+        )
+        .bind(VM_DAY2_TARGET)
+        .execute(pool)
+        .await
+        .ok()?;
         Some(pool)
     }
 
     fn plan_body(suffix: &str) -> VmDay2PlanRequest {
         VmDay2PlanRequest {
-            target_ci_key: format!("ci-vm-{suffix}"),
+            target_ci_key: VM_DAY2_TARGET.into(),
             change_type: "resize-cpu".into(),
             target_value: 8,
-            site: "DEFRA".into(),
-            environment: "production".into(),
             owner: format!("test-owner-{suffix}"),
             maintenance_window: "EU-Overnight".into(),
         }
@@ -95649,7 +97323,22 @@ mod vm_day2_operations_db_tests {
             .expect("operation not found after insert");
 
         assert_eq!(op.id, id, "id must round-trip");
+        assert_eq!(op.target_ci_key, VM_DAY2_TARGET);
         assert_eq!(op.site, "DEFRA", "site must round-trip");
+        assert_eq!(op.environment, "production");
+        assert_eq!(op.owner, format!("test-owner-{suffix}"));
+        let target_id: String =
+            sqlx::query_scalar("SELECT id::text FROM configuration_items WHERE ci_name = $1")
+                .bind(VM_DAY2_TARGET)
+                .fetch_one(pool)
+                .await
+                .expect("read authoritative target UUID");
+        let target_authority = op.target_authority.as_ref().expect("target authority");
+        assert_eq!(target_authority.configuration_item_id, target_id);
+        assert_eq!(
+            target_authority.provenance,
+            ryuki_engine::models::VmDay2TargetProvenance::CmdbConfigurationItem
+        );
         assert_eq!(
             op.status,
             ryuki_engine::models::VmChangeStatus::Planned,
@@ -95660,6 +97349,53 @@ mod vm_day2_operations_db_tests {
         assert!(!governance.plan_digest.is_empty());
 
         cleanup(pool, &id).await;
+    }
+
+    /// Legacy clients may still send site/environment fields, but those values
+    /// are ignored: only the locked CMDB target supplies authorization axes.
+    #[tokio::test]
+    async fn request_body_axes_cannot_spoof_target_authority() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let spoofed_body = || {
+            serde_json::from_value::<VmDay2PlanRequest>(json!({
+                "targetCiKey": VM_DAY2_TARGET,
+                "changeType": "resize-cpu",
+                "targetValue": 8,
+                "site": "GBLON",
+                "environment": "development",
+                "owner": "request-owner",
+                "maintenanceWindow": "EU-Overnight"
+            }))
+            .expect("decode compatibility request")
+        };
+
+        let mut foreign = AuthSession::static_dry_run();
+        foreign.site_scope = vec!["GBLON".into()];
+        foreign.environment_scope = vec!["development".into()];
+        let denied = vm_day2_plan(AuthExtractor(foreign), Json(spoofed_body())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "spoofed body axes must not authorize the DEFRA/production target"
+        );
+
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(spoofed_body()),
+        )
+        .await
+        else {
+            panic!("unrestricted authoritative plan failed");
+        };
+        assert_eq!(created["target_ci_key"], VM_DAY2_TARGET);
+        assert_eq!(created["site"], "DEFRA");
+        assert_eq!(created["environment"], "production");
+        assert_eq!(created["owner"], "request-owner");
+        let id = created["id"].as_str().expect("operation id");
+        cleanup(pool, id).await;
     }
 
     /// Full lifecycle: plan → validate → distinct approve → lock → execute → verify.
@@ -95886,11 +97622,8 @@ mod vm_day2_operations_db_tests {
             return;
         };
         let suffix = uuid::Uuid::new_v4().to_string();
-        let shared_target = format!("ci-vm-shared-{suffix}");
-        let mut first_body = plan_body(&format!("{suffix}-first"));
-        first_body.target_ci_key = shared_target.clone();
-        let mut second_body = plan_body(&format!("{suffix}-second"));
-        second_body.target_ci_key = shared_target;
+        let first_body = plan_body(&format!("{suffix}-first"));
+        let second_body = plan_body(&format!("{suffix}-second"));
         let first_id = create_validated(first_body).await;
         let second_id = create_validated(second_body).await;
 
@@ -96967,6 +98700,496 @@ mod runbook_executions_db_tests {
     }
 
     #[tokio::test]
+    async fn runbook_start_requires_current_durable_active_site() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let actor_label = format!("runbook-active-start-{}", uuid::Uuid::new_v4());
+        let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
+        let actor = bind_test_principal(&mut session, &actor_label);
+
+        crate::repos::site_registry::set_active(pool, "DEFRA", false)
+            .await
+            .expect("deactivate durable runbook site");
+        let denied = super::runbook_start(
+            super::Extension(session.clone()),
+            super::Json(super::RunbookStartRequest {
+                runbook_id: "patch-windows-server".into(),
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        crate::repos::site_registry::set_active(pool, "DEFRA", true)
+            .await
+            .expect("restore durable runbook site");
+
+        let unknown_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let unknown_site = format!("R11-UNKNOWN-{}", &unknown_suffix[..8]);
+        let unknown = super::runbook_start(
+            super::Extension(session.clone()),
+            super::Json(super::RunbookStartRequest {
+                runbook_id: "patch-windows-server".into(),
+                site: unknown_site.clone(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(denied, Err((axum::http::StatusCode::CONFLICT, _))));
+        assert!(matches!(
+            unknown,
+            Err((axum::http::StatusCode::CONFLICT, _))
+        ));
+        let denied_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runbook_executions WHERE started_by = $1")
+                .bind(actor.to_string())
+                .fetch_one(pool)
+                .await
+                .expect("count denied starts");
+        let denied_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE actor_principal = $1 AND action = 'runbook-start'",
+        )
+        .bind(actor.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count denied start audits");
+        assert_eq!(denied_rows, 0, "inactive start must not persist");
+        assert_eq!(
+            denied_audits, 0,
+            "inactive start must not emit success audit"
+        );
+
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', 'Runbook start test', 'Test', 'ZZ', 'Etc/UTC', TRUE)",
+        )
+        .bind(&unknown_site)
+        .execute(pool)
+        .await
+        .expect("register active custom runbook site in the durable authority");
+        let super::Json(custom_active) = super::runbook_start(
+            super::Extension(session.clone()),
+            super::Json(super::RunbookStartRequest {
+                runbook_id: "patch-windows-server".into(),
+                site: unknown_site.clone(),
+            }),
+        )
+        .await
+        .expect("durable active custom site must not depend on a process-cache entry");
+        cleanup(
+            pool,
+            custom_active["id"]
+                .as_str()
+                .expect("custom-site execution id"),
+        )
+        .await;
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&unknown_site)
+            .execute(pool)
+            .await
+            .expect("remove active custom runbook site fixture");
+
+        let super::Json(active) = super::runbook_start(
+            super::Extension(session),
+            super::Json(super::RunbookStartRequest {
+                runbook_id: "patch-windows-server".into(),
+                site: "DEFRA".into(),
+            }),
+        )
+        .await
+        .expect("the same start remains supported for an active site");
+        let id = active["id"].as_str().expect("started execution id");
+        cleanup(pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn inactive_site_blocks_forward_transitions_but_allows_protective_terminalization() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let approval = make_exec(&format!("{suffix}-approve"), "certificate-renewal", "DEFRA");
+        let step = make_exec(&format!("{suffix}-step"), "restart-service", "DEFRA");
+        let complete_ready = make_exec(&format!("{suffix}-complete"), "restart-service", "DEFRA");
+        let complete_step_1 =
+            ryuki_engine::runbook_execution::execute_step_pure(&complete_ready, 1).unwrap();
+        let complete_step_2 =
+            ryuki_engine::runbook_execution::execute_step_pure(&complete_step_1, 2).unwrap();
+        let complete =
+            ryuki_engine::runbook_execution::execute_step_pure(&complete_step_2, 3).unwrap();
+        let fail = make_exec(&format!("{suffix}-fail"), "certificate-renewal", "DEFRA");
+        let rollback = make_exec(
+            &format!("{suffix}-rollback"),
+            "certificate-renewal",
+            "DEFRA",
+        );
+        let fixtures = [
+            approval.clone(),
+            step.clone(),
+            complete.clone(),
+            fail.clone(),
+            rollback.clone(),
+        ];
+        for fixture in &fixtures {
+            crate::repos::runbook_executions::insert(pool, fixture)
+                .await
+                .expect("insert active-site transition fixture");
+        }
+
+        let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
+        bind_test_principal(&mut session, &format!("runbook-transition-actor-{suffix}"));
+        crate::repos::site_registry::set_active(pool, "DEFRA", false)
+            .await
+            .expect("deactivate durable runbook site");
+        let blocked_outcomes = vec![
+            super::runbook_approve(
+                super::Path(approval.id.clone()),
+                super::Extension(session.clone()),
+            )
+            .await,
+            super::runbook_execute_step(
+                super::AuthExtractor(session.clone()),
+                super::Path((step.id.clone(), 1)),
+            )
+            .await,
+            super::runbook_complete(
+                super::AuthExtractor(session.clone()),
+                super::Path(complete.id.clone()),
+            )
+            .await,
+        ];
+        let failed = super::runbook_fail(
+            super::AuthExtractor(session.clone()),
+            super::Path(fail.id.clone()),
+            super::Json(super::RunbookFailRequest {
+                reason: "controlled failure".into(),
+            }),
+        )
+        .await;
+        let rolled_back = super::runbook_rollback(
+            super::AuthExtractor(session),
+            super::Path(rollback.id.clone()),
+        )
+        .await;
+        crate::repos::site_registry::set_active(pool, "DEFRA", true)
+            .await
+            .expect("restore durable runbook site");
+
+        for outcome in blocked_outcomes {
+            assert!(
+                matches!(outcome, Err((axum::http::StatusCode::CONFLICT, _))),
+                "every forward runbook transition must reject inactive site authority: {outcome:?}"
+            );
+        }
+        assert!(
+            failed.is_ok(),
+            "protective failure must remain available after deactivation: {failed:?}"
+        );
+        assert!(
+            rolled_back.is_ok(),
+            "protective rollback must remain available after deactivation: {rolled_back:?}"
+        );
+
+        for fixture in &fixtures[..3] {
+            let (persisted, _) = crate::repos::runbook_executions::get(pool, &fixture.id)
+                .await
+                .expect("read denied transition fixture")
+                .expect("denied transition fixture remains");
+            assert_eq!(
+                serde_json::to_value(persisted).unwrap(),
+                serde_json::to_value(fixture).unwrap(),
+                "inactive-site denial must preserve the exact execution snapshot"
+            );
+            let audit_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action LIKE 'runbook-%' \
+                   AND (detail->>'execution_id' = $1 \
+                        OR detail->>'runbook_execution_id' = $1)",
+            )
+            .bind(&fixture.id)
+            .fetch_one(pool)
+            .await
+            .expect("count denied transition audits");
+            assert_eq!(audit_count, 0, "denied transition must not emit audit");
+        }
+        for (fixture, expected_status) in [
+            (
+                &fail,
+                ryuki_engine::runbook_execution::ExecutionStatus::Failed,
+            ),
+            (
+                &rollback,
+                ryuki_engine::runbook_execution::ExecutionStatus::RolledBack,
+            ),
+        ] {
+            let (persisted, _) = crate::repos::runbook_executions::get(pool, &fixture.id)
+                .await
+                .expect("read protective terminalization")
+                .expect("terminalized execution remains");
+            assert_eq!(persisted.status, expected_status);
+            let audit_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action LIKE 'runbook-%' \
+                   AND (detail->>'execution_id' = $1 \
+                        OR detail->>'runbook_execution_id' = $1)",
+            )
+            .bind(&fixture.id)
+            .fetch_one(pool)
+            .await
+            .expect("count protective terminalization audits");
+            assert_eq!(
+                audit_count, 1,
+                "terminalization must retain one success audit"
+            );
+        }
+        for fixture in &fixtures {
+            cleanup(pool, &fixture.id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_site_blocks_handler_repository_and_raw_sql_transition() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("R11-{}", &suffix[..12]).to_ascii_uppercase();
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', 'Runbook authority test', 'Test', 'ZZ', 'Etc/UTC', TRUE)",
+        )
+        .bind(&site)
+        .execute(pool)
+        .await
+        .expect("insert temporary active canonical site");
+
+        let lowercase_alias = site.to_ascii_lowercase();
+        let mut aliased = make_exec(
+            &format!("{suffix}-lowercase-alias"),
+            "certificate-renewal",
+            "DEFRA",
+        );
+        aliased.site = lowercase_alias.clone();
+        let alias_repository_error = crate::repos::runbook_executions::insert(pool, &aliased)
+            .await
+            .expect_err("case-folded site aliases must not acquire repository authority");
+        assert!(
+            alias_repository_error
+                .to_string()
+                .contains("current active canonical site"),
+            "unexpected lowercase-alias repository rejection: {alias_repository_error}"
+        );
+        let alias_raw_error = sqlx::query(
+            "INSERT INTO runbook_executions \
+             (id, runbook_id, status, site, started_by, execution_json, \
+              invariant_state, invariant_reason) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'Verified', NULL)",
+        )
+        .bind(&aliased.id)
+        .bind(&aliased.runbook_id)
+        .bind(crate::repos::runbook_executions::status_str(
+            &aliased.status,
+        ))
+        .bind(&lowercase_alias)
+        .bind(&aliased.started_by)
+        .bind(serde_json::to_value(&aliased).unwrap())
+        .execute(pool)
+        .await
+        .expect_err("database trigger must reject a lowercase alias of an active site");
+        assert!(
+            alias_raw_error
+                .to_string()
+                .contains("current active canonical site"),
+            "unexpected lowercase-alias direct-writer rejection: {alias_raw_error}"
+        );
+
+        let mut exec = make_exec(&suffix, "certificate-renewal", "DEFRA");
+        exec.site = site.clone();
+        let id = exec.id.clone();
+        crate::repos::runbook_executions::insert(pool, &exec)
+            .await
+            .expect("insert execution while temporary site is active");
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&site)
+            .execute(pool)
+            .await
+            .expect("remove temporary site to model unknown legacy authority");
+
+        let mut rejected_insert = make_exec(
+            &format!("{suffix}-rejected-insert"),
+            "certificate-renewal",
+            "DEFRA",
+        );
+        rejected_insert.site = site.clone();
+        let insert_error = crate::repos::runbook_executions::insert(pool, &rejected_insert)
+            .await
+            .expect_err("repository insert must reject an unknown site");
+        assert!(
+            insert_error
+                .to_string()
+                .contains("current active canonical site"),
+            "unexpected repository insert rejection: {insert_error}"
+        );
+
+        let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
+        let actor = bind_test_principal(&mut session, &format!("runbook-unknown-site-{suffix}"));
+        let handler =
+            super::runbook_approve(super::Path(id.clone()), super::Extension(session)).await;
+        assert!(matches!(
+            handler,
+            Err((axum::http::StatusCode::CONFLICT, _))
+        ));
+
+        let (persisted, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("read unknown-site execution")
+            .expect("unknown-site execution remains quarantined in place");
+        let updated =
+            ryuki_engine::runbook_execution::approve_execution_pure(&persisted, &actor.to_string())
+                .expect("construct otherwise-valid approval projection");
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin direct repository transition");
+        let applied =
+            crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
+                .await
+                .expect("repository must fail closed without a SQL error");
+        tx.rollback()
+            .await
+            .expect("roll back rejected repository transition");
+        assert!(
+            !applied,
+            "repository transition must reject an unknown site"
+        );
+
+        let raw_error = sqlx::query(
+            "UPDATE runbook_executions SET status = $2, execution_json = $3 WHERE id = $1",
+        )
+        .bind(&id)
+        .bind(crate::repos::runbook_executions::status_str(
+            &updated.status,
+        ))
+        .bind(serde_json::to_value(&updated).unwrap())
+        .execute(pool)
+        .await
+        .expect_err("database trigger must reject a direct unknown-site transition");
+        assert!(
+            raw_error
+                .to_string()
+                .contains("current active canonical site"),
+            "unexpected direct-writer rejection: {raw_error}"
+        );
+
+        let (unchanged, _) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("read after direct denials")
+            .expect("denied execution remains");
+        assert_eq!(
+            serde_json::to_value(unchanged).unwrap(),
+            serde_json::to_value(exec).unwrap()
+        );
+        cleanup(pool, &id).await;
+    }
+
+    #[tokio::test]
+    async fn forward_transition_serializes_with_concurrent_site_deactivation() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let draft = make_exec(&suffix, "certificate-renewal", "DEFRA");
+        let id = draft.id.clone();
+        crate::repos::runbook_executions::insert(pool, &draft)
+            .await
+            .expect("insert transition/deactivation fixture");
+        let (persisted, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("read transition/deactivation fixture")
+            .expect("transition/deactivation fixture exists");
+        let approved = ryuki_engine::runbook_execution::approve_execution_pure(
+            &persisted,
+            "concurrent.site.checker",
+        )
+        .expect("construct approved projection");
+
+        let mut tx = pool.begin().await.expect("begin forward transition");
+        assert!(
+            crate::repos::runbook_executions::transition(&mut tx, &id, &version, &approved,)
+                .await
+                .expect("apply forward transition while retaining site lock")
+        );
+
+        let deactivation_pool = pool.clone();
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let deactivation = tokio::spawn(async move {
+            let mut connection = deactivation_pool.acquire().await?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await?;
+            let _ = pid_sender.send(pid);
+            crate::repos::site_registry::set_active(&mut *connection, "DEFRA", false).await
+        });
+        let deactivation_pid =
+            tokio::time::timeout(std::time::Duration::from_secs(5), pid_receiver)
+                .await
+                .expect("deactivation connection must start")
+                .expect("deactivation task must publish its backend pid");
+        let deactivation_waited_on_lock =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let wait_event_type: Option<String> = sqlx::query_scalar(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",
+                    )
+                    .bind(deactivation_pid)
+                    .fetch_one(pool)
+                    .await
+                    .expect("observe deactivation backend");
+                    if wait_event_type.as_deref() == Some("Lock") {
+                        break true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or(false);
+        tx.commit().await.expect("commit admitted transition");
+        let deactivated = tokio::time::timeout(std::time::Duration::from_secs(5), deactivation)
+            .await
+            .expect("deactivation must resume after transition commit")
+            .expect("deactivation task must not panic")
+            .expect("deactivation update must succeed");
+        crate::repos::site_registry::set_active(pool, "DEFRA", true)
+            .await
+            .expect("restore durable runbook site");
+        assert!(
+            deactivation_waited_on_lock,
+            "PostgreSQL must observe deactivation waiting on the retained FOR SHARE lock"
+        );
+        assert!(deactivated, "the canonical site must still exist");
+
+        let (after, _) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("read committed forward transition")
+            .expect("committed execution remains");
+        assert_eq!(
+            after.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Approved
+        );
+        cleanup(pool, &id).await;
+    }
+
+    #[tokio::test]
     async fn runbook_initiator_cannot_approve_own_execution() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
@@ -97745,6 +99968,49 @@ mod incident_contexts_db_tests {
         make_bound_incident(suffix, site, "app-portal", "Application")
     }
 
+    fn make_incident_with_cis(
+        suffix: &str,
+        ci_names: &[String],
+    ) -> ryuki_engine::incident_context::IncidentContext {
+        let bindings = ci_names
+            .iter()
+            .map(|ci_name| ryuki_engine::incident_context::AffectedCI {
+                ci_name: ci_name.clone(),
+                ci_type: "Server".into(),
+                site: "DEFRA".into(),
+                status: "impacted".into(),
+            })
+            .collect();
+        ryuki_engine::incident_context::build_incident_context_from_bindings(
+            &format!("bounded incident {suffix}"),
+            "sev2",
+            bindings,
+            "DEFRA",
+        )
+        .expect("bounded authoritative incident fixture must build")
+    }
+
+    async fn insert_incident_ci_fixtures(pool: &PgPool, ci_names: &[String]) {
+        sqlx::query(
+            "INSERT INTO configuration_items \
+             (ci_name, ci_type, criticality, site, owner) \
+             SELECT fixture.ci_name, 'Server', 'High', 'DEFRA', 'incident-cap-test' \
+             FROM unnest($1::text[]) AS fixture(ci_name)",
+        )
+        .bind(ci_names)
+        .execute(pool)
+        .await
+        .expect("insert incident-cap CMDB fixtures");
+    }
+
+    async fn cleanup_incident_ci_fixtures(pool: &PgPool, ci_names: &[String]) {
+        sqlx::query("DELETE FROM configuration_items WHERE ci_name = ANY($1::text[])")
+            .bind(ci_names)
+            .execute(pool)
+            .await
+            .expect("clean incident-cap CMDB fixtures");
+    }
+
     fn scoped_session(site: &str) -> ryuki_engine::auth::AuthSession {
         let mut session = ryuki_engine::auth::AuthSession::static_dry_run();
         session.site_scope = vec![site.to_string()];
@@ -97759,6 +100025,113 @@ mod incident_contexts_db_tests {
 
     fn error_status(result: &super::ApiResult) -> Option<super::StatusCode> {
         result.as_ref().err().map(|(status, _)| *status)
+    }
+
+    #[test]
+    fn incident_ci_cap_migration_checks_cardinality_before_expansion() {
+        let migration =
+            include_str!("../../../migrations/203_incident_context_affected_ci_cap.sql");
+        let cap = migration
+            .find("jsonb_array_length(NEW.incident_json->'affected_ci') NOT BETWEEN 1 AND 100")
+            .expect("migration must impose the trigger-level 1..100 cap");
+        let first_expansion = migration
+            .find("FROM jsonb_array_elements(NEW.incident_json->'affected_ci')")
+            .expect("migration must retain authoritative per-binding validation");
+        let quarantine_return = migration
+            .find("IF NEW.site IS NULL THEN")
+            .expect("migration must retain rolling-writer quarantine semantics");
+        assert!(
+            cap < quarantine_return && cap < first_expansion,
+            "the fixed-cost cardinality check must precede quarantine return and JSON expansion"
+        );
+        assert!(
+            !migration.contains("WHEN site IS NULL THEN true"),
+            "the durable table constraint must not exempt quarantined rows"
+        );
+        for preserved_authority in [
+            "NEW.site IS DISTINCT FROM OLD.site",
+            "registry.active = true",
+            "FOR SHARE",
+            "affected CIs must match exact same-site CMDB bindings",
+            "CMDB provenance may be appended but not changed or removed",
+            "incident_contexts_affected_ci_cardinality_check",
+        ] {
+            assert!(
+                migration.contains(preserved_authority),
+                "incident authority control disappeared: {preserved_authority}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quarantined_incident_rows_cannot_bypass_affected_ci_cap() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let rejected_id = format!("inc-quarantine-cap-rejected-{suffix}");
+        let retained_id = format!("inc-quarantine-cap-retained-{suffix}");
+        let oversized_affected_ci = (0..=super::MAX_INCIDENT_AFFECTED_CIS)
+            .map(|index| serde_json::json!({"legacy_ci": index}))
+            .collect::<Vec<_>>();
+        let oversized_json = serde_json::json!({"affected_ci": oversized_affected_ci});
+
+        let insert_error = sqlx::query(
+            "INSERT INTO incident_contexts \
+             (incident_id, title, severity, status, incident_json) \
+             VALUES ($1, 'quarantined oversized', 'sev2', 'active', $2)",
+        )
+        .bind(&rejected_id)
+        .bind(&oversized_json)
+        .execute(pool)
+        .await
+        .expect_err("a NULL-site insert must not bypass the durable cap");
+        assert!(
+            insert_error.as_database_error().is_some_and(|error| error
+                .message()
+                .contains("between 1 and 100 affected CI bindings")),
+            "the quarantined insert must fail at the fixed-cost cardinality check: {insert_error}"
+        );
+
+        sqlx::query(
+            "INSERT INTO incident_contexts \
+             (incident_id, title, severity, status, incident_json) \
+             VALUES ($1, 'quarantined boundary control', 'sev2', 'active', $2)",
+        )
+        .bind(&retained_id)
+        .bind(serde_json::json!({"affected_ci": [{"legacy_ci": 0}]}))
+        .execute(pool)
+        .await
+        .expect("a bounded quarantined row must retain rolling-writer compatibility");
+
+        let update_error =
+            sqlx::query("UPDATE incident_contexts SET incident_json = $2 WHERE incident_id = $1")
+                .bind(&retained_id)
+                .bind(&oversized_json)
+                .execute(pool)
+                .await
+                .expect_err("a NULL-site update must not bypass the durable cap");
+        assert!(
+            update_error.as_database_error().is_some_and(|error| error
+                .message()
+                .contains("between 1 and 100 affected CI bindings")),
+            "the quarantined update must fail at the fixed-cost cardinality check: {update_error}"
+        );
+        let persisted_count: i64 = sqlx::query_scalar(
+            "SELECT jsonb_array_length(incident_json->'affected_ci')::bigint \
+             FROM incident_contexts WHERE incident_id = $1",
+        )
+        .bind(&retained_id)
+        .fetch_one(pool)
+        .await
+        .expect("reload bounded quarantined row");
+        assert_eq!(persisted_count, 1, "the rejected update must be atomic");
+
+        cleanup(pool, &rejected_id).await;
+        cleanup(pool, &retained_id).await;
     }
 
     /// The `list_active` LIMIT is wired and bounds the result set: insert two
@@ -98969,6 +101342,154 @@ mod incident_contexts_db_tests {
             !ok_b,
             "second same-status writer with stale version must return false (xmin CAS catches it; status-only CAS would miss it)"
         );
+    }
+
+    #[tokio::test]
+    async fn incident_ci_cap_accepts_boundary_and_trigger_rejects_direct_overflow() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let ci_names = (0..=super::MAX_INCIDENT_AFFECTED_CIS)
+            .map(|index| format!("incident-cap-{suffix}-{index:03}"))
+            .collect::<Vec<_>>();
+        insert_incident_ci_fixtures(pool, &ci_names).await;
+
+        let ctx = make_incident_with_cis(&suffix, &ci_names[..super::MAX_INCIDENT_AFFECTED_CIS]);
+        let id = ctx.incident_id.clone();
+        crate::repos::incident_contexts::insert(pool, &ctx)
+            .await
+            .expect("the exact 100-CI boundary must persist");
+
+        let overflow_binding = serde_json::json!([{
+            "ci_name": &ci_names[super::MAX_INCIDENT_AFFECTED_CIS],
+            "ci_type": "Server",
+            "site": "DEFRA",
+            "status": "impacted"
+        }]);
+        let error = sqlx::query(
+            "UPDATE incident_contexts \
+             SET incident_json = jsonb_set( \
+                 incident_json, \
+                 '{affected_ci}', \
+                 (incident_json->'affected_ci') || $2::jsonb, \
+                 true \
+             ) \
+             WHERE incident_id = $1",
+        )
+        .bind(&id)
+        .bind(overflow_binding)
+        .execute(pool)
+        .await
+        .expect_err("the DB trigger must reject a direct 101st binding");
+        let database_error = error
+            .as_database_error()
+            .expect("the cap rejection must be a PostgreSQL constraint error");
+        assert_eq!(database_error.code().as_deref(), Some("23514"));
+        assert!(
+            database_error
+                .message()
+                .contains("between 1 and 100 affected CI bindings"),
+            "the cardinality check must run before provenance expansion: {database_error}"
+        );
+
+        let persisted_count: i64 = sqlx::query_scalar(
+            "SELECT jsonb_array_length(incident_json->'affected_ci')::bigint \
+             FROM incident_contexts WHERE incident_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("reload persisted affected-CI count");
+        assert_eq!(
+            persisted_count,
+            super::MAX_INCIDENT_AFFECTED_CIS as i64,
+            "the rejected direct write must leave the valid boundary unchanged"
+        );
+
+        cleanup(pool, &id).await;
+        cleanup_incident_ci_fixtures(pool, &ci_names).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_add_ci_at_boundary_commits_exactly_one_append() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let ci_names = (0..=super::MAX_INCIDENT_AFFECTED_CIS)
+            .map(|index| format!("incident-race-{suffix}-{index:03}"))
+            .collect::<Vec<_>>();
+        insert_incident_ci_fixtures(pool, &ci_names).await;
+
+        let initial_count = super::MAX_INCIDENT_AFFECTED_CIS - 1;
+        let ctx = make_incident_with_cis(&suffix, &ci_names[..initial_count]);
+        let id = ctx.incident_id.clone();
+        crate::repos::incident_contexts::insert(pool, &ctx)
+            .await
+            .expect("persist incident one slot below the cap");
+
+        let candidate_a = ci_names[initial_count].clone();
+        let candidate_b = ci_names[initial_count + 1].clone();
+        let (result_a, result_b) = tokio::join!(
+            super::incident_add_ci(
+                super::AuthExtractor(scoped_session("DEFRA")),
+                super::Path(id.clone()),
+                super::Json(super::IncidentAddCiRequest {
+                    ci_name: candidate_a.clone(),
+                    ci_type: "attacker-asserted-type".into(),
+                }),
+            ),
+            super::incident_add_ci(
+                super::AuthExtractor(scoped_session("DEFRA")),
+                super::Path(id.clone()),
+                super::Json(super::IncidentAddCiRequest {
+                    ci_name: candidate_b.clone(),
+                    ci_type: "attacker-asserted-type".into(),
+                }),
+            )
+        );
+        let results = [result_a, result_b];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "the locked repeated-add boundary must admit exactly one writer: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| error_status(result) == Some(super::StatusCode::CONFLICT))
+                .count(),
+            1,
+            "the writer that observes the full persisted state must receive 409"
+        );
+
+        let (persisted, _) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("reload boundary incident")
+            .expect("boundary incident remains visible");
+        assert_eq!(
+            persisted.affected_ci.len(),
+            super::MAX_INCIDENT_AFFECTED_CIS
+        );
+        assert_eq!(
+            persisted
+                .affected_ci
+                .iter()
+                .filter(|ci| ci.ci_name == candidate_a || ci.ci_name == candidate_b)
+                .count(),
+            1,
+            "no append may be lost or admitted beyond the cap"
+        );
+
+        cleanup(pool, &id).await;
+        cleanup_incident_ci_fixtures(pool, &ci_names).await;
     }
 }
 

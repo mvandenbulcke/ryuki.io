@@ -49,6 +49,13 @@ const RESTORE_SCAN_JOB_KIND: &str = "restore_overdue_scan_v2";
 const GOLDEN_IMAGE_SCAN_JOB_KIND: &str = "golden_image_stale_scan_v2";
 const SECRET_ROTATION_SCAN_JOB_KIND: &str = "secret_rotation_due_scan_v2";
 
+/// Physical certificate-expiry dispatcher protocol installed by migration 209.
+/// The v1 name is fenced so an old replica cannot execute the population-wide
+/// query while a v2 replica is advancing durable composite-key progress.
+const CERTIFICATE_SCAN_PROTOCOL_VERSION: i16 = 2;
+const CERTIFICATE_SCAN_JOB_KIND: &str = "certificate_expiry_scan_v2";
+const CERTIFICATE_SCAN_WINDOW_SECS: i64 = 30 * 86_400;
+
 /// Digest an untrusted legacy tuple with length framing. Only this bounded key
 /// reaches the global queue; raw malformed/oversized authority never does.
 fn restore_authority_quarantine_key(source_ci_key: &str, site: &str, environment: &str) -> String {
@@ -105,6 +112,34 @@ struct ScanProgress {
     cycle_cutoff: chrono::DateTime<chrono::Utc>,
 }
 
+/// Durable progress for one certificate-expiry cycle. Unlike the sidecar-backed
+/// population scans, certificates already have the exact indexed work order:
+/// `(valid_to, id)`. The epoch excludes concurrent enrollment/deadline changes,
+/// the fixed cutoff freezes classification, and the high-water tuple makes the
+/// active population's upper boundary explicit.
+#[derive(sqlx::FromRow)]
+struct CertificateScanProgress {
+    job_kind: String,
+    protocol_version: i16,
+    scan_epoch: bool,
+    cursor_valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    cursor_id: Option<uuid::Uuid>,
+    high_water_valid_to: chrono::DateTime<chrono::Utc>,
+    high_water_id: uuid::Uuid,
+    cycle_cutoff: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct CertificateScanRow {
+    id: uuid::Uuid,
+    common_name: String,
+    hostname: String,
+    service_type: String,
+    site: String,
+    valid_to: chrono::DateTime<chrono::Utc>,
+    status: String,
+}
+
 fn is_population_scan(job_kind: &str) -> bool {
     job_kind == RESTORE_SCAN_JOB_KIND
         || job_kind == GOLDEN_IMAGE_SCAN_JOB_KIND
@@ -115,6 +150,10 @@ fn is_legacy_population_scan(job_kind: &str) -> bool {
     job_kind == "restore_overdue_scan"
         || job_kind == "golden_image_stale_scan"
         || job_kind == "secret_rotation_due_scan"
+}
+
+fn is_certificate_scan(job_kind: &str) -> bool {
+    job_kind == CERTIFICATE_SCAN_JOB_KIND
 }
 
 /// Verify the database dispatcher version and mark this transaction as a v2
@@ -154,6 +193,48 @@ async fn admit_population_scan_protocol(
     if configured != POPULATION_SCAN_PROTOCOL_VERSION.to_string() {
         return Err(sqlx::Error::Protocol(
             "database refused the population scheduler protocol marker".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Admit only the versioned certificate-expiry dispatcher. Migration 209's
+/// trigger requires this marker before the schedule can advance, which makes a
+/// migration-first rollout fail closed on an old binary. The reverse ordering
+/// also fails closed because this binary refuses the persisted v1 name.
+async fn admit_certificate_scan_protocol(
+    tx: &mut Transaction<'_, Postgres>,
+    job_kind: &str,
+) -> Result<(), sqlx::Error> {
+    if job_kind == "certificate_expiry_scan" {
+        return Err(sqlx::Error::Protocol(
+            "certificate-expiry scheduler protocol v1 is fenced; migration 209 is required"
+                .to_string(),
+        ));
+    }
+    if !is_certificate_scan(job_kind) {
+        return Ok(());
+    }
+    let installed: i16 = sqlx::query_scalar(
+        "SELECT protocol_version FROM scheduler_protocol_versions \
+         WHERE component = 'certificate_expiry_scan'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if installed != CERTIFICATE_SCAN_PROTOCOL_VERSION {
+        return Err(sqlx::Error::Protocol(format!(
+            "certificate-expiry scheduler protocol mismatch: database={installed}, binary={CERTIFICATE_SCAN_PROTOCOL_VERSION}"
+        )));
+    }
+    let configured: String = sqlx::query_scalar(
+        "SELECT set_config('ryuki.scheduler_certificate_expiry_protocol', $1, true)",
+    )
+    .bind(CERTIFICATE_SCAN_PROTOCOL_VERSION.to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    if configured != CERTIFICATE_SCAN_PROTOCOL_VERSION.to_string() {
+        return Err(sqlx::Error::Protocol(
+            "database refused the certificate-expiry scheduler protocol marker".to_string(),
         ));
     }
     Ok(())
@@ -265,6 +346,229 @@ async fn finish_scan_progress(
             "population scan completed without its locked progress row".to_string(),
         ))
     }
+}
+
+async fn load_certificate_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+) -> Result<Option<CertificateScanProgress>, sqlx::Error> {
+    let progress: Option<CertificateScanProgress> = sqlx::query_as(
+        "SELECT job_kind, protocol_version, scan_epoch, cursor_valid_to, cursor_id, \
+                high_water_valid_to, high_water_id, cycle_cutoff \
+         FROM certificate_expiry_scan_progress \
+         WHERE schedule_id = $1 \
+         FOR UPDATE",
+    )
+    .bind(schedule_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match progress {
+        Some(progress)
+            if progress.job_kind == job_kind
+                && progress.protocol_version == CERTIFICATE_SCAN_PROTOCOL_VERSION =>
+        {
+            Ok(Some(progress))
+        }
+        Some(_) => {
+            sqlx::query("DELETE FROM certificate_expiry_scan_progress WHERE schedule_id = $1")
+                .bind(schedule_id)
+                .execute(&mut **tx)
+                .await?;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Start a cycle from one database statement so its clock cutoff, active epoch,
+/// and greatest `(valid_to, id)` tuple describe the same drained population.
+async fn start_certificate_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+) -> Result<Option<CertificateScanProgress>, sqlx::Error> {
+    // Drain and briefly fence certificate writers while the first page fixes
+    // the active population boundary. Later inserts/deadline changes are routed
+    // to the next epoch by migration 209's trigger and do not need this lock.
+    sqlx::query("LOCK TABLE certificates IN SHARE MODE")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query_as(
+        "WITH scan_state AS MATERIALIZED ( \
+             SELECT active_epoch AS scan_epoch \
+             FROM certificate_expiry_scan_state \
+             WHERE singleton \
+         ), cycle_clock AS MATERIALIZED ( \
+             SELECT clock_timestamp() AS cycle_cutoff \
+         ), high_water AS MATERIALIZED ( \
+             SELECT certificate.valid_to, certificate.id \
+             FROM certificates AS certificate \
+             CROSS JOIN scan_state \
+             WHERE octet_length(certificate.site) BETWEEN 1 AND 32 \
+               AND certificate.valid_to >= TIMESTAMPTZ '0001-01-01 00:00:00+00' \
+               AND certificate.valid_to < TIMESTAMPTZ '10000-01-01 00:00:00+00' \
+               AND certificate.expiry_scan_epoch = scan_state.scan_epoch \
+             ORDER BY certificate.valid_to DESC, certificate.id DESC \
+             LIMIT 1 \
+         ) \
+         INSERT INTO certificate_expiry_scan_progress ( \
+             schedule_id, job_kind, protocol_version, scan_epoch, \
+             high_water_valid_to, high_water_id, cycle_cutoff \
+         ) \
+         SELECT $1, $2, $3, scan_state.scan_epoch, \
+                high_water.valid_to, high_water.id, \
+                cycle_clock.cycle_cutoff \
+         FROM high_water CROSS JOIN cycle_clock CROSS JOIN scan_state \
+         RETURNING job_kind, protocol_version, scan_epoch, cursor_valid_to, cursor_id, \
+                   high_water_valid_to, high_water_id, cycle_cutoff",
+    )
+    .bind(schedule_id)
+    .bind(job_kind)
+    .bind(CERTIFICATE_SCAN_PROTOCOL_VERSION)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+async fn certificate_scan_page(
+    tx: &mut Transaction<'_, Postgres>,
+    progress: &CertificateScanProgress,
+    limit: i64,
+) -> Result<Vec<CertificateScanRow>, sqlx::Error> {
+    if !(1..=POPULATION_SCAN_BATCH).contains(&limit) {
+        return Err(sqlx::Error::Protocol(format!(
+            "certificate-expiry scan page limit must be within 1..={POPULATION_SCAN_BATCH}"
+        )));
+    }
+    match (progress.cursor_valid_to, progress.cursor_id) {
+        (None, None) => {
+            sqlx::query_as(
+                "WITH candidates AS MATERIALIZED ( \
+                     SELECT id \
+                     FROM certificates \
+                     WHERE octet_length(site) BETWEEN 1 AND 32 \
+                       AND valid_to >= TIMESTAMPTZ '0001-01-01 00:00:00+00' \
+                       AND valid_to < TIMESTAMPTZ '10000-01-01 00:00:00+00' \
+                       AND expiry_scan_epoch = $1 \
+                       AND ROW(valid_to, id) <= ROW($2, $3) \
+                     ORDER BY valid_to ASC, id ASC \
+                     LIMIT $4 \
+                     FOR UPDATE \
+                 ), claimed AS ( \
+                     UPDATE certificates AS certificate \
+                     SET expiry_scan_epoch = NOT $1 \
+                     FROM candidates \
+                     WHERE certificate.id = candidates.id \
+                       AND certificate.expiry_scan_epoch = $1 \
+                     RETURNING certificate.id, certificate.common_name, \
+                               certificate.hostname, certificate.service_type, \
+                               certificate.site, certificate.valid_to, certificate.status \
+                 ) \
+                 SELECT id, common_name, hostname, service_type, site, valid_to, status \
+                 FROM claimed ORDER BY valid_to ASC, id ASC",
+            )
+            .bind(progress.scan_epoch)
+            .bind(progress.high_water_valid_to)
+            .bind(progress.high_water_id)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+        }
+        (Some(cursor_valid_to), Some(cursor_id)) => {
+            if (cursor_valid_to, cursor_id) > (progress.high_water_valid_to, progress.high_water_id)
+            {
+                return Err(sqlx::Error::Protocol(
+                    "certificate-expiry scan cursor exceeds its high-water tuple".to_string(),
+                ));
+            }
+            sqlx::query_as(
+                "WITH candidates AS MATERIALIZED ( \
+                     SELECT id \
+                     FROM certificates \
+                     WHERE octet_length(site) BETWEEN 1 AND 32 \
+                       AND valid_to >= TIMESTAMPTZ '0001-01-01 00:00:00+00' \
+                       AND valid_to < TIMESTAMPTZ '10000-01-01 00:00:00+00' \
+                       AND expiry_scan_epoch = $1 \
+                       AND ROW(valid_to, id) > ROW($2, $3) \
+                       AND ROW(valid_to, id) <= ROW($4, $5) \
+                     ORDER BY valid_to ASC, id ASC \
+                     LIMIT $6 \
+                     FOR UPDATE \
+                 ), claimed AS ( \
+                     UPDATE certificates AS certificate \
+                     SET expiry_scan_epoch = NOT $1 \
+                     FROM candidates \
+                     WHERE certificate.id = candidates.id \
+                       AND certificate.expiry_scan_epoch = $1 \
+                     RETURNING certificate.id, certificate.common_name, \
+                               certificate.hostname, certificate.service_type, \
+                               certificate.site, certificate.valid_to, certificate.status \
+                 ) \
+                 SELECT id, common_name, hostname, service_type, site, valid_to, status \
+                 FROM claimed ORDER BY valid_to ASC, id ASC",
+            )
+            .bind(progress.scan_epoch)
+            .bind(cursor_valid_to)
+            .bind(cursor_id)
+            .bind(progress.high_water_valid_to)
+            .bind(progress.high_water_id)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+        }
+        _ => Err(sqlx::Error::Protocol(
+            "certificate-expiry scan cursor tuple is incomplete".to_string(),
+        )),
+    }
+}
+
+async fn advance_certificate_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+    valid_to: chrono::DateTime<chrono::Utc>,
+    id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    let _: uuid::Uuid = sqlx::query_scalar(
+        "UPDATE certificate_expiry_scan_progress \
+         SET cursor_valid_to = $3, cursor_id = $4, updated_at = clock_timestamp() \
+         WHERE schedule_id = $1 AND job_kind = $2 \
+           AND (cursor_valid_to IS NULL OR ROW(cursor_valid_to, cursor_id) < ROW($3, $4)) \
+           AND ROW($3, $4) <= ROW(high_water_valid_to, high_water_id) \
+         RETURNING cursor_id",
+    )
+    .bind(schedule_id)
+    .bind(job_kind)
+    .bind(valid_to)
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn finish_certificate_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+) -> Result<(), sqlx::Error> {
+    let _: bool = sqlx::query_scalar(
+        "WITH finished AS ( \
+             DELETE FROM certificate_expiry_scan_progress \
+             WHERE schedule_id = $1 AND job_kind = $2 \
+             RETURNING scan_epoch \
+         ) \
+         UPDATE certificate_expiry_scan_state AS state \
+         SET active_epoch = NOT finished.scan_epoch, \
+             updated_at = clock_timestamp() \
+         FROM finished \
+         WHERE state.singleton AND state.active_epoch = finished.scan_epoch \
+         RETURNING state.active_epoch",
+    )
+    .bind(schedule_id)
+    .bind(job_kind)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// A schedule as exposed by the read API. No secrets live on a schedule, so the
@@ -1634,37 +1938,34 @@ async fn run_job(
                 )),
             ))
         }
-        "certificate_expiry_scan" => {
-            // Safe-internal write (run-3): surface TLS certs within (or past) the 30-day
-            // actionable window as deduped shift_queue work — mirrors legal_hold_expiry_scan.
-            // Reads certificates, writes only our own shift_queue — NO cert mutation (renewal /
-            // revoke stays a deliberate action). `certificates` holds only cert METADATA (no
-            // private key), so every surfaced field is safe for the execute-tier queue.
-            #[derive(sqlx::FromRow)]
-            struct CertScanRow {
-                id: String,
-                common_name: String,
-                hostname: String,
-                service_type: String,
-                site: String,
-                valid_to: chrono::DateTime<chrono::Utc>,
-                status: String,
-            }
-            // Predicate on valid_to (NOT the un-synced status column): a genuinely-past cert is
-            // surfaced even if its stored status is stale.
-            let rows: Vec<CertScanRow> = sqlx::query_as(
-                "SELECT id::text, common_name, hostname, service_type, site, valid_to, status \
-                 FROM certificates WHERE valid_to <= NOW() + INTERVAL '30 days' ORDER BY valid_to",
-            )
-            .fetch_all(&mut **tx)
-            .await?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let soon_window_ms: i64 = 30 * 86_400_000;
+        "certificate_expiry_scan_v2" => {
+            // Safe-internal write (R12-C001): claim one fixed `(valid_to, id)`
+            // keyset page per invocation. Migration 209's epoch-leading index
+            // bounds examined and returned rows, while its trigger routes new
+            // enrollments/deadline mutations to the next cycle. The epoch claim,
+            // queue effects, and cursor movement share this transaction, so a
+            // rollback replays the exact page. No provider call is made.
+            let page_started = std::time::Instant::now();
+            let progress = match load_certificate_scan_progress(tx, schedule_id, job_kind).await? {
+                Some(progress) => progress,
+                None => {
+                    let Some(progress) =
+                        start_certificate_scan_progress(tx, schedule_id, job_kind).await?
+                    else {
+                        return Ok((
+                            "succeeded".to_string(),
+                            Some("enqueued 0 expiring/expired certificate(s)".to_string()),
+                        ));
+                    };
+                    progress
+                }
+            };
+            let rows = certificate_scan_page(tx, &progress, POPULATION_SCAN_BATCH).await?;
+            let now_ms = progress.cycle_cutoff.timestamp_millis();
+            let soon_window_ms = CERTIFICATE_SCAN_WINDOW_SECS * 1_000;
             let mut enqueued: u64 = 0;
             for row in &rows {
-                if row.id.trim().is_empty() {
-                    continue;
-                }
+                let certificate_id = row.id.to_string();
                 let verdict = ryuki_engine::certificate_lifecycle::classify_certificate_expiry(
                     row.valid_to.timestamp_millis(),
                     now_ms,
@@ -1693,7 +1994,7 @@ async fn run_job(
                     row.valid_to.to_rfc3339(),
                 );
                 let metadata = serde_json::json!({
-                    "source_ci_key": row.id,
+                    "source_ci_key": &certificate_id,
                     "common_name": row.common_name,
                     "hostname": row.hostname,
                     "service_type": row.service_type,
@@ -1706,7 +2007,7 @@ async fn run_job(
                 enqueued += crate::repos::shift_queue::enqueue_if_absent(
                     &mut **tx,
                     crate::repos::shift_queue::CERTIFICATE_EXPIRY_ITEM_TYPE,
-                    &row.id,
+                    &certificate_id,
                     ShiftQueueAuthority::Resource {
                         site: &row.site,
                         environment: None,
@@ -1717,9 +2018,8 @@ async fn run_job(
                     &metadata,
                 )
                 .await?;
-                // REFRESH the OPEN item to the CURRENT state so an expiring-soon item upgrades to
-                // expired (and P2→P1) on a later scan — enqueue_if_absent's ON CONFLICT DO NOTHING
-                // would otherwise leave the first-seen label/priority stale (codex).
+                // Refresh the open item to the cycle's fixed state so a later
+                // cycle upgrades expiring-soon/P2 to expired/P1 in place.
                 sqlx::query(
                     "UPDATE shift_queue \
                      SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
@@ -1728,7 +2028,7 @@ async fn run_job(
                        AND visibility_kind = 'resource' \
                        AND source_ci_key = $1 AND site = $6 AND environment IS NULL",
                 )
-                .bind(&row.id)
+                .bind(&certificate_id)
                 .bind(&title)
                 .bind(&description)
                 .bind(priority)
@@ -1737,6 +2037,45 @@ async fn run_job(
                 .execute(&mut **tx)
                 .await?;
             }
+
+            let continuation = rows.len() == POPULATION_SCAN_BATCH as usize
+                && rows.last().is_some_and(|last| {
+                    (last.valid_to, last.id)
+                        < (progress.high_water_valid_to, progress.high_water_id)
+                });
+            if continuation {
+                let last = rows
+                    .last()
+                    .expect("a full positive-sized certificate page has a last row");
+                advance_certificate_scan_progress(
+                    tx,
+                    schedule_id,
+                    job_kind,
+                    last.valid_to,
+                    last.id,
+                )
+                .await?;
+            } else {
+                finish_certificate_scan_progress(tx, schedule_id, job_kind).await?;
+            }
+            tracing::info!(
+                schedule = %schedule_id,
+                job_kind = %job_kind,
+                rows_scanned = rows.len(),
+                enqueue_attempt_ceiling = rows.len(),
+                inserted_items = enqueued,
+                scan_epoch = progress.scan_epoch,
+                high_water_valid_to = %progress.high_water_valid_to,
+                high_water_id = %progress.high_water_id,
+                cursor_valid_to = ?rows
+                    .last()
+                    .map(|row| row.valid_to)
+                    .or(progress.cursor_valid_to),
+                cursor_id = ?rows.last().map(|row| row.id).or(progress.cursor_id),
+                continuation,
+                page_duration_ms = page_started.elapsed().as_millis() as u64,
+                "bounded certificate-expiry page completed"
+            );
             Ok((
                 "succeeded".to_string(),
                 Some(format!(
@@ -2097,9 +2436,9 @@ async fn advance_schedule(
     tx: &mut Transaction<'_, Postgres>,
     schedule_id: &str,
     interval_secs: i64,
-    continue_population_scan: bool,
+    continue_bounded_scan: bool,
 ) -> Result<(), sqlx::Error> {
-    let bounded = if continue_population_scan {
+    let bounded = if continue_bounded_scan {
         POPULATION_SCAN_CONTINUATION_SECS
     } else {
         interval_secs.clamp(
@@ -2132,15 +2471,19 @@ async fn run_and_record(
     // A full bounded page leaves its locked progress row in place. Record the
     // page and schedule a prompt continuation in the SAME transaction. A
     // short/empty page deleted the row, so the configured cadence resumes.
-    let continue_population_scan = if is_population_scan(&sched.job_kind) {
+    let continue_bounded_scan = if is_population_scan(&sched.job_kind) {
         load_scan_progress(tx, &sched.id, &sched.job_kind)
+            .await?
+            .is_some()
+    } else if is_certificate_scan(&sched.job_kind) {
+        load_certificate_scan_progress(tx, &sched.id, &sched.job_kind)
             .await?
             .is_some()
     } else {
         false
     };
     insert_execution(tx, &sched.id, &sched.job_kind, &status, &detail).await?;
-    advance_schedule(tx, &sched.id, sched.interval_secs, continue_population_scan).await?;
+    advance_schedule(tx, &sched.id, sched.interval_secs, continue_bounded_scan).await?;
     Ok(())
 }
 
@@ -2175,6 +2518,7 @@ async fn run_due_schedule(
     };
 
     admit_population_scan_protocol(&mut tx, &sched.job_kind).await?;
+    admit_certificate_scan_protocol(&mut tx, &sched.job_kind).await?;
     let mut sp = tx.begin().await?;
     match run_and_record(&mut sp, &sched).await {
         Ok(()) => {
@@ -2253,6 +2597,7 @@ pub async fn list_schedules(
                     WHEN 'restore_overdue_scan_v2' THEN 'restore_overdue_scan' \
                     WHEN 'golden_image_stale_scan_v2' THEN 'golden_image_stale_scan' \
                     WHEN 'secret_rotation_due_scan_v2' THEN 'secret_rotation_due_scan' \
+                    WHEN 'certificate_expiry_scan_v2' THEN 'certificate_expiry_scan' \
                     ELSE job_kind \
                 END AS job_kind, \
                 interval_secs, enabled, next_run_at, last_run_at \
@@ -2282,6 +2627,7 @@ pub async fn list_recent_executions(
                     WHEN 'restore_overdue_scan_v2' THEN 'restore_overdue_scan' \
                     WHEN 'golden_image_stale_scan_v2' THEN 'golden_image_stale_scan' \
                     WHEN 'secret_rotation_due_scan_v2' THEN 'secret_rotation_due_scan' \
+                    WHEN 'certificate_expiry_scan_v2' THEN 'certificate_expiry_scan' \
                     ELSE job_kind \
                 END AS job_kind, \
                 status, detail, started_at, finished_at \
@@ -3549,6 +3895,54 @@ mod db_tests {
     /// tests, breaking the per-tick count assertions).
     const RESTORE_SCAN_SEED_ID: &str = "55555555-5555-4555-8555-555555555555";
 
+    /// Seed the typed CMDB/restore-point authority required for a Verified
+    /// restore fixture. Malformed legacy keys remain deliberately unbound and
+    /// are inserted as Quarantined below.
+    async fn seed_restore_source_authority(
+        pool: &PgPool,
+        source_ci_key: &str,
+    ) -> Option<(uuid::Uuid, uuid::Uuid)> {
+        if !ryuki_engine::backup_engine::is_canonical_restore_authority_component(source_ci_key) {
+            return None;
+        }
+
+        sqlx::query(
+            "INSERT INTO configuration_items \
+             (ci_name, ci_type, criticality, site, environment, owner) \
+             VALUES ($1, 'Server', 'High', 'GBLON', 'production', \
+                     'scheduler-restore-authority-test') \
+             ON CONFLICT (ci_name) DO NOTHING",
+        )
+        .bind(source_ci_key)
+        .execute(pool)
+        .await
+        .expect("seed scheduler restore source CI");
+        let configuration_item_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM configuration_items \
+             WHERE ci_name = $1 AND site = 'GBLON' AND environment = 'production'",
+        )
+        .bind(source_ci_key)
+        .fetch_one(pool)
+        .await
+        .expect("scheduler restore source CI has canonical scope");
+        let restore_point_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO backup_restore_points \
+             (configuration_item_id, captured_at, status, source_system, source_reference) \
+             VALUES ($1, '2000-01-01T00:00:00Z'::timestamptz, 'Available', \
+                     'scheduler-test', $2) \
+             ON CONFLICT (configuration_item_id, captured_at) DO UPDATE \
+             SET status = 'Available' \
+             RETURNING id",
+        )
+        .bind(configuration_item_id)
+        .bind(format!("scheduler-test:{source_ci_key}"))
+        .fetch_one(pool)
+        .await
+        .expect("seed scheduler restore point");
+
+        Some((configuration_item_id, restore_point_id))
+    }
+
     /// Seed one restore_request for `source_ci_key` with the given status and an
     /// `updated_at` backdated by `age_secs` seconds. `updated_at` is what the
     /// recency aggregate uses for a success-state row, so backdating it controls
@@ -3556,6 +3950,7 @@ mod db_tests {
     async fn seed_restore_request(pool: &PgPool, source_ci_key: &str, status: &str, age_secs: i64) {
         let canonical =
             ryuki_engine::backup_engine::is_canonical_restore_authority_component(source_ci_key);
+        let source_authority = seed_restore_source_authority(pool, source_ci_key).await;
         let approved_or_later = matches!(
             status,
             "Approved" | "Locked" | "Executed" | "Verified" | "Completed" | "Failed"
@@ -3572,9 +3967,12 @@ mod db_tests {
             "INSERT INTO restore_requests \
              (source_ci_key, restore_type, restore_point, target_site, \
               target_environment, owner, status, updated_at, approver, metadata, \
-              authority_state, authority_reason) \
-             VALUES ($1, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $2, \
-                     NOW() - make_interval(secs => $3::double precision), $4, $5, $6, $7)",
+              authority_state, authority_reason, source_configuration_item_id, \
+              restore_point_id, source_site, source_environment, \
+              source_scope_provenance) \
+             VALUES ($1, 'FullVm', $8, 'GBLON', 'production', 'sys', $2, \
+                     NOW() - make_interval(secs => $3::double precision), $4, $5, $6, $7, \
+                     $9, $10, 'GBLON', 'production', $11)",
         )
         .bind(source_ci_key)
         .bind(status)
@@ -3583,6 +3981,18 @@ mod db_tests {
         .bind(metadata)
         .bind(if canonical { "Verified" } else { "Quarantined" })
         .bind((!canonical).then_some("test-invalid-restore-authority"))
+        .bind(
+            canonical
+                .then_some("2000-01-01T00:00:00Z")
+                .unwrap_or("rp-1"),
+        )
+        .bind(source_authority.map(|authority| authority.0))
+        .bind(source_authority.map(|authority| authority.1))
+        .bind(if canonical {
+            "backup-restore-point"
+        } else {
+            "unresolved-legacy"
+        })
         .execute(pool)
         .await
         .expect("seed restore request");
@@ -3758,6 +4168,102 @@ mod db_tests {
             .all(|row| row.source_ci_key != after_high_water));
 
         tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_scheduler_replan_supersedes_quarantined_history_without_erasing_it() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let key = format!("restore-replan-authority-{}", uuid::Uuid::new_v4());
+        let legacy_id = uuid::Uuid::new_v4();
+        let cursor = crate::repos::restore_requests::scheduler_scan_high_water(pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (id, source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status, updated_at) \
+             VALUES ($1, $2, 'FullVm', 'untrusted-legacy-point', 'GBLON', \
+                     'production', 'legacy-writer', 'Draft', \
+                     clock_timestamp() - INTERVAL '1 day')",
+        )
+        .bind(legacy_id)
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("seed quarantined legacy restore history");
+        let high_water = crate::repos::restore_requests::scheduler_scan_high_water(pool)
+            .await
+            .unwrap();
+        let before = crate::repos::restore_requests::scheduler_scan_page(
+            pool,
+            cursor,
+            high_water,
+            POPULATION_SCAN_BATCH,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source_ci_key == key)
+        .expect("legacy authority tuple is in the bounded page");
+        assert!(before.authority_quarantined);
+
+        seed_restore_request(pool, &key, "Draft", 0).await;
+        let replanned = crate::repos::restore_requests::scheduler_scan_page(
+            pool,
+            cursor,
+            high_water,
+            POPULATION_SCAN_BATCH,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source_ci_key == key)
+        .expect("replanned authority tuple retains its immutable scan sequence");
+        assert!(
+            !replanned.authority_quarantined,
+            "a newer independently verified plan supersedes, but does not erase, legacy evidence"
+        );
+
+        let stale_transition =
+            sqlx::query("UPDATE restore_requests SET status = 'Failed' WHERE id = $1")
+                .bind(legacy_id)
+                .execute(pool)
+                .await;
+        assert!(
+            stale_transition.is_err(),
+            "the retained quarantined request itself never regains execution authority"
+        );
+
+        sqlx::query(
+            "UPDATE backup_restore_points SET status = 'Quarantined' \
+             WHERE configuration_item_id = ( \
+                 SELECT id FROM configuration_items WHERE ci_name = $1 \
+             )",
+        )
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("revoke the latest restore-point authority");
+        let revoked = crate::repos::restore_requests::scheduler_scan_page(
+            pool,
+            cursor,
+            high_water,
+            POPULATION_SCAN_BATCH,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source_ci_key == key)
+        .expect("revoked authority tuple remains visible");
+        assert!(
+            revoked.authority_quarantined,
+            "scheduler revalidates the latest plan's current source authority"
+        );
     }
 
     /// C184 durable-summary regression: concurrent/direct legacy writers for
@@ -5058,6 +5564,7 @@ mod db_tests {
     ) {
         let canonical =
             ryuki_engine::backup_engine::is_canonical_restore_authority_component(source_ci_key);
+        let source_authority = seed_restore_source_authority(pool, source_ci_key).await;
         let approved_or_later = matches!(
             status,
             "Approved" | "Locked" | "Executed" | "Verified" | "Completed" | "Failed"
@@ -5074,9 +5581,12 @@ mod db_tests {
             "INSERT INTO restore_requests \
              (id, source_ci_key, restore_type, restore_point, target_site, \
               target_environment, owner, status, updated_at, created_at, approver, \
-              metadata, authority_state, authority_reason) \
-             VALUES ($1::uuid, $2, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $3, \
-                     $4, NOW() - make_interval(secs => $5::double precision), $6, $7, $8, $9)",
+              metadata, authority_state, authority_reason, source_configuration_item_id, \
+              restore_point_id, source_site, source_environment, \
+              source_scope_provenance) \
+             VALUES ($1::uuid, $2, 'FullVm', $10, 'GBLON', 'production', 'sys', $3, \
+                     $4, NOW() - make_interval(secs => $5::double precision), $6, $7, $8, $9, \
+                     $11, $12, 'GBLON', 'production', $13)",
         )
         .bind(id)
         .bind(source_ci_key)
@@ -5087,6 +5597,18 @@ mod db_tests {
         .bind(metadata)
         .bind(if canonical { "Verified" } else { "Quarantined" })
         .bind((!canonical).then_some("test-invalid-restore-authority"))
+        .bind(
+            canonical
+                .then_some("2000-01-01T00:00:00Z")
+                .unwrap_or("rp-1"),
+        )
+        .bind(source_authority.map(|authority| authority.0))
+        .bind(source_authority.map(|authority| authority.1))
+        .bind(if canonical {
+            "backup-restore-point"
+        } else {
+            "unresolved-legacy"
+        })
         .execute(pool)
         .await
         .expect("seed restore request (explicit id + timestamps)");
@@ -5103,6 +5625,25 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
+        sqlx::query(
+            "DELETE FROM backup_restore_points \
+             WHERE configuration_item_id IN ( \
+                 SELECT id FROM configuration_items \
+                 WHERE ci_name = $1 AND owner = 'scheduler-restore-authority-test' \
+             )",
+        )
+        .bind(source_ci_key)
+        .execute(pool)
+        .await
+        .ok();
+        sqlx::query(
+            "DELETE FROM configuration_items \
+             WHERE ci_name = $1 AND owner = 'scheduler-restore-authority-test'",
+        )
+        .bind(source_ci_key)
+        .execute(pool)
+        .await
+        .ok();
         sqlx::query("DELETE FROM schedules WHERE id = $1")
             .bind(sched_id)
             .execute(pool)
@@ -5921,8 +6462,74 @@ mod db_tests {
             .ok();
     }
 
+    #[test]
+    fn migration_209_keeps_a_finite_lock_and_exact_keyset_contract() {
+        let migration =
+            include_str!("../../../migrations/209_certificate_expiry_scan_progress.sql");
+        let index_migration = include_str!("../../../migrations/172_certificate_query_bounds.sql");
+        assert!(migration.contains("SET LOCAL lock_timeout = '30s';"));
+        assert!(migration.contains("certificate_expiry_scan_v2"));
+        assert!(migration.contains("cursor_valid_to"));
+        assert!(migration.contains("high_water_valid_to"));
+        assert!(migration.contains("expiry_scan_epoch, valid_to ASC, id ASC"));
+        assert!(migration.contains("ROW(cursor_valid_to, cursor_id)"));
+        assert!(migration.contains("valid_to >= TIMESTAMPTZ '0001-01-01 00:00:00+00'"));
+        assert!(migration.contains("valid_to < TIMESTAMPTZ '10000-01-01 00:00:00+00'"));
+        assert!(index_migration.contains("ON certificates (valid_to ASC, id ASC)"));
+        assert!(!migration.contains("lock_timeout = '0'"));
+    }
+
     #[tokio::test]
-    async fn migration_130_is_idempotent_and_index_dedups() {
+    async fn certificate_scan_rejects_non_finite_deadlines() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        for valid_to in ["infinity", "-infinity"] {
+            let insert = sqlx::query(
+                "INSERT INTO certificates \
+                 (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+                 VALUES ($1, 'CN=non-finite', TIMESTAMPTZ '2026-01-01 00:00:00+00', \
+                         $2::timestamptz, 'IIS', 'non-finite.test', 'GBLON', 'Active')",
+            )
+            .bind(format!("non-finite-{}", uuid::Uuid::new_v4()))
+            .bind(valid_to)
+            .execute(pool)
+            .await;
+            assert!(
+                insert.is_err(),
+                "{valid_to} cannot enter the Chrono-decoded certificate scan population"
+            );
+        }
+    }
+
+    async fn run_complete_certificate_cycle(pool: &'static PgPool, schedule_id: &str) {
+        const MAX_TEST_PAGES: usize = 10_000;
+        for _page in 0..MAX_TEST_PAGES {
+            let mut tx = pool.begin().await.unwrap();
+            admit_certificate_scan_protocol(&mut tx, CERTIFICATE_SCAN_JOB_KIND)
+                .await
+                .unwrap();
+            let (status, _) = run_job(&mut tx, schedule_id, CERTIFICATE_SCAN_JOB_KIND)
+                .await
+                .unwrap();
+            assert_eq!(status, "succeeded");
+            let continuation =
+                load_certificate_scan_progress(&mut tx, schedule_id, CERTIFICATE_SCAN_JOB_KIND)
+                    .await
+                    .unwrap()
+                    .is_some();
+            tx.commit().await.unwrap();
+            if !continuation {
+                return;
+            }
+        }
+        panic!("certificate scan exceeded the {MAX_TEST_PAGES}-page test ceiling");
+    }
+
+    #[tokio::test]
+    async fn certificate_v2_migration_seed_and_index_dedup_hold() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -5930,7 +6537,7 @@ mod db_tests {
         };
         sqlx::query(
             "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
-             VALUES ($1, 'Certificate expiry scan (all certs)', 'certificate_expiry_scan', \
+             VALUES ($1, 'Certificate expiry scan (all certs)', 'certificate_expiry_scan_v2', \
                      86400, TRUE, NOW(), 'system') \
              ON CONFLICT (id) DO NOTHING",
         )
@@ -5948,7 +6555,7 @@ mod db_tests {
             .await
             .unwrap();
         assert_eq!(name, "Certificate expiry scan (all certs)", "seed name");
-        assert_eq!(kind, "certificate_expiry_scan", "seed job_kind");
+        assert_eq!(kind, CERTIFICATE_SCAN_JOB_KIND, "seed job_kind");
         assert_eq!(interval, 86400, "seed interval_secs (daily)");
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
@@ -5990,6 +6597,485 @@ mod db_tests {
     }
 
     #[tokio::test]
+    async fn certificate_scan_protocol_fences_legacy_dispatchers() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut binary_first = pool.begin().await.unwrap();
+        assert!(matches!(
+            admit_certificate_scan_protocol(&mut binary_first, "certificate_expiry_scan").await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        binary_first.rollback().await.unwrap();
+
+        let legacy_id = format!("sched-test-cert-v1-{}", uuid::Uuid::new_v4().simple());
+        let legacy_insert = sqlx::query(
+            "INSERT INTO schedules \
+             (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'legacy certificate scan', 'certificate_expiry_scan', \
+                     86400, TRUE, clock_timestamp())",
+        )
+        .bind(&legacy_id)
+        .execute(pool)
+        .await;
+        assert!(legacy_insert.is_err(), "the v1 job kind must stay fenced");
+
+        let schedule_id = format!("sched-test-cert-v2-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO schedules \
+             (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'certificate protocol fence', 'certificate_expiry_scan_v2', \
+                     86400, FALSE, clock_timestamp() + INTERVAL '1 hour')",
+        )
+        .bind(&schedule_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let unmarked_advance = sqlx::query(
+            "UPDATE schedules SET next_run_at = clock_timestamp() + INTERVAL '2 hours' \
+             WHERE id = $1",
+        )
+        .bind(&schedule_id)
+        .execute(pool)
+        .await;
+        assert!(
+            unmarked_advance.is_err(),
+            "an old scheduler cannot advance v2 certificate work"
+        );
+
+        let mut v2 = pool.begin().await.unwrap();
+        admit_certificate_scan_protocol(&mut v2, CERTIFICATE_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE schedules SET next_run_at = clock_timestamp() + INTERVAL '3 hours' \
+             WHERE id = $1",
+        )
+        .bind(&schedule_id)
+        .execute(&mut *v2)
+        .await
+        .expect("a v2-marked transaction may advance its schedule");
+        v2.rollback().await.unwrap();
+
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&schedule_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_certificate_ticks_commit_only_one_claimed_page() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(CERT_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let schedule_id = format!("sched-cert-race-{suffix}");
+        let certificate_id = seed_certificate(pool, "1900-01-01T00:00:00Z", "Active").await;
+        sqlx::query(
+            "INSERT INTO schedules \
+             (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'concurrent certificate page', 'certificate_expiry_scan_v2', \
+                     86400, TRUE, TIMESTAMPTZ '1900-01-01 00:00:00+00')",
+        )
+        .bind(&schedule_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let mut left_connection = pool.acquire().await.unwrap();
+        let mut right_connection = pool.acquire().await.unwrap();
+        let left_hint = DueSchedule {
+            id: schedule_id.clone(),
+            job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
+            interval_secs: 86_400,
+        };
+        let right_hint = DueSchedule {
+            id: schedule_id.clone(),
+            job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
+            interval_secs: 86_400,
+        };
+        let (left, right) = tokio::join!(
+            run_due_schedule(&mut left_connection, &left_hint),
+            run_due_schedule(&mut right_connection, &right_hint)
+        );
+        left.unwrap();
+        right.unwrap();
+        let executions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_executions WHERE schedule_id = $1")
+                .bind(&schedule_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            executions, 1,
+            "the transaction-scoped leader and schedule lock admit one page"
+        );
+        let queue_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'certificate-expiring' AND source_ci_key = $1",
+        )
+        .bind(&certificate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            queue_items, 1,
+            "the racing tick cannot duplicate the page effect"
+        );
+
+        let continuation: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM certificate_expiry_scan_progress WHERE schedule_id = $1)",
+        )
+        .bind(&schedule_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if continuation {
+            run_complete_certificate_cycle(pool, &schedule_id).await;
+        }
+        cleanup_cert(pool, &certificate_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&schedule_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(CERT_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn certificate_page_uses_strict_valid_to_id_boundaries_and_hard_limit() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let scan_epoch: bool = sqlx::query_scalar(
+            "SELECT active_epoch FROM certificate_expiry_scan_state WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        let valid_to = chrono::Utc::now() - chrono::Duration::days(7);
+        let ids = [
+            uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-000000000001").unwrap(),
+            uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-000000000002").unwrap(),
+            uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-000000000003").unwrap(),
+        ];
+        sqlx::query("DELETE FROM certificates WHERE id IN ($1, $2, $3)")
+            .bind(ids[0])
+            .bind(ids[1])
+            .bind(ids[2])
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for id in ids {
+            sqlx::query(
+                "INSERT INTO certificates \
+                 (id, common_name, subject, valid_from, valid_to, service_type, \
+                  hostname, site, status) \
+                 VALUES ($1, $2, 'CN=page-boundary', $3 - INTERVAL '1 year', $3, \
+                         'IIS', 'page-boundary.test', 'GBLON', 'Active')",
+            )
+            .bind(id)
+            .bind(format!("page-boundary-{id}"))
+            .bind(valid_to)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        let cutoff: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO certificate_expiry_scan_progress \
+             (schedule_id, job_kind, protocol_version, scan_epoch, \
+              high_water_valid_to, high_water_id, cycle_cutoff) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(CERT_SCAN_SEED_ID)
+        .bind(CERTIFICATE_SCAN_JOB_KIND)
+        .bind(CERTIFICATE_SCAN_PROTOCOL_VERSION)
+        .bind(scan_epoch)
+        .bind(valid_to)
+        .bind(ids[2])
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        admit_certificate_scan_protocol(&mut tx, CERTIFICATE_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        let first_progress = CertificateScanProgress {
+            job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
+            protocol_version: CERTIFICATE_SCAN_PROTOCOL_VERSION,
+            scan_epoch,
+            cursor_valid_to: Some(valid_to - chrono::Duration::microseconds(1)),
+            cursor_id: Some(uuid::Uuid::nil()),
+            high_water_valid_to: valid_to,
+            high_water_id: ids[2],
+            cycle_cutoff: cutoff,
+        };
+        let first = certificate_scan_page(&mut tx, &first_progress, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ids[..2],
+            "same-deadline rows use UUID as a strict stable tie-breaker"
+        );
+        let second_progress = CertificateScanProgress {
+            job_kind: CERTIFICATE_SCAN_JOB_KIND.to_string(),
+            protocol_version: CERTIFICATE_SCAN_PROTOCOL_VERSION,
+            scan_epoch,
+            cursor_valid_to: Some(valid_to),
+            cursor_id: Some(ids[1]),
+            high_water_valid_to: valid_to,
+            high_water_id: ids[2],
+            cycle_cutoff: cutoff,
+        };
+        let second = certificate_scan_page(&mut tx, &second_progress, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![ids[2]],
+            "the next page resumes strictly after the committed composite cursor"
+        );
+        assert!(matches!(
+            certificate_scan_page(&mut tx, &first_progress, 0).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            certificate_scan_page(&mut tx, &first_progress, POPULATION_SCAN_BATCH + 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn certificate_page_is_atomic_and_epoch_defers_concurrent_mutations() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let prefix = format!("cert-atomic-{suffix}-");
+        let schedule_id = format!("sched-cert-atomic-{suffix}");
+        sqlx::query(
+            "INSERT INTO schedules \
+             (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'certificate atomic page', 'certificate_expiry_scan_v2', \
+                     86400, FALSE, clock_timestamp() + INTERVAL '1 day')",
+        )
+        .bind(&schedule_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO certificates \
+             (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+             SELECT $1 || series::text, 'CN=atomic', \
+                    TIMESTAMPTZ '1899-01-01 00:00:00+00', \
+                    TIMESTAMPTZ '1900-01-01 00:00:00+00' \
+                        + series * INTERVAL '1 microsecond', \
+                    'IIS', 'atomic.test', 'GBLON', 'Active' \
+             FROM generate_series(1, 101) AS generated(series)",
+        )
+        .bind(&prefix)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO certificates \
+             (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+             VALUES ($1, 'CN=atomic-high-water', TIMESTAMPTZ '1999-01-01 00:00:00+00', \
+                     TIMESTAMPTZ '2000-01-01 00:00:00+00', 'IIS', 'atomic-high-water.test', \
+                     'GBLON', 'Active')",
+        )
+        .bind(format!("{prefix}high-water"))
+        .execute(pool)
+        .await
+        .unwrap();
+        let first_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM certificates WHERE common_name LIKE $1 || '%' \
+             ORDER BY valid_to ASC, id ASC LIMIT 1",
+        )
+        .bind(&prefix)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let mut rolled_back = pool.begin().await.unwrap();
+        admit_certificate_scan_protocol(&mut rolled_back, CERTIFICATE_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        run_job(&mut rolled_back, &schedule_id, CERTIFICATE_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        let in_tx_queue: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'certificate-expiring' AND source_ci_key = $1",
+        )
+        .bind(first_id.to_string())
+        .fetch_one(&mut *rolled_back)
+        .await
+        .unwrap();
+        let in_tx_cursor: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT cursor_id FROM certificate_expiry_scan_progress WHERE schedule_id = $1",
+        )
+        .bind(&schedule_id)
+        .fetch_one(&mut *rolled_back)
+        .await
+        .unwrap();
+        assert_eq!(in_tx_queue, 1);
+        assert!(in_tx_cursor.is_some());
+        rolled_back.rollback().await.unwrap();
+
+        let persisted_after_rollback: (i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT COUNT(*) FROM shift_queue \
+                  WHERE item_type = 'certificate-expiring' AND source_ci_key = $2), \
+                 (SELECT COUNT(*) FROM certificate_expiry_scan_progress \
+                  WHERE schedule_id = $1)",
+        )
+        .bind(&schedule_id)
+        .bind(first_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted_after_rollback,
+            (0, 0),
+            "queue effects and cursor creation roll back as one page unit"
+        );
+
+        let mut committed = pool.begin().await.unwrap();
+        admit_certificate_scan_protocol(&mut committed, CERTIFICATE_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        run_job(&mut committed, &schedule_id, CERTIFICATE_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        committed.commit().await.unwrap();
+        let committed_state: (i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT COUNT(*) FROM shift_queue \
+                  WHERE item_type = 'certificate-expiring' \
+                    AND metadata->>'common_name' LIKE $2 || '%'), \
+                 (SELECT COUNT(*) FROM certificate_expiry_scan_progress \
+                  WHERE schedule_id = $1)",
+        )
+        .bind(&schedule_id)
+        .bind(&prefix)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            committed_state,
+            (100, 1),
+            "one tick commits exactly one page"
+        );
+
+        let progress: CertificateScanProgress = sqlx::query_as(
+            "SELECT job_kind, protocol_version, scan_epoch, cursor_valid_to, cursor_id, \
+                    high_water_valid_to, high_water_id, cycle_cutoff \
+             FROM certificate_expiry_scan_progress WHERE schedule_id = $1",
+        )
+        .bind(&schedule_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let late_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO certificates \
+             (id, common_name, subject, valid_from, valid_to, service_type, hostname, \
+              site, status, created_at) \
+             VALUES ($1, $2, 'CN=late', TIMESTAMPTZ '1899-01-01 00:00:00+00', \
+                     TIMESTAMPTZ '1900-01-01 00:00:01+00', 'IIS', 'late.test', \
+                     'GBLON', 'Active', $3 + INTERVAL '1 microsecond')",
+        )
+        .bind(late_id)
+        .bind(format!("{prefix}late"))
+        .bind(progress.cycle_cutoff)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE certificates \
+             SET valid_to = TIMESTAMPTZ '1900-01-01 00:00:00.500000+00' \
+             WHERE id = $1",
+        )
+        .bind(first_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let deferred_epochs: (bool, bool) = sqlx::query_as(
+            "SELECT \
+                 (SELECT expiry_scan_epoch FROM certificates WHERE id = $1), \
+                 (SELECT expiry_scan_epoch FROM certificates WHERE id = $2)",
+        )
+        .bind(first_id)
+        .bind(late_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            deferred_epochs,
+            (!progress.scan_epoch, !progress.scan_epoch),
+            "new enrollment and a processed deadline mutation join the next epoch"
+        );
+        let mut next_page_tx = pool.begin().await.unwrap();
+        let next_page = certificate_scan_page(&mut next_page_tx, &progress, POPULATION_SCAN_BATCH)
+            .await
+            .unwrap();
+        assert!(
+            next_page
+                .iter()
+                .all(|row| row.id != late_id && row.id != first_id),
+            "next-epoch enrollment and renewal cannot re-enter the active keyset"
+        );
+        next_page_tx.rollback().await.unwrap();
+
+        // Drain the remaining bounded pages so the committed epoch transition
+        // completes before this test removes its disabled schedule.
+        run_complete_certificate_cycle(pool, &schedule_id).await;
+
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'common_name' LIKE $1 || '%'")
+            .bind(&prefix)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM certificates WHERE common_name LIKE $1 || '%'")
+            .bind(&prefix)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&schedule_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
     async fn certificate_scan_enqueues_by_state_and_refreshes() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
@@ -6004,15 +7090,7 @@ mod db_tests {
         let expiring = seed_certificate(pool, &soon, "Active").await;
         let healthy = seed_certificate(pool, &far, "Active").await;
 
-        let run = |pool: &'static PgPool| async move {
-            let mut tx = pool.begin().await.unwrap();
-            let (status, _) = run_job(&mut tx, "direct-test", "certificate_expiry_scan")
-                .await
-                .unwrap();
-            assert_eq!(status, "succeeded");
-            tx.commit().await.unwrap();
-        };
-        run(pool).await;
+        run_complete_certificate_cycle(pool, CERT_SCAN_SEED_ID).await;
 
         // Expired → P1/"expired"; expiring-soon → P2/"expiring-soon"; far-future → none.
         assert_eq!(
@@ -6040,7 +7118,7 @@ mod db_tests {
         .execute(pool)
         .await
         .unwrap();
-        run(pool).await;
+        run_complete_certificate_cycle(pool, CERT_SCAN_SEED_ID).await;
         assert_eq!(
             open_cert_item(pool, &expiring).await,
             Some(("P1".into(), "expired".into())),

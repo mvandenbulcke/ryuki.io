@@ -6,11 +6,11 @@
 //! Read functions (`get`, `list_page`, `count`) remain `&PgPool`-only. Callers
 //! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
 //!
-//! # Audit parameter
-//! `transition` accepts an `_audit_action: Option<&str>` parameter for
-//! signature parity with the decommission template. Audit rows are written by
-//! the handler via `audit::record_audit_tx` on the same connection.
+//! # Approval provenance
+//! `transition` accepts an optional typed checker only for approval. The
+//! checker write, status CAS, and handler audit share one transaction.
 
+use ryuki_core::PrincipalId;
 use ryuki_engine::models::{PatchSchedule, PatchWave, PatchWaveStatus, RebootPolicy};
 use sqlx::{PgConnection, PgPool};
 use std::collections::HashMap;
@@ -30,7 +30,10 @@ pub const COLUMNS: &str = "id::text AS id, \
      blackout_dates::text AS blackout_dates, \
      validation_errors::text AS validation_errors, \
      status, \
-     metadata::text AS metadata";
+     metadata::text AS metadata, \
+     maker_binding_state, \
+     maker_principal_id, \
+     approved_by_principal_id";
 
 // ─── Overdue-scan projection (#59) ─────────────────────────────────────────────
 
@@ -109,6 +112,19 @@ pub struct PatchWaveRow {
     pub status: String,
     /// Raw JSON text from JSONB::text cast, e.g. `{"k":"v"}`
     pub metadata: String,
+    pub maker_binding_state: String,
+    pub maker_principal_id: Option<Uuid>,
+    pub approved_by_principal_id: Option<Uuid>,
+}
+
+/// Immutable authorization provenance stored beside the caller-editable wave
+/// model. Rows created before migration 205 remain explicitly unresolved and
+/// cannot enter the approval transition.
+#[derive(Debug)]
+pub struct PersistedPatchWave {
+    pub wave: PatchWave,
+    pub maker_principal_id: Option<PrincipalId>,
+    pub approved_by_principal_id: Option<PrincipalId>,
 }
 
 impl PatchWaveRow {
@@ -119,7 +135,7 @@ impl PatchWaveRow {
     /// decode error (caller → 500) rather than silently substituting defaults —
     /// a subsequent `transition` would otherwise persist those defaults over the
     /// real data, since the CAS only guards `status`, not the other columns.
-    pub fn into_model(self) -> Result<PatchWave, sqlx::Error> {
+    pub fn into_record(self) -> Result<PersistedPatchWave, sqlx::Error> {
         fn decode<T: serde::de::DeserializeOwned>(
             raw: &str,
             field: &str,
@@ -146,7 +162,55 @@ impl PatchWaveRow {
         let reboot_policy: RebootPolicy =
             decode(&format!("\"{}\"", self.reboot_policy), "reboot_policy")?;
 
-        Ok(PatchWave {
+        let maker_principal_id = self
+            .maker_principal_id
+            .map(PrincipalId::from_uuid)
+            .transpose()
+            .map_err(|e| {
+                sqlx::Error::Decode(
+                    format!("patch_waves.maker_principal_id: corrupt persisted value: {e}").into(),
+                )
+            })?;
+        let approved_by_principal_id = self
+            .approved_by_principal_id
+            .map(PrincipalId::from_uuid)
+            .transpose()
+            .map_err(|e| {
+                sqlx::Error::Decode(
+                    format!("patch_waves.approved_by_principal_id: corrupt persisted value: {e}")
+                        .into(),
+                )
+            })?;
+
+        let verified_provenance_is_consistent = maker_principal_id.is_some()
+            && match &status {
+                PatchWaveStatus::Draft | PatchWaveStatus::Validated => {
+                    approved_by_principal_id.is_none()
+                }
+                PatchWaveStatus::Approved
+                | PatchWaveStatus::Scheduled
+                | PatchWaveStatus::InProgress
+                | PatchWaveStatus::Completed
+                | PatchWaveStatus::Failed => {
+                    approved_by_principal_id.is_some()
+                        && approved_by_principal_id != maker_principal_id
+                }
+            };
+        match self.maker_binding_state.as_str() {
+            "unresolved-legacy"
+                if maker_principal_id.is_none() && approved_by_principal_id.is_none() => {}
+            "verified-principal" if verified_provenance_is_consistent => {}
+            state => {
+                return Err(sqlx::Error::Decode(
+                    format!(
+                        "patch_waves.maker_binding_state: inconsistent persisted provenance: {state}"
+                    )
+                    .into(),
+                ));
+            }
+        }
+
+        let wave = PatchWave {
             id: self.id,
             name: self.name,
             servers,
@@ -158,7 +222,17 @@ impl PatchWaveRow {
             validation_errors,
             status,
             metadata,
+        };
+
+        Ok(PersistedPatchWave {
+            wave,
+            maker_principal_id,
+            approved_by_principal_id,
         })
+    }
+
+    pub fn into_model(self) -> Result<PatchWave, sqlx::Error> {
+        self.into_record().map(|record| record.wave)
     }
 }
 
@@ -201,7 +275,11 @@ pub fn reboot_policy_str(p: &RebootPolicy) -> &'static str {
 ///
 /// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
 /// `&mut *tx` to share a transaction with an audit write.
-pub async fn insert(executor: impl sqlx::PgExecutor<'_>, w: &PatchWave) -> Result<(), sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    w: &PatchWave,
+    maker_principal_id: PrincipalId,
+) -> Result<(), sqlx::Error> {
     let id = Uuid::parse_str(&w.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let servers = serde_json::to_string(&w.servers).unwrap_or_else(|_| "[]".into());
@@ -227,9 +305,11 @@ pub async fn insert(executor: impl sqlx::PgExecutor<'_>, w: &PatchWave) -> Resul
     sqlx::query(
         "INSERT INTO patch_waves \
          (id, site, os_family, name, servers, site_scope, environment_scope, \
-          schedule, reboot_policy, blackout_dates, validation_errors, status, metadata) \
+          schedule, reboot_policy, blackout_dates, validation_errors, status, metadata, \
+          maker_binding_state, maker_principal_id) \
          VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, \
-                 $8::jsonb, $9, $10::jsonb, $11::jsonb, $12, $13::jsonb)",
+                 $8::jsonb, $9, $10::jsonb, $11::jsonb, $12, $13::jsonb, \
+                 'verified-principal', $14)",
     )
     .bind(id)
     .bind(site)
@@ -244,6 +324,7 @@ pub async fn insert(executor: impl sqlx::PgExecutor<'_>, w: &PatchWave) -> Resul
     .bind(&validation_errors)
     .bind(status_str(&w.status))
     .bind(&meta)
+    .bind(maker_principal_id.into_uuid())
     .execute(executor)
     .await?;
 
@@ -255,6 +336,16 @@ pub async fn insert(executor: impl sqlx::PgExecutor<'_>, w: &PatchWave) -> Resul
 /// handler's not-found behaviour uniform. `Err` is reserved for genuine DB
 /// failures (callers map to 500).
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PatchWave>, sqlx::Error> {
+    Ok(get_record(pool, id).await?.map(|record| record.wave))
+}
+
+/// Fetch one wave together with immutable maker/checker provenance. Approval
+/// callers must use this projection; the compatibility `get` projection is for
+/// lifecycle operations that do not consume maker/checker authority.
+pub async fn get_record(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<PersistedPatchWave>, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
         return Ok(None);
     };
@@ -265,7 +356,7 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PatchWave>, sqlx::Err
             .fetch_optional(pool)
             .await?;
 
-    row.map(|r| r.into_model()).transpose()
+    row.map(|r| r.into_record()).transpose()
 }
 
 /// Build the per-axis TARGET-SET scope predicate (#2/#14) shared by
@@ -362,14 +453,15 @@ pub async fn count(
 /// An `Ok(false)` (CAS miss) returns without mutating — the caller drops the tx
 /// (rollback). Only `Ok(true)` callers should commit.
 ///
-/// `_audit_action` is accepted for signature parity with the decommission
-/// template but is intentionally unused — patch wave audit rows are written by
-/// the handler via `audit::record_audit_tx` on the same connection.
+/// `approval_principal_id` is `Some(checker)` only for the
+/// `Validated -> Approved` transition. The predicate then requires a verified,
+/// distinct persisted maker and an unset checker. Migration 205 independently
+/// enforces the same invariant and makes both identities immutable.
 pub async fn transition(
     conn: &mut PgConnection,
     expected_status: &str,
     w: &PatchWave,
-    _audit_action: Option<&str>,
+    approval_principal_id: Option<PrincipalId>,
 ) -> Result<bool, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(&w.id) else {
         return Ok(false);
@@ -397,8 +489,16 @@ pub async fn transition(
          validation_errors = $9::jsonb, \
          status = $10, \
          metadata = $11::jsonb, \
+         approved_by_principal_id = COALESCE($12::uuid, approved_by_principal_id), \
          updated_at = NOW() \
-         WHERE id = $1 AND status = $12",
+         WHERE id = $1 AND status = $13 \
+           AND ( \
+                $12::uuid IS NULL \
+                OR (maker_binding_state = 'verified-principal' \
+                    AND maker_principal_id IS NOT NULL \
+                    AND maker_principal_id <> $12::uuid \
+                    AND approved_by_principal_id IS NULL) \
+           )",
     )
     .bind(uid)
     .bind(&w.name)
@@ -411,6 +511,7 @@ pub async fn transition(
     .bind(&validation_errors)
     .bind(status_str(&w.status))
     .bind(&meta)
+    .bind(approval_principal_id.map(PrincipalId::into_uuid))
     .bind(expected_status)
     .execute(&mut *conn)
     .await?;
