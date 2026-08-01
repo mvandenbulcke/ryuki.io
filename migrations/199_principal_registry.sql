@@ -1021,6 +1021,8 @@ DECLARE
     lifecycle_changed BOOLEAN;
     authority_changed BOOLEAN;
     transition_allowed BOOLEAN;
+    expected_lifecycle_version BIGINT;
+    expected_authority_version BIGINT;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.lifecycle_state <> 'active' THEN
@@ -1061,6 +1063,15 @@ BEGIN
         AND NEW.authority_version = OLD.authority_version + 1
     );
 
+    expected_lifecycle_version := OLD.lifecycle_version;
+    IF lifecycle_changed THEN
+        expected_lifecycle_version := expected_lifecycle_version + 1;
+    END IF;
+    expected_authority_version := OLD.authority_version;
+    IF authority_changed THEN
+        expected_authority_version := expected_authority_version + 1;
+    END IF;
+
     transition_allowed := CASE OLD.lifecycle_state
         WHEN 'active' THEN NEW.lifecycle_state IN (
             'active', 'suspended', 'deprovisioned', 'tombstoned'
@@ -1079,10 +1090,8 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
 
-    IF NEW.lifecycle_version <> OLD.lifecycle_version
-            + CASE WHEN lifecycle_changed THEN 1 ELSE 0 END
-       OR NEW.authority_version <> OLD.authority_version
-            + CASE WHEN authority_changed THEN 1 ELSE 0 END THEN
+    IF NEW.lifecycle_version <> expected_lifecycle_version
+       OR NEW.authority_version <> expected_authority_version THEN
         RAISE EXCEPTION 'principal lifecycle and authority versions must advance exactly once'
             USING ERRCODE = '23514';
     END IF;
