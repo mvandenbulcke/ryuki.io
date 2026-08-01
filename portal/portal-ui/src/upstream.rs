@@ -718,20 +718,186 @@ pub fn set_entra_login_binding_cookie(binding: &str, secure: bool) {
     append_set_cookie(&entra_login_binding_cookie(binding, secure));
 }
 
+/// Marks an authentication response as non-cacheable before any credential,
+/// one-time URL, or authentication error is written to it. Call this at the
+/// start of an auth server function so both success and early-error responses
+/// inherit the same cache prohibition.
+pub fn mark_auth_response_no_store() {
+    with_response_options(apply_auth_response_no_store);
+}
+
+fn apply_auth_response_no_store(response: &leptos_axum::ResponseOptions) {
+    response.insert_header(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+}
+
 fn append_set_cookie(cookie: &str) {
+    with_response_options(|response| {
+        if let Ok(value) = axum::http::HeaderValue::from_str(cookie) {
+            response.append_header(axum::http::header::SET_COOKIE, value);
+        }
+    });
+}
+
+fn with_response_options(action: impl FnOnce(&leptos_axum::ResponseOptions)) {
     use leptos::prelude::use_context;
 
-    let Some(response) = use_context::<leptos_axum::ResponseOptions>() else {
-        return;
-    };
-    if let Ok(value) = axum::http::HeaderValue::from_str(cookie) {
-        response.append_header(axum::http::header::SET_COOKIE, value);
+    if let Some(response) = use_context::<leptos_axum::ResponseOptions>() {
+        action(&response);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entra_authorize_server_function_request() -> axum::http::Request<axum::body::Body> {
+        let (path, method) = leptos::server_fn::axum::server_fn_paths()
+            .find(|(path, _)| *path == "/portal/api/auth-entra-authorize-url")
+            .expect("the Entra authorize server function is registered");
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::empty())
+            .expect("authorize server-function request builds")
+    }
+
+    fn assert_exact_no_store(response: &axum::response::Response) {
+        let values = response
+            .headers()
+            .get_all(axum::http::header::CACHE_CONTROL)
+            .iter()
+            .map(|value| value.to_str().expect("cache policy is text"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["no-store"]);
+    }
+
+    #[test]
+    fn auth_response_no_store_overwrites_weaker_cache_policy() {
+        let response = leptos_axum::ResponseOptions::default();
+        response.insert_header(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("private, max-age=60"),
+        );
+
+        apply_auth_response_no_store(&response);
+
+        let parts = response.0.read().expect("response headers remain readable");
+        assert_eq!(
+            parts
+                .headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_server_function_early_error_is_no_store() {
+        use axum::response::IntoResponse;
+        use leptos::prelude::provide_context;
+
+        let upstream = UpstreamClient::new("http://127.0.0.1:8081", false, true, false)
+            .expect("static loopback upstream is valid");
+        let response = leptos_axum::handle_server_fns_with_context(
+            move || provide_context(upstream.clone()),
+            entra_authorize_server_function_request(),
+        )
+        .await
+        .into_response();
+
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "the real registered server function must dispatch"
+        );
+        assert_exact_no_store(&response);
+    }
+
+    #[tokio::test]
+    async fn authorize_server_function_cookie_rejection_is_no_store() {
+        use axum::response::IntoResponse;
+        use leptos::prelude::provide_context;
+
+        let upstream = UpstreamClient::new("http://127.0.0.1:9", true, true, false)
+            .expect("live loopback upstream is valid");
+        let mut request = entra_authorize_server_function_request();
+        request.headers_mut().insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "entra_login_csrf=attacker; entra_login_csrf=victim",
+            ),
+        );
+        let response = leptos_axum::handle_server_fns_with_context(
+            move || provide_context(upstream.clone()),
+            request,
+        )
+        .await
+        .into_response();
+
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "the real registered server function must dispatch"
+        );
+        assert_exact_no_store(&response);
+    }
+
+    #[tokio::test]
+    async fn authorize_server_function_success_keeps_cookie_and_no_store() {
+        use axum::response::IntoResponse;
+        use leptos::prelude::provide_context;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream binds");
+        let address = listener.local_addr().expect("test address is available");
+        let body = serde_json::json!({
+            "authorize_url": "https://login.example.test/authorize?state=single-use",
+            "binding": "test-binding"
+        })
+        .to_string();
+        let raw_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let server = tokio::spawn(serve_one(listener, raw_response));
+        let upstream = UpstreamClient::new(&format!("http://{address}"), true, true, false)
+            .expect("live loopback upstream is valid");
+
+        let response = leptos_axum::handle_server_fns_with_context(
+            move || provide_context(upstream.clone()),
+            entra_authorize_server_function_request(),
+        )
+        .await
+        .into_response();
+
+        assert!(response.status().is_success());
+        assert_exact_no_store(&response);
+        assert_eq!(
+            response
+                .headers()
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter(|value| value.starts_with("entra_login_csrf="))
+                .count(),
+            1,
+            "the no-store helper must preserve the Entra binding cookie"
+        );
+        let upstream_request = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server function reaches the test upstream")
+            .expect("test upstream completes");
+        assert!(upstream_request.starts_with("GET /api/auth/entra/authorize-url "));
+    }
 
     #[test]
     fn portal_execution_mode_is_explicit_and_external_origins_require_live_provider() {

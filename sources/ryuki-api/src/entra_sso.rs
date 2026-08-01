@@ -64,7 +64,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Query, Request};
-use axum::http::header::LOCATION;
+use axum::http::header::{CACHE_CONTROL, LOCATION};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -944,6 +944,19 @@ fn verified_entra_handler_authority(
     Ok((Arc::clone(handler.base()), Arc::clone(handler.origin())))
 }
 
+/// Converts an authentication payload or redirect into a response that no
+/// browser, intermediary, or idempotency layer may retain. Authentication
+/// handlers use one helper so one-time URLs and session-bearing redirects
+/// cannot drift onto different cache policies.
+fn auth_response_no_store(response: impl IntoResponse) -> Response {
+    let mut response = response.into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 /// GET /api/auth/entra/authorize-url — begins a browser sign-in.
 ///
 /// Persists `(state, nonce, pkce_verifier, binding)` via the single-use
@@ -1047,14 +1060,13 @@ pub(crate) async fn entra_authorize_url(
             )
         })?;
 
-    let mut response = (
+    let mut response = auth_response_no_store((
         StatusCode::OK,
         Json(json!({
             "authorize_url": authorize_url.as_str(),
             "binding": binding,
         })),
-    )
-        .into_response();
+    ));
     binding_cookie.append_to(&mut response);
     Ok(response)
 }
@@ -1099,7 +1111,10 @@ pub(crate) async fn entra_callback(
     if params.error.is_some() {
         tracing::warn!("entra callback: IdP returned an error, redirecting to auth_error page");
         let location = axum::http::HeaderValue::from_static("/?auth_error=1");
-        return Ok((StatusCode::FOUND, [(LOCATION, location)]).into_response());
+        return Ok(auth_response_no_store((
+            StatusCode::FOUND,
+            [(LOCATION, location)],
+        )));
     }
 
     let code_val = params.code.ok_or_else(|| {
@@ -1253,17 +1268,7 @@ pub(crate) async fn entra_callback(
         })?;
     let location = axum::http::HeaderValue::from_static("/");
 
-    let mut response = (
-        StatusCode::FOUND,
-        [
-            (LOCATION, location),
-            (
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-store"),
-            ),
-        ],
-    )
-        .into_response();
+    let mut response = auth_response_no_store((StatusCode::FOUND, [(LOCATION, location)]));
     cookies.append_to(&mut response);
     binding_retirement.append_to(&mut response);
     Ok(response)
@@ -1274,6 +1279,22 @@ pub(crate) async fn entra_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_response_helper_overwrites_weaker_cache_policy() {
+        let response = auth_response_no_store((
+            StatusCode::OK,
+            [(CACHE_CONTROL, "private, max-age=60")],
+        ));
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+    }
 
     fn handler_deps(
         base: Arc<EntraSsoDeps>,
@@ -2116,6 +2137,13 @@ mod entra_sso_db_tests {
             .await
             .expect("authorize-url request");
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "one-time authorize URLs must never be cacheable"
+        );
         let set_cookie = resp
             .headers()
             .get("set-cookie")

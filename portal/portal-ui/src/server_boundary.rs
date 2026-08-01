@@ -101,7 +101,8 @@ use crate::models::{request_detail_fallback, request_summary_fallbacks};
 use crate::upstream::{
     clear_portal_session_cookie, cookie_max_age_from_expires_at,
     entra_login_binding_cookie_headers_are_unambiguous, session_id_from_request,
-    set_entra_login_binding_cookie, set_portal_session_cookie, UpstreamClient, UpstreamResponse,
+    mark_auth_response_no_store, set_entra_login_binding_cookie, set_portal_session_cookie,
+    UpstreamClient, UpstreamResponse,
 };
 use leptos::prelude::{server, ServerFnError};
 use ryuki_core::types::{BoundaryStatus, ExecutionMode};
@@ -2297,6 +2298,10 @@ struct EntraAuthorizeUrlPayload {
 /// `__Host-ryuki_session`; explicit loopback HTTP uses `ryuki_session`.
 #[server(prefix = "/portal/api", endpoint = "auth-entra-authorize-url")]
 pub async fn get_entra_authorize_url() -> Result<String, ServerFnError> {
+    // The payload contains a fresh, single-use authorization URL. Mark the
+    // response before any early return so neither the URL nor auth errors can
+    // be retained by a browser, intermediary, or service worker cache.
+    mark_auth_response_no_store();
     let boundary = PortalServerBoundary::static_dry_run();
     let path = boundary
         .validate_platform_api_path(auth_entra_authorize_url_path())

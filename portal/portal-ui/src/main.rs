@@ -8,10 +8,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum::routing::any;
     use axum::{middleware, routing::get, Router};
     use leptos::prelude::*;
-    use leptos_axum::{file_and_error_handler_with_context, generate_route_list, LeptosRoutes};
+    use leptos_axum::{
+        file_and_error_handler_with_context, generate_route_list_with_exclusions, LeptosRoutes,
+    };
     use ryuki_portal_ui::app::{shell, App};
     use ryuki_portal_ui::security::{
-        protect_server_function_routes, PortalPublicOrigin, PortalServerFunctionLimits,
+        protect_server_function_routes, registered_server_function_route_exclusions,
+        PortalPublicOrigin, PortalServerFunctionLimits,
     };
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
     use ryuki_portal_ui::startup::validate_live_provider_auth_posture;
@@ -23,7 +26,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let configuration = get_configuration(None)?;
     let leptos_options = configuration.leptos_options;
     let address = leptos_options.site_addr;
-    let routes = generate_route_list(App);
+    // Exclude every registered server function from Leptos's concrete Axum
+    // route generation. The protected catch-all is merged after page-route
+    // assembly and remains the only server-function dispatcher.
+    let routes = generate_route_list_with_exclusions(
+        App,
+        Some(registered_server_function_route_exclusions()),
+    );
     let boundary = PortalServerBoundary::static_dry_run();
     boundary.validate_platform_api_path("/api/platform/summary")?;
     let _core_read_plans = boundary.plan_core_platform_reads()?;
@@ -60,7 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
-        .merge(server_function_routes)
         .leptos_routes_with_context(
             &leptos_options,
             routes,
@@ -70,6 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 move || shell(leptos_options.clone())
             },
         )
+        // This merge must remain after Leptos route registration. Every
+        // registered server-function path above was excluded, so the guarded
+        // catch-all is the sole dispatch path and cannot be shadowed.
+        .merge(server_function_routes)
         .fallback(file_and_error_handler_with_context(
             move || provide_context(upstream_for_fallback.clone()),
             shell,

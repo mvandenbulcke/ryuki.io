@@ -320,6 +320,27 @@ fn is_safe_method(method: &Method) -> bool {
     )
 }
 
+fn is_server_function_path(path: &str) -> bool {
+    path == "/portal/api" || path.starts_with("/portal/api/")
+}
+
+/// Returns every concrete server-function path that Leptos would otherwise
+/// register directly on the application router.
+///
+/// Passing this complete inventory to
+/// `generate_route_list_with_exclusions` makes the guarded `/portal/api/*`
+/// catch-all the sole dispatcher. Off-prefix additions are excluded too and
+/// therefore fail closed as unreachable instead of being exposed without the
+/// portal boundary.
+pub fn registered_server_function_route_exclusions() -> Vec<String> {
+    let mut paths = leptos::server_fn::axum::server_fn_paths()
+        .map(|(path, _)| path.to_owned())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
 /// Route middleware for every `/portal/api/*` server-function request.
 /// Unsafe methods require one exact, non-null Origin match.
 pub async fn enforce_server_function_origin(
@@ -327,6 +348,9 @@ pub async fn enforce_server_function_origin(
     request: Request,
     next: Next,
 ) -> Response {
+    if !is_server_function_path(request.uri().path()) {
+        return next.run(request).await;
+    }
     if !public_origin.permits(request.method(), request.headers()) {
         return (StatusCode::FORBIDDEN, "forbidden request origin").into_response();
     }
@@ -341,6 +365,9 @@ pub async fn enforce_server_function_capacity(
     request: Request,
     next: Next,
 ) -> Response {
+    if !is_server_function_path(request.uri().path()) {
+        return next.run(request).await;
+    }
     let Ok(_permit) = limits.permits.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -360,9 +387,12 @@ pub async fn enforce_server_function_capacity(
     }
 }
 
-/// Applies the complete ingress boundary to an existing server-function
-/// router. The origin check runs first, then the streaming body cap, then the
-/// non-queuing execution/deadline guard immediately around Leptos dispatch.
+/// Applies the complete ingress boundary to the dedicated server-function
+/// router. Its registered paths must first be excluded from Leptos route
+/// generation, then this protected catch-all must be merged after generated
+/// page-route assembly. The origin check runs first, then the streaming body
+/// cap, then the non-queuing execution/deadline guard immediately around
+/// Leptos dispatch.
 pub fn protect_server_function_routes<S>(
     router: Router<S>,
     public_origin: PortalPublicOrigin,
@@ -391,6 +421,7 @@ mod tests {
     use axum::http::{header::CONTENT_LENGTH, HeaderValue, Request};
     use axum::routing::any;
     use axum::Router;
+    use leptos_axum::{generate_route_list, generate_route_list_with_exclusions, LeptosRoutes};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -428,6 +459,142 @@ mod tests {
             test_origin(),
             PortalServerFunctionLimits::new(1024, 8, 5).expect("test limits are valid"),
         )
+    }
+
+    #[test]
+    fn registered_server_functions_are_excluded_and_stay_under_the_guarded_prefix() {
+        let paths = registered_server_function_route_exclusions();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "/portal/api/auth-entra-authorize-url"),
+            "the real authorize-url server function is in the exclusion inventory"
+        );
+        assert!(
+            paths.iter().all(|path| is_server_function_path(path)),
+            "every current server function must use the guarded portal prefix: {paths:?}"
+        );
+
+        let generated_page_paths = generate_route_list(crate::app::App)
+            .into_iter()
+            .map(|route| route.path().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            generated_page_paths
+                .iter()
+                .all(|path| !is_server_function_path(path)),
+            "page routes must not shadow the protected server-function prefix: {generated_page_paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_generated_server_function_uses_the_guarded_catch_all() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_handler = dispatches.clone();
+        let options = leptos::config::LeptosOptions::builder()
+            .output_name("portal-security-test")
+            .build();
+        let routes = generate_route_list_with_exclusions(
+            crate::app::App,
+            Some(registered_server_function_route_exclusions()),
+        );
+        let protected_server_functions = protect_server_function_routes(
+            Router::new()
+                .route(
+                    "/portal/api/{*fn_name}",
+                    any(move || {
+                        let dispatches = dispatches_for_handler.clone();
+                        async move {
+                            dispatches.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    }),
+                ),
+            test_origin(),
+            test_limits(1024, 8, Duration::from_secs(1)),
+        );
+        let router = Router::new()
+            .leptos_routes_with_context(&options, routes, || {}, {
+                let options = options.clone();
+                move || crate::app::shell(options.clone())
+            })
+            // Match production ordering: protected dispatch is merged only
+            // after Leptos has assembled its excluded page-route inventory.
+            .merge(protected_server_functions)
+            .with_state(options);
+
+        for origin in [None, Some("https://foreign.example.test")] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/portal/api/auth-entra-authorize-url")
+                .body(Body::empty())
+                .expect("adversarial request builds");
+            if let Some(origin) = origin {
+                request
+                    .headers_mut()
+                    .insert(ORIGIN, HeaderValue::from_static(origin));
+            }
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("guard rejects the generated server-function path");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+
+        let admitted = router
+            .clone()
+            .oneshot(protected_post(
+                "/portal/api/auth-entra-authorize-url",
+                Body::empty(),
+                0,
+            ))
+            .await
+            .expect("same-origin request reaches the guarded catch-all");
+        assert_eq!(admitted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+        let oversized = router
+            .oneshot(protected_post(
+                "/portal/api/auth-entra-authorize-url",
+                Body::from(vec![b'x'; 1025]),
+                1025,
+            ))
+            .await
+            .expect("oversized request receives a response");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_server_routes_remain_outside_the_origin_and_capacity_budget() {
+        let limits = test_limits(1024, 1, Duration::from_secs(1));
+        let _held_permit = limits
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .expect("test occupies the only server-function permit");
+        let router = protect_server_function_routes(
+            Router::new().route(
+                "/workspace",
+                any(|| async { StatusCode::NO_CONTENT }),
+            ),
+            test_origin(),
+            limits,
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/workspace")
+                    .body(Body::empty())
+                    .expect("non-server request builds"),
+            )
+            .await
+            .expect("non-server route responds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     async fn guarded_status(method: Method, origin: Option<&str>) -> StatusCode {
@@ -486,7 +653,7 @@ mod tests {
         let dispatches_for_handler = dispatches.clone();
         let router = protect_server_function_routes(
             Router::new().route(
-                "/portal/api/{*fn_name}",
+                "/portal/api/generated-body-reader",
                 any(move || {
                     let dispatches = dispatches_for_handler.clone();
                     async move {
@@ -502,7 +669,7 @@ mod tests {
         let oversized = router
             .clone()
             .oneshot(protected_post(
-                "/portal/api/auth-login",
+                "/portal/api/generated-body-reader",
                 Body::from(vec![b'x'; 9]),
                 9,
             ))
@@ -513,7 +680,7 @@ mod tests {
 
         let valid = router
             .oneshot(protected_post(
-                "/portal/api/auth-login",
+                "/portal/api/generated-body-reader",
                 Body::from(vec![b'x'; 8]),
                 8,
             ))
@@ -524,6 +691,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunked_server_function_body_is_stream_limited_without_content_length() {
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let body_reads_for_handler = body_reads.clone();
+        let router = protect_server_function_routes(
+            Router::new().route(
+                "/portal/api/generated-stream-reader",
+                any(move |request: Request| {
+                    let body_reads = body_reads_for_handler.clone();
+                    async move {
+                        body_reads.fetch_add(1, Ordering::SeqCst);
+                        match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+                            Ok(_) => StatusCode::NO_CONTENT,
+                            Err(_) => StatusCode::PAYLOAD_TOO_LARGE,
+                        }
+                    }
+                }),
+            ),
+            test_origin(),
+            test_limits(8, 1, Duration::from_secs(1)),
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/portal/api/generated-stream-reader")
+            .header(ORIGIN, "https://portal.example.test")
+            // Deliberately omit Content-Length so only the streaming wrapper
+            // can stop the ninth byte.
+            .body(Body::from(vec![b'x'; 9]))
+            .expect("chunked-style request builds");
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("stream-limited request receives a response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn over_concurrency_request_fails_fast_without_displacing_admitted_work() {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -531,7 +736,7 @@ mod tests {
         let release_for_handler = release.clone();
         let router = protect_server_function_routes(
             Router::new().route(
-                "/portal/api/{*fn_name}",
+                "/portal/api/generated-capacity",
                 any(move || {
                     let entered = entered_for_handler.clone();
                     let release = release_for_handler.clone();
@@ -547,7 +752,7 @@ mod tests {
         );
 
         let admitted = tokio::spawn(router.clone().oneshot(protected_post(
-            "/portal/api/slow",
+            "/portal/api/generated-capacity",
             Body::empty(),
             0,
         )));
@@ -557,7 +762,11 @@ mod tests {
 
         let overloaded = router
             .clone()
-            .oneshot(protected_post("/portal/api/login", Body::empty(), 0))
+            .oneshot(protected_post(
+                "/portal/api/generated-capacity",
+                Body::empty(),
+                0,
+            ))
             .await
             .expect("overloaded request receives a response");
         assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -583,7 +792,7 @@ mod tests {
         let dispatches_for_handler = dispatches.clone();
         let router = protect_server_function_routes(
             Router::new().route(
-                "/portal/api/{*fn_name}",
+                "/portal/api/generated-deadline",
                 any(move || {
                     let dispatches = dispatches_for_handler.clone();
                     async move {
@@ -600,13 +809,21 @@ mod tests {
 
         let timed_out = router
             .clone()
-            .oneshot(protected_post("/portal/api/slow", Body::empty(), 0))
+            .oneshot(protected_post(
+                "/portal/api/generated-deadline",
+                Body::empty(),
+                0,
+            ))
             .await
             .expect("timed-out request receives a response");
         assert_eq!(timed_out.status(), StatusCode::GATEWAY_TIMEOUT);
 
         let after_timeout = router
-            .oneshot(protected_post("/portal/api/login", Body::empty(), 0))
+            .oneshot(protected_post(
+                "/portal/api/generated-deadline",
+                Body::empty(),
+                0,
+            ))
             .await
             .expect("request after timeout receives a response");
         assert_eq!(after_timeout.status(), StatusCode::NO_CONTENT);

@@ -2388,7 +2388,12 @@ struct LeptosRouteBinding {
 
 const PORTAL_MAIN_TRUSTED_PATH_ROOTS: &[&str] =
     &["axum", "leptos", "leptos_axum", "ryuki_portal_ui", "tokio"];
-const PORTAL_MAIN_WILDCARD_VALUES: &[&str] = &["get_configuration", "provide_context"];
+const PORTAL_MAIN_WILDCARD_VALUES: &[&str] = &[
+    "Some",
+    "get_configuration",
+    "provide_context",
+    "registered_server_function_route_exclusions",
+];
 
 pub(crate) fn inspect_portal_main(main_rs: &str) -> PortalMainInspection {
     let Ok(file) = syn::parse_file(main_rs) else {
@@ -2451,12 +2456,43 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
         path.last()
             .is_some_and(|segment| segment == "provide_context")
             && !path_matches_segments(path, &["leptos", "prelude", "provide_context"])
+    }) || imports.iter().any(|path| {
+        path.last().is_some_and(|segment| segment == "Some")
+    }) || imports.iter().any(|path| {
+        path.last()
+            .is_some_and(|segment| segment == "generate_route_list_with_exclusions")
+            && !path_matches_segments(
+                path,
+                &["leptos_axum", "generate_route_list_with_exclusions"],
+            )
+    }) || imports.iter().any(|path| {
+        path.last()
+            .is_some_and(|segment| segment == "registered_server_function_route_exclusions")
+            && !path_matches_segments(
+                path,
+                &[
+                    "ryuki_portal_ui",
+                    "security",
+                    "registered_server_function_route_exclusions",
+                ],
+            )
     }) || !imported(&imports, &["axum", "Router"])
         || !imported(&imports, &["leptos_axum", "LeptosRoutes"])
-        || !imported(&imports, &["leptos_axum", "generate_route_list"])
+        || !imported(
+            &imports,
+            &["leptos_axum", "generate_route_list_with_exclusions"],
+        )
         || !imported(&imports, &["axum", "routing", "get"])
         || !imported(&imports, &["ryuki_portal_ui", "app", "App"])
         || !imported(&imports, &["ryuki_portal_ui", "app", "shell"])
+        || !imported(
+            &imports,
+            &[
+                "ryuki_portal_ui",
+                "security",
+                "registered_server_function_route_exclusions",
+            ],
+        )
         || !imported(
             &imports,
             &["ryuki_portal_ui", "server_boundary", "PortalServerBoundary"],
@@ -2515,14 +2551,16 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
                 if [
                     "App",
                     "Router",
+                    "Some",
                     "PortalServerBoundary",
                     "any",
                     "file_and_error_handler_with_context",
-                    "generate_route_list",
+                    "generate_route_list_with_exclusions",
                     "get",
                     "get_configuration",
                     "provide_context",
                     "protect_server_function_routes",
+                    "registered_server_function_route_exclusions",
                     "shell",
                     "validate_live_provider_auth_posture",
                 ]
@@ -2762,14 +2800,23 @@ fn inspect_router_initializer(
                 if method.args.len() != 2 {
                     return None;
                 }
-                if let Some(path) = method.args.first().and_then(string_literal) {
-                    if path == "/healthz" {
+                // The outer router may declare only its two read-only health
+                // endpoints, and both must precede generated route assembly.
+                // Any other exact route could shadow the protected catch-all
+                // after server-function exclusions are applied.
+                if leptos_route_index.is_some() {
+                    return None;
+                }
+                match method.args.first().and_then(string_literal).as_deref() {
+                    Some("/healthz") => {
                         healthz_routes += 1;
                         health_routes_are_get &= route_method_uses_get(method, imports);
-                    } else if path == "/readyz" {
+                    }
+                    Some("/readyz") => {
                         readyz_routes += 1;
                         health_routes_are_get &= route_method_uses_get(method, imports);
                     }
+                    _ => return None,
                 }
             }
             "layer" => {
@@ -2787,8 +2834,8 @@ fn inspect_router_initializer(
         return None;
     };
     let route_binding = route_binding?;
-    if merge_index >= leptos_route_index
-        || leptos_route_index >= fallback_index
+    if leptos_route_index >= merge_index
+        || merge_index >= fallback_index
         || fallback_index >= state_index
         || state_index + 1 != methods.len()
         || Some(route_binding.options) != state_options
@@ -2959,14 +3006,47 @@ fn expression_generates_app_routes(expression: &syn::Expr, imports: &[Vec<String
     };
     path_is_bound(
         function,
-        "generate_route_list",
-        &["leptos_axum", "generate_route_list"],
+        "generate_route_list_with_exclusions",
+        &["leptos_axum", "generate_route_list_with_exclusions"],
         imports,
-    ) && call.args.len() == 1
+    ) && call.args.len() == 2
         && call
             .args
             .first()
             .is_some_and(|app| expression_is_app(app, imports))
+        && call.args.iter().nth(1).is_some_and(|exclusions| {
+            expression_is_registered_server_function_route_exclusions(exclusions, imports)
+        })
+}
+
+fn expression_is_registered_server_function_route_exclusions(
+    expression: &syn::Expr,
+    imports: &[Vec<String>],
+) -> bool {
+    let Some(option) = expression_call(strip_paren_group(expression)) else {
+        return false;
+    };
+    if option.args.len() != 1
+        || !expression_path(&option.func).is_some_and(|path| path_matches(path, &["Some"]))
+    {
+        return false;
+    }
+    let Some(exclusions) = option.args.first().and_then(expression_call) else {
+        return false;
+    };
+    exclusions.args.is_empty()
+        && expression_path(&exclusions.func).is_some_and(|path| {
+            path_is_bound(
+                path,
+                "registered_server_function_route_exclusions",
+                &[
+                    "ryuki_portal_ui",
+                    "security",
+                    "registered_server_function_route_exclusions",
+                ],
+                imports,
+            )
+        })
 }
 
 fn expression_is_app(expression: &syn::Expr, imports: &[Vec<String>]) -> bool {
@@ -3221,8 +3301,10 @@ fn expression_creates_server_function_router(
     if handler_block.label.is_some() {
         return false;
     }
-    let [syn::Stmt::Local(context_clone), syn::Stmt::Expr(async_expression, None)] =
-        handler_block.block.stmts.as_slice()
+    let [
+        syn::Stmt::Local(context_clone),
+        syn::Stmt::Expr(async_expression, None),
+    ] = handler_block.block.stmts.as_slice()
     else {
         return false;
     };
@@ -4671,10 +4753,13 @@ mod tests {
         assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
         for shadow in [
             "mod leptos { pub mod prelude {} }",
+            "mod leptos { pub mod prelude { pub use ::leptos::prelude::*; pub fn provide_context<T>(_value: T) {} } }",
             "mod ryuki_portal_ui { pub mod security {} }",
+            "extern crate attacker as leptos;",
             "extern crate attacker as axum;",
             "type leptos_axum = Attacker;",
             "struct tokio;",
+            "use attacker as leptos;",
             "use attacker as ryuki_portal_ui;",
         ] {
             let shadowed_main = format!("{shadow}\n{main_rs}");
@@ -4691,6 +4776,14 @@ mod tests {
         let unknown_tail = main_rs.replace(
             "        .with_state(leptos_options);",
             "        .with_state(leptos_options).replace_with_attacker();",
+        );
+        let post_state_layer = main_rs.replace(
+            "        .with_state(leptos_options);",
+            "        .with_state(leptos_options).layer(attacker_layer);",
+        );
+        let second_state_tail = main_rs.replace(
+            "        .with_state(leptos_options);",
+            "        .with_state(leptos_options).with_state(attacker_state);",
         );
         let recognized_tail = main_rs.replace(
             "        .with_state(leptos_options);",
@@ -4712,10 +4805,58 @@ mod tests {
         assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
         for invalid_main in [
             unknown_tail,
+            post_state_layer,
+            second_state_tail,
             recognized_tail,
             missing_merge,
             attacker_merge,
             unprotected_routes,
+        ] {
+            assert_ne!(invalid_main, main_rs);
+            assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
+        }
+    }
+
+    #[test]
+    fn server_function_routes_require_excluded_generation_and_post_leptos_merge() {
+        let main_rs = context_aware_ssr_main();
+        let unexcluded_generation = main_rs
+            .replace(
+                "generate_route_list_with_exclusions(App, Some(registered_server_function_route_exclusions()))",
+                "generate_route_list(App)",
+            )
+            .replace(
+                "generate_route_list_with_exclusions",
+                "generate_route_list",
+            );
+        let before_leptos_merge = main_rs
+            .replace("        .merge(server_function_routes)\n", "")
+            .replace(
+                "        .leptos_routes_with_context(",
+                concat!(
+                    "        .merge(server_function_routes)\n",
+                    "        .leptos_routes_with_context("
+                ),
+            );
+        let attacker_exclusions = main_rs.replace(
+            "Some(registered_server_function_route_exclusions())",
+            "Some(attacker_server_function_route_exclusions())",
+        );
+        let shadow_route = main_rs.replace(
+            "        .merge(server_function_routes)",
+            concat!(
+                "        .route(\"/portal/api/auth-entra-authorize-url\", ",
+                "any(|| async { \"attacker\" }))\n",
+                "        .merge(server_function_routes)"
+            ),
+        );
+
+        assert!(inspect_portal_main(&main_rs).runs_axum_leptos_ssr);
+        for invalid_main in [
+            unexcluded_generation,
+            before_leptos_merge,
+            attacker_exclusions,
+            shadow_route,
         ] {
             assert_ne!(invalid_main, main_rs);
             assert!(!inspect_portal_main(&invalid_main).runs_axum_leptos_ssr);
@@ -4728,8 +4869,15 @@ mod tests {
         for invalid_main in [
             main_rs.replace("#[tokio::main]", "#[tokio::main]\n#[cfg(any())]"),
             main_rs.replace(
-                "    let routes = generate_route_list(App);",
-                "    #[cfg(any())]\n    let routes = generate_route_list(App);",
+                concat!(
+                    "    let routes = generate_route_list_with_exclusions(App, ",
+                    "Some(registered_server_function_route_exclusions()));"
+                ),
+                concat!(
+                    "    #[cfg(any())]\n",
+                    "    let routes = generate_route_list_with_exclusions(App, ",
+                    "Some(registered_server_function_route_exclusions()));"
+                ),
             ),
             main_rs.replace(
                 "    use leptos::prelude::*;",
@@ -4986,18 +5134,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum::{routing::{any, get}, Router};
     use leptos::prelude::*;
     use leptos_axum::{
-        file_and_error_handler_with_context, generate_route_list, LeptosRoutes,
+        file_and_error_handler_with_context, generate_route_list_with_exclusions, LeptosRoutes,
     };
     use ryuki_portal_ui::app::{shell, App};
     use ryuki_portal_ui::security::{
-        protect_server_function_routes, PortalPublicOrigin, PortalServerFunctionLimits,
+        protect_server_function_routes, registered_server_function_route_exclusions,
+        PortalPublicOrigin, PortalServerFunctionLimits,
     };
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
     use ryuki_portal_ui::upstream::UpstreamClient;
     let configuration = get_configuration(None)?;
     let leptos_options = configuration.leptos_options;
     let address = leptos_options.site_addr;
-    let routes = generate_route_list(App);
+    let routes = generate_route_list_with_exclusions(App, Some(registered_server_function_route_exclusions()));
     let boundary = PortalServerBoundary::static_dry_run();
     boundary.plan_core_platform_reads()?;
     let public_origin = PortalPublicOrigin::from_env()?;
@@ -5026,7 +5175,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
-        .merge(server_function_routes)
         .leptos_routes_with_context(
             &leptos_options,
             routes,
@@ -5036,6 +5184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 move || shell(leptos_options.clone())
             },
         )
+        .merge(server_function_routes)
         .fallback(file_and_error_handler_with_context(
             move || provide_context(upstream_for_fallback.clone()),
             shell,
