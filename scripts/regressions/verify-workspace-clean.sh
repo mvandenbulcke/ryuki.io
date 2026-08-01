@@ -66,6 +66,19 @@ wait_for_exit() {
   return 1
 }
 
+for member_target in \
+  sources/ryuki-core/target \
+  sources/ryuki-api/target \
+  sources/ryuki-engine/target \
+  sources/ryuki-runner/target \
+  sources/ryuki-protocol/target \
+  sources/ryuki-agent/target \
+  portal/portal-ui/target \
+  scripts/validator-rs/target; do
+  [[ -f "${ROOT_DIR}/${member_target}" && ! -L "${ROOT_DIR}/${member_target}" ]] \
+    || fail "workspace member target blocker is missing or is not a regular file: ${member_target}"
+done
+
 mkdir -p "${FIXTURE_ROOT}/scripts/regressions" "${FIXTURE_ROOT}/.cargo" \
   "$STATE_BASE" "$TMP_A" "$TMP_B" "$FAKE_BIN" "$OUTSIDE_CWD"
 FIXTURE_ROOT="$(cd "$FIXTURE_ROOT" && pwd -P)"

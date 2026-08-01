@@ -1,0 +1,7 @@
+This tracked regular file prevents Cargo from creating a checkout-local
+artifact directory for this workspace member when an IDE or command overrides
+the workspace target directory.
+
+Use the repository Cargo configuration or sanctioned verification scripts.
+Build artifacts belong outside the checkout.
+
