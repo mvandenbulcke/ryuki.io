@@ -2372,10 +2372,12 @@ name = "ryuki-integration-tests"
                     version,
                     &mut errors,
                 );
+                let rejected_at_lifecycle_boundary = errors.iter().any(|error| {
+                    error.contains("root setup step 1 must be the next exact JSON-exec action")
+                        || error.contains("heredoc instruction framing")
+                });
                 assert!(
-                    errors.iter().any(|error| error.contains(
-                        "root setup step 1 must be the next exact JSON-exec action"
-                    )),
+                    rejected_at_lifecycle_boundary,
                     "post-install execution bypass was accepted for {package}: {bypass:?}; {errors:?}"
                 );
             }

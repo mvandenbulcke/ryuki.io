@@ -3289,6 +3289,8 @@ pub(crate) async fn webhook_secret_material_was_used(
     Ok(false)
 }
 
+type WebhookAuthorityRow = (String, Option<String>, String, Option<String>, i64);
+
 /// Resolve the DEDICATED inbound-webhook signing secret for `connection_id`, if one
 /// is configured. Read counterpart of [`set_webhook_secret`] for the (later) receiver
 /// handler slice.
@@ -3306,7 +3308,7 @@ pub(crate) async fn resolve_webhook_authority(
     // Always acquire the connection lock before the credential lock. Rotation
     // and deletion use that same ordering, which makes the authority snapshot
     // both atomic and deadlock-safe.
-    let authority: Option<(String, Option<String>, String, Option<String>, i64)> = sqlx::query_as(
+    let authority: Option<WebhookAuthorityRow> = sqlx::query_as(
         "SELECT vendor_type, site_scope, execution_mode, webhook_secret_ref, webhook_secret_generation \
          FROM integration_connections WHERE id = $1 FOR SHARE",
     )
