@@ -11,13 +11,15 @@ set -Eeuo pipefail
 # checks disk headroom between gates, and removes its target on success, failure,
 # interruption, or the next run after an untrappable process death.
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT_PARENT="$(cd "${ROOT_DIR}/.." && pwd -P)"
 RUSTC_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_WATCH_INTERVAL_SECONDS=5
 TEST_MODE="${RYUKI_VERIFY_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_VERIFY_TEST_MAX_KIB:-}"
+STATE_BASE_INPUT="${RYUKI_VERIFY_STATE_BASE:-/tmp}"
 if [[ ! -f "$RUSTC_GUARD" || -L "$RUSTC_GUARD" || ! -x "$RUSTC_GUARD" ]]; then
   echo "error: repository Cargo rustc guard is missing or unsafe: ${RUSTC_GUARD}" >&2
   exit 75
@@ -26,7 +28,7 @@ if [[ -n "${RYUKI_VERIFY_STATE_BASE:-}" && "$TEST_MODE" != "1" ]]; then
   echo "error: RYUKI_VERIFY_STATE_BASE is reserved for verify-clean regression tests" >&2
   exit 64
 fi
-STATE_BASE_ROOT="$(cd "${RYUKI_VERIFY_STATE_BASE:-/tmp}" && pwd -P)"
+STATE_BASE_ROOT="$(cd "$STATE_BASE_INPUT" && pwd -P)"
 GIT_COMMON_DIR_RAW="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir)"
 GIT_COMMON_DIR="$(cd "$GIT_COMMON_DIR_RAW" && pwd -P)"
 REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object --stdin)"
@@ -36,6 +38,8 @@ KEEP_TARGET="${RYUKI_VERIFY_KEEP_TARGET:-0}"
 WATCH_INTERVAL_SECONDS="${RYUKI_VERIFY_WATCH_INTERVAL_SECONDS:-5}"
 ACTIVE_GATE_PID=""
 SUPERVISED_COMMAND_PID=""
+SUPERVISED_COMMAND_PGID=""
+GATE_SUPERVISOR_ACTUAL_PID=""
 RETAIN_CURRENT_TARGET=0
 WRAPPER_PID="$$"
 VERIFY_NAMESPACE="${STATE_BASE_ROOT}/ryuki-verify-$(id -u)"
@@ -47,22 +51,32 @@ VERIFY_DIR_CREATED=0
 SENTINEL_TMP="${VERIFY_TARGET_ROOT}/.run.${RUN_ID}.owner.tmp"
 SENTINEL_TMP_CREATED=0
 SENTINEL_PUBLISHED=0
+VERIFY_GATE_CONTROL_FILE="${VERIFY_DIR}/.ryuki-verify-command-owner"
+VERIFY_GATE_CONTROL_TEMP="${VERIFY_GATE_CONTROL_FILE}.next"
+VERIFY_GATE_RELEASE_FILE="${VERIFY_DIR}/.ryuki-verify-command-release"
+VERIFY_GATE_RELEASE_TEMP="${VERIFY_GATE_RELEASE_FILE}.next"
 
 # Dedicated Cargo environment variables override checked-in configuration.
 # Do not let an inherited IDE, sccache, or caller configuration redirect the
 # target or replace the repository guard inside this bounded verification.
-unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
-unset CARGO_BUILD_BUILD_DIR
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
 unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
 unset CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
 unset CARGO_BUILD_INCREMENTAL
 unset CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL
+unset RYUKI_CARGO_GUARD_TEST_MODE RYUKI_CARGO_GUARD_TEST_MAX_KIB
+unset RYUKI_CARGO_MAX_TARGET_GIB RYUKI_CARGO_MIN_FREE_GIB
+unset RYUKI_CARGO_GUARD_INTERVAL_SECONDS
 export CARGO_TARGET_DIR="${VERIFY_DIR}/target"
+export CARGO_BUILD_BUILD_DIR="${CARGO_TARGET_DIR}/build-cache"
 export RUSTC_WRAPPER="$RUSTC_GUARD"
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_TEST_DEBUG=0
+export RYUKI_CARGO_MAX_TARGET_GIB="$MAX_TARGET_GIB"
+export RYUKI_CARGO_MIN_FREE_GIB="$MIN_FREE_GIB"
+export RYUKI_CARGO_GUARD_INTERVAL_SECONDS=2
 
 require_positive_integer() {
   local name="$1"
@@ -91,12 +105,34 @@ case "$TEST_MODE" in
     ;;
 esac
 
+if [[ "$TEST_MODE" == "1" ]]; then
+  if [[ -z "${RYUKI_VERIFY_STATE_BASE:-}" ]]; then
+    echo "error: verify-clean test mode requires an explicit external RYUKI_VERIFY_STATE_BASE" >&2
+    exit 64
+  fi
+  case "$STATE_BASE_ROOT" in
+    "$ROOT_PARENT"|"$ROOT_PARENT"/*)
+      echo "error: verify-clean test state must be outside the repository and its parent" >&2
+      exit 64
+      ;;
+  esac
+  if [[ -L "$STATE_BASE_INPUT" || ! -d "$STATE_BASE_ROOT" \
+    || ! -O "$STATE_BASE_ROOT" || ! -w "$STATE_BASE_ROOT" ]]; then
+    echo "error: verify-clean test state must be a canonical, owned, writable directory" >&2
+    exit 64
+  fi
+fi
+
 if [[ -n "$TEST_MAX_KIB" && "$TEST_MODE" != "1" ]]; then
   echo "error: RYUKI_VERIFY_TEST_MAX_KIB is reserved for regression tests" >&2
   exit 64
 fi
 if [[ -n "$TEST_MAX_KIB" ]]; then
   require_positive_integer RYUKI_VERIFY_TEST_MAX_KIB "$TEST_MAX_KIB"
+  if (( TEST_MAX_KIB > MAX_TARGET_GIB * 1024 * 1024 )); then
+    echo "error: RYUKI_VERIFY_TEST_MAX_KIB must not exceed the configured verification target ceiling" >&2
+    exit 64
+  fi
 fi
 
 if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
@@ -249,6 +285,148 @@ acquire_verify_lock() {
   fi
 }
 
+run_without_verify_lock() (
+  exec 9>&-
+  exec "$@"
+)
+
+pause_without_verify_lock() (
+  exec 9>&-
+  sleep "$1"
+)
+
+verify_gate_control_contents() {
+  local run_id="$1"
+  local supervisor_pid="$2"
+  local command_pid="$3"
+  local command_pgid="$4"
+  printf '%s\n' \
+    'version=1' \
+    "repository_id=$REPOSITORY_ID" \
+    "run_id=$run_id" \
+    "supervisor_pid=$supervisor_pid" \
+    "command_pid=$command_pid" \
+    "command_pgid=$command_pgid"
+}
+
+verify_gate_control_value() {
+  local control_file="$1"
+  local wanted="$2"
+  local key value found=0
+  while IFS='=' read -r key value; do
+    if [[ "$key" == "$wanted" ]]; then
+      (( found == 0 )) || return 1
+      printf '%s\n' "$value"
+      found=1
+    fi
+  done < "$control_file"
+  (( found == 1 ))
+}
+
+valid_verify_gate_control() {
+  local control_file="$1"
+  local run_id="$2"
+  local expected_supervisor_pid="${3:-}"
+  local supervisor_pid command_pid command_pgid expected actual
+
+  [[ -f "$control_file" && ! -L "$control_file" && -O "$control_file" ]] || return 1
+  supervisor_pid="$(verify_gate_control_value "$control_file" supervisor_pid)" || \
+    return 1
+  command_pid="$(verify_gate_control_value "$control_file" command_pid)" || return 1
+  command_pgid="$(verify_gate_control_value "$control_file" command_pgid)" || return 1
+  [[ "$supervisor_pid" =~ ^[1-9][0-9]{0,9}$ \
+    && "$command_pid" =~ ^[1-9][0-9]{0,9}$ \
+    && "$command_pgid" =~ ^[1-9][0-9]{0,9}$ \
+    && "$command_pid" == "$command_pgid" ]] || return 1
+  [[ -z "$expected_supervisor_pid" \
+    || "$supervisor_pid" == "$expected_supervisor_pid" ]] || return 1
+  expected="$(verify_gate_control_contents "$run_id" "$supervisor_pid" \
+    "$command_pid" "$command_pgid")"
+  actual="$(<"$control_file")" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+publish_verify_gate_control() {
+  local supervisor_pid="$1"
+  local command_pid="$2"
+  local command_pgid="$3"
+  [[ ! -e "$VERIFY_GATE_CONTROL_FILE" && ! -L "$VERIFY_GATE_CONTROL_FILE" \
+    && ! -e "$VERIFY_GATE_CONTROL_TEMP" && ! -L "$VERIFY_GATE_CONTROL_TEMP" ]] \
+    || return 1
+  (exec 9>&-; set -o noclobber; verify_gate_control_contents "$RUN_ID" \
+    "$supervisor_pid" "$command_pid" "$command_pgid" \
+    > "$VERIFY_GATE_CONTROL_TEMP") || return 1
+  run_without_verify_lock chmod 600 "$VERIFY_GATE_CONTROL_TEMP" || return 1
+  run_without_verify_lock mv -- "$VERIFY_GATE_CONTROL_TEMP" \
+    "$VERIFY_GATE_CONTROL_FILE" || return 1
+  valid_verify_gate_control "$VERIFY_GATE_CONTROL_FILE" "$RUN_ID" "$supervisor_pid"
+}
+
+publish_verify_gate_release() {
+  [[ ! -e "$VERIFY_GATE_RELEASE_FILE" && ! -L "$VERIFY_GATE_RELEASE_FILE" \
+    && ! -e "$VERIFY_GATE_RELEASE_TEMP" && ! -L "$VERIFY_GATE_RELEASE_TEMP" ]] \
+    || return 1
+  (exec 9>&-; set -o noclobber; : > "$VERIFY_GATE_RELEASE_TEMP") || return 1
+  run_without_verify_lock chmod 600 "$VERIFY_GATE_RELEASE_TEMP" || return 1
+  run_without_verify_lock mv -- "$VERIFY_GATE_RELEASE_TEMP" \
+    "$VERIFY_GATE_RELEASE_FILE"
+}
+
+clear_verify_gate_control() {
+  local supervisor_pid="$1"
+  if [[ -e "$VERIFY_GATE_CONTROL_FILE" || -L "$VERIFY_GATE_CONTROL_FILE" ]]; then
+    valid_verify_gate_control "$VERIFY_GATE_CONTROL_FILE" "$RUN_ID" \
+      "$supervisor_pid" || return 1
+  fi
+  run_without_verify_lock rm -f -- "$VERIFY_GATE_RELEASE_FILE" \
+    "$VERIFY_GATE_RELEASE_TEMP" "$VERIFY_GATE_CONTROL_TEMP"
+  run_without_verify_lock rm -f -- "$VERIFY_GATE_CONTROL_FILE"
+}
+
+recover_verify_gate_control() {
+  local verify_dir="$1"
+  local run_id="$2"
+  local expected_supervisor_pid="${3:-}"
+  local control_file control_temp release_file release_temp
+  local supervisor_pid command_pid command_pgid
+  control_file="$verify_dir/.ryuki-verify-command-owner"
+  control_temp="${control_file}.next"
+  release_file="$verify_dir/.ryuki-verify-command-release"
+  release_temp="${release_file}.next"
+
+  if [[ ! -e "$control_file" && ! -L "$control_file" ]]; then
+    if [[ -e "$control_temp" || -L "$control_temp" \
+      || -e "$release_file" || -L "$release_file" \
+      || -e "$release_temp" || -L "$release_temp" ]]; then
+      echo "error: refusing malformed verification command ownership state" >&2
+      return 75
+    fi
+    return 0
+  fi
+  valid_verify_gate_control "$control_file" "$run_id" \
+    "$expected_supervisor_pid" || {
+    echo "error: refusing malformed verification command ownership control" >&2
+    return 75
+  }
+  supervisor_pid="$(verify_gate_control_value "$control_file" supervisor_pid)"
+  command_pid="$(verify_gate_control_value "$control_file" command_pid)"
+  command_pgid="$(verify_gate_control_value "$control_file" command_pgid)"
+
+  if [[ -z "$expected_supervisor_pid" ]]; then
+    if kill -0 "$supervisor_pid" 2>/dev/null || process_group_alive "$command_pgid"; then
+      echo "error: stale verification ownership still references live processes; refusing unsafe PID reuse recovery" >&2
+      return 75
+    fi
+  elif process_group_alive "$command_pgid"; then
+    echo "recovering verification process group after supervisor exit: ${command_pgid}" >&2
+    SUPERVISED_COMMAND_PID="$command_pid"
+    SUPERVISED_COMMAND_PGID="$command_pgid"
+    supervisor_stop_command || return $?
+  fi
+  run_without_verify_lock rm -f -- "$release_file" "$release_temp" "$control_temp"
+  run_without_verify_lock rm -f -- "$control_file"
+}
+
 reclaim_stale_verify_dirs() {
   local candidate sentinel version repository_id run_id keep_target expected_run_id sentinel_tmp
 
@@ -299,6 +477,8 @@ reclaim_stale_verify_dirs() {
       return 75
     fi
 
+    recover_verify_gate_control "$candidate" "$run_id" || return $?
+
     if [[ "$keep_target" == "1" ]]; then
       echo "preserving explicitly retained verification target: ${candidate}" >&2
       continue
@@ -315,16 +495,23 @@ fi
 
 cleanup() {
   local status=$?
+  local gate_cleanup_status=0 safe_to_remove=1
   trap - EXIT
-  trap '' INT TERM
-  stop_active_gate
+  trap '' HUP INT TERM
+  stop_active_gate || gate_cleanup_status=$?
+  if (( gate_cleanup_status != 0 )); then
+    echo "error: refusing verification target cleanup until command ownership is safely recovered" >&2
+    status="$gate_cleanup_status"
+    safe_to_remove=0
+  fi
   if [[ "$SENTINEL_TMP_CREATED" == "1" && -f "$SENTINEL_TMP" && ! -L "$SENTINEL_TMP" ]]; then
     rm -f -- "$SENTINEL_TMP" || status=75
   fi
   if [[ "$VERIFY_DIR_CREATED" == "1" && "$SENTINEL_PUBLISHED" == "1" \
     && "$RETAIN_CURRENT_TARGET" == "1" ]]; then
     echo "verification target retained at ${CARGO_TARGET_DIR}" >&2
-  elif [[ "$VERIFY_DIR_CREATED" == "1" && -e "$VERIFY_DIR" ]]; then
+  elif [[ "$VERIFY_DIR_CREATED" == "1" && -e "$VERIFY_DIR" \
+    && "$safe_to_remove" == "1" ]]; then
     if is_managed_verify_dir "$VERIFY_DIR"; then
       if ! rm -rf -- "$VERIFY_DIR"; then
         echo "error: unable to remove disposable verification target: ${VERIFY_DIR}" >&2
@@ -334,6 +521,8 @@ cleanup() {
       echo "error: refusing to remove unmanaged verification path: ${VERIFY_DIR}" >&2
       status=75
     fi
+  elif [[ "$VERIFY_DIR_CREATED" == "1" && -e "$VERIFY_DIR" ]]; then
+    echo "verification target preserved for fail-closed recovery: ${VERIFY_DIR}" >&2
   fi
   exit "$status"
 }
@@ -416,25 +605,55 @@ terminate_process_tree() {
   done
 }
 
+process_group_alive() {
+  local pgid="${1:-}"
+  [[ -n "$pgid" ]] || return 1
+  kill -0 -- "-$pgid" 2>/dev/null
+}
+
+terminate_process_group() {
+  local pgid="$1"
+  local attempt
+
+  process_group_alive "$pgid" || return 0
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  for attempt in {1..20}; do
+    process_group_alive "$pgid" || return 0
+    pause_without_verify_lock 0.1
+  done
+
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+  for attempt in {1..20}; do
+    process_group_alive "$pgid" || return 0
+    pause_without_verify_lock 0.1
+  done
+  return 75
+}
+
 stop_active_gate() {
   local pid="${ACTIVE_GATE_PID:-}"
+  local recovery_status=0
   [[ -n "$pid" ]] || return 0
 
   if kill -0 "$pid" 2>/dev/null; then
-    terminate_process_tree "$pid"
+    kill -TERM "$pid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
+  recover_verify_gate_control "$VERIFY_DIR" "$RUN_ID" "$pid" || \
+    recovery_status=$?
   ACTIVE_GATE_PID=""
+  return "$recovery_status"
 }
 
 handle_signal() {
   local status="$1"
-  trap '' INT TERM
+  trap '' HUP INT TERM
   stop_active_gate
   exit "$status"
 }
 
 trap cleanup EXIT
+trap 'handle_signal 129' HUP
 trap 'handle_signal 130' INT
 trap 'handle_signal 143' TERM
 
@@ -458,47 +677,114 @@ mkdir -p "$CARGO_TARGET_DIR"
 
 supervisor_stop_command() {
   local pid="${SUPERVISED_COMMAND_PID:-}"
-  [[ -n "$pid" ]] || return 0
-  if kill -0 "$pid" 2>/dev/null; then
+  local pgid="${SUPERVISED_COMMAND_PGID:-}"
+  local status=0
+
+  [[ -n "$pid" || -n "$pgid" ]] || return 0
+  if [[ -n "$pgid" ]] && process_group_alive "$pgid"; then
+    terminate_process_group "$pgid" || status=$?
+  elif [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     terminate_process_tree "$pid"
   fi
-  wait "$pid" 2>/dev/null || true
+  [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
   SUPERVISED_COMMAND_PID=""
+  SUPERVISED_COMMAND_PGID=""
+  return "$status"
 }
 
 supervisor_signal() {
   local status="$1"
-  trap - INT TERM
-  supervisor_stop_command
+  trap '' HUP INT TERM
+  supervisor_stop_command || true
+  [[ -z "$GATE_SUPERVISOR_ACTUAL_PID" ]] || \
+    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
   exit "$status"
 }
 
 run_gate_command() {
   local wrapper_pid="$1"
   local label="$2"
-  local command_pid command_status guard_status
+  local command_pid command_pgid command_status command_wait_status guard_status
+  local command_status_file command_status_tmp stop_status
+  local release_attempt released supervisor_pid_probe
   shift 2
 
   # This supervisor retains the repository lock and the disk watcher if the
   # outer wrapper is killed. It then stops the actual gate within one watch
   # interval, so an orphaned Cargo process cannot grow without a ceiling.
-  trap - EXIT
+  trap - EXIT HUP INT TERM
+  trap 'supervisor_signal 129' HUP
   trap 'supervisor_signal 130' INT
   trap 'supervisor_signal 143' TERM
 
-  "$@" &
+  supervisor_pid_probe="${VERIFY_DIR}/.gate-supervisor-pid.${RUN_ID}"
+  [[ ! -e "$supervisor_pid_probe" && ! -L "$supervisor_pid_probe" ]] || return 75
+  set -o noclobber
+  if ! run_without_verify_lock /bin/sh -c 'printf "%s\n" "$PPID"' \
+    > "$supervisor_pid_probe"; then
+    set +o noclobber
+    return 75
+  fi
+  set +o noclobber
+  read -r GATE_SUPERVISOR_ACTUAL_PID < "$supervisor_pid_probe" || \
+    GATE_SUPERVISOR_ACTUAL_PID=""
+  run_without_verify_lock rm -f -- "$supervisor_pid_probe"
+  [[ "$GATE_SUPERVISOR_ACTUAL_PID" =~ ^[1-9][0-9]{0,9}$ ]] || return 75
+  command_status_file="${VERIFY_DIR}/.gate-status.${RUN_ID}.$RANDOM"
+  command_status_tmp="${command_status_file}.tmp"
+  set -m
+  (
+    trap - EXIT HUP INT TERM
+    exec 9>&-
+    released=0
+    for release_attempt in {1..100}; do
+      if [[ -e "$VERIFY_GATE_RELEASE_FILE" || -L "$VERIFY_GATE_RELEASE_FILE" ]]; then
+        [[ -f "$VERIFY_GATE_RELEASE_FILE" && ! -L "$VERIFY_GATE_RELEASE_FILE" \
+          && -O "$VERIFY_GATE_RELEASE_FILE" ]] || exit 75
+        rm -f -- "$VERIFY_GATE_RELEASE_FILE"
+        released=1
+        break
+      fi
+      kill -0 "$GATE_SUPERVISOR_ACTUAL_PID" 2>/dev/null || exit 75
+      sleep 0.05
+    done
+    (( released == 1 )) || exit 75
+    set +e
+    "$@"
+    command_status=$?
+    printf '%s\n' "$command_status" > "$command_status_tmp"
+    mv -f -- "$command_status_tmp" "$command_status_file"
+    exit "$command_status"
+  ) &
   command_pid=$!
+  command_pgid="$command_pid"
+  set +m
   SUPERVISED_COMMAND_PID="$command_pid"
-  while kill -0 "$command_pid" 2>/dev/null; do
+  SUPERVISED_COMMAND_PGID="$command_pgid"
+  if ! publish_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" \
+    "$command_pid" "$command_pgid" || ! publish_verify_gate_release; then
+    supervisor_stop_command || true
+    clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+    return 75
+  fi
+  while process_group_alive "$command_pgid"; do
+    [[ ! -f "$command_status_file" ]] || break
     if ! kill -0 "$wrapper_pid" 2>/dev/null; then
       echo "error: stopping ${label}: verification wrapper no longer exists" >&2
       supervisor_stop_command
+      run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
+      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
       return 75
     fi
 
-    sleep "$WATCH_INTERVAL_SECONDS"
-    if ! kill -0 "$command_pid" 2>/dev/null; then
-      break
+    pause_without_verify_lock "$WATCH_INTERVAL_SECONDS"
+    [[ ! -f "$command_status_file" ]] || break
+    if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+      echo "error: stopping ${label}: verification wrapper no longer exists" >&2
+      supervisor_stop_command
+      run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
+      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
+      return 75
     fi
     if disk_guard 0; then
       continue
@@ -506,22 +792,45 @@ run_gate_command() {
       guard_status=$?
       echo "error: stopping ${label} before it can exhaust the disk" >&2
       supervisor_stop_command
+      run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
+      clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
       return "$guard_status"
     fi
   done
 
   if wait "$command_pid"; then
-    command_status=0
+    command_wait_status=0
   else
-    command_status=$?
+    command_wait_status=$?
   fi
   SUPERVISED_COMMAND_PID=""
+  if [[ -f "$command_status_file" ]]; then
+    read -r command_status < "$command_status_file" || command_status=""
+  else
+    command_status="$command_wait_status"
+  fi
+  if [[ ! "$command_status" =~ ^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then
+    echo "error: ${label} did not publish a valid command status" >&2
+    command_status=75
+  fi
+  run_without_verify_lock rm -f -- "$command_status_file" "$command_status_tmp"
+
+  stop_status=0
+  if process_group_alive "$command_pgid"; then
+    echo "stopping surviving ${label} descendants after command exit" >&2
+  fi
+  supervisor_stop_command || stop_status=$?
+  if (( stop_status != 0 )); then
+    echo "error: unable to stop every ${label} process-group member" >&2
+    return "$stop_status"
+  fi
+  clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
   return "$command_status"
 }
 
 run_gate() {
   local label="$1"
-  local command_pid command_status
+  local command_pid command_status recovery_status control_remained
   shift
   disk_guard
   echo "==> ${label}"
@@ -534,7 +843,19 @@ run_gate() {
   else
     command_status=$?
   fi
+  control_remained=0
+  if [[ -e "$VERIFY_GATE_CONTROL_FILE" || -L "$VERIFY_GATE_CONTROL_FILE" ]]; then
+    control_remained=1
+  fi
+  recovery_status=0
+  recover_verify_gate_control "$VERIFY_DIR" "$RUN_ID" "$command_pid" || \
+    recovery_status=$?
+  (( recovery_status == 0 )) || return "$recovery_status"
   ACTIVE_GATE_PID=""
+  if (( command_status == 0 && control_remained == 1 )); then
+    echo "error: ${label} supervisor left command ownership published" >&2
+    return 75
+  fi
   if (( command_status != 0 )); then
     return "$command_status"
   fi
@@ -604,6 +925,8 @@ fi
 
 run_gate "verification cleanup regression" ./scripts/regressions/verify-workspace-clean.sh
 run_gate "repository Cargo disk guard regression" ./scripts/regressions/cargo-rustc-disk-guard.sh
+run_gate "persistent Cargo dev guard regression" ./scripts/regressions/cargo-dev-guard.sh
+run_gate "proving-ground build cleanup regression" ./scripts/regressions/proving-ground-build-cleanup.sh
 run_gate "format" cargo fmt --check --all
 run_gate "workspace build" cargo build --workspace
 run_gate "workspace tests" cargo test --workspace

@@ -5,6 +5,11 @@
 # outside the repository with only `--manifest-path` (which skips this config).
 target-dir = "../.ryuki-target-ryuki.io"
 
+# Cargo's build-dir is independently configurable and can otherwise place a
+# profile directory such as `debug/` in the checkout even when target-dir is
+# external. Keep it inside the same bounded development cache.
+build-dir = "../.ryuki-target-ryuki.io/build-cache"
+
 # Every Cargo entry point (direct commands, Make, cargo-leptos, rust-analyzer,
 # and the disposable verification wrapper) passes rustc through the same hard
 # disk ceiling. The wrapper delegates transparently while the effective target

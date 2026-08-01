@@ -64,32 +64,25 @@ verify-clean:
 	./scripts/verify-workspace-clean.sh
 
 cache-status:
-	@echo "development Cargo target: $(RYUKI_DEV_TARGET_DIR)"
-	@if [ -d "$(RYUKI_DEV_TARGET_DIR)" ]; then \
-		du -sh "$(RYUKI_DEV_TARGET_DIR)"; \
-		if du --apparent-size --count-links -sh "$(RYUKI_DEV_TARGET_DIR)" >/dev/null 2>&1; then \
-			du --apparent-size --count-links -sh "$(RYUKI_DEV_TARGET_DIR)" | sed 's/^/apparent: /'; \
-		else \
-			du -A -l -s -h "$(RYUKI_DEV_TARGET_DIR)" | sed 's/^/apparent: /'; \
-		fi; \
-	else \
-		echo "development target: absent"; \
-	fi
-	@df -h "$(REPO_ROOT)/.." | tail -1
+	@RYUKI_DEV_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
+	  RYUKI_LEPTOS_SITE_ROOT="$(RYUKI_LEPTOS_SITE_ROOT)" \
+	  ./scripts/cargo-dev-guard.sh status
 
 clean:
-	CARGO_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" cargo clean
+	RYUKI_DEV_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
+	  RYUKI_LEPTOS_SITE_ROOT="$(RYUKI_LEPTOS_SITE_ROOT)" \
+	  ./scripts/cargo-dev-guard.sh clean
 	rm -rf output/
 
 run-api:
-	CARGO_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
-	  RYUKI_MIGRATION_MODE=local-auto \
-	  cargo run --manifest-path sources/ryuki-api/Cargo.toml
+	RYUKI_DEV_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
+	  RYUKI_LEPTOS_SITE_ROOT="$(RYUKI_LEPTOS_SITE_ROOT)" \
+	  ./scripts/cargo-dev-guard.sh run-api
 
 run-portal:
-	CARGO_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
-	  LEPTOS_SITE_ROOT="$(RYUKI_LEPTOS_SITE_ROOT)" \
-	  cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
+	RYUKI_DEV_TARGET_DIR="$(RYUKI_DEV_TARGET_DIR)" \
+	  RYUKI_LEPTOS_SITE_ROOT="$(RYUKI_LEPTOS_SITE_ROOT)" \
+	  ./scripts/cargo-dev-guard.sh run-portal
 
 # Local-dev logical backup of the compose database. Writes a timestamped,
 # custom-format (-Fc) dump under ./backups/ that `db-restore` can replay. This

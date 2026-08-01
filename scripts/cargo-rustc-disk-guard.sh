@@ -10,14 +10,16 @@ set -Eeuo pipefail
 #
 #   cargo-rustc-disk-guard.sh /path/to/rustc <rustc arguments...>
 #
-# The effective target is located from rustc's `--out-dir`, so `--target-dir`,
-# target triples, and the disposable verification target are all covered.
+# The rustc `--out-dir` must resolve inside the configured target. Repository
+# launchers pin `CARGO_TARGET_DIR`; an unexported CLI `--target-dir` is refused
+# rather than trusting a cache marker from an unrelated directory.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DEFAULT_TARGET_DIR="$(cd "$ROOT_DIR/.." && pwd -P)/.ryuki-target-ryuki.io"
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_CHECK_INTERVAL_SECONDS=2
+HARD_MAX_TARGET_KIB=$((HARD_MAX_TARGET_GIB * 1024 * 1024))
 MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-24}"
 MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
 CHECK_INTERVAL_SECONDS="${RYUKI_CARGO_GUARD_INTERVAL_SECONDS:-2}"
@@ -94,22 +96,21 @@ case "$TEST_MODE" in
     ;;
 esac
 
-# These environment variables are tunable only toward a stricter production
-# posture. Regression tests use their separately gated KiB ceiling and may use
-# a lower free-space floor on constrained test hosts.
-if [[ "$TEST_MODE" != "1" ]]; then
-  if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
-    echo "error: RYUKI_CARGO_MAX_TARGET_GIB must not exceed ${HARD_MAX_TARGET_GIB}" >&2
-    exit 64
-  fi
-  if (( MIN_FREE_GIB < HARD_MIN_FREE_GIB )); then
-    echo "error: RYUKI_CARGO_MIN_FREE_GIB must not be less than ${HARD_MIN_FREE_GIB}" >&2
-    exit 64
-  fi
-  if (( CHECK_INTERVAL_SECONDS > HARD_MAX_CHECK_INTERVAL_SECONDS )); then
-    echo "error: RYUKI_CARGO_GUARD_INTERVAL_SECONDS must not exceed ${HARD_MAX_CHECK_INTERVAL_SECONDS}" >&2
-    exit 64
-  fi
+# These environment variables are tunable only toward a stricter posture.
+# Test mode may select a smaller KiB ceiling for cheap regression fixtures, but
+# it never weakens the repository's production size, free-space, or sampling
+# bounds.
+if (( MAX_TARGET_GIB > HARD_MAX_TARGET_GIB )); then
+  echo "error: RYUKI_CARGO_MAX_TARGET_GIB must not exceed ${HARD_MAX_TARGET_GIB}" >&2
+  exit 64
+fi
+if (( MIN_FREE_GIB < HARD_MIN_FREE_GIB )); then
+  echo "error: RYUKI_CARGO_MIN_FREE_GIB must not be less than ${HARD_MIN_FREE_GIB}" >&2
+  exit 64
+fi
+if (( CHECK_INTERVAL_SECONDS > HARD_MAX_CHECK_INTERVAL_SECONDS )); then
+  echo "error: RYUKI_CARGO_GUARD_INTERVAL_SECONDS must not exceed ${HARD_MAX_CHECK_INTERVAL_SECONDS}" >&2
+  exit 64
 fi
 
 if [[ -n "$TEST_MAX_KIB" && "$TEST_MODE" != "1" ]]; then
@@ -118,6 +119,15 @@ if [[ -n "$TEST_MAX_KIB" && "$TEST_MODE" != "1" ]]; then
 fi
 if [[ -n "$TEST_MAX_KIB" ]]; then
   require_positive_integer RYUKI_CARGO_GUARD_TEST_MAX_KIB "$TEST_MAX_KIB"
+  if (( TEST_MAX_KIB > HARD_MAX_TARGET_KIB )); then
+    echo "error: RYUKI_CARGO_GUARD_TEST_MAX_KIB must not exceed ${HARD_MAX_TARGET_KIB}" >&2
+    exit 64
+  fi
+  configured_max_target_kib=$((MAX_TARGET_GIB * 1024 * 1024))
+  if (( TEST_MAX_KIB > configured_max_target_kib )); then
+    echo "error: RYUKI_CARGO_GUARD_TEST_MAX_KIB must not exceed the configured target ceiling of ${configured_max_target_kib} KiB" >&2
+    exit 64
+  fi
 fi
 
 out_dir=""
@@ -134,43 +144,81 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
   fi
 done
 
-find_target_root() {
-  local candidate parent attempt configured_target configured_real out_real
+canonicalize_directory_destination() {
+  local input="$1"
+  local absolute_path resolved component candidate
+  local -a components
 
-  if [[ -n "$out_dir" ]]; then
-    candidate="$out_dir"
-    for attempt in {1..10}; do
-      if [[ -f "$candidate/CACHEDIR.TAG" ]]; then
-        (cd "$candidate" && pwd -P)
-        return 0
-      fi
-      parent="$(dirname "$candidate")"
-      [[ "$parent" != "$candidate" ]] || break
-      candidate="$parent"
-    done
+  if [[ "$input" == /* ]]; then
+    absolute_path="$input"
+  else
+    absolute_path="$PWD/$input"
   fi
+
+  # Resolve every existing path component physically. Missing trailing
+  # components are normalized without creating them, so a configured build
+  # directory can be checked before Cargo creates it while symlink escapes in
+  # any existing ancestor still fail containment.
+  resolved="/"
+  IFS='/' read -r -a components <<< "$absolute_path"
+  for component in "${components[@]}"; do
+    case "$component" in
+      ''|.)
+        continue
+        ;;
+      ..)
+        if [[ "$resolved" != "/" ]]; then
+          resolved="${resolved%/*}"
+          [[ -n "$resolved" ]] || resolved="/"
+        fi
+        continue
+        ;;
+    esac
+
+    if [[ "$resolved" == "/" ]]; then
+      candidate="/$component"
+    else
+      candidate="$resolved/$component"
+    fi
+
+    if [[ -L "$candidate" ]]; then
+      [[ -d "$candidate" ]] || return 1
+      resolved="$(cd "$candidate" && pwd -P)" || return 1
+    elif [[ -e "$candidate" && ! -d "$candidate" ]]; then
+      return 1
+    elif [[ -d "$candidate" ]]; then
+      resolved="$(cd "$candidate" && pwd -P)" || return 1
+    else
+      resolved="$candidate"
+    fi
+  done
+
+  printf '%s\n' "$resolved"
+}
+
+find_target_root() {
+  local configured_target configured_real out_real
 
   configured_target="${CARGO_TARGET_DIR:-$DEFAULT_TARGET_DIR}"
   if [[ "$configured_target" != /* ]]; then
     configured_target="$PWD/$configured_target"
   fi
-  if [[ -d "$configured_target" ]]; then
-    configured_real="$(cd "$configured_target" && pwd -P)"
-    if [[ -z "$out_dir" ]]; then
-      printf '%s\n' "$configured_real"
-      return 0
-    fi
-    if [[ -d "$out_dir" ]]; then
-      out_real="$(cd "$out_dir" && pwd -P)"
-      case "$out_real/" in
-        "$configured_real/"*)
-          printf '%s\n' "$configured_real"
-          return 0
-          ;;
-      esac
-    fi
+  [[ -d "$configured_target" ]] || return 1
+  configured_real="$(cd "$configured_target" && pwd -P)" || return 1
+
+  if [[ -n "$out_dir" ]]; then
+    # Compare physical paths only. A lexical `$target/debug` path may cross a
+    # symlink, and no CACHEDIR.TAG outside the configured target may redefine
+    # which directory the guard supervises.
+    [[ -d "$out_dir" ]] || return 1
+    out_real="$(cd "$out_dir" && pwd -P)" || return 1
+    case "$out_real/" in
+      "$configured_real/"*) ;;
+      *) return 1 ;;
+    esac
   fi
-  return 1
+
+  printf '%s\n' "$configured_real"
 }
 
 # Cargo also uses the wrapper for compiler capability probes that have no
@@ -183,6 +231,50 @@ if ! target_root="$(find_target_root)"; then
     exit 75
   fi
   exec "$@"
+fi
+
+case "$target_root" in
+  "$ROOT_DIR"|"$ROOT_DIR"/*)
+    echo "error: Cargo compilation refused: target root must be outside the repository checkout" >&2
+    exit 75
+    ;;
+esac
+
+if [[ "${CARGO_BUILD_BUILD_DIR+x}" == "x" ]]; then
+  if [[ -z "$CARGO_BUILD_BUILD_DIR" ]] \
+    || ! build_dir_real="$(canonicalize_directory_destination "$CARGO_BUILD_BUILD_DIR")"; then
+    echo "error: Cargo compilation refused: CARGO_BUILD_BUILD_DIR is not a resolvable directory destination" >&2
+    exit 75
+  fi
+  case "$build_dir_real/" in
+    "$target_root/"*) ;;
+    *)
+      echo "error: Cargo compilation refused: CARGO_BUILD_BUILD_DIR must resolve inside the target root" >&2
+      exit 75
+      ;;
+  esac
+fi
+
+if [[ "$TEST_MODE" == "1" ]]; then
+  test_tmp="${TMPDIR:-/tmp}"
+  if [[ ! -d "$test_tmp" ]]; then
+    echo "error: Cargo disk-guard test mode requires a safe temporary directory" >&2
+    exit 75
+  fi
+  test_tmp="$(cd "$test_tmp" && pwd -P)"
+  case "$test_tmp" in
+    "$ROOT_DIR"|"$ROOT_DIR"/*)
+      echo "error: Cargo disk-guard test mode temporary directory must be outside the repository checkout" >&2
+      exit 75
+      ;;
+  esac
+  case "$target_root" in
+    "$test_tmp"/ryuki-cargo-guard.*/*) ;;
+    *)
+      echo "error: Cargo disk-guard test mode target must remain inside its private regression fixture" >&2
+      exit 75
+      ;;
+  esac
 fi
 
 state_dir="$target_root/.ryuki-cargo-disk-guard"

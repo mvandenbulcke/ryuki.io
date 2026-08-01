@@ -1,0 +1,6 @@
+This tracked regular file prevents an explicit Cargo build directory equal to
+the repository root from creating a checkout-local debug artifact tree.
+
+Persistent artifacts belong in ../.ryuki-target-ryuki.io. Use the sanctioned
+Make targets or scripts/verify-workspace-clean.sh so both Cargo target-dir and
+build-dir remain externally bounded.

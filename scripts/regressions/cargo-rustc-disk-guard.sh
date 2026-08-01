@@ -6,6 +6,7 @@ GUARD="$ROOT_DIR/scripts/cargo-rustc-disk-guard.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-cargo-guard.XXXXXX")"
 TARGET="$TEST_ROOT/target"
 OUT_DIR="$TARGET/debug/deps"
+export CARGO_TARGET_DIR="$TARGET"
 MARKER="$TEST_ROOT/rustc-called"
 FAKE_RUSTC="$TEST_ROOT/fake-rustc"
 GROWER_STARTED="$TEST_ROOT/grower-started"
@@ -18,6 +19,10 @@ FAST_GROWER_FINISHED="$TEST_ROOT/fast-grower-finished"
 FAKE_FAST_GROWER="$TEST_ROOT/fake-fast-growing-rustc"
 SPARSE_TARGET="$TEST_ROOT/sparse-target"
 SPARSE_OUT_DIR="$SPARSE_TARGET/debug/deps"
+BUILD_ESCAPE="$TEST_ROOT/build-escape"
+SYMLINK_TARGET="$TEST_ROOT/symlink-target"
+SYMLINK_OUTSIDE="$TEST_ROOT/symlink-output"
+SYMLINK_OUT_DIR="$SYMLINK_TARGET/debug/deps"
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -57,6 +62,108 @@ if RYUKI_CARGO_GUARD_INTERVAL_SECONDS=3 \
 fi
 grep -q "RYUKI_CARGO_GUARD_INTERVAL_SECONDS must not exceed 2" "$TEST_ROOT/interval.log"
 
+if RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_MAX_TARGET_GIB=25 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/test-max-target.log"; then
+  echo "error: test mode weakened the production target ceiling" >&2
+  exit 1
+fi
+grep -q "RYUKI_CARGO_MAX_TARGET_GIB must not exceed 24" "$TEST_ROOT/test-max-target.log"
+
+if RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=25165825 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/test-max-kib.log"; then
+  echo "error: test mode accepted a KiB ceiling above 24 GiB" >&2
+  exit 1
+fi
+grep -q "RYUKI_CARGO_GUARD_TEST_MAX_KIB must not exceed 25165824" \
+  "$TEST_ROOT/test-max-kib.log"
+
+if RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_MAX_TARGET_GIB=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1048577 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/test-configured-max-kib.log"; then
+  echo "error: test mode weakened a stricter configured target ceiling" >&2
+  exit 1
+fi
+grep -q "must not exceed the configured target ceiling of 1048576 KiB" \
+  "$TEST_ROOT/test-configured-max-kib.log"
+
+if CARGO_TARGET_DIR="$ROOT_DIR" \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$ROOT_DIR" 2>"$TEST_ROOT/in-repo-target.log"; then
+  echo "error: repository-local Cargo target was accepted" >&2
+  exit 1
+fi
+grep -q "target root must be outside the repository checkout" \
+  "$TEST_ROOT/in-repo-target.log"
+
+if TMPDIR="$ROOT_DIR" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/unsafe-test-root.log"; then
+  echo "error: test mode accepted a repository-local temporary root" >&2
+  exit 1
+fi
+grep -q "temporary directory must be outside the repository checkout" \
+  "$TEST_ROOT/unsafe-test-root.log"
+
+if CARGO_BUILD_BUILD_DIR=. \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/root-build-dir.log"; then
+  echo "error: checkout-root Cargo build directory was accepted" >&2
+  exit 1
+fi
+grep -q "CARGO_BUILD_BUILD_DIR must resolve inside the target root" \
+  "$TEST_ROOT/root-build-dir.log"
+
+mkdir -p "$BUILD_ESCAPE"
+ln -s "$BUILD_ESCAPE" "$TARGET/build-link"
+if CARGO_BUILD_BUILD_DIR="$TARGET/build-link" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/symlink-build-dir.log"; then
+  echo "error: symlinked Cargo build directory escaped the target" >&2
+  exit 1
+fi
+grep -q "CARGO_BUILD_BUILD_DIR must resolve inside the target root" \
+  "$TEST_ROOT/symlink-build-dir.log"
+
+# A lexical target ancestor carrying CACHEDIR.TAG is not sufficient when an
+# output path crosses a symlink. The guard must canonicalize the rustc output
+# directory before looking for its target root.
+mkdir -p "$SYMLINK_TARGET" "$SYMLINK_OUTSIDE/deps"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' \
+  > "$SYMLINK_TARGET/CACHEDIR.TAG"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' \
+  > "$SYMLINK_OUTSIDE/CACHEDIR.TAG"
+ln -s "$SYMLINK_OUTSIDE" "$SYMLINK_TARGET/debug"
+if CARGO_TARGET_DIR="$SYMLINK_TARGET" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$SYMLINK_OUT_DIR" 2>"$TEST_ROOT/symlink-out-dir.log"; then
+  echo "error: symlinked rustc output escaped physical target containment" >&2
+  exit 1
+fi
+grep -q "unable to identify the target root" "$TEST_ROOT/symlink-out-dir.log"
+
+if CARGO_TARGET_DIR="$TEST_ROOT/missing-target" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/missing-target.log"; then
+  echo "error: absent configured target was replaced by an out-dir marker" >&2
+  exit 1
+fi
+grep -q "unable to identify the target root" "$TEST_ROOT/missing-target.log"
+
 [[ ! -e "$MARKER" ]] || {
   echo "error: rustc ran while a weakened production guard was rejected" >&2
   exit 1
@@ -66,7 +173,7 @@ grep -q "RYUKI_CARGO_GUARD_INTERVAL_SECONDS must not exceed 2" "$TEST_ROOT/inter
 dd if=/dev/zero of="$TARGET/oversized.bin" bs=1024 count=32 status=none
 if RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=8 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/refused.log"; then
   echo "error: oversized target was not refused" >&2
@@ -95,13 +202,15 @@ fi
   exit 1
 }
 if RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  CARGO_TARGET_DIR="$SPARSE_TARGET" \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=128 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$SPARSE_OUT_DIR" 2>"$TEST_ROOT/sparse-refused.log"; then
   echo "error: sparse target escaped the apparent-size ceiling" >&2
   exit 1
 fi
+grep -q "Cargo target exceeded" "$TEST_ROOT/sparse-refused.log"
 grep -q "Cargo compilation refused" "$TEST_ROOT/sparse-refused.log"
 [[ ! -e "$MARKER" ]] || {
   echo "error: rustc ran after sparse target growth exceeded the ceiling" >&2
@@ -115,7 +224,7 @@ mkdir -p "$UNMARKED_OUT_DIR"
 if CARGO_TARGET_DIR="$TARGET" \
   RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$UNMARKED_OUT_DIR" 2>"$TEST_ROOT/unidentified.log"; then
   echo "error: unidentified compiler output ran without its own target supervisor" >&2
@@ -135,7 +244,7 @@ rm -rf "$TARGET/.ryuki-cargo-disk-guard"
 set +e
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=32 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_PEER" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/peer.log" &
 peer_wrapper_pid=$!
@@ -151,7 +260,7 @@ done
 }
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=32 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_GROWER" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/grower.log" &
 grower_wrapper_pid=$!
@@ -186,7 +295,7 @@ TRIP_FILE="$TARGET/.ryuki-cargo-disk-guard/target-limit-tripped"
 rm -f "$TARGET/runtime-oversized.bin"
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR"
 [[ -f "$MARKER" ]] || {
@@ -204,7 +313,7 @@ RYUKI_CARGO_GUARD_TEST_MODE=1 \
 set +e
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=64 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_FAST_GROWER" --out-dir "$OUT_DIR" 2>"$TEST_ROOT/fast-grower.log"
 fast_grower_status=$?
@@ -222,7 +331,7 @@ grep -q "compiler output crossed" "$TEST_ROOT/fast-grower.log"
 rm -f "$TARGET/fast-oversized.bin"
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
-  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
   RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
   "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR"
 [[ ! -e "$TRIP_FILE" ]] || {
@@ -238,7 +347,7 @@ stress_pids=()
 for index in {1..32}; do
   RYUKI_CARGO_GUARD_TEST_MODE=1 \
     RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
-    RYUKI_CARGO_MIN_FREE_GIB=1 \
+    RYUKI_CARGO_MIN_FREE_GIB=30 \
     RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
     "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" \
     2>"$TEST_ROOT/stress-${index}.log" &

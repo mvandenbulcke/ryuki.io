@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 SOURCE_SCRIPT="${ROOT_DIR}/scripts/verify-workspace-clean.sh"
 SOURCE_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
 SOURCE_CARGO_CONFIG="${ROOT_DIR}/.cargo/config.toml"
 SOURCE_TARGET_BLOCKER="${ROOT_DIR}/target"
+SOURCE_DEBUG_BLOCKER="${ROOT_DIR}/debug"
 BLOCKING_GATE_FIXTURE="${ROOT_DIR}/scripts/regressions/fixtures/verify-workspace-clean-blocking-gate.sh"
+DETACHED_CARGO_FIXTURE="${ROOT_DIR}/scripts/regressions/fixtures/verify-workspace-clean-detached-cargo.sh"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-verify-regression.XXXXXX")"
-FIXTURE_ROOT="${WORK_DIR}/repo"
+FIXTURE_ROOT="${WORK_DIR}/checkout/repo"
 STATE_BASE="${WORK_DIR}/state"
 TMP_A="${WORK_DIR}/tmp-a"
 TMP_B="${WORK_DIR}/tmp-b"
@@ -17,21 +19,37 @@ READY_FILE="${WORK_DIR}/ready"
 RELEASE_FILE="${WORK_DIR}/release"
 BLOCKER_PID_FILE="${WORK_DIR}/blocker.pid"
 WRAPPER_PID=""
+SUPERVISOR_PID=""
+SUPERVISOR_KILL_OUTPUT="${WORK_DIR}/supervisor-kill-output"
 FAKE_BIN="${WORK_DIR}/bin"
 FAKE_CARGO="${FAKE_BIN}/cargo"
 CARGO_ENV_CAPTURE="${WORK_DIR}/cargo-env"
 OUTSIDE_CWD="${WORK_DIR}/outside-cwd"
 MANIFEST_TARGET_PROBE="${WORK_DIR}/manifest-target-probe"
+DETACHED_PID_FILE="${WORK_DIR}/detached.pid"
+DETACHED_READY_FILE="${WORK_DIR}/detached.ready"
+DETACHED_ATTEMPTED_FILE="${WORK_DIR}/detached-attempted"
+DETACHED_TARGET_CAPTURE="${WORK_DIR}/detached-target"
 
 cleanup() {
   local blocker_pid=""
+  local detached_pid=""
   if [[ -n "$WRAPPER_PID" ]] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
     kill -KILL "$WRAPPER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$SUPERVISOR_PID" ]] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+    kill -KILL "$SUPERVISOR_PID" 2>/dev/null || true
   fi
   if [[ -f "$BLOCKER_PID_FILE" ]]; then
     blocker_pid="$(sed -n '1p' "$BLOCKER_PID_FILE")"
     if [[ "$blocker_pid" =~ ^[0-9]+$ ]] && kill -0 "$blocker_pid" 2>/dev/null; then
       kill -KILL "$blocker_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$DETACHED_PID_FILE" ]]; then
+    detached_pid="$(sed -n '1p' "$DETACHED_PID_FILE")"
+    if [[ "$detached_pid" =~ ^[0-9]+$ ]] && kill -0 "$detached_pid" 2>/dev/null; then
+      kill -KILL "$detached_pid" 2>/dev/null || true
     fi
   fi
   rm -rf -- "$WORK_DIR"
@@ -78,6 +96,11 @@ for member_target in \
   [[ -f "${ROOT_DIR}/${member_target}" && ! -L "${ROOT_DIR}/${member_target}" ]] \
     || fail "workspace member target blocker is missing or is not a regular file: ${member_target}"
 done
+[[ -f "$SOURCE_DEBUG_BLOCKER" && ! -L "$SOURCE_DEBUG_BLOCKER" ]] \
+  || fail "checkout debug blocker is missing or is not a regular file"
+grep -Fqx 'build-dir = "../.ryuki-target-ryuki.io/build-cache"' \
+  "$SOURCE_CARGO_CONFIG" \
+  || fail "Cargo config does not pin build-dir beneath the external cache"
 
 mkdir -p "${FIXTURE_ROOT}/scripts/regressions" "${FIXTURE_ROOT}/.cargo" \
   "$STATE_BASE" "$TMP_A" "$TMP_B" "$FAKE_BIN" "$OUTSIDE_CWD"
@@ -116,6 +139,12 @@ chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
   printf '%s\n' '  printf "CARGO_INCREMENTAL=%s\n" "${CARGO_INCREMENTAL-}"'
   printf '%s\n' '  printf "CARGO_PROFILE_DEV_DEBUG=%s\n" "${CARGO_PROFILE_DEV_DEBUG-}"'
   printf '%s\n' '  printf "CARGO_PROFILE_TEST_DEBUG=%s\n" "${CARGO_PROFILE_TEST_DEBUG-}"'
+  printf '%s\n' '  printf "RYUKI_CARGO_GUARD_TEST_MODE=%s\n" "${RYUKI_CARGO_GUARD_TEST_MODE-}"'
+  printf '%s\n' '  printf "RYUKI_CARGO_GUARD_TEST_MAX_KIB=%s\n" "${RYUKI_CARGO_GUARD_TEST_MAX_KIB-}"'
+  printf '%s\n' '  printf "RYUKI_CARGO_MAX_TARGET_GIB=%s\n" "${RYUKI_CARGO_MAX_TARGET_GIB-}"'
+  printf '%s\n' '  printf "RYUKI_CARGO_MIN_FREE_GIB=%s\n" "${RYUKI_CARGO_MIN_FREE_GIB-}"'
+  printf '%s\n' '  printf "RYUKI_CARGO_GUARD_INTERVAL_SECONDS=%s\n" "${RYUKI_CARGO_GUARD_INTERVAL_SECONDS-}"'
+  printf '%s\n' '  if [[ -e /dev/fd/9 || -e /proc/self/fd/9 ]]; then printf "FD9=open\n"; else printf "FD9=closed\n"; fi'
   printf '%s\n' '} > "$RYUKI_VERIFY_TEST_CARGO_ENV"'
 } > "$FAKE_CARGO"
 chmod 700 "$FAKE_CARGO"
@@ -208,6 +237,29 @@ grep -q "RYUKI_VERIFY_MAX_TARGET_GIB must not exceed 24" "$OUTPUT_FILE" \
 
 if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
+  RYUKI_VERIFY_TEST_MAX_KIB=25165825 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
+  fail "test-only target ceiling could weaken the 24 GiB repository maximum"
+fi
+grep -q "RYUKI_VERIFY_TEST_MAX_KIB must not exceed the configured verification target ceiling" \
+  "$OUTPUT_FILE" \
+  || fail "inflated test-only target ceiling refusal was not reported"
+
+UNSAFE_STATE_BASE="${FIXTURE_ROOT}/unsafe-state"
+mkdir -p "$UNSAFE_STATE_BASE"
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$UNSAFE_STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
+  fail "test mode accepted verification state inside the repository"
+fi
+grep -q "verify-clean test state must be outside the repository and its parent" \
+  "$OUTPUT_FILE" \
+  || fail "unsafe checkout-local test state refusal was not reported"
+[[ ! -e "${UNSAFE_STATE_BASE}/ryuki-verify-$(id -u)" ]] \
+  || fail "unsafe test state created a checkout-local verification namespace"
+
+if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
   RYUKI_VERIFY_MIN_FREE_GIB=29 \
   "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
   fail "verification accepted a free-space floor below the repository minimum"
@@ -247,25 +299,42 @@ PATH="${FAKE_BIN}:$PATH" \
   CARGO_INCREMENTAL=1 \
   CARGO_PROFILE_DEV_DEBUG=2 \
   CARGO_PROFILE_TEST_DEBUG=2 \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=999999999 \
+  RYUKI_CARGO_MAX_TARGET_GIB=999 \
+  RYUKI_CARGO_MIN_FREE_GIB=1 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=999 \
   "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" -- cargo check \
   > "$OUTPUT_FILE" 2>&1 \
   || fail "focused verification failed while sanitizing inherited Cargo overrides"
 
 captured_target="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$CARGO_ENV_CAPTURE")"
+captured_build_dir="$(sed -n 's/^CARGO_BUILD_BUILD_DIR=//p' "$CARGO_ENV_CAPTURE")"
 case "$captured_target" in
   "${VERIFY_TARGET_ROOT}"/run.*/target) ;;
   *) fail "focused verification did not replace the inherited Cargo target" ;;
 esac
+[[ "$captured_build_dir" == "${captured_target}/build-cache" ]] \
+  || fail "focused verification did not pin Cargo build-dir beneath its disposable target"
 grep -Fxq "RUSTC_WRAPPER=${FIXTURE_ROOT}/scripts/cargo-rustc-disk-guard.sh" \
   "$CARGO_ENV_CAPTURE" \
   || fail "focused verification did not install the absolute repository rustc guard"
-for cleared in CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR RUSTC_WORKSPACE_WRAPPER \
+for cleared in CARGO_BUILD_TARGET_DIR RUSTC_WORKSPACE_WRAPPER \
   CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER RUSTFLAGS \
   CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_BUILD_INCREMENTAL \
-  CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL; do
+  CARGO_PROFILE_DEV_INCREMENTAL CARGO_PROFILE_TEST_INCREMENTAL \
+  RYUKI_CARGO_GUARD_TEST_MODE RYUKI_CARGO_GUARD_TEST_MAX_KIB; do
   grep -Fxq "${cleared}=" "$CARGO_ENV_CAPTURE" \
     || fail "focused verification retained inherited ${cleared}"
 done
+grep -Fxq 'RYUKI_CARGO_MAX_TARGET_GIB=24' "$CARGO_ENV_CAPTURE" \
+  || fail "focused verification did not pin the rustc target ceiling"
+grep -Fxq 'RYUKI_CARGO_MIN_FREE_GIB=30' "$CARGO_ENV_CAPTURE" \
+  || fail "focused verification did not pin the rustc free-space floor"
+grep -Fxq 'RYUKI_CARGO_GUARD_INTERVAL_SECONDS=2' "$CARGO_ENV_CAPTURE" \
+  || fail "focused verification did not pin the rustc watcher interval"
+grep -Fxq 'FD9=closed' "$CARGO_ENV_CAPTURE" \
+  || fail "focused Cargo command inherited repository lock descriptor 9"
 for pinned in CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do
   grep -Fxq "${pinned}=0" "$CARGO_ENV_CAPTURE" \
     || fail "focused verification did not pin ${pinned} to zero"
@@ -308,6 +377,59 @@ grep -q "removing stale verification target" "$OUTPUT_FILE" \
 if [[ -d "$VERIFY_TARGET_ROOT" \
   && -n "$(find "$VERIFY_TARGET_ROOT" -mindepth 1 -maxdepth 1 -name 'run.*' -print -quit)" ]]; then
   fail "interrupted target was not reclaimed after the gate child exited"
+fi
+
+rm -f "$READY_FILE" "$RELEASE_FILE" "$BLOCKER_PID_FILE"
+TMPDIR="$TMP_A" \
+  RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 \
+  RYUKI_VERIFY_KEEP_TARGET=0 \
+  RYUKI_VERIFY_PREFLIGHT_ONLY=0 \
+  RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=1 \
+  RYUKI_VERIFY_TEST_BLOCKER_PID="$BLOCKER_PID_FILE" \
+  RYUKI_VERIFY_TEST_READY="$READY_FILE" \
+  RYUKI_VERIFY_TEST_RELEASE="$RELEASE_FILE" \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" \
+  > "$SUPERVISOR_KILL_OUTPUT" 2>&1 &
+WRAPPER_PID=$!
+wait_for_file "$READY_FILE" || fail "supervisor-SIGKILL gate did not start"
+VERIFY_CONTROL_FILE=""
+for _ in {1..200}; do
+  for candidate in "$VERIFY_TARGET_ROOT"/run.*/.ryuki-verify-command-owner; do
+    [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+    VERIFY_CONTROL_FILE="$candidate"
+    break
+  done
+  [[ -n "$VERIFY_CONTROL_FILE" ]] && break
+  sleep 0.05
+done
+[[ -n "$VERIFY_CONTROL_FILE" ]] \
+  || fail "verify supervisor ownership control was not published"
+SUPERVISOR_PID="$(sed -n 's/^supervisor_pid=//p' "$VERIFY_CONTROL_FILE")"
+[[ "$SUPERVISOR_PID" =~ ^[1-9][0-9]*$ ]] \
+  || fail "verify supervisor ownership control has an invalid pid"
+kill -KILL "$SUPERVISOR_PID"
+if wait "$WRAPPER_PID" 2>/dev/null; then
+  fail "verification accepted a killed gate supervisor"
+fi
+WRAPPER_PID=""
+blocker_pid="$(sed -n '1p' "$BLOCKER_PID_FILE")"
+wait_for_exit "$blocker_pid" \
+  || fail "gate command survived its verify supervisor being killed"
+SUPERVISOR_PID=""
+grep -q 'recovering verification process group after supervisor exit' \
+  "$SUPERVISOR_KILL_OUTPUT" \
+  || fail "verify supervisor-SIGKILL parent recovery was not reported"
+run_preflight "$TMP_B" > "$OUTPUT_FILE" 2>&1 \
+  || fail "verification lock was not immediately reusable after supervisor SIGKILL"
+if [[ -d "$VERIFY_TARGET_ROOT" \
+  && -n "$(find "$VERIFY_TARGET_ROOT" -mindepth 1 -maxdepth 2 \
+    -name '.ryuki-verify-command-*' -print -quit)" ]]; then
+  fail "verify supervisor-SIGKILL left command ownership state"
+fi
+if [[ -d "$VERIFY_TARGET_ROOT" \
+  && -n "$(find "$VERIFY_TARGET_ROOT" -mindepth 1 -maxdepth 1 -name 'run.*' -print -quit)" ]]; then
+  fail "verify supervisor-SIGKILL left a disposable target"
 fi
 
 create_managed_target stale-one 0
@@ -449,5 +571,40 @@ if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
 fi
 grep -q "accepts only cargo build, check, clippy, run, or test" "$OUTPUT_FILE" \
   || fail "focused Cargo subcommand refusal was not reported"
+
+cp "$DETACHED_CARGO_FIXTURE" "$FAKE_CARGO"
+chmod 700 "$FAKE_CARGO"
+PATH="${FAKE_BIN}:$PATH" \
+  TMPDIR="$TMP_A" \
+  RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 \
+  RYUKI_VERIFY_KEEP_TARGET=0 \
+  RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=1 \
+  RYUKI_VERIFY_TEST_DETACHED_PID="$DETACHED_PID_FILE" \
+  RYUKI_VERIFY_TEST_DETACHED_READY="$DETACHED_READY_FILE" \
+  RYUKI_VERIFY_TEST_DETACHED_ATTEMPTED="$DETACHED_ATTEMPTED_FILE" \
+  RYUKI_VERIFY_TEST_DETACHED_TARGET="$DETACHED_TARGET_CAPTURE" \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" -- cargo check \
+  > "$OUTPUT_FILE" 2>&1 \
+  || fail "focused verification failed while stopping a detached command descendant"
+wait_for_file "$DETACHED_PID_FILE" \
+  || fail "detached command fixture did not publish its descendant pid"
+detached_pid="$(sed -n '1p' "$DETACHED_PID_FILE")"
+[[ "$detached_pid" =~ ^[0-9]+$ ]] \
+  || fail "detached command fixture published an invalid descendant pid"
+wait_for_exit "$detached_pid" \
+  || fail "focused verification left a detached command descendant running"
+detached_target="$(sed -n '1p' "$DETACHED_TARGET_CAPTURE")"
+case "$detached_target" in
+  "${VERIFY_TARGET_ROOT}"/run.*/target) ;;
+  *) fail "detached command fixture did not receive the managed Cargo target" ;;
+esac
+[[ ! -e "$detached_target" ]] \
+  || fail "detached command descendant recreated the disposable Cargo target"
+[[ ! -e "$DETACHED_ATTEMPTED_FILE" ]] \
+  || fail "detached command descendant survived long enough to attempt target recreation"
+grep -q "stopping surviving focused verification descendants after command exit" \
+  "$OUTPUT_FILE" \
+  || fail "detached command descendant cleanup was not reported"
 
 echo "verify-workspace-clean regression passed"
