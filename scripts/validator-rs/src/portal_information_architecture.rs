@@ -2973,7 +2973,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         r#"#[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum::{routing::{any, get}, Router};
+    use axum::{middleware, routing::{any, get}, Router};
     use leptos::prelude::*;
     use leptos_axum::{
         file_and_error_handler_with_context, generate_route_list_with_exclusions, LeptosRoutes,
@@ -3031,10 +3031,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             move || provide_context(upstream_for_fallback.clone()),
             shell,
         ))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(leptos_options);
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app.into_make_service()).await?;
     Ok(())
+}
+
+#[cfg(feature = "ssr")]
+async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    apply_security_headers(response.headers_mut());
+    response
 }
 "#
         .to_string()
