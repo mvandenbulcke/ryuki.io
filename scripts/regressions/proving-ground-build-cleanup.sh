@@ -18,6 +18,7 @@ SUPERVISOR_KILL_OUTPUT="$WORK_DIR/supervisor-kill-output"
 RUN_AGENT_PID=""
 NESTED_PID=""
 RECOVERY_PGID=""
+UNRELATED_PGID=""
 
 cleanup() {
   if [[ -n "$RUN_AGENT_PID" ]] && kill -0 "$RUN_AGENT_PID" 2>/dev/null; then
@@ -28,6 +29,9 @@ cleanup() {
   fi
   if [[ -n "$RECOVERY_PGID" ]] && kill -0 -- "-$RECOVERY_PGID" 2>/dev/null; then
     kill -KILL -- "-$RECOVERY_PGID" 2>/dev/null || true
+  fi
+  if [[ -n "$UNRELATED_PGID" ]] && kill -0 -- "-$UNRELATED_PGID" 2>/dev/null; then
+    kill -KILL -- "-$UNRELATED_PGID" 2>/dev/null || true
   fi
   rm -rf -- "$WORK_DIR"
 }
@@ -141,6 +145,20 @@ write_sentinel() {
     "run_id=$run_id" \
     "workspace=$ROOT_DIR" \
     'disposition=disposable' > "$destination"
+}
+
+write_command_control() {
+  local destination="$1"
+  local run_id="$2"
+  local supervisor_pid="$3"
+  local command_pgid="$4"
+  printf '%s\n' \
+    'version=1' \
+    "repository_id=$REPOSITORY_ID" \
+    "run_id=$run_id" \
+    "supervisor_pid=$supervisor_pid" \
+    "command_pid=$command_pgid" \
+    "command_pgid=$command_pgid" > "$destination"
 }
 
 run_preflight > "$OUTPUT_FILE" 2>&1 || fail "initial preflight failed"
@@ -288,6 +306,34 @@ if RYUKI_PG_ENV_ISOLATED=1 \
 fi
 grep -q 'cannot weaken the production build ceiling' "$OUTPUT_FILE" || \
   fail "weakened test ceiling refusal was not reported"
+
+set -m
+(
+  trap '' HUP INT TERM
+  while :; do sleep 1; done
+) &
+UNRELATED_PGID=$!
+set +m
+mkdir -m 700 "$TARGET_ROOT/run.pid-reuse"
+write_sentinel "$TARGET_ROOT/run.pid-reuse/.ryuki-proving-ground-build-owner" \
+  pid-reuse
+write_command_control \
+  "$TARGET_ROOT/run.pid-reuse/.ryuki-proving-ground-command-owner" \
+  pid-reuse "$UNRELATED_PGID" "$UNRELATED_PGID"
+if run_preflight > "$OUTPUT_FILE" 2>&1; then
+  fail "stale command ownership signalled a reused live process group"
+fi
+grep -q 'refusing unsafe PID reuse recovery' "$OUTPUT_FILE" || \
+  fail "live stale process-group refusal was not reported"
+kill -0 -- "-$UNRELATED_PGID" 2>/dev/null || \
+  fail "stale ownership killed an unrelated live process group"
+kill -KILL -- "-$UNRELATED_PGID" 2>/dev/null || true
+wait "$UNRELATED_PGID" 2>/dev/null || true
+UNRELATED_PGID=""
+run_preflight > "$OUTPUT_FILE" 2>&1 || \
+  fail "dead stale process ownership was not reclaimable"
+[[ ! -e "$TARGET_ROOT/run.pid-reuse" ]] || \
+  fail "dead stale process ownership root was not removed"
 
 mkdir -m 700 "$TARGET_ROOT/run.stale"
 write_sentinel "$TARGET_ROOT/run.stale/.ryuki-proving-ground-build-owner" stale

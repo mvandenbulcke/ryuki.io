@@ -22,6 +22,10 @@ const UNSAFE_DOCKERIGNORE_ENTRIES: &[&str] = &[
     "graphify-out",
     "target/",
     "**/target/",
+    "debug",
+    "debug/",
+    "**/debug",
+    "**/debug/",
     "*.log",
     ".env",
     ".env.*",
@@ -616,6 +620,10 @@ networks:
             "graphify-out\n",
             "target/\n",
             "**/target/\n",
+            "debug\n",
+            "debug/\n",
+            "**/debug\n",
+            "**/debug/\n",
             "*.log\n",
             ".env\n",
             ".env.*\n",
@@ -629,6 +637,44 @@ networks:
             "Expected dockerignore preserving required inputs and excluding unsafe artifacts to pass but got: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn dockerignore_requires_every_debug_exclusion() {
+        let dockerignore = concat!(
+            ".git\n",
+            ".codex\n",
+            ".codegraph\n",
+            ".atl\n",
+            "graphify-out\n",
+            "target/\n",
+            "**/target/\n",
+            "debug\n",
+            "debug/\n",
+            "**/debug\n",
+            "**/debug/\n",
+            "*.log\n",
+            ".env\n",
+            ".env.*\n",
+            "*.key\n",
+            "*.pem\n",
+            "*.crt\n"
+        );
+
+        for required in ["debug", "debug/", "**/debug", "**/debug/"] {
+            let incomplete = dockerignore
+                .lines()
+                .filter(|line| *line != required)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let errors = validate_dockerignore_content(&incomplete);
+
+            assert!(
+                errors.iter().any(|error| error.contains(required)),
+                "Expected dockerignore missing {required:?} to be rejected, got: {:?}",
+                errors
+            );
+        }
     }
 
     #[test]
