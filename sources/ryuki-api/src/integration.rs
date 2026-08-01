@@ -15,14 +15,14 @@
 //!   plaintext.
 
 use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -37,7 +37,7 @@ use crate::database::get_db;
 use crate::secret_provider_runtime::VaultKubernetesRuntime;
 use ryuki_core::config::{AuthMode, RyukiConfig, SecretProvider};
 use ryuki_engine::integration_connections::{
-    CredentialSource, ExecutionMode, IntegrationConnection, TestResult, test_connection_stub,
+    test_connection_stub, CredentialSource, ExecutionMode, IntegrationConnection, TestResult,
 };
 use ryuki_engine::secret_material::{
     IssuedSecretLease, ResolvedSecret, SecretLeaseLifecycleInput, SecretLeaseMetadata,
@@ -1813,11 +1813,13 @@ impl IntegrationConnectionRow {
 }
 
 #[cfg(test)]
-const CONN_COLUMNS: &str = "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
+const CONN_COLUMNS: &str =
+    "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
      status, readiness, execution_mode, last_test_at, last_test_result, created_by, \
      created_at, updated_at";
 
-const TYPED_CONN_COLUMNS: &str = "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
+const TYPED_CONN_COLUMNS: &str =
+    "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
      credential_secret_ref, credential_secret_ref_generation, status, readiness, execution_mode, \
      last_test_at, last_test_result, created_by, created_at, updated_at";
 
@@ -2121,12 +2123,12 @@ fn validate_env_var_credential_ref(credential_ref: &str) -> Result<(), CredError
 // ---------------------------------------------------------------------------
 
 use axum::{
-    Extension, Json,
     extract::{Path, Query},
     http::StatusCode,
+    Extension, Json,
 };
 use ryuki_core::PrincipalId;
-use ryuki_engine::auth::{AuthSession, ScopeFilter, check_permission, resolve_scope_filter};
+use ryuki_engine::auth::{check_permission, resolve_scope_filter, AuthSession, ScopeFilter};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
@@ -7455,7 +7457,7 @@ mod unit_tests {
         let error = require_opaque_principal(&session)
             .expect_err("UUID-shaped display text must not become authority");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.1.0["error"], "OPAQUE_PRINCIPAL_REQUIRED");
+        assert_eq!(error.1 .0["error"], "OPAQUE_PRINCIPAL_REQUIRED");
 
         let principal_id = PrincipalId::from_uuid(uuid::Uuid::new_v4())
             .expect("generated integration test principal");
@@ -7581,10 +7583,10 @@ mod unit_tests {
         let escaping_mount = tempfile::tempdir().expect("escaping projected mount");
         symlink(outside.path(), escaping_mount.path().join("keyring"))
             .expect("link escaping keyring");
-        assert!(
-            SecretReferenceFingerprintKeyring::from_file(&escaping_mount.path().join("keyring"))
-                .is_err()
-        );
+        assert!(SecretReferenceFingerprintKeyring::from_file(
+            &escaping_mount.path().join("keyring")
+        )
+        .is_err());
     }
 
     #[test]
@@ -8498,15 +8500,13 @@ mod unit_tests {
 
     #[test]
     fn startup_secret_configuration_is_complete_typed_and_provider_matched() {
-        assert!(
-            validate_secret_manager_configuration(
-                &SecretProvider::HashicorpVault,
-                None,
-                None,
-                None,
-            )
-            .is_ok()
-        );
+        assert!(validate_secret_manager_configuration(
+            &SecretProvider::HashicorpVault,
+            None,
+            None,
+            None,
+        )
+        .is_ok());
 
         for (addr, token) in [
             (Some("https://vault.example:8200".to_string()), None),
@@ -8542,17 +8542,15 @@ mod unit_tests {
         )
         .expect("explicit literal-loopback development configuration should be admitted");
 
-        assert!(
-            validate_secret_manager_configuration(
-                &SecretProvider::AwsSecretsManager,
-                Some("https://vault.example:8200".to_string()),
-                Some("fixture-token".to_string()),
-                None,
-            )
-            .expect_err("Vault variables must not configure another provider")
-            .to_string()
-            .contains("aws-secrets-manager")
-        );
+        assert!(validate_secret_manager_configuration(
+            &SecretProvider::AwsSecretsManager,
+            Some("https://vault.example:8200".to_string()),
+            Some("fixture-token".to_string()),
+            None,
+        )
+        .expect_err("Vault variables must not configure another provider")
+        .to_string()
+        .contains("aws-secrets-manager"));
 
         validate_secret_manager_configuration(&SecretProvider::AwsSecretsManager, None, None, None)
             .expect("an unconfigured non-Vault adapter remains a dependent-operation concern");
@@ -8618,15 +8616,15 @@ mod unit_tests {
 
     #[test]
     fn vault_transport_policy_is_fail_closed() {
-        assert!(
-            VaultKv2Resolver::from_parts(None, None, false)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            VaultKv2Resolver::from_parts(Some("https://vault.example:8200".into()), None, false)
-                .is_err()
-        );
+        assert!(VaultKv2Resolver::from_parts(None, None, false)
+            .unwrap()
+            .is_none());
+        assert!(VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200".into()),
+            None,
+            false
+        )
+        .is_err());
         assert!(VaultKv2Resolver::from_parts(None, Some("fixture-token".into()), false).is_err());
         assert!(
             VaultKv2Resolver::from_parts(Some("   ".into()), Some("fixture-token".into()), false,)
@@ -8709,13 +8707,11 @@ mod unit_tests {
         )
         .expect_err("fragment-bearing endpoints must be rejected");
 
-        assert!(
-            parse_optional_bool_env(
-                VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
-                Some("yes".to_string()),
-            )
-            .is_err()
-        );
+        assert!(parse_optional_bool_env(
+            VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
+            Some("yes".to_string()),
+        )
+        .is_err());
     }
 
     #[test]

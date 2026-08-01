@@ -1351,16 +1351,17 @@ name = "ryuki-integration-tests"
     }
 
     fn canonical_portal_runtime_stage() -> String {
-        format!(concat!(
-            "FROM {PORTAL_RUNTIME_IMAGE} AS {PORTAL_RUNTIME_STAGE}\n",
-            "WORKDIR {PORTAL_RUNTIME_WORKDIR}\n",
-            "ENV LEPTOS_SITE_ROOT=/app/site LEPTOS_SITE_ADDR=0.0.0.0:8080 RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\n",
-            "{PORTAL_RUNTIME_BINARY_COPY}\n",
-            "{PORTAL_RUNTIME_SITE_COPY}\n",
-            "USER {PORTAL_RUNTIME_USER}\n",
-            "EXPOSE {PORTAL_RUNTIME_PORT}\n",
-            "CMD [\"{PORTAL_RUNTIME_BINARY}\"]\n",
-        ))
+        format!(
+            "FROM {image} AS {stage}\nWORKDIR {workdir}\nENV LEPTOS_SITE_ROOT=/app/site LEPTOS_SITE_ADDR=0.0.0.0:8080 RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\n{binary_copy}\n{site_copy}\nUSER {user}\nEXPOSE {port}\nCMD [\"{binary}\"]\n",
+            image = PORTAL_RUNTIME_IMAGE,
+            stage = PORTAL_RUNTIME_STAGE,
+            workdir = PORTAL_RUNTIME_WORKDIR,
+            binary_copy = PORTAL_RUNTIME_BINARY_COPY,
+            site_copy = PORTAL_RUNTIME_SITE_COPY,
+            user = PORTAL_RUNTIME_USER,
+            port = PORTAL_RUNTIME_PORT,
+            binary = PORTAL_RUNTIME_BINARY,
+        )
     }
 
     fn canonical_portal_runtime_with_builder() -> String {
@@ -2009,21 +2010,15 @@ name = "ryuki-integration-tests"
             full_copy_set()
         );
         let errors = validate_portal_dockerfile(&dockerfile, &members());
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("rust:1.96-bookworm"))
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("debian:bookworm-slim"))
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("cargo-leptos") && error.contains("0.3.7"))
-        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rust:1.96-bookworm")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("debian:bookworm-slim")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("cargo-leptos") && error.contains("0.3.7")));
     }
 
     #[test]

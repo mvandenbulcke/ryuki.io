@@ -499,17 +499,16 @@ mod tests {
             Some(registered_server_function_route_exclusions()),
         );
         let protected_server_functions = protect_server_function_routes(
-            Router::new()
-                .route(
-                    "/portal/api/{*fn_name}",
-                    any(move || {
-                        let dispatches = dispatches_for_handler.clone();
-                        async move {
-                            dispatches.fetch_add(1, Ordering::SeqCst);
-                            StatusCode::NO_CONTENT
-                        }
-                    }),
-                ),
+            Router::new().route(
+                "/portal/api/{*fn_name}",
+                any(move || {
+                    let dispatches = dispatches_for_handler.clone();
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            ),
             test_origin(),
             test_limits(1024, 8, Duration::from_secs(1)),
         );
@@ -576,10 +575,7 @@ mod tests {
             .try_acquire_owned()
             .expect("test occupies the only server-function permit");
         let router = protect_server_function_routes(
-            Router::new().route(
-                "/workspace",
-                any(|| async { StatusCode::NO_CONTENT }),
-            ),
+            Router::new().route("/workspace", any(|| async { StatusCode::NO_CONTENT })),
             test_origin(),
             limits,
         );

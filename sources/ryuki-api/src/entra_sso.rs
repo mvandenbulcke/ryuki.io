@@ -1282,10 +1282,8 @@ mod tests {
 
     #[test]
     fn auth_response_helper_overwrites_weaker_cache_policy() {
-        let response = auth_response_no_store((
-            StatusCode::OK,
-            [(CACHE_CONTROL, "private, max-age=60")],
-        ));
+        let response =
+            auth_response_no_store((StatusCode::OK, [(CACHE_CONTROL, "private, max-age=60")]));
 
         assert_eq!(
             response

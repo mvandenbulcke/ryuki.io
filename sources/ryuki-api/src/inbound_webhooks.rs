@@ -56,7 +56,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -67,8 +67,8 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::database::get_db;
@@ -730,8 +730,8 @@ mod inbound_webhook_db_tests {
     use sha2::Sha256;
     use sqlx::PgPool;
     use tokio::sync::{Barrier, Notify};
-    use tower::ServiceExt;
     use tower::limit::ConcurrencyLimitLayer;
+    use tower::ServiceExt;
 
     /// Mirrors the `global_pool()` helper used throughout agents.rs / background.rs
     /// / scheduler.rs db test modules: connects via the REAL `try_connect_with_url`
@@ -994,30 +994,31 @@ mod inbound_webhook_db_tests {
         )
         .await
         .expect("insert seeded webhook event");
-        assert!(
-            inbound_webhook_receipts::try_claim(
-                &mut tx,
-                connection_id,
-                delivery_id,
-                WEBHOOK_SIGNATURE_VERSION,
-                secret_ref,
-                1,
-                &authority_digest,
-                "synthetic",
-                None,
-                signed_at,
-                &body_sha256,
-                lock_key,
-                expires_at,
-            )
-            .await
-            .expect("claim seeded receipt")
-        );
-        assert!(
-            inbound_webhook_receipts::bind_event(&mut tx, connection_id, delivery_id, event_id,)
-                .await
-                .expect("bind seeded receipt")
-        );
+        assert!(inbound_webhook_receipts::try_claim(
+            &mut tx,
+            connection_id,
+            delivery_id,
+            WEBHOOK_SIGNATURE_VERSION,
+            secret_ref,
+            1,
+            &authority_digest,
+            "synthetic",
+            None,
+            signed_at,
+            &body_sha256,
+            lock_key,
+            expires_at,
+        )
+        .await
+        .expect("claim seeded receipt"));
+        assert!(inbound_webhook_receipts::bind_event(
+            &mut tx,
+            connection_id,
+            delivery_id,
+            event_id,
+        )
+        .await
+        .expect("bind seeded receipt"));
         tx.commit().await.expect("commit seeded receipt");
         event_id
     }
@@ -1304,10 +1305,8 @@ mod inbound_webhook_db_tests {
 
     #[test]
     fn duplicate_or_malformed_forwarding_evidence_falls_back_to_peer_bucket() {
-        let trusted = vec![
-            ryuki_core::config::TrustedProxyNetwork::parse("10.0.0.0/8")
-                .expect("trusted proxy fixture"),
-        ];
+        let trusted = vec![ryuki_core::config::TrustedProxyNetwork::parse("10.0.0.0/8")
+            .expect("trusted proxy fixture")];
         let admission = WebhookAdmission::new(1, 1, 100, 100, 10, trusted);
         let proxy = peer("10.0.0.5:443");
 
@@ -1821,7 +1820,7 @@ mod inbound_webhook_db_tests {
             .await
             .expect_err("out-of-window delivery must fail closed");
             assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-            assert_eq!(error.1.0["error"], "signature verification failed");
+            assert_eq!(error.1 .0["error"], "signature verification failed");
         }
 
         // A skewed application clock alone is insufficient: make the envelope
@@ -1852,7 +1851,7 @@ mod inbound_webhook_db_tests {
         .expect_err("database clock must reject an application-clock bypass");
         assert_eq!(database_clock_error.0, StatusCode::UNAUTHORIZED);
         assert_eq!(
-            database_clock_error.1.0["error"],
+            database_clock_error.1 .0["error"],
             "signature verification failed"
         );
 
@@ -1949,7 +1948,7 @@ mod inbound_webhook_db_tests {
 
         assert_eq!(first.0, StatusCode::ACCEPTED);
         assert_eq!(second.0, StatusCode::ACCEPTED);
-        assert_eq!(first.1.0["event_id"], second.1.0["event_id"]);
+        assert_eq!(first.1 .0["event_id"], second.1 .0["event_id"]);
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         cleanup_connection(pool, &conn_id).await;
     }
@@ -1991,7 +1990,7 @@ mod inbound_webhook_db_tests {
         );
         let first = first.expect("first concurrent copy accepted");
         let second = second.expect("second concurrent copy idempotently accepted");
-        assert_eq!(first.1.0["event_id"], second.1.0["event_id"]);
+        assert_eq!(first.1 .0["event_id"], second.1 .0["event_id"]);
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         cleanup_connection(pool, &conn_id).await;
     }
@@ -2047,7 +2046,7 @@ mod inbound_webhook_db_tests {
         .await
         .expect_err("delivery-id collision must fail closed");
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(error.1.0["error"], "signature verification failed");
+        assert_eq!(error.1 .0["error"], "signature verification failed");
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         cleanup_connection(pool, &conn_id).await;
     }
@@ -2069,25 +2068,23 @@ mod inbound_webhook_db_tests {
         let secret_ref = "is-wh-rollback";
         let authority_digest =
             webhook_authority_context_digest(&connection_id, secret_ref, 1, "synthetic", None);
-        assert!(
-            inbound_webhook_receipts::try_claim(
-                &mut tx,
-                &connection_id,
-                delivery_id,
-                WEBHOOK_SIGNATURE_VERSION,
-                secret_ref,
-                1,
-                &authority_digest,
-                "synthetic",
-                None,
-                signed_at,
-                &ryuki_protocol::sha256_hex(b"synthetic rollback body"),
-                inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
-                signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
-            )
-            .await
-            .expect("claim receipt")
-        );
+        assert!(inbound_webhook_receipts::try_claim(
+            &mut tx,
+            &connection_id,
+            delivery_id,
+            WEBHOOK_SIGNATURE_VERSION,
+            secret_ref,
+            1,
+            &authority_digest,
+            "synthetic",
+            None,
+            signed_at,
+            &ryuki_protocol::sha256_hex(b"synthetic rollback body"),
+            inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
+            signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
+        )
+        .await
+        .expect("claim receipt"));
         tx.rollback().await.expect("roll back receipt claim");
 
         let count: i64 = sqlx::query_scalar(
@@ -2191,25 +2188,23 @@ mod inbound_webhook_db_tests {
         let secret_ref = "is-wh-unbound-fence";
         let authority_digest =
             webhook_authority_context_digest(&connection_id, secret_ref, 1, "synthetic", None);
-        assert!(
-            inbound_webhook_receipts::try_claim(
-                &mut tx,
-                &connection_id,
-                delivery_id,
-                WEBHOOK_SIGNATURE_VERSION,
-                secret_ref,
-                1,
-                &authority_digest,
-                "synthetic",
-                None,
-                signed_at,
-                &ryuki_protocol::sha256_hex(b"synthetic unbound receipt"),
-                inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
-                signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
-            )
-            .await
-            .expect("claim unbound receipt")
-        );
+        assert!(inbound_webhook_receipts::try_claim(
+            &mut tx,
+            &connection_id,
+            delivery_id,
+            WEBHOOK_SIGNATURE_VERSION,
+            secret_ref,
+            1,
+            &authority_digest,
+            "synthetic",
+            None,
+            signed_at,
+            &ryuki_protocol::sha256_hex(b"synthetic unbound receipt"),
+            inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
+            signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
+        )
+        .await
+        .expect("claim unbound receipt"));
         let commit_error = tx
             .commit()
             .await
@@ -2268,35 +2263,31 @@ mod inbound_webhook_db_tests {
         )
         .await
         .expect("statement-level v2 event insert");
-        assert!(
-            inbound_webhook_receipts::try_claim(
-                &mut mismatch_tx,
-                &connection_id,
-                mismatch_delivery_id,
-                WEBHOOK_SIGNATURE_VERSION,
-                mismatch_secret_ref,
-                1,
-                &mismatch_digest,
-                "synthetic",
-                None,
-                signed_at,
-                &mismatch_body_sha256,
-                inbound_webhook_receipts::advisory_lock_key(&connection_id, mismatch_delivery_id),
-                signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
-            )
-            .await
-            .expect("claim mismatched receipt")
-        );
-        assert!(
-            inbound_webhook_receipts::bind_event(
-                &mut mismatch_tx,
-                &connection_id,
-                mismatch_delivery_id,
-                mismatched_event_id,
-            )
-            .await
-            .expect("bind mismatched receipt")
-        );
+        assert!(inbound_webhook_receipts::try_claim(
+            &mut mismatch_tx,
+            &connection_id,
+            mismatch_delivery_id,
+            WEBHOOK_SIGNATURE_VERSION,
+            mismatch_secret_ref,
+            1,
+            &mismatch_digest,
+            "synthetic",
+            None,
+            signed_at,
+            &mismatch_body_sha256,
+            inbound_webhook_receipts::advisory_lock_key(&connection_id, mismatch_delivery_id),
+            signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
+        )
+        .await
+        .expect("claim mismatched receipt"));
+        assert!(inbound_webhook_receipts::bind_event(
+            &mut mismatch_tx,
+            &connection_id,
+            mismatch_delivery_id,
+            mismatched_event_id,
+        )
+        .await
+        .expect("bind mismatched receipt"));
         let mismatch_commit_error = mismatch_tx
             .commit()
             .await

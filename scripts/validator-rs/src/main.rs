@@ -4555,11 +4555,9 @@ mod tests {
             &mut errors,
         );
 
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("API endpoint coverage path is unsafe"))
-        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("API endpoint coverage path is unsafe")));
     }
 
     #[test]

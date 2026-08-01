@@ -3016,11 +3016,9 @@ mod tests {
 
         validate_catalog_value(&catalog, &mut errors);
 
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("rule details must be unique"))
-        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("rule details must be unique")));
     }
 
     #[test]
@@ -3091,10 +3089,8 @@ app.MapGet("/api/platform/vault-secret-delivery-contract", () => Results.Json(ne
             &mut errors,
         );
 
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("prohibited literal value"))
-        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("prohibited literal value")));
     }
 }

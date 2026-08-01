@@ -2456,27 +2456,30 @@ fn inspect_portal_main_body(block: &syn::Block) -> PortalMainInspection {
         path.last()
             .is_some_and(|segment| segment == "provide_context")
             && !path_matches_segments(path, &["leptos", "prelude", "provide_context"])
-    }) || imports.iter().any(|path| {
-        path.last().is_some_and(|segment| segment == "Some")
-    }) || imports.iter().any(|path| {
-        path.last()
-            .is_some_and(|segment| segment == "generate_route_list_with_exclusions")
-            && !path_matches_segments(
-                path,
-                &["leptos_axum", "generate_route_list_with_exclusions"],
-            )
-    }) || imports.iter().any(|path| {
-        path.last()
-            .is_some_and(|segment| segment == "registered_server_function_route_exclusions")
-            && !path_matches_segments(
-                path,
-                &[
-                    "ryuki_portal_ui",
-                    "security",
-                    "registered_server_function_route_exclusions",
-                ],
-            )
-    }) || !imported(&imports, &["axum", "Router"])
+    }) || imports
+        .iter()
+        .any(|path| path.last().is_some_and(|segment| segment == "Some"))
+        || imports.iter().any(|path| {
+            path.last()
+                .is_some_and(|segment| segment == "generate_route_list_with_exclusions")
+                && !path_matches_segments(
+                    path,
+                    &["leptos_axum", "generate_route_list_with_exclusions"],
+                )
+        })
+        || imports.iter().any(|path| {
+            path.last()
+                .is_some_and(|segment| segment == "registered_server_function_route_exclusions")
+                && !path_matches_segments(
+                    path,
+                    &[
+                        "ryuki_portal_ui",
+                        "security",
+                        "registered_server_function_route_exclusions",
+                    ],
+                )
+        })
+        || !imported(&imports, &["axum", "Router"])
         || !imported(&imports, &["leptos_axum", "LeptosRoutes"])
         || !imported(
             &imports,
@@ -3301,10 +3304,8 @@ fn expression_creates_server_function_router(
     if handler_block.label.is_some() {
         return false;
     }
-    let [
-        syn::Stmt::Local(context_clone),
-        syn::Stmt::Expr(async_expression, None),
-    ] = handler_block.block.stmts.as_slice()
+    let [syn::Stmt::Local(context_clone), syn::Stmt::Expr(async_expression, None)] =
+        handler_block.block.stmts.as_slice()
     else {
         return false;
     };
