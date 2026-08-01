@@ -6817,8 +6817,7 @@ esac
             let components = vec![b"registered-test-value".to_vec()];
             let refs = components.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let error = write_secret_tfvars_file(&ws, &names, &components, &refs, &BTreeMap::new())
-                .err()
-                .expect("backend credential source overlap must fail before spawn")
+                .expect_err("backend credential source overlap must fail before spawn")
                 .to_string();
             assert!(
                 error.contains("overlaps a backend credential source"),
