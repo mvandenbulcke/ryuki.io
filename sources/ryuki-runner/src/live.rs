@@ -6207,7 +6207,7 @@ esac
         let mut output = Zeroizing::new(Vec::with_capacity(2));
         let initial_capacity = output.capacity();
         let mut writer = FixedCapacityJsonWriter {
-            output: &mut *output,
+            output: &mut output,
             exact_length: 2,
         };
         assert!(writer.write_all(b"abc").is_err());
