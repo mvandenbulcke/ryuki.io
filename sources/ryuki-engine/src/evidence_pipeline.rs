@@ -43,9 +43,10 @@ const SENSITIVE_VALUE_LABELS: &[&str] = &[
     "x-api-key",
 ];
 
-/// Secret-bearing value markers that need no delimiter — a full auth-scheme
-/// prefix carries the credential right after it. (`Authorization: Bearer <jwt>`
-/// / `Authorization: Basic <base64>` riding in a value under a generic key.)
+/// Secret-bearing value markers that need no delimiter. The broad Bearer
+/// marker is retained for JWT-like credentials, while Basic credentials use
+/// the bounded canonical recognizer below so ordinary text such as `Basic
+/// delegated` is not over-redacted.
 const SENSITIVE_VALUE_MARKERS: &[&str] = &["bearer ", "authorization: basic "];
 
 const AUTHORIZATION_LABEL: &str = "authorization";
@@ -90,6 +91,10 @@ const MAX_NESTED_JSON_SECRET_DEPTH: usize = 4;
 const MAX_STRUCTURED_SECRET_BYTES: usize = 256 * 1024;
 const MAX_STRUCTURED_SECRET_NODES: usize = 4_096;
 const MAX_EMBEDDED_STRUCTURED_END_CANDIDATES: usize = 32;
+/// Upper bound for validating one standalone Basic credential. HTTP stacks
+/// ordinarily cap the complete header below this size. A longer token-shaped
+/// value after the Basic scheme fails closed without allocating or decoding it.
+const MAX_STANDALONE_BASIC_CREDENTIAL_BYTES: usize = 8 * 1024;
 /// Canonical replacement emitted by every evidence and audit projection.
 pub const REDACTED_EVIDENCE_VALUE: &str = "***REDACTED***";
 
@@ -458,6 +463,136 @@ fn authorization_scheme_bears_secret(value: &str) -> bool {
     })
 }
 
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_token68_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+}
+
+fn base64_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Validate canonical RFC 4648 base64 and inspect the decoded bytes in-place.
+/// Basic credentials encode `user-id ":" password`; requiring that delimiter
+/// distinguishes credential material from safe prose such as `Basic mode`.
+fn canonical_basic_credential_bears_user_pass(token: &[u8]) -> bool {
+    if token.len() < 4
+        || token.len() > MAX_STANDALONE_BASIC_CREDENTIAL_BYTES
+        || !token.len().is_multiple_of(4)
+    {
+        return false;
+    }
+
+    let padding = token.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 {
+        return false;
+    }
+    let data_len = token.len() - padding;
+    if data_len == 0
+        || token[..data_len]
+            .iter()
+            .any(|byte| base64_sextet(*byte).is_none())
+        || token[data_len..].iter().any(|byte| *byte != b'=')
+    {
+        return false;
+    }
+
+    // RFC 4648 canonical encodings have zeroed unused bits in their final
+    // sextet. Rejecting alternate encodings keeps this recognizer narrow and
+    // prevents accepting a valid prefix of malformed token68 text.
+    let final_sextet = base64_sextet(token[data_len - 1]).expect("validated base64 sextet");
+    if (padding == 1 && final_sextet & 0b11 != 0) || (padding == 2 && final_sextet & 0b1111 != 0) {
+        return false;
+    }
+
+    token.chunks_exact(4).any(|chunk| {
+        let first = base64_sextet(chunk[0]).expect("validated base64 quartet");
+        let second = base64_sextet(chunk[1]).expect("validated base64 quartet");
+        let third = base64_sextet(chunk[2]).unwrap_or(0);
+        let fourth = base64_sextet(chunk[3]).unwrap_or(0);
+        let decoded = [
+            (first << 2) | (second >> 4),
+            (second << 4) | (third >> 2),
+            (third << 6) | fourth,
+        ];
+        let decoded_len = if chunk[2] == b'=' {
+            1
+        } else if chunk[3] == b'=' {
+            2
+        } else {
+            3
+        };
+        decoded[..decoded_len].contains(&b':')
+    })
+}
+
+/// Recognize a standalone `Basic <base64(user:password)>` field or an embedded
+/// occurrence under a generic key. Matching is ASCII case-insensitive, accepts
+/// ASCII whitespace, requires an HTTP-token boundary before the scheme, and
+/// consumes the complete token68 candidate before validating canonical base64.
+fn standalone_basic_credential_bears_secret(value: &str) -> bool {
+    const BASIC_SCHEME: &[u8] = b"basic";
+
+    let bytes = value.as_bytes();
+    let mut offset = 0;
+    while offset + BASIC_SCHEME.len() <= bytes.len() {
+        let after_scheme = offset + BASIC_SCHEME.len();
+        if bytes[offset..after_scheme].eq_ignore_ascii_case(BASIC_SCHEME)
+            && (offset == 0 || !is_http_token_byte(bytes[offset - 1]))
+            && bytes.get(after_scheme).is_some_and(u8::is_ascii_whitespace)
+        {
+            let mut token_start = after_scheme;
+            while bytes.get(token_start).is_some_and(u8::is_ascii_whitespace) {
+                token_start += 1;
+            }
+
+            let mut token_end = token_start;
+            while bytes
+                .get(token_end)
+                .is_some_and(|byte| is_token68_byte(*byte))
+            {
+                token_end += 1;
+                if token_end - token_start > MAX_STANDALONE_BASIC_CREDENTIAL_BYTES {
+                    return true;
+                }
+            }
+
+            if canonical_basic_credential_bears_user_pass(&bytes[token_start..token_end]) {
+                return true;
+            }
+        }
+        offset += 1;
+    }
+    false
+}
+
 /// Recognizes exact `Authorization`, `Cookie`, and `Set-Cookie` fields in valid
 /// JSON, including nested objects and JSON-encoded object strings. Parsing
 /// first also covers escaped key spellings such as `\u0043ookie` without
@@ -649,6 +784,7 @@ fn header_text_bears_secret(value: &str) -> bool {
     SENSITIVE_VALUE_MARKERS
         .iter()
         .any(|marker| value_lower.contains(marker))
+        || standalone_basic_credential_bears_secret(value)
         || authorization_assignment_bears_secret(&value_lower)
         || cookie_assignment_bears_secret(&value_lower)
 }
@@ -791,6 +927,7 @@ fn value_bears_secret_inner(value: &str, normalize_unicode: bool) -> bool {
     if SENSITIVE_VALUE_MARKERS
         .iter()
         .any(|marker| value_lower.contains(marker))
+        || standalone_basic_credential_bears_secret(value)
         || authorization_assignment_bears_secret(&value_lower)
         || cookie_assignment_bears_secret(&value_lower)
     {
@@ -1293,6 +1430,49 @@ mod tests {
         assert!(
             !should_redact("status", "deployment ok, no credentials present"),
             "benign evidence must not be over-redacted"
+        );
+    }
+
+    #[test]
+    fn test_should_redact_standalone_basic_credentials_without_basic_prose() {
+        for value in [
+            "Basic dXNlcjpwYXNz",
+            "bAsIc\tdTpwdw==",
+            "stage=authorize (Basic dXNlcjpwYXNz); denied",
+            "[retry] BASIC\r\ndXNlcjpwYXNz, upstream rejected the request",
+        ] {
+            assert!(
+                should_redact("reason", value),
+                "standalone Basic credential must be redacted: {value}"
+            );
+            assert_eq!(
+                redact_sensitive_text("reason", value),
+                REDACTED_EVIDENCE_VALUE
+            );
+        }
+
+        for value in [
+            "Basic",
+            "Basic   ",
+            "Basic delegated",
+            "Basic bW9kZQ==",
+            "Basic dXNlcjpwYXN",
+            "Basic dXNlcjpwYXNz===",
+            "Basic dTpwdx==",
+            "Basic dXNlcjpwYXNz.",
+            "NotBasic dXNlcjpwYXNz",
+        ] {
+            assert!(
+                !should_redact("reason", value),
+                "non-credential Basic metadata must remain available: {value}"
+            );
+            assert_eq!(redact_sensitive_text("reason", value), value);
+        }
+
+        let oversized_token = "A".repeat(MAX_STANDALONE_BASIC_CREDENTIAL_BYTES + 1);
+        assert!(
+            should_redact("reason", &format!("Basic {oversized_token}")),
+            "an oversized token68-shaped credential must fail closed at the bound"
         );
     }
 

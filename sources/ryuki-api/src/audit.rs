@@ -172,11 +172,12 @@ impl AuditEntry {
     }
 }
 
-/// Redacts secret-bearing values in an audit `detail` JSON before it is served.
-/// Every READ path (`/api/requests/{id}/audit`, `/api/activity/audit`, and the
-/// evidence pack that embeds the trail) must protect both current and historical
-/// rows. The shared bounded engine traversal also recognizes structured header
-/// maps, named entries, and tuples rather than inspecting only direct strings.
+/// Redacts secret-bearing values in an audit `detail` JSON before persistence
+/// and again when it is served. Applying the same canonical transformation at
+/// both write seams keeps the persisted JSON and its database-computed hash in
+/// agreement; defensive read redaction still protects historical rows. The
+/// shared bounded engine traversal recognizes structured header maps, named
+/// entries, tuples, and standalone credential-bearing text.
 fn redact_detail(value: &Value) -> Value {
     ryuki_engine::evidence_pipeline::redact_json_evidence_value(value)
 }
@@ -253,7 +254,7 @@ fn entry_from(
         to_stage: record.to_stage.to_string(),
         from_status: record.from_status.map(str::to_string),
         to_status: record.to_status.to_string(),
-        detail: record.detail.clone(),
+        detail: redact_detail(&record.detail),
         outcome: record.outcome.to_string(),
     }
 }
@@ -274,6 +275,7 @@ pub async fn record_audit_tx(
     record: &AuditRecord<'_>,
 ) -> Result<ryuki_engine::authorization::AuditReservationEvidence, sqlx::Error> {
     let actor_principal = required_principal_id(session)?;
+    let detail = redact_detail(&record.detail);
     let request_uuid = record
         .request_id
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
@@ -299,7 +301,7 @@ pub async fn record_audit_tx(
     .bind(record.to_stage)
     .bind(record.from_status)
     .bind(record.to_status)
-    .bind(record.detail.to_string())
+    .bind(detail.to_string())
     .bind(record.outcome)
     .fetch_one(&mut **tx)
     .await?;
@@ -1436,18 +1438,64 @@ mod tests {
     fn redact_detail_scrubs_secret_bearing_values() {
         let detail = json!({
             "reason": "rotate password: hunter2 before lock",
+            "standalone_value": "stage=approve (Basic dXNlcjpwYXNz); denied",
             "note": "ordinary handover text",
+            "mode": "Basic delegated",
             "nested": {"api_key": "abc123", "ok": "fine"},
         });
         let redacted = redact_detail(&detail);
         // Value pattern (`password:`) redacts a free-text reason.
         assert_eq!(redacted["reason"], "***REDACTED***");
+        assert_eq!(redacted["standalone_value"], "***REDACTED***");
         // Ordinary text is preserved verbatim.
         assert_eq!(redacted["note"], "ordinary handover text");
+        assert_eq!(redacted["mode"], "Basic delegated");
         // Key-name match (`api_key` contains `key`) redacts regardless of value,
         // recursing into nested objects; sibling non-secret values are kept.
         assert_eq!(redacted["nested"]["api_key"], "***REDACTED***");
         assert_eq!(redacted["nested"]["ok"], "fine");
+    }
+
+    #[tokio::test]
+    async fn local_audit_sanitizes_standalone_basic_before_storage() {
+        let actor_principal = PrincipalId::from_uuid(uuid::Uuid::new_v4())
+            .expect("non-nil local audit test principal");
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let raw_credential = "dXNlcjpwYXNz";
+        let mut session = AuthSession::static_dry_run();
+        session.principal_id = Some(actor_principal);
+
+        record_audit_local(
+            &session,
+            &AuditRecord {
+                action: "request.reject",
+                request_id: Some(&request_id),
+                from_status: Some("planned"),
+                to_status: "rejected",
+                from_stage: Some("plan"),
+                to_stage: "reject",
+                detail: json!({
+                    "reason": format!("stage=reject (Basic {raw_credential})"),
+                    "mode": "Basic delegated",
+                }),
+                outcome: "applied",
+            },
+        )
+        .await
+        .expect("record local audit entry");
+
+        let mut store = audit_store().lock().await;
+        let position = store
+            .iter()
+            .position(|entry| entry.request_id.as_deref() == Some(request_id.as_str()))
+            .expect("local audit entry was persisted");
+        let persisted_detail = store[position].detail.clone();
+        store.remove(position);
+
+        let serialized = serde_json::to_string(&persisted_detail).unwrap();
+        assert!(!serialized.contains(raw_credential));
+        assert_eq!(persisted_detail["reason"], "***REDACTED***");
+        assert_eq!(persisted_detail["mode"], "Basic delegated");
     }
 
     #[test]
@@ -1638,6 +1686,7 @@ mod audit_chain_db_tests {
             // large decimal) — the round trip must still verify, proving the
             // canonicalization survives jsonb numeric representation.
             json!({"f": 1.0, "i": 1, "exp": 1e3, "big": 1234567890.5, "neg": -2.50}),
+            json!({"reason": "stage=approve (Basic dXNlcjpwYXNz)"}),
         ]
         .into_iter()
         .enumerate()
@@ -1659,6 +1708,20 @@ mod audit_chain_db_tests {
             .await
             .expect("record audit");
         }
+
+        let persisted_detail: String = sqlx::query_scalar(
+            "SELECT detail::text FROM audit_log WHERE actor_principal = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(actor_principal.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("read persisted redacted detail");
+        assert!(!persisted_detail.contains("dXNlcjpwYXNz"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&persisted_detail).unwrap(),
+            json!({"reason": "***REDACTED***"})
+        );
 
         let (complete_domain_rows, excluded_rows): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COUNT(*) FILTER ( \
