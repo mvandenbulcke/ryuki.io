@@ -29,16 +29,21 @@ pub fn advisory_lock_key(connection_id: &str, delivery_id: &str) -> i64 {
 #[derive(Debug, sqlx::FromRow)]
 pub struct ReceiptRow {
     pub signature_version: i16,
+    pub webhook_secret_ref: Option<String>,
+    pub webhook_secret_generation: Option<i64>,
+    pub authority_context_sha256: Option<String>,
+    pub webhook_vendor_type: Option<String>,
+    pub webhook_site_scope: Option<String>,
     pub signed_at: chrono::DateTime<chrono::Utc>,
     pub body_sha256: String,
     pub event_id: Option<i64>,
 }
 
-/// Mark this transaction as implementing the v1 signed-envelope/receipt
-/// contract. Migration 160 rejects legacy webhook-event writers that do not set
-/// this transaction-local marker, so a rolling deployment fails closed.
-pub async fn enable_contract_v1(connection: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT set_config('ryuki.inbound_webhook_contract', '1', true)")
+/// Mark this transaction as implementing the v2 authority-bound
+/// signed-envelope/receipt contract. Migration 207 rejects legacy webhook-event
+/// writers that do not set this marker, so deployment overlap fails closed.
+pub async fn enable_contract_v2(connection: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('ryuki.inbound_webhook_contract', '2', true)")
         .execute(connection)
         .await?;
     Ok(())
@@ -71,6 +76,11 @@ pub async fn try_claim(
     connection_id: &str,
     delivery_id: &str,
     signature_version: i16,
+    webhook_secret_ref: &str,
+    webhook_secret_generation: i64,
+    authority_context_sha256: &str,
+    webhook_vendor_type: &str,
+    webhook_site_scope: Option<&str>,
     signed_at: chrono::DateTime<chrono::Utc>,
     body_sha256: &str,
     advisory_lock_key: i64,
@@ -78,15 +88,21 @@ pub async fn try_claim(
 ) -> Result<bool, sqlx::Error> {
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO inbound_webhook_receipts \
-         (connection_id, delivery_id, signature_version, signed_at, body_sha256, \
-          advisory_lock_key, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (connection_id, delivery_id, signature_version, webhook_secret_ref, \
+          webhook_secret_generation, authority_context_sha256, webhook_vendor_type, \
+          webhook_site_scope, signed_at, body_sha256, advisory_lock_key, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (connection_id, delivery_id) DO NOTHING \
          RETURNING delivery_id",
     )
     .bind(connection_id)
     .bind(delivery_id)
     .bind(signature_version)
+    .bind(webhook_secret_ref)
+    .bind(webhook_secret_generation)
+    .bind(authority_context_sha256)
+    .bind(webhook_vendor_type)
+    .bind(webhook_site_scope)
     .bind(signed_at)
     .bind(body_sha256)
     .bind(advisory_lock_key)
@@ -124,7 +140,9 @@ pub async fn get_for_update(
     delivery_id: &str,
 ) -> Result<Option<ReceiptRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT signature_version, signed_at, body_sha256, event_id \
+        "SELECT signature_version, webhook_secret_ref, webhook_secret_generation, \
+                authority_context_sha256, webhook_vendor_type, webhook_site_scope, \
+                signed_at, body_sha256, event_id \
          FROM inbound_webhook_receipts \
          WHERE connection_id = $1 AND delivery_id = $2 \
          FOR UPDATE",

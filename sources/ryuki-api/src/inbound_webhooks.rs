@@ -3,8 +3,9 @@
 //! An external system (ServiceNow, monitoring, CI) POSTs a signed webhook to
 //! `/api/integrations/{connection_id}/webhook`. This is a PUBLIC endpoint with NO
 //! human session. It authenticates a versioned canonical message containing the
-//! fixed method/path, connection id, Unix timestamp, delivery id, and SHA-256 of
-//! the exact raw body against the connection's dedicated webhook secret.
+//! fixed method/path, connection id, credential generation, authoritative
+//! vendor/site digest, Unix timestamp, delivery id, and SHA-256 of the exact raw
+//! body against the connection's dedicated webhook secret.
 //!
 //! SECURITY-CRITICAL, fail-closed at every step:
 //! - The body extractor is `axum::body::Bytes`, NOT `Json` — the canonical
@@ -16,9 +17,14 @@
 //!   event and receipt commit together; an exact retry returns the original
 //!   event id, while a delivery-id/content collision fails closed.
 //! - The HMAC input is the UTF-8 byte sequence below with no trailing newline:
-//!   `ryuki-webhook-v1\nmethod:POST\npath:/api/integrations/{connection_id}/webhook\n`
-//!   `connection-id:{connection_id}\ntimestamp:{unix_seconds}\n`
+//!   `ryuki-webhook-v2\nmethod:POST\npath:/api/integrations/{connection_id}/webhook\n`
+//!   `connection-id:{connection_id}\ncredential-generation:{generation}\n`
+//!   `authority-context-sha256:{lower_hex}\ntimestamp:{unix_seconds}\n`
 //!   `delivery-id:{delivery_id}\nbody-sha256:{lower_hex}`.
+//! - Secret resolution, generation/context selection, HMAC verification, receipt
+//!   claim, and event attribution occur in one transaction holding `FOR SHARE`
+//!   locks on the connection and immutable secret row. Rotation, reassignment,
+//!   and deletion therefore cannot swap authority between verification and use.
 //! - Every "this request is not authenticated" path — unknown connection id, a
 //!   connection with no webhook secret configured, a missing secret row, AND a
 //!   wrong signature — returns the SAME 401 with the SAME body. This is the
@@ -50,7 +56,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -61,17 +67,17 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::database::get_db;
-use crate::integration::resolve_webhook_secret;
+use crate::integration::resolve_webhook_authority;
 use crate::repos::domain_events::{self, NewEvent};
 use crate::repos::inbound_webhook_receipts;
 
-const WEBHOOK_SIGNATURE_VERSION: i16 = 1;
-const WEBHOOK_SIGNATURE_DOMAIN: &str = "ryuki-webhook-v1";
+const WEBHOOK_SIGNATURE_VERSION: i16 = 2;
+const WEBHOOK_SIGNATURE_DOMAIN: &str = "ryuki-webhook-v2";
 const WEBHOOK_TIMESTAMP_HEADER: &str = "X-Ryuki-Webhook-Timestamp";
 const WEBHOOK_DELIVERY_ID_HEADER: &str = "X-Ryuki-Webhook-Delivery-Id";
 const WEBHOOK_MAX_CLOCK_SKEW_SECS: i64 = 300;
@@ -338,19 +344,23 @@ fn timestamp_is_fresh(
     matches!((lower, upper), (Some(lower), Some(upper)) if signed_at >= lower && signed_at <= upper)
 }
 
-/// Domain-separated, line-oriented v1 message. Every interpolated identifier
+/// Domain-separated, line-oriented v2 message. Every interpolated identifier
 /// is restricted to `[A-Za-z0-9._-]`, the timestamp has one canonical decimal
 /// representation, and the body digest is fixed-length lowercase hex, so no
 /// field can inject a delimiter or create an alternate parse.
 fn canonical_webhook_message(
     connection_id: &str,
+    credential_generation: i64,
+    authority_context_sha256: &str,
     signed_at: chrono::DateTime<chrono::Utc>,
     delivery_id: &str,
     body_sha256: &str,
 ) -> String {
     format!(
         "{WEBHOOK_SIGNATURE_DOMAIN}\nmethod:POST\npath:/api/integrations/{connection_id}/webhook\n\
-         connection-id:{connection_id}\ntimestamp:{}\ndelivery-id:{delivery_id}\n\
+         connection-id:{connection_id}\ncredential-generation:{credential_generation}\n\
+         authority-context-sha256:{authority_context_sha256}\ntimestamp:{}\n\
+         delivery-id:{delivery_id}\n\
          body-sha256:{body_sha256}",
         signed_at.timestamp()
     )
@@ -422,7 +432,7 @@ pub(crate) async fn webhook_admission_middleware(
 ///
 /// PUBLIC — no human session or agent bearer. Requires
 /// `X-Ryuki-Webhook-Timestamp`, `X-Ryuki-Webhook-Delivery-Id`, and an
-/// `X-Hub-Signature-256` HMAC over the module's v1 canonical message. A first
+/// `X-Hub-Signature-256` HMAC over the module's v2 canonical message. A first
 /// verified delivery records one domain event; an exact retry returns that
 /// event's original id. The external payload is capped at 256 KiB and is never
 /// echoed or stored.
@@ -492,37 +502,43 @@ async fn webhook_receive_with_pool_at(
 
     let delivery_id = delivery_id.to_string();
     let body_sha256 = ryuki_protocol::sha256_hex(&body);
-    let canonical_message =
-        canonical_webhook_message(&connection_id, signed_at, &delivery_id, &body_sha256);
-
-    // (c) NO-ORACLE MERGE POINT: unknown connection id, no webhook secret
-    // configured, and a missing secret row all resolve to `Ok(None)` inside
-    // `resolve_webhook_secret` and MUST all produce the identical 401 below as a
-    // wrong signature (d) — this endpoint never reveals which connection ids
-    // exist or are webhook-enabled.
-    let secret = match resolve_webhook_secret(pool, &connection_id).await {
-        Err(e) => return Err(generic_500("resolve_webhook_secret failed", e)),
-        Ok(None) => return Err(signature_verification_failed()),
-        Ok(Some(secret)) => secret,
-    };
-
-    // (d) Bad signature is INDISTINGUISHABLE from (c)'s None case — same status,
-    // same body.
-    if !ryuki_engine::webhook_receipt::verify_hmac_sha256(
-        &secret,
-        canonical_message.as_bytes(),
-        sig,
-    ) {
-        return Err(signature_verification_failed());
-    }
 
     let mut tx = pool
         .begin()
         .await
         .map_err(|error| generic_500("webhook transaction begin failed", error))?;
-    inbound_webhook_receipts::enable_contract_v1(&mut tx)
+    inbound_webhook_receipts::enable_contract_v2(&mut tx)
         .await
         .map_err(|error| generic_500("webhook contract activation failed", error))?;
+
+    // (c) NO-ORACLE MERGE POINT: unknown connection id, no webhook secret
+    // configured, and a missing secret row all resolve to `Ok(None)` inside
+    // `resolve_webhook_authority` and MUST all produce the identical 401 below
+    // as a wrong signature (d). The joined connection/credential rows remain
+    // share-locked in this transaction through the receipt/event commit.
+    let authority = match resolve_webhook_authority(&mut tx, &connection_id).await {
+        Err(error) => return Err(generic_500("resolve_webhook_authority failed", error)),
+        Ok(None) => return Err(signature_verification_failed()),
+        Ok(Some(authority)) => authority,
+    };
+    let canonical_message = canonical_webhook_message(
+        &connection_id,
+        authority.generation,
+        &authority.authority_context_sha256,
+        signed_at,
+        &delivery_id,
+        &body_sha256,
+    );
+
+    // (d) Bad signature is INDISTINGUISHABLE from (c)'s None case — same status,
+    // same body.
+    if !ryuki_engine::webhook_receipt::verify_hmac_sha256(
+        &authority.secret,
+        canonical_message.as_bytes(),
+        sig,
+    ) {
+        return Err(signature_verification_failed());
+    }
 
     // Serialize this delivery before the final clock read. The cleanup worker
     // attempts the same key without waiting, so it cannot delete a receipt after
@@ -571,11 +587,23 @@ async fn webhook_receive_with_pool_at(
             .map_err(|error| generic_500("webhook receipt lookup failed", error))?
     {
         let duplicate_event_id = (existing.signature_version == WEBHOOK_SIGNATURE_VERSION
+            && existing.webhook_secret_ref.as_deref() == Some(authority.secret_ref.as_str())
+            && existing.webhook_secret_generation == Some(authority.generation)
+            && existing.authority_context_sha256.as_deref()
+                == Some(authority.authority_context_sha256.as_str())
+            && existing.webhook_vendor_type.as_deref() == Some(authority.vendor_type.as_str())
+            && existing.webhook_site_scope == authority.site_scope
             && existing.signed_at == signed_at
             && existing.body_sha256 == body_sha256)
             .then_some(existing.event_id)
             .flatten();
         let matching_but_unbound = existing.signature_version == WEBHOOK_SIGNATURE_VERSION
+            && existing.webhook_secret_ref.as_deref() == Some(authority.secret_ref.as_str())
+            && existing.webhook_secret_generation == Some(authority.generation)
+            && existing.authority_context_sha256.as_deref()
+                == Some(authority.authority_context_sha256.as_str())
+            && existing.webhook_vendor_type.as_deref() == Some(authority.vendor_type.as_str())
+            && existing.webhook_site_scope == authority.site_scope
             && existing.signed_at == signed_at
             && existing.body_sha256 == body_sha256
             && existing.event_id.is_none();
@@ -599,6 +627,11 @@ async fn webhook_receive_with_pool_at(
         &connection_id,
         &delivery_id,
         WEBHOOK_SIGNATURE_VERSION,
+        &authority.secret_ref,
+        authority.generation,
+        &authority.authority_context_sha256,
+        &authority.vendor_type,
+        authority.site_scope.as_deref(),
         signed_at,
         &body_sha256,
         advisory_lock_key,
@@ -608,7 +641,7 @@ async fn webhook_receive_with_pool_at(
     .map_err(|error| generic_500("webhook receipt claim failed", error))?;
 
     if !claimed {
-        // All v1 delivery writers take the same transaction advisory lock, so
+        // All v2 delivery writers take the same transaction advisory lock, so
         // an absent key cannot become occupied between the locked read and this
         // insert. Treat a conflict as a database/application invariant failure;
         // never append an unreceipted event.
@@ -618,25 +651,17 @@ async fn webhook_receive_with_pool_at(
         ));
     }
 
-    // Signature and freshness verified and the delivery was claimed. Fetch
-    // scope in the same transaction; if the connection vanished after secret
-    // resolution, preserve the existing degraded-scope acceptance behavior.
-    let scope: Option<(Option<String>, String)> =
-        sqlx::query_as("SELECT site_scope, vendor_type FROM integration_connections WHERE id = $1")
-            .bind(&connection_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| generic_500("connection scope lookup failed", e))?;
-    let (site_scope, vendor_type) = scope.unwrap_or((None, "unknown".to_string()));
-
-    let actor = format!("webhook:{vendor_type}");
+    // Signature verification and event attribution consume the exact same
+    // locked authority snapshot. Missing/deleted connections never degrade to
+    // an `unknown` actor or unscoped event.
+    let actor = format!("webhook:{}", authority.vendor_type);
     let event_id = domain_events::insert(
         &mut *tx,
         NewEvent {
             event_type: "integration.webhook-received",
             aggregate_type: "integration_connection",
             aggregate_id: &connection_id,
-            site: site_scope.as_deref(),
+            site: authority.site_scope.as_deref(),
             environment: None,
             actor: &actor,
             // NEVER the raw external payload verbatim — only a hash + size, so
@@ -644,8 +669,10 @@ async fn webhook_receive_with_pool_at(
             // whatever the external system chose to send.
             payload: json!({
                 "connection_id": &connection_id,
-                "vendor_type": &vendor_type,
+                "vendor_type": &authority.vendor_type,
                 "signature_version": WEBHOOK_SIGNATURE_VERSION,
+                "webhook_secret_generation": authority.generation,
+                "authority_context_sha256": &authority.authority_context_sha256,
                 "signed_at": signed_at,
                 "delivery_id": &delivery_id,
                 "body_sha256": &body_sha256,
@@ -695,6 +722,7 @@ pub fn routes() -> Router {
 mod inbound_webhook_db_tests {
     use super::*;
     use crate::database::DB_TEST_SERIAL;
+    use crate::integration::{webhook_authority_context_digest, webhook_secret_material_was_used};
     use axum::body::Body;
     use axum::middleware;
     use base64::Engine;
@@ -702,8 +730,8 @@ mod inbound_webhook_db_tests {
     use sha2::Sha256;
     use sqlx::PgPool;
     use tokio::sync::{Barrier, Notify};
-    use tower::limit::ConcurrencyLimitLayer;
     use tower::ServiceExt;
+    use tower::limit::ConcurrencyLimitLayer;
 
     /// Mirrors the `global_pool()` helper used throughout agents.rs / background.rs
     /// / scheduler.rs db test modules: connects via the REAL `try_connect_with_url`
@@ -770,12 +798,53 @@ mod inbound_webhook_db_tests {
             .ok();
     }
 
+    #[derive(Clone)]
+    struct TestWebhookSigningContext {
+        generation: i64,
+        authority_context_sha256: String,
+    }
+
+    fn signing_context(
+        connection_id: &str,
+        secret_ref: &str,
+        vendor_type: &str,
+        site_scope: Option<&str>,
+        generation: i64,
+    ) -> TestWebhookSigningContext {
+        TestWebhookSigningContext {
+            generation,
+            authority_context_sha256: webhook_authority_context_digest(
+                connection_id,
+                secret_ref,
+                generation,
+                vendor_type,
+                site_scope,
+            ),
+        }
+    }
+
     /// Provision a webhook secret directly (bypassing the admin HTTP handler,
     /// which requires a session) by calling `integration::set_webhook_secret`'s
     /// underlying encrypt+store logic inline. We can't call the handler (it
     /// needs an `AuthSession` Extension), so we replicate the minimal insert the
     /// same way `resolve_webhook_secret` expects to read it back.
-    async fn provision_webhook_secret(pool: &PgPool, connection_id: &str, secret: &[u8]) {
+    async fn provision_webhook_secret(
+        pool: &PgPool,
+        connection_id: &str,
+        secret: &[u8],
+    ) -> TestWebhookSigningContext {
+        let (vendor_type, site_scope, prior_generation): (String, Option<String>, i64) =
+            sqlx::query_as(
+                "SELECT vendor_type, site_scope, webhook_secret_generation \
+                 FROM integration_connections WHERE id = $1",
+            )
+            .bind(connection_id)
+            .fetch_one(pool)
+            .await
+            .expect("load webhook authority");
+        let generation = prior_generation
+            .checked_add(1)
+            .expect("test webhook generation");
         let (ciphertext, nonce, _key_id) =
             crate::integration::encrypt_secret(connection_id, secret)
                 .expect("encrypt_secret must succeed with a valid test key");
@@ -783,23 +852,37 @@ mod inbound_webhook_db_tests {
         let now = now_iso();
         sqlx::query(
             "INSERT INTO integration_secrets \
-             (id, connection_id, ciphertext, nonce, key_id, created_at, updated_at) \
-             VALUES ($1,$2,$3,$4,'test-key',$5,$5)",
+             (id, connection_id, ciphertext, nonce, key_id, webhook_secret_generation, \
+              created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,'test-key',$5,$6,$6)",
         )
         .bind(&secret_id)
         .bind(connection_id)
         .bind(&ciphertext)
         .bind(&nonce)
+        .bind(generation)
         .bind(&now)
         .execute(pool)
         .await
         .expect("insert secret");
-        sqlx::query("UPDATE integration_connections SET webhook_secret_ref = $1 WHERE id = $2")
-            .bind(&secret_id)
-            .bind(connection_id)
-            .execute(pool)
-            .await
-            .expect("link webhook_secret_ref");
+        sqlx::query(
+            "UPDATE integration_connections \
+             SET webhook_secret_ref = $1, webhook_secret_generation = $2 \
+             WHERE id = $3",
+        )
+        .bind(&secret_id)
+        .bind(generation)
+        .bind(connection_id)
+        .execute(pool)
+        .await
+        .expect("link webhook_secret_ref");
+        signing_context(
+            connection_id,
+            &secret_id,
+            &vendor_type,
+            site_scope.as_deref(),
+            generation,
+        )
     }
 
     fn sign_bytes(secret: &[u8], message: &[u8]) -> String {
@@ -811,6 +894,7 @@ mod inbound_webhook_db_tests {
 
     fn sign_delivery(
         secret: &[u8],
+        authority: &TestWebhookSigningContext,
         connection_id: &str,
         timestamp: i64,
         delivery_id: &str,
@@ -819,7 +903,14 @@ mod inbound_webhook_db_tests {
         let signed_at =
             chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0).expect("test timestamp");
         let digest = ryuki_protocol::sha256_hex(body);
-        let canonical = canonical_webhook_message(connection_id, signed_at, delivery_id, &digest);
+        let canonical = canonical_webhook_message(
+            connection_id,
+            authority.generation,
+            &authority.authority_context_sha256,
+            signed_at,
+            delivery_id,
+            &digest,
+        );
         sign_bytes(secret, canonical.as_bytes())
     }
 
@@ -869,9 +960,13 @@ mod inbound_webhook_db_tests {
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> i64 {
         let mut tx = pool.begin().await.expect("begin receipt seed transaction");
-        inbound_webhook_receipts::enable_contract_v1(&mut tx)
+        inbound_webhook_receipts::enable_contract_v2(&mut tx)
             .await
             .expect("enable receipt contract");
+        let secret_ref = "is-wh-synthetic-receipt";
+        let authority_digest =
+            webhook_authority_context_digest(connection_id, secret_ref, 1, "synthetic", None);
+        let body_sha256 = ryuki_protocol::sha256_hex(b"synthetic seeded receipt");
         let lock_key = inbound_webhook_receipts::advisory_lock_key(connection_id, delivery_id);
         inbound_webhook_receipts::lock_delivery(&mut tx, lock_key)
             .await
@@ -885,31 +980,44 @@ mod inbound_webhook_db_tests {
                 site: None,
                 environment: None,
                 actor: "webhook:synthetic",
-                payload: json!({"synthetic": true}),
+                payload: json!({
+                    "connection_id": connection_id,
+                    "signature_version": WEBHOOK_SIGNATURE_VERSION,
+                    "webhook_secret_generation": 1,
+                    "authority_context_sha256": &authority_digest,
+                    "vendor_type": "synthetic",
+                    "signed_at": signed_at,
+                    "delivery_id": delivery_id,
+                    "body_sha256": &body_sha256,
+                }),
             },
         )
         .await
         .expect("insert seeded webhook event");
-        assert!(inbound_webhook_receipts::try_claim(
-            &mut tx,
-            connection_id,
-            delivery_id,
-            WEBHOOK_SIGNATURE_VERSION,
-            signed_at,
-            &ryuki_protocol::sha256_hex(b"synthetic seeded receipt"),
-            lock_key,
-            expires_at,
-        )
-        .await
-        .expect("claim seeded receipt"));
-        assert!(inbound_webhook_receipts::bind_event(
-            &mut tx,
-            connection_id,
-            delivery_id,
-            event_id,
-        )
-        .await
-        .expect("bind seeded receipt"));
+        assert!(
+            inbound_webhook_receipts::try_claim(
+                &mut tx,
+                connection_id,
+                delivery_id,
+                WEBHOOK_SIGNATURE_VERSION,
+                secret_ref,
+                1,
+                &authority_digest,
+                "synthetic",
+                None,
+                signed_at,
+                &body_sha256,
+                lock_key,
+                expires_at,
+            )
+            .await
+            .expect("claim seeded receipt")
+        );
+        assert!(
+            inbound_webhook_receipts::bind_event(&mut tx, connection_id, delivery_id, event_id,)
+                .await
+                .expect("bind seeded receipt")
+        );
         tx.commit().await.expect("commit seeded receipt");
         event_id
     }
@@ -939,40 +1047,80 @@ mod inbound_webhook_db_tests {
 
     #[test]
     fn canonical_signature_binds_every_security_field() {
-        let secret = b"synthetic-canonical-test-key";
+        let secret = rand::random::<[u8; 32]>();
         let connection_id = "ic-servicenow-canonical";
+        let credential_generation = 7;
+        let authority_context_sha256 = webhook_authority_context_digest(
+            connection_id,
+            "is-wh-canonical",
+            credential_generation,
+            "servicenow",
+            Some("site-a"),
+        );
         let delivery_id = "delivery-canonical-001";
         let signed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(2_000_000_000, 0).unwrap();
         let body_digest = ryuki_protocol::sha256_hex(b"synthetic payload");
-        let canonical =
-            canonical_webhook_message(connection_id, signed_at, delivery_id, &body_digest);
-        let signature = sign_bytes(secret, canonical.as_bytes());
+        let canonical = canonical_webhook_message(
+            connection_id,
+            credential_generation,
+            &authority_context_sha256,
+            signed_at,
+            delivery_id,
+            &body_digest,
+        );
+        let signature = sign_bytes(&secret, canonical.as_bytes());
 
         assert!(ryuki_engine::webhook_receipt::verify_hmac_sha256(
-            secret,
+            &secret,
             canonical.as_bytes(),
             &signature,
         ));
         for changed in [
-            canonical_webhook_message("ic-servicenow-other", signed_at, delivery_id, &body_digest),
             canonical_webhook_message(
                 connection_id,
+                credential_generation + 1,
+                &authority_context_sha256,
+                signed_at,
+                delivery_id,
+                &body_digest,
+            ),
+            canonical_webhook_message(
+                connection_id,
+                credential_generation,
+                &ryuki_protocol::sha256_hex(b"changed authority context"),
+                signed_at,
+                delivery_id,
+                &body_digest,
+            ),
+            canonical_webhook_message(
+                connection_id,
+                credential_generation,
+                &authority_context_sha256,
                 signed_at + chrono::Duration::seconds(1),
                 delivery_id,
                 &body_digest,
             ),
-            canonical_webhook_message(connection_id, signed_at, "delivery-other", &body_digest),
             canonical_webhook_message(
                 connection_id,
+                credential_generation,
+                &authority_context_sha256,
+                signed_at,
+                "delivery-other",
+                &body_digest,
+            ),
+            canonical_webhook_message(
+                connection_id,
+                credential_generation,
+                &authority_context_sha256,
                 signed_at,
                 delivery_id,
                 &ryuki_protocol::sha256_hex(b"changed payload"),
             ),
-            canonical.replacen(WEBHOOK_SIGNATURE_DOMAIN, "ryuki-webhook-v2", 1),
+            canonical.replacen(WEBHOOK_SIGNATURE_DOMAIN, "ryuki-webhook-v3", 1),
             canonical.replacen("method:POST", "method:PUT", 1),
         ] {
             assert!(!ryuki_engine::webhook_receipt::verify_hmac_sha256(
-                secret,
+                &secret,
                 changed.as_bytes(),
                 &signature,
             ));
@@ -1156,8 +1304,10 @@ mod inbound_webhook_db_tests {
 
     #[test]
     fn duplicate_or_malformed_forwarding_evidence_falls_back_to_peer_bucket() {
-        let trusted = vec![ryuki_core::config::TrustedProxyNetwork::parse("10.0.0.0/8")
-            .expect("trusted proxy fixture")];
+        let trusted = vec![
+            ryuki_core::config::TrustedProxyNetwork::parse("10.0.0.0/8")
+                .expect("trusted proxy fixture"),
+        ];
         let admission = WebhookAdmission::new(1, 1, 100, 100, 10, trusted);
         let proxy = peer("10.0.0.5:443");
 
@@ -1304,9 +1454,9 @@ mod inbound_webhook_db_tests {
     async fn latest_event_for(
         pool: &PgPool,
         connection_id: &str,
-    ) -> Option<(String, serde_json::Value)> {
-        sqlx::query_as::<_, (String, serde_json::Value)>(
-            "SELECT event_type, payload FROM domain_events \
+    ) -> Option<(String, String, Option<String>, serde_json::Value)> {
+        sqlx::query_as::<_, (String, String, Option<String>, serde_json::Value)>(
+            "SELECT event_type, actor, site, payload FROM domain_events \
              WHERE aggregate_id = $1 AND event_type = 'integration.webhook-received' \
              ORDER BY id DESC LIMIT 1",
         )
@@ -1329,13 +1479,13 @@ mod inbound_webhook_db_tests {
 
         let conn_id = format!("ic-webhook-recv-{}", uuid::Uuid::new_v4());
         insert_test_connection(pool, &conn_id, Some("site-a")).await;
-        let secret = b"receiver-test-secret";
-        provision_webhook_secret(pool, &conn_id, secret).await;
+        let secret = rand::random::<[u8; 32]>();
+        let authority = provision_webhook_secret(pool, &conn_id, &secret).await;
 
         let body = Bytes::from_static(br#"{"event":"incident.created","id":"INC001"}"#);
         let timestamp = chrono::Utc::now().timestamp();
         let delivery_id = "delivery-valid-001";
-        let sig = sign_delivery(secret, &conn_id, timestamp, delivery_id, &body);
+        let sig = sign_delivery(&secret, &authority, &conn_id, timestamp, delivery_id, &body);
 
         let result = webhook_receive_with_pool(
             conn_id.clone(),
@@ -1351,21 +1501,239 @@ mod inbound_webhook_db_tests {
         assert_eq!(payload["status"], "accepted");
         assert!(payload["event_id"].is_i64());
 
-        let (event_type, event_payload) = latest_event_for(pool, &conn_id)
+        let (event_type, actor, site, event_payload) = latest_event_for(pool, &conn_id)
             .await
             .expect("event must be recorded");
         assert_eq!(event_type, "integration.webhook-received");
+        assert_eq!(actor, "webhook:servicenow");
+        assert_eq!(site.as_deref(), Some("site-a"));
         assert_eq!(
             event_payload["body_sha256"],
             ryuki_protocol::sha256_hex(&body)
         );
         assert_eq!(event_payload["body_bytes"], body.len() as i64);
         assert_eq!(event_payload["delivery_id"], delivery_id);
+        assert_eq!(
+            event_payload["webhook_secret_generation"],
+            authority.generation
+        );
+        assert_eq!(
+            event_payload["authority_context_sha256"],
+            authority.authority_context_sha256
+        );
+        let receipt: (i16, i64, String, String, Option<String>) = sqlx::query_as(
+            "SELECT signature_version, webhook_secret_generation, \
+                    authority_context_sha256, webhook_vendor_type, webhook_site_scope \
+             FROM inbound_webhook_receipts \
+             WHERE connection_id = $1 AND delivery_id = $2",
+        )
+        .bind(&conn_id)
+        .bind(delivery_id)
+        .fetch_one(pool)
+        .await
+        .expect("authority-bound receipt");
+        assert_eq!(receipt.0, WEBHOOK_SIGNATURE_VERSION);
+        assert_eq!(receipt.1, authority.generation);
+        assert_eq!(receipt.2, authority.authority_context_sha256);
+        assert_eq!(receipt.3, "servicenow");
+        assert_eq!(receipt.4.as_deref(), Some("site-a"));
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         // The raw external payload must never appear verbatim in the stored event.
         assert!(!event_payload.to_string().contains("incident.created"));
 
         cleanup_connection(pool, &conn_id).await;
+    }
+
+    #[tokio::test]
+    async fn metadata_reassignment_revokes_old_authority_until_reprovisioned() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+
+        let conn_id = format!("ic-webhook-reassign-{}", uuid::Uuid::new_v4());
+        insert_test_connection(pool, &conn_id, Some("site-a")).await;
+        let old_secret = rand::random::<[u8; 32]>();
+        let old_authority = provision_webhook_secret(pool, &conn_id, &old_secret).await;
+
+        sqlx::query(
+            "UPDATE integration_connections \
+             SET vendor_type = 'grafana', site_scope = 'site-b', \
+                 webhook_secret_ref = NULL \
+             WHERE id = $1",
+        )
+        .bind(&conn_id)
+        .execute(pool)
+        .await
+        .expect("metadata reassignment atomically revokes the active credential");
+
+        let mut reuse_tx = pool.begin().await.expect("begin retired-secret check");
+        sqlx::query("SELECT id FROM integration_connections WHERE id = $1 FOR UPDATE")
+            .bind(&conn_id)
+            .execute(&mut *reuse_tx)
+            .await
+            .expect("lock reassigned connection");
+        assert!(
+            webhook_secret_material_was_used(&mut reuse_tx, &conn_id, &old_secret)
+                .await
+                .expect("check revoked credential history"),
+            "reassignment must not make old plaintext eligible for reuse"
+        );
+        reuse_tx
+            .rollback()
+            .await
+            .expect("release retired-secret check");
+
+        let body = Bytes::from_static(br#"{"event":"synthetic.reassignment"}"#);
+        let timestamp = chrono::Utc::now().timestamp();
+        let old_signature = sign_delivery(
+            &old_secret,
+            &old_authority,
+            &conn_id,
+            timestamp,
+            "delivery-reassignment-old",
+            &body,
+        );
+        let old_error = webhook_receive_with_pool(
+            conn_id.clone(),
+            headers_for_delivery(Some(&old_signature), timestamp, "delivery-reassignment-old"),
+            body.clone(),
+            pool,
+        )
+        .await
+        .expect_err("an old sender must lose authority at reassignment");
+        assert_eq!(old_error.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (0, 0));
+
+        let new_secret = rand::random::<[u8; 32]>();
+        let new_authority = provision_webhook_secret(pool, &conn_id, &new_secret).await;
+        assert_eq!(new_authority.generation, old_authority.generation + 1);
+        assert_ne!(
+            new_authority.authority_context_sha256,
+            old_authority.authority_context_sha256
+        );
+        let new_signature = sign_delivery(
+            &new_secret,
+            &new_authority,
+            &conn_id,
+            timestamp,
+            "delivery-reassignment-new",
+            &body,
+        );
+        webhook_receive_with_pool(
+            conn_id.clone(),
+            headers_for_delivery(Some(&new_signature), timestamp, "delivery-reassignment-new"),
+            body,
+            pool,
+        )
+        .await
+        .expect("fresh authority for the reassigned metadata is accepted");
+
+        let (_, actor, site, _) = latest_event_for(pool, &conn_id)
+            .await
+            .expect("reprovisioned delivery records an event");
+        assert_eq!(actor, "webhook:grafana");
+        assert_eq!(site.as_deref(), Some("site-b"));
+        assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    #[tokio::test]
+    async fn authority_snapshot_serializes_reassignment_and_deletion() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+
+        let conn_id = format!("ic-webhook-authority-lock-{}", uuid::Uuid::new_v4());
+        insert_test_connection(pool, &conn_id, Some("site-a")).await;
+        let secret = rand::random::<[u8; 32]>();
+        provision_webhook_secret(pool, &conn_id, &secret).await;
+
+        let mut receiver_tx = pool.begin().await.expect("begin receiver snapshot");
+        resolve_webhook_authority(&mut receiver_tx, &conn_id)
+            .await
+            .expect("resolve locked authority")
+            .expect("configured authority");
+
+        let reassignment_started = Arc::new(Notify::new());
+        let task_started = reassignment_started.clone();
+        let reassigned_id = conn_id.clone();
+        let mut reassignment = tokio::spawn(async move {
+            task_started.notify_one();
+            sqlx::query(
+                "UPDATE integration_connections \
+                 SET vendor_type = 'grafana', webhook_secret_ref = NULL \
+                 WHERE id = $1",
+            )
+            .bind(&reassigned_id)
+            .execute(pool)
+            .await
+        });
+        reassignment_started.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut reassignment,)
+                .await
+                .is_err(),
+            "reassignment must wait while the receiver holds its authority snapshot"
+        );
+        receiver_tx
+            .commit()
+            .await
+            .expect("release receiver authority snapshot");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reassignment)
+            .await
+            .expect("reassignment completes after receiver commit")
+            .expect("reassignment task")
+            .expect("reassignment query");
+
+        let replacement_secret = rand::random::<[u8; 32]>();
+        provision_webhook_secret(pool, &conn_id, &replacement_secret).await;
+        let mut second_receiver_tx = pool.begin().await.expect("begin deletion snapshot");
+        resolve_webhook_authority(&mut second_receiver_tx, &conn_id)
+            .await
+            .expect("resolve authority before deletion")
+            .expect("reprovisioned authority");
+
+        let deletion_started = Arc::new(Notify::new());
+        let task_started = deletion_started.clone();
+        let deleted_id = conn_id.clone();
+        let mut deletion = tokio::spawn(async move {
+            task_started.notify_one();
+            sqlx::query("DELETE FROM integration_connections WHERE id = $1")
+                .bind(&deleted_id)
+                .execute(pool)
+                .await
+        });
+        deletion_started.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait while the receiver holds its authority snapshot"
+        );
+        second_receiver_tx
+            .commit()
+            .await
+            .expect("release deletion authority snapshot");
+        tokio::time::timeout(std::time::Duration::from_secs(5), deletion)
+            .await
+            .expect("deletion completes after receiver commit")
+            .expect("deletion task")
+            .expect("deletion query");
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM integration_connections WHERE id = $1")
+                .bind(&conn_id)
+                .fetch_one(pool)
+                .await
+                .expect("count deleted connection");
+        assert_eq!(remaining, 0);
+        assert!(latest_event_for(pool, &conn_id).await.is_none());
     }
 
     /// (ii) Tampered body / wrong signature -> 401, no event recorded.
@@ -1380,13 +1748,20 @@ mod inbound_webhook_db_tests {
 
         let conn_id = format!("ic-webhook-tamper-{}", uuid::Uuid::new_v4());
         insert_test_connection(pool, &conn_id, None).await;
-        let secret = b"another-receiver-secret";
-        provision_webhook_secret(pool, &conn_id, secret).await;
+        let secret = rand::random::<[u8; 32]>();
+        let authority = provision_webhook_secret(pool, &conn_id, &secret).await;
 
         let original = b"{\"a\":1}";
         let timestamp = chrono::Utc::now().timestamp();
         let delivery_id = "delivery-tamper-001";
-        let sig = sign_delivery(secret, &conn_id, timestamp, delivery_id, original);
+        let sig = sign_delivery(
+            &secret,
+            &authority,
+            &conn_id,
+            timestamp,
+            delivery_id,
+            original,
+        );
         let tampered = Bytes::from_static(b"{\"a\":2}");
 
         let result = webhook_receive_with_pool(
@@ -1417,8 +1792,8 @@ mod inbound_webhook_db_tests {
 
         let conn_id = format!("ic-webhook-freshness-{}", uuid::Uuid::new_v4());
         insert_test_connection(pool, &conn_id, None).await;
-        let secret = b"synthetic-freshness-test-secret";
-        provision_webhook_secret(pool, &conn_id, secret).await;
+        let secret = rand::random::<[u8; 32]>();
+        let authority = provision_webhook_secret(pool, &conn_id, &secret).await;
         let application_now = chrono::Utc::now();
         let body = Bytes::from_static(br#"{"event":"synthetic.freshness"}"#);
 
@@ -1428,7 +1803,14 @@ mod inbound_webhook_db_tests {
         ] {
             let timestamp = application_now.timestamp() + offset;
             let delivery_id = format!("delivery-{label}-001");
-            let signature = sign_delivery(secret, &conn_id, timestamp, &delivery_id, &body);
+            let signature = sign_delivery(
+                &secret,
+                &authority,
+                &conn_id,
+                timestamp,
+                &delivery_id,
+                &body,
+            );
             let error = webhook_receive_with_pool_at(
                 conn_id.clone(),
                 headers_for_delivery(Some(&signature), timestamp, &delivery_id),
@@ -1439,7 +1821,7 @@ mod inbound_webhook_db_tests {
             .await
             .expect_err("out-of-window delivery must fail closed");
             assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-            assert_eq!(error.1 .0["error"], "signature verification failed");
+            assert_eq!(error.1.0["error"], "signature verification failed");
         }
 
         // A skewed application clock alone is insufficient: make the envelope
@@ -1452,7 +1834,8 @@ mod inbound_webhook_db_tests {
                 .expect("skewed application clock fixture");
         let delivery_id = "delivery-database-clock-stale-001";
         let signature = sign_delivery(
-            secret,
+            &secret,
+            &authority,
             &conn_id,
             database_stale_timestamp,
             delivery_id,
@@ -1469,7 +1852,7 @@ mod inbound_webhook_db_tests {
         .expect_err("database clock must reject an application-clock bypass");
         assert_eq!(database_clock_error.0, StatusCode::UNAUTHORIZED);
         assert_eq!(
-            database_clock_error.1 .0["error"],
+            database_clock_error.1.0["error"],
             "signature verification failed"
         );
 
@@ -1493,7 +1876,9 @@ mod inbound_webhook_db_tests {
         // returns None regardless of what's supplied.
         let timestamp = chrono::Utc::now().timestamp();
         let delivery_id = "delivery-unknown-001";
-        let sig = sign_delivery(b"irrelevant", &conn_id, timestamp, delivery_id, &body);
+        let secret = rand::random::<[u8; 32]>();
+        let authority = signing_context(&conn_id, "is-wh-unknown", "unknown", None, 1);
+        let sig = sign_delivery(&secret, &authority, &conn_id, timestamp, delivery_id, &body);
 
         let result = webhook_receive_with_pool(
             conn_id,
@@ -1547,12 +1932,12 @@ mod inbound_webhook_db_tests {
 
         let conn_id = format!("ic-webhook-replay-{}", uuid::Uuid::new_v4());
         insert_test_connection(pool, &conn_id, Some("site-a")).await;
-        let secret = b"synthetic-replay-test-secret";
-        provision_webhook_secret(pool, &conn_id, secret).await;
+        let secret = rand::random::<[u8; 32]>();
+        let authority = provision_webhook_secret(pool, &conn_id, &secret).await;
         let timestamp = chrono::Utc::now().timestamp();
         let delivery_id = "delivery-replay-001";
         let body = Bytes::from_static(br#"{"event":"synthetic.retry"}"#);
-        let signature = sign_delivery(secret, &conn_id, timestamp, delivery_id, &body);
+        let signature = sign_delivery(&secret, &authority, &conn_id, timestamp, delivery_id, &body);
         let headers = headers_for_delivery(Some(&signature), timestamp, delivery_id);
 
         let first = webhook_receive_with_pool(conn_id.clone(), headers.clone(), body.clone(), pool)
@@ -1564,7 +1949,7 @@ mod inbound_webhook_db_tests {
 
         assert_eq!(first.0, StatusCode::ACCEPTED);
         assert_eq!(second.0, StatusCode::ACCEPTED);
-        assert_eq!(first.1 .0["event_id"], second.1 .0["event_id"]);
+        assert_eq!(first.1.0["event_id"], second.1.0["event_id"]);
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         cleanup_connection(pool, &conn_id).await;
     }
@@ -1580,12 +1965,12 @@ mod inbound_webhook_db_tests {
 
         let conn_id = format!("ic-webhook-race-{}", uuid::Uuid::new_v4());
         insert_test_connection(pool, &conn_id, None).await;
-        let secret = b"synthetic-race-test-secret";
-        provision_webhook_secret(pool, &conn_id, secret).await;
+        let secret = rand::random::<[u8; 32]>();
+        let authority = provision_webhook_secret(pool, &conn_id, &secret).await;
         let timestamp = chrono::Utc::now().timestamp();
         let delivery_id = "delivery-race-001";
         let body = Bytes::from_static(br#"{"event":"synthetic.concurrent"}"#);
-        let signature = sign_delivery(secret, &conn_id, timestamp, delivery_id, &body);
+        let signature = sign_delivery(&secret, &authority, &conn_id, timestamp, delivery_id, &body);
         let headers = headers_for_delivery(Some(&signature), timestamp, delivery_id);
         let start = Arc::new(Barrier::new(2));
         let first_start = start.clone();
@@ -1606,7 +1991,7 @@ mod inbound_webhook_db_tests {
         );
         let first = first.expect("first concurrent copy accepted");
         let second = second.expect("second concurrent copy idempotently accepted");
-        assert_eq!(first.1 .0["event_id"], second.1 .0["event_id"]);
+        assert_eq!(first.1.0["event_id"], second.1.0["event_id"]);
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         cleanup_connection(pool, &conn_id).await;
     }
@@ -1622,12 +2007,19 @@ mod inbound_webhook_db_tests {
 
         let conn_id = format!("ic-webhook-collision-{}", uuid::Uuid::new_v4());
         insert_test_connection(pool, &conn_id, None).await;
-        let secret = b"synthetic-collision-test-secret";
-        provision_webhook_secret(pool, &conn_id, secret).await;
+        let secret = rand::random::<[u8; 32]>();
+        let authority = provision_webhook_secret(pool, &conn_id, &secret).await;
         let timestamp = chrono::Utc::now().timestamp();
         let delivery_id = "delivery-collision-001";
         let first_body = Bytes::from_static(br#"{"state":"first"}"#);
-        let first_signature = sign_delivery(secret, &conn_id, timestamp, delivery_id, &first_body);
+        let first_signature = sign_delivery(
+            &secret,
+            &authority,
+            &conn_id,
+            timestamp,
+            delivery_id,
+            &first_body,
+        );
         let _ = webhook_receive_with_pool(
             conn_id.clone(),
             headers_for_delivery(Some(&first_signature), timestamp, delivery_id),
@@ -1638,8 +2030,14 @@ mod inbound_webhook_db_tests {
         .expect("first delivery accepted");
 
         let changed_body = Bytes::from_static(br#"{"state":"changed"}"#);
-        let changed_signature =
-            sign_delivery(secret, &conn_id, timestamp, delivery_id, &changed_body);
+        let changed_signature = sign_delivery(
+            &secret,
+            &authority,
+            &conn_id,
+            timestamp,
+            delivery_id,
+            &changed_body,
+        );
         let error = webhook_receive_with_pool(
             conn_id.clone(),
             headers_for_delivery(Some(&changed_signature), timestamp, delivery_id),
@@ -1649,7 +2047,7 @@ mod inbound_webhook_db_tests {
         .await
         .expect_err("delivery-id collision must fail closed");
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(error.1 .0["error"], "signature verification failed");
+        assert_eq!(error.1.0["error"], "signature verification failed");
         assert_eq!(event_and_receipt_counts(pool, &conn_id).await, (1, 1));
         cleanup_connection(pool, &conn_id).await;
     }
@@ -1665,21 +2063,31 @@ mod inbound_webhook_db_tests {
         let delivery_id = "delivery-rollback-001";
         let signed_at = chrono::Utc::now();
         let mut tx = pool.begin().await.expect("begin rollback test transaction");
-        inbound_webhook_receipts::enable_contract_v1(&mut tx)
+        inbound_webhook_receipts::enable_contract_v2(&mut tx)
             .await
             .expect("enable receipt contract");
-        assert!(inbound_webhook_receipts::try_claim(
-            &mut tx,
-            &connection_id,
-            delivery_id,
-            WEBHOOK_SIGNATURE_VERSION,
-            signed_at,
-            &ryuki_protocol::sha256_hex(b"synthetic rollback body"),
-            inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
-            signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
-        )
-        .await
-        .expect("claim receipt"));
+        let secret_ref = "is-wh-rollback";
+        let authority_digest =
+            webhook_authority_context_digest(&connection_id, secret_ref, 1, "synthetic", None);
+        assert!(
+            inbound_webhook_receipts::try_claim(
+                &mut tx,
+                &connection_id,
+                delivery_id,
+                WEBHOOK_SIGNATURE_VERSION,
+                secret_ref,
+                1,
+                &authority_digest,
+                "synthetic",
+                None,
+                signed_at,
+                &ryuki_protocol::sha256_hex(b"synthetic rollback body"),
+                inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
+                signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
+            )
+            .await
+            .expect("claim receipt")
+        );
         tx.rollback().await.expect("roll back receipt claim");
 
         let count: i64 = sqlx::query_scalar(
@@ -1723,10 +2131,36 @@ mod inbound_webhook_db_tests {
             .map(|code| code.into_owned());
         assert_eq!(legacy_code.as_deref(), Some("55000"));
 
-        let mut receipt_free_event_tx = pool.begin().await.expect("begin receipt-free event test");
-        inbound_webhook_receipts::enable_contract_v1(&mut receipt_free_event_tx)
+        let mut explicit_v1_tx = pool.begin().await.expect("begin explicit v1 fence test");
+        sqlx::query("SELECT set_config('ryuki.inbound_webhook_contract', '1', true)")
+            .execute(&mut *explicit_v1_tx)
             .await
-            .expect("enable v1 marker without receipt");
+            .expect("set legacy contract marker");
+        let explicit_v1_error = domain_events::insert(
+            &mut *explicit_v1_tx,
+            NewEvent {
+                event_type: "integration.webhook-received",
+                aggregate_type: "integration_connection",
+                aggregate_id: &connection_id,
+                site: None,
+                environment: None,
+                actor: "webhook:synthetic",
+                payload: json!({"synthetic": "explicit-v1"}),
+            },
+        )
+        .await
+        .expect_err("an explicit v1 marker must fail the rolling-deployment fence");
+        let explicit_v1_code = explicit_v1_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(explicit_v1_code.as_deref(), Some("55000"));
+        explicit_v1_tx.rollback().await.ok();
+
+        let mut receipt_free_event_tx = pool.begin().await.expect("begin receipt-free event test");
+        inbound_webhook_receipts::enable_contract_v2(&mut receipt_free_event_tx)
+            .await
+            .expect("enable v2 marker without receipt");
         domain_events::insert(
             &mut *receipt_free_event_tx,
             NewEvent {
@@ -1740,7 +2174,7 @@ mod inbound_webhook_db_tests {
             },
         )
         .await
-        .expect("early v1 marker admits the statement");
+        .expect("v2 marker admits the statement before the deferred proof");
         let receipt_free_commit_error = receipt_free_event_tx
             .commit()
             .await
@@ -1754,18 +2188,28 @@ mod inbound_webhook_db_tests {
         let delivery_id = "delivery-unbound-fence-001";
         let signed_at = chrono::Utc::now();
         let mut tx = pool.begin().await.expect("begin unbound receipt test");
-        assert!(inbound_webhook_receipts::try_claim(
-            &mut tx,
-            &connection_id,
-            delivery_id,
-            WEBHOOK_SIGNATURE_VERSION,
-            signed_at,
-            &ryuki_protocol::sha256_hex(b"synthetic unbound receipt"),
-            inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
-            signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
-        )
-        .await
-        .expect("claim unbound receipt"));
+        let secret_ref = "is-wh-unbound-fence";
+        let authority_digest =
+            webhook_authority_context_digest(&connection_id, secret_ref, 1, "synthetic", None);
+        assert!(
+            inbound_webhook_receipts::try_claim(
+                &mut tx,
+                &connection_id,
+                delivery_id,
+                WEBHOOK_SIGNATURE_VERSION,
+                secret_ref,
+                1,
+                &authority_digest,
+                "synthetic",
+                None,
+                signed_at,
+                &ryuki_protocol::sha256_hex(b"synthetic unbound receipt"),
+                inbound_webhook_receipts::advisory_lock_key(&connection_id, delivery_id),
+                signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
+            )
+            .await
+            .expect("claim unbound receipt")
+        );
         let commit_error = tx
             .commit()
             .await
@@ -1786,6 +2230,83 @@ mod inbound_webhook_db_tests {
         .await
         .expect("count rejected unbound receipt");
         assert_eq!(receipt_count, 0);
+
+        let mismatch_delivery_id = "delivery-authority-mismatch-001";
+        let mut mismatch_tx = pool.begin().await.expect("begin authority mismatch test");
+        inbound_webhook_receipts::enable_contract_v2(&mut mismatch_tx)
+            .await
+            .expect("enable v2 contract for mismatch test");
+        let mismatch_secret_ref = "is-wh-authority-mismatch";
+        let mismatch_digest = webhook_authority_context_digest(
+            &connection_id,
+            mismatch_secret_ref,
+            1,
+            "synthetic",
+            None,
+        );
+        let mismatch_body_sha256 = ryuki_protocol::sha256_hex(b"synthetic authority mismatch");
+        let mismatched_event_id = domain_events::insert(
+            &mut *mismatch_tx,
+            NewEvent {
+                event_type: "integration.webhook-received",
+                aggregate_type: "integration_connection",
+                aggregate_id: &connection_id,
+                site: None,
+                environment: None,
+                actor: "webhook:synthetic",
+                payload: json!({
+                    "connection_id": &connection_id,
+                    "signature_version": WEBHOOK_SIGNATURE_VERSION,
+                    "webhook_secret_generation": 1,
+                    "authority_context_sha256": &mismatch_digest,
+                    "vendor_type": "tampered-vendor",
+                    "signed_at": signed_at,
+                    "delivery_id": mismatch_delivery_id,
+                    "body_sha256": &mismatch_body_sha256,
+                }),
+            },
+        )
+        .await
+        .expect("statement-level v2 event insert");
+        assert!(
+            inbound_webhook_receipts::try_claim(
+                &mut mismatch_tx,
+                &connection_id,
+                mismatch_delivery_id,
+                WEBHOOK_SIGNATURE_VERSION,
+                mismatch_secret_ref,
+                1,
+                &mismatch_digest,
+                "synthetic",
+                None,
+                signed_at,
+                &mismatch_body_sha256,
+                inbound_webhook_receipts::advisory_lock_key(&connection_id, mismatch_delivery_id),
+                signed_at + chrono::Duration::seconds(WEBHOOK_MAX_CLOCK_SKEW_SECS),
+            )
+            .await
+            .expect("claim mismatched receipt")
+        );
+        assert!(
+            inbound_webhook_receipts::bind_event(
+                &mut mismatch_tx,
+                &connection_id,
+                mismatch_delivery_id,
+                mismatched_event_id,
+            )
+            .await
+            .expect("bind mismatched receipt")
+        );
+        let mismatch_commit_error = mismatch_tx
+            .commit()
+            .await
+            .expect_err("exact receipt/event authority mismatch must fail at commit");
+        assert_eq!(
+            mismatch_commit_error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("domain_events_inbound_webhook_receipt_authority")
+        );
     }
 
     #[tokio::test]

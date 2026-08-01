@@ -113,9 +113,9 @@ the route's access class.
 | --- | --- |
 | `Authorization: Bearer ...` | Human API routes accept exactly one applicable credential: a `ryk_...` API token, a validated Entra JWT, or an opaque `rys_...` persisted-session token. Token minting rejects `ryk_...` credentials and requires an interactive administrator. Agent routes use their own `rya_...` bearer tokens. |
 | `X-Ryuki-Session-Id` | Compatibility carrier for the opaque `rys_...` session token used by the portal and scripts. Despite the header name, an administrative session UUID is never valid here. HTTPS uses the `__Host-ryuki_session` cookie; explicitly configured non-Secure loopback development uses `ryuki_session`. Either cookie can authorize safe reads only in its matching mode; cookie-only `POST`, `PUT`, `PATCH`, and `DELETE` requests are rejected as a CSRF defense. |
-| `Content-Type: application/json` | Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: the v1 webhook message covers the exact-body SHA-256 digest. |
+| `Content-Type: application/json` | Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: the v2 webhook message covers the exact-body SHA-256 digest. |
 | `x-ryuki-protocol-version` | Required on agent registration, poll, acknowledgement, heartbeat, and result requests. This build accepts version `2`; missing, duplicate, malformed, or unsupported values return `400`. The public-key and OpenAPI bootstrap reads do not require it. |
-| `X-Hub-Signature-256` | Required by the inbound webhook receiver. Send the hex HMAC-SHA256 of the Ryuki v1 canonical message (fixed POST path, connection ID, timestamp, delivery ID, and exact-body SHA-256), optionally prefixed with `sha256=`. |
+| `X-Hub-Signature-256` | Required by the inbound webhook receiver. Send the hex HMAC-SHA256 of the Ryuki v2 canonical message (fixed POST path, connection ID, credential generation, authority digest, timestamp, delivery ID, and exact-body SHA-256), optionally prefixed with `sha256=`. |
 | `X-Ryuki-Webhook-Timestamp` | Required by the inbound webhook receiver. Send canonical Unix time in seconds; it is signed and accepted only within five minutes of both receiver clocks. |
 | `X-Ryuki-Webhook-Delivery-Id` | Required by the inbound webhook receiver. Send a unique 1-128 byte identifier using `[A-Za-z0-9._-]`; it is signed and atomically deduplicated per connection. |
 | `Idempotency-Key` | Enables durable deduplication for authenticated, DB-backed human mutations. Use a unique, unguessable key for each logical operation; the emergency-initiate route requires one. |
@@ -126,15 +126,25 @@ expiry field. Proxies must preserve these as independent `Set-Cookie` header
 fields; they must not comma-join them. The expired legacy name is never accepted
 as an HTTPS credential.
 
-For inbound webhooks, compute the HMAC over this exact UTF-8 v1 message with no
-trailing newline (replace the placeholders with the header/path values and the
-lowercase hex SHA-256 of the exact body bytes):
+Provision or rotate a connection's dedicated inbound credential with
+`POST /api/integrations/{id}/webhook-secret`. Preserve the returned
+`webhook_secret_generation` and `authority_context_sha256` alongside the secret
+in the sender configuration. Changing a connection's vendor or site revokes the
+active credential; re-provision it before resuming delivery. The v2 migration
+also revokes legacy v1 credentials because their historical authority context
+cannot be proven.
+
+Compute the HMAC over this exact UTF-8 v2 message with no trailing newline
+(replace the placeholders with the returned authority fields, header/path
+values, and lowercase hex SHA-256 of the exact body bytes):
 
 ```text
-ryuki-webhook-v1
+ryuki-webhook-v2
 method:POST
 path:/api/integrations/{connection_id}/webhook
 connection-id:{connection_id}
+credential-generation:{webhook_secret_generation}
+authority-context-sha256:{authority_context_sha256}
 timestamp:{unix_seconds}
 delivery-id:{delivery_id}
 body-sha256:{lowercase_hex_digest}
