@@ -335,8 +335,7 @@ const LOCAL_GUARD_SNIPPETS: &[&str] = &[
         guardBlocks.Add("secret-reference-not-configured");
     }"#,
 ];
-const LOCAL_MISSING_INPUTS_EXPRESSION: &str =
-    "var missingInputs = inputs.Where(item => string.IsNullOrWhiteSpace(item.Value)).Select(item => item.Key).ToArray();";
+const LOCAL_MISSING_INPUTS_EXPRESSION: &str = "var missingInputs = inputs.Where(item => string.IsNullOrWhiteSpace(item.Value)).Select(item => item.Key).ToArray();";
 const LOCAL_BLOCKED_EXPRESSION: &str =
     "var blocked = missingInputs.Length > 0 || guardBlocks.Count > 0;";
 const LOCAL_ENDPOINT_BLOCK: &str = r#"app.MapGet("/api/workflows/preflight/local/decision", (

@@ -417,7 +417,9 @@ fn validate_required_rules(catalog: &Value, errors: &mut Vec<String>) {
         if keys.iter().any(|key| !RULE_FIELDS.contains(key))
             || RULE_FIELDS.iter().any(|field| !keys.contains(field))
         {
-            errors.push(format!("monitoring review queue rule {id} keys must be id, decision, requirement, evidence"));
+            errors.push(format!(
+                "monitoring review queue rule {id} keys must be id, decision, requirement, evidence"
+            ));
         }
     }
     for (id, decision, requirement, evidence) in REQUIRED_RULES {

@@ -131,22 +131,19 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-health-remediation",
         decision: "block",
-        requirement:
-            "Platform health reporting can suggest safe remediation but must not execute live remediation.",
+        requirement: "Platform health reporting can suggest safe remediation but must not execute live remediation.",
         evidence: "Safe remediation",
     },
     RuleDetail {
         id: "raw-logs-not-exposed",
         decision: "block",
-        requirement:
-            "Dashboard health output must not expose raw logs, provider payloads, credentials, or endpoint details.",
+        requirement: "Dashboard health output must not expose raw logs, provider payloads, credentials, or endpoint details.",
         evidence: "Health summary",
     },
     RuleDetail {
         id: "stale-data-must-be-marked",
         decision: "block",
-        requirement:
-            "Stale data must be explicit so operators do not mistake cached state for live health.",
+        requirement: "Stale data must be explicit so operators do not mistake cached state for live health.",
         evidence: "Stale-data marker",
     },
     RuleDetail {

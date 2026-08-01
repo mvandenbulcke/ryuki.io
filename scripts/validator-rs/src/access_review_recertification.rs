@@ -187,8 +187,7 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-access-changes",
         decision: "block",
-        requirement:
-            "Access recertification reports review state only and never changes Entra groups, AD groups, ServiceNow records, local memberships, or provider state.",
+        requirement: "Access recertification reports review state only and never changes Entra groups, AD groups, ServiceNow records, local memberships, or provider state.",
         evidence: "Access review summary",
     },
     RuleDetail {
@@ -200,22 +199,19 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "ownership-and-approval-required",
         decision: "block",
-        requirement:
-            "Ownership, support group, approval route, expiry, and review cadence must be known before acceptance.",
+        requirement: "Ownership, support group, approval route, expiry, and review cadence must be known before acceptance.",
         evidence: "Ownership decision",
     },
     RuleDetail {
         id: "privileged-access-reviewed",
         decision: "block",
-        requirement:
-            "Privileged access and service account scope must be reviewed before exception or remediation decisions.",
+        requirement: "Privileged access and service account scope must be reviewed before exception or remediation decisions.",
         evidence: "Privileged access review",
     },
     RuleDetail {
         id: "raw-identity-data-not-exposed",
         decision: "block",
-        requirement:
-            "Access recertification evidence must use safe summaries only and must not expose raw user records, group membership rows, principal IDs, tenant IDs, object IDs, account names, email addresses, or provider payloads.",
+        requirement: "Access recertification evidence must use safe summaries only and must not expose raw user records, group membership rows, principal IDs, tenant IDs, object IDs, account names, email addresses, or provider payloads.",
         evidence: "Evidence references",
     },
 ];

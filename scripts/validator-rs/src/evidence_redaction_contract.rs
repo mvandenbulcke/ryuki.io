@@ -259,22 +259,19 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "redaction-before-export-required",
         decision: "block",
-        requirement:
-            "Evidence export requires redacted state, export readiness, prohibited content review, and evidence references before any audit, CAB, incident, handover, or CMDB file package can be accepted.",
+        requirement: "Evidence export requires redacted state, export readiness, prohibited content review, and evidence references before any audit, CAB, incident, handover, or CMDB file package can be accepted.",
         evidence: "Export readiness decision",
     },
     RuleDetail {
         id: "raw-evidence-data-not-exposed",
         decision: "block",
-        requirement:
-            "Evidence records must use safe summaries only and must not expose raw request payloads, raw provider payloads, raw evidence payloads, raw log content, unfiltered logs, stack traces, credentials, secrets, tokens, tenant IDs, object IDs, private network values, or raw recipient data.",
+        requirement: "Evidence records must use safe summaries only and must not expose raw request payloads, raw provider payloads, raw evidence payloads, raw log content, unfiltered logs, stack traces, credentials, secrets, tokens, tenant IDs, object IDs, private network values, or raw recipient data.",
         evidence: "Prohibited content review",
     },
     RuleDetail {
         id: "manifest-catalog-alignment-required",
         decision: "block",
-        requirement:
-            "Redaction states, export readiness states, manifest fields, redaction checks, safe export targets, and retention classes must align with the evidence manifest catalog.",
+        requirement: "Redaction states, export readiness states, manifest fields, redaction checks, safe export targets, and retention classes must align with the evidence manifest catalog.",
         evidence: "Evidence manifest summary",
     },
 ];

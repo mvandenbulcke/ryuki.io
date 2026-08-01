@@ -250,10 +250,30 @@ const SECRET_ASSIGNMENT_KEYS: &[&str] = &[
 ];
 
 const REQUIRED_RULES: &[RuleDetail] = &[
-    RuleDetail { id: "template-catalog-read-only", decision: "block", requirement: "Request intake support exposes template metadata only and must not create, update, or persist request drafts.", evidence: "Template catalog review" },
-    RuleDetail { id: "duplicate-detection-dry-run-only", decision: "block", requirement: "Duplicate detection remains a static signal contract and must not query live request stores, provider systems, or raw request payloads.", evidence: "Duplicate signal review" },
-    RuleDetail { id: "submission-and-approval-mutation-disabled", decision: "block", requirement: "Intake support cannot submit requests, mutate workflows, mutate approvals, or start live execution.", evidence: "Intake precheck summary" },
-    RuleDetail { id: "raw-intake-data-not-exposed", decision: "block", requirement: "Request intake support evidence must use safe summaries only and must not expose raw request payloads, raw draft payloads, raw duplicate rows, raw provider payloads, raw logs, raw rows, recipient data, credential values, tenant identifiers, object identifiers, private network values, live endpoints, or URLs.", evidence: "Evidence references" },
+    RuleDetail {
+        id: "template-catalog-read-only",
+        decision: "block",
+        requirement: "Request intake support exposes template metadata only and must not create, update, or persist request drafts.",
+        evidence: "Template catalog review",
+    },
+    RuleDetail {
+        id: "duplicate-detection-dry-run-only",
+        decision: "block",
+        requirement: "Duplicate detection remains a static signal contract and must not query live request stores, provider systems, or raw request payloads.",
+        evidence: "Duplicate signal review",
+    },
+    RuleDetail {
+        id: "submission-and-approval-mutation-disabled",
+        decision: "block",
+        requirement: "Intake support cannot submit requests, mutate workflows, mutate approvals, or start live execution.",
+        evidence: "Intake precheck summary",
+    },
+    RuleDetail {
+        id: "raw-intake-data-not-exposed",
+        decision: "block",
+        requirement: "Request intake support evidence must use safe summaries only and must not expose raw request payloads, raw draft payloads, raw duplicate rows, raw provider payloads, raw logs, raw rows, recipient data, credential values, tenant identifiers, object identifiers, private network values, live endpoints, or URLs.",
+        evidence: "Evidence references",
+    },
 ];
 
 #[derive(Deserialize)]

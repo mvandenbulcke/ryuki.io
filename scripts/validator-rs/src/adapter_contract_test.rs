@@ -177,43 +177,37 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-provider-contract-tests",
         decision: "block",
-        requirement:
-            "Adapter contract tests use static fixtures and mock results only and never call provider APIs.",
+        requirement: "Adapter contract tests use static fixtures and mock results only and never call provider APIs.",
         evidence: "Contract test summary",
     },
     RuleDetail {
         id: "mock-fixtures-only",
         decision: "block",
-        requirement:
-            "Contract fixtures must be static, redacted, and safe to commit before any assertion can run.",
+        requirement: "Contract fixtures must be static, redacted, and safe to commit before any assertion can run.",
         evidence: "Fixture scope",
     },
     RuleDetail {
         id: "credential-values-not-accepted",
         decision: "block",
-        requirement:
-            "Contract tests accept secret reference states only and never accept credential values, secret values, tokens, or provider endpoint identifiers.",
+        requirement: "Contract tests accept secret reference states only and never accept credential values, secret values, tokens, or provider endpoint identifiers.",
         evidence: "Redaction assertions",
     },
     RuleDetail {
         id: "blocked-default-required",
         decision: "block",
-        requirement:
-            "Adapter readiness contracts must prove blocked-default behavior when readiness, credentials, stale-data markers, or approval routes are missing.",
+        requirement: "Adapter readiness contracts must prove blocked-default behavior when readiness, credentials, stale-data markers, or approval routes are missing.",
         evidence: "Blocked default assertions",
     },
     RuleDetail {
         id: "dry-run-readiness-required",
         decision: "block",
-        requirement:
-            "Adapter contract tests must prove dry-run and readiness behavior before any future provider integration can be considered.",
+        requirement: "Adapter contract tests must prove dry-run and readiness behavior before any future provider integration can be considered.",
         evidence: "Dry-run assertions",
     },
     RuleDetail {
         id: "raw-provider-data-not-exposed",
         decision: "block",
-        requirement:
-            "Adapter contract test evidence must use safe summaries only and must not expose provider endpoints, credential values, tenant IDs, object IDs, hostnames, private IPs, serial numbers, raw provider payloads, raw fixture rows, raw logs, or provider responses.",
+        requirement: "Adapter contract test evidence must use safe summaries only and must not expose provider endpoints, credential values, tenant IDs, object IDs, hostnames, private IPs, serial numbers, raw provider payloads, raw fixture rows, raw logs, or provider responses.",
         evidence: "Evidence assertions",
     },
 ];

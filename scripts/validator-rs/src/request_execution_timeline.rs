@@ -225,10 +225,30 @@ const SECRET_ASSIGNMENT_KEYS: &[&str] = &[
 ];
 
 const REQUIRED_RULES: &[RuleDetail] = &[
-    RuleDetail { id: "request-execution-timeline-read-only", decision: "block", requirement: "Request execution timeline summaries are read-only and must not run live request queries, mutate requests, mutate operations, call providers, or dispatch notifications.", evidence: "Request timeline summary" },
-    RuleDetail { id: "evidence-reference-only", decision: "block", requirement: "Request evidence links expose redacted evidence reference states only and must not expose raw evidence payloads or raw log content.", evidence: "Evidence reference summary" },
-    RuleDetail { id: "approval-operation-links-safe", decision: "block", requirement: "Approval, lock, child operation, status callback, blocker, and handover timeline items must remain safe summaries without raw approval data or operation rows.", evidence: "Operation link summary" },
-    RuleDetail { id: "raw-request-timeline-data-not-exposed", decision: "block", requirement: "Request timeline evidence must not expose raw request payloads, raw timeline rows, raw approval data, raw operation rows, raw evidence payloads, raw provider payloads, raw logs, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.", evidence: "Blocked reason summary" },
+    RuleDetail {
+        id: "request-execution-timeline-read-only",
+        decision: "block",
+        requirement: "Request execution timeline summaries are read-only and must not run live request queries, mutate requests, mutate operations, call providers, or dispatch notifications.",
+        evidence: "Request timeline summary",
+    },
+    RuleDetail {
+        id: "evidence-reference-only",
+        decision: "block",
+        requirement: "Request evidence links expose redacted evidence reference states only and must not expose raw evidence payloads or raw log content.",
+        evidence: "Evidence reference summary",
+    },
+    RuleDetail {
+        id: "approval-operation-links-safe",
+        decision: "block",
+        requirement: "Approval, lock, child operation, status callback, blocker, and handover timeline items must remain safe summaries without raw approval data or operation rows.",
+        evidence: "Operation link summary",
+    },
+    RuleDetail {
+        id: "raw-request-timeline-data-not-exposed",
+        decision: "block",
+        requirement: "Request timeline evidence must not expose raw request payloads, raw timeline rows, raw approval data, raw operation rows, raw evidence payloads, raw provider payloads, raw logs, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.",
+        evidence: "Blocked reason summary",
+    },
 ];
 
 #[derive(Debug, Deserialize)]
@@ -1588,7 +1608,9 @@ mod tests {
 
     #[test]
     fn comments_do_not_satisfy_endpoint_assignment() {
-        let program = format!("app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // requestTimelineMode = \"static-request-execution-timeline\",\n    requestTimelineMode = \"live-request-execution-timeline\",\n}}));");
+        let program = format!(
+            "app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // requestTimelineMode = \"static-request-execution-timeline\",\n    requestTimelineMode = \"live-request-execution-timeline\",\n}}));"
+        );
         let mut errors = Vec::new();
         let block = endpoint_block(&csharp_without_comments(&program), &mut errors);
         assert!(!exact_string_assignment(

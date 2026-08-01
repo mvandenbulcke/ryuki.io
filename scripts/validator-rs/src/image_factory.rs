@@ -189,8 +189,7 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-image-promotion",
         decision: "block",
-        requirement:
-            "Image factory contracts define promotion gates only; live image promotion remains disabled.",
+        requirement: "Image factory contracts define promotion gates only; live image promotion remains disabled.",
         evidence: "Promotion decision",
     },
     RuleDetail {

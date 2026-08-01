@@ -287,29 +287,25 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "approval-route-readiness-required",
         decision: "block",
-        requirement:
-            "Approval decisions require route, scope, decision state, delegated authority posture, emergency posture, and evidence references before workflow approval can be represented.",
+        requirement: "Approval decisions require route, scope, decision state, delegated authority posture, emergency posture, and evidence references before workflow approval can be represented.",
         evidence: "Approval route summary",
     },
     RuleDetail {
         id: "datacenter-final-approval-required",
         decision: "block",
-        requirement:
-            "Live execution readiness requires Datacenter final approval unless a future delegated approval model is explicitly configured outside this static contract.",
+        requirement: "Live execution readiness requires Datacenter final approval unless a future delegated approval model is explicitly configured outside this static contract.",
         evidence: "Decision state summary",
     },
     RuleDetail {
         id: "no-live-approval-execution",
         decision: "block",
-        requirement:
-            "Approval readiness is read-only and never executes approvals, mutates queues, dispatches notifications, calls identity providers, calls ServiceNow, or changes workflow state.",
+        requirement: "Approval readiness is read-only and never executes approvals, mutates queues, dispatches notifications, calls identity providers, calls ServiceNow, or changes workflow state.",
         evidence: "Approval evidence references",
     },
     RuleDetail {
         id: "raw-approval-data-not-exposed",
         decision: "block",
-        requirement:
-            "Approval readiness evidence must use safe summaries only and must not expose approver records, raw approval payloads, raw request payloads, raw recipient data, raw provider payloads, raw logs, raw rows, tenant IDs, object IDs, principal IDs, group IDs, ServiceNow identifiers, private network values, credentials, or tokens.",
+        requirement: "Approval readiness evidence must use safe summaries only and must not expose approver records, raw approval payloads, raw request payloads, raw recipient data, raw provider payloads, raw logs, raw rows, tenant IDs, object IDs, principal IDs, group IDs, ServiceNow identifiers, private network values, credentials, or tokens.",
         evidence: "Approval evidence references",
     },
 ];
@@ -2160,7 +2156,9 @@ mod tests {
 
     #[test]
     fn mapget_routes_accept_receiver_whitespace() {
-        let program = format!("app . MapGet ( \"{ENDPOINT}\", () => Results.Json(new {{ source = \"static-seed\" }}));");
+        let program = format!(
+            "app . MapGet ( \"{ENDPOINT}\", () => Results.Json(new {{ source = \"static-seed\" }}));"
+        );
         let routes = mapget_routes(&program);
 
         assert_eq!(routes.len(), 1);

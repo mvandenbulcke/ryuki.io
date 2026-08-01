@@ -809,7 +809,9 @@ fn validate_portal_role_group_proposals(catalog: &Value, errors: &mut Vec<String
             string_value(proposal, "accessBoundary")
                 .is_some_and(|value| value.contains("disabled")),
             errors,
-            format!("portalRoleGroupProposals {role} access boundary must keep live integration disabled"),
+            format!(
+                "portalRoleGroupProposals {role} access boundary must keep live integration disabled"
+            ),
         );
     }
 }

@@ -129,15 +129,13 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-worker-execution",
         decision: "block",
-        requirement:
-            "Operator runbook contracts produce plans only and never execute worker or provider actions.",
+        requirement: "Operator runbook contracts produce plans only and never execute worker or provider actions.",
         evidence: "Runbook plan summary",
     },
     RuleDetail {
         id: "role-and-approval-required",
         decision: "block",
-        requirement:
-            "Runbook launch requires authorized role and approval route before execution can be considered.",
+        requirement: "Runbook launch requires authorized role and approval route before execution can be considered.",
         evidence: "Approval decisions",
     },
     RuleDetail {

@@ -209,10 +209,30 @@ const SECRET_ASSIGNMENT_KEYS: &[&str] = &[
 ];
 
 const REQUIRED_RULES: &[RuleDetail] = &[
-    RuleDetail { id: "aggregate-compliance-only", decision: "block", requirement: "Compliance dashboard summaries are aggregate-only and must not run live compliance evaluation or expose raw control rows.", evidence: "Compliance dashboard summary" },
-    RuleDetail { id: "control-status-read-only", decision: "block", requirement: "Control status, trend windows, stale-data markers, and owner review summaries are read-only and must not mutate evidence, export, retention, or workflow state.", evidence: "Control status summary" },
-    RuleDetail { id: "evidence-pack-reference-only", decision: "block", requirement: "Dashboard evidence uses evidence pack references and redaction summaries only; it must not copy raw evidence payloads or audit logs.", evidence: "Evidence pack references" },
-    RuleDetail { id: "raw-compliance-data-not-exposed", decision: "block", requirement: "Evidence compliance dashboard evidence must not expose raw evidence payloads, raw control rows, raw audit logs, raw user data, raw provider payloads, recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.", evidence: "Evidence references" },
+    RuleDetail {
+        id: "aggregate-compliance-only",
+        decision: "block",
+        requirement: "Compliance dashboard summaries are aggregate-only and must not run live compliance evaluation or expose raw control rows.",
+        evidence: "Compliance dashboard summary",
+    },
+    RuleDetail {
+        id: "control-status-read-only",
+        decision: "block",
+        requirement: "Control status, trend windows, stale-data markers, and owner review summaries are read-only and must not mutate evidence, export, retention, or workflow state.",
+        evidence: "Control status summary",
+    },
+    RuleDetail {
+        id: "evidence-pack-reference-only",
+        decision: "block",
+        requirement: "Dashboard evidence uses evidence pack references and redaction summaries only; it must not copy raw evidence payloads or audit logs.",
+        evidence: "Evidence pack references",
+    },
+    RuleDetail {
+        id: "raw-compliance-data-not-exposed",
+        decision: "block",
+        requirement: "Evidence compliance dashboard evidence must not expose raw evidence payloads, raw control rows, raw audit logs, raw user data, raw provider payloads, recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.",
+        evidence: "Evidence references",
+    },
 ];
 
 #[derive(Debug, Deserialize)]
@@ -1498,7 +1518,9 @@ mod tests {
 
     #[test]
     fn comments_do_not_satisfy_endpoint_assignment() {
-        let program = format!("app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // evidenceComplianceDashboardMode = \"static-evidence-compliance-dashboard\",\n    evidenceComplianceDashboardMode = \"live-evidence-compliance-dashboard\",\n}}));");
+        let program = format!(
+            "app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // evidenceComplianceDashboardMode = \"static-evidence-compliance-dashboard\",\n    evidenceComplianceDashboardMode = \"live-evidence-compliance-dashboard\",\n}}));"
+        );
         let mut errors = Vec::new();
         let block = endpoint_block(&csharp_without_comments(&program), &mut errors);
         assert!(!exact_string_assignment(

@@ -253,36 +253,31 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-registry-actions",
         decision: "block",
-        requirement:
-            "Registry readiness reports static readiness only and never calls Harbor APIs, pushes images, pulls images, mutates projects, changes robot accounts, changes retention policies, changes immutability rules, changes scanners, changes replication, changes webhooks, or changes provider state.",
+        requirement: "Registry readiness reports static readiness only and never calls Harbor APIs, pushes images, pulls images, mutates projects, changes robot accounts, changes retention policies, changes immutability rules, changes scanners, changes replication, changes webhooks, or changes provider state.",
         evidence: "Registry readiness summary",
     },
     RuleDetail {
         id: "project-rbac-and-robot-scope-required",
         decision: "block",
-        requirement:
-            "Harbor project topology, project creation restriction, project RBAC, robot account scope, and quota posture must be reviewed before registry readiness can be accepted.",
+        requirement: "Harbor project topology, project creation restriction, project RBAC, robot account scope, and quota posture must be reviewed before registry readiness can be accepted.",
         evidence: "RBAC and robot scope review",
     },
     RuleDetail {
         id: "retention-scanning-immutability-required",
         decision: "block",
-        requirement:
-            "Tag retention, vulnerability scanning, vulnerability allowlist posture, tag immutability, and audit logging must be reviewed before platform images can depend on the registry.",
+        requirement: "Tag retention, vulnerability scanning, vulnerability allowlist posture, tag immutability, and audit logging must be reviewed before platform images can depend on the registry.",
         evidence: "Scanner readiness review",
     },
     RuleDetail {
         id: "replication-webhook-readiness-required",
         decision: "block",
-        requirement:
-            "Replication, webhook, proxy cache, and monitoring posture must be summarized before future registry automation can be accepted.",
+        requirement: "Replication, webhook, proxy cache, and monitoring posture must be summarized before future registry automation can be accepted.",
         evidence: "Audit log review",
     },
     RuleDetail {
         id: "raw-registry-data-not-exposed",
         decision: "block",
-        requirement:
-            "Registry readiness evidence must use safe summaries only and must not expose registry URLs, project names, repository names, image tags, image digests, robot account names, robot secrets, user names, group names, OIDC identifiers, LDAP identifiers, CVE rows, webhook URLs, replication endpoints, tenant IDs, object IDs, private IPs, credentials, tokens, raw registry payloads, raw scanner payloads, or provider payloads.",
+        requirement: "Registry readiness evidence must use safe summaries only and must not expose registry URLs, project names, repository names, image tags, image digests, robot account names, robot secrets, user names, group names, OIDC identifiers, LDAP identifiers, CVE rows, webhook URLs, replication endpoints, tenant IDs, object IDs, private IPs, credentials, tokens, raw registry payloads, raw scanner payloads, or provider payloads.",
         evidence: "Evidence references",
     },
 ];

@@ -194,36 +194,31 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-release-deployment",
         decision: "block",
-        requirement:
-            "Platform release promotion records approval and evidence only and never deploys, upgrades, applies, or mutates clusters.",
+        requirement: "Platform release promotion records approval and evidence only and never deploys, upgrades, applies, or mutates clusters.",
         evidence: "Release summary",
     },
     RuleDetail {
         id: "static-render-validation-required",
         decision: "block",
-        requirement:
-            "Helm lint, Helm template render, and Kustomize build summaries must be reviewed before promotion approval.",
+        requirement: "Helm lint, Helm template render, and Kustomize build summaries must be reviewed before promotion approval.",
         evidence: "Manifest diff review",
     },
     RuleDetail {
         id: "no-registry-or-cluster-mutation",
         decision: "block",
-        requirement:
-            "Promotion review never pushes registry artifacts and never applies manifests to live clusters.",
+        requirement: "Promotion review never pushes registry artifacts and never applies manifests to live clusters.",
         evidence: "Release summary",
     },
     RuleDetail {
         id: "approval-and-rollback-required",
         decision: "block",
-        requirement:
-            "Approval route and rollback readiness must be present before a publish decision can be recorded.",
+        requirement: "Approval route and rollback readiness must be present before a publish decision can be recorded.",
         evidence: "Rollback readiness",
     },
     RuleDetail {
         id: "raw-release-data-not-exposed",
         decision: "block",
-        requirement:
-            "Release promotion evidence must use safe summaries only and must not expose registry URLs, image digests, commit SHAs, pipeline run IDs, raw release identifiers, committed image refs, cluster names, namespace names, tenant IDs, object IDs, private IPs, serial numbers, raw pipeline logs, raw registry payloads, credentials, secret values, access tokens, or provider payloads.",
+        requirement: "Release promotion evidence must use safe summaries only and must not expose registry URLs, image digests, commit SHAs, pipeline run IDs, raw release identifiers, committed image refs, cluster names, namespace names, tenant IDs, object IDs, private IPs, serial numbers, raw pipeline logs, raw registry payloads, credentials, secret values, access tokens, or provider payloads.",
         evidence: "Evidence references",
     },
 ];

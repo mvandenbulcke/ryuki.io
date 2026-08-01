@@ -233,10 +233,30 @@ const SECRET_ASSIGNMENT_KEYS: &[&str] = &[
 ];
 
 const REQUIRED_RULES: &[RuleDetail] = &[
-    RuleDetail { id: "operation-run-state-read-only", decision: "block", requirement: "Operation run state summaries are read-only and must not execute, retry, cancel, close, or mutate operation runs.", evidence: "Operation run summary" },
-    RuleDetail { id: "child-lock-retry-state-read-only", decision: "block", requirement: "Child operation, lock, and retry state summaries are read-only and must not dispatch workers, acquire locks, release locks, or update retry state.", evidence: "Lock state summary" },
-    RuleDetail { id: "redacted-log-summary-required", decision: "block", requirement: "Run-state evidence must use redacted log summaries only and must not expose raw execution logs or provider payloads.", evidence: "Redacted log summary" },
-    RuleDetail { id: "raw-operation-run-data-not-exposed", decision: "block", requirement: "Operation run-state evidence must not expose raw operation rows, child operation rows, lock rows, retry rows, recipient data, credential values, token values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.", evidence: "Evidence references" },
+    RuleDetail {
+        id: "operation-run-state-read-only",
+        decision: "block",
+        requirement: "Operation run state summaries are read-only and must not execute, retry, cancel, close, or mutate operation runs.",
+        evidence: "Operation run summary",
+    },
+    RuleDetail {
+        id: "child-lock-retry-state-read-only",
+        decision: "block",
+        requirement: "Child operation, lock, and retry state summaries are read-only and must not dispatch workers, acquire locks, release locks, or update retry state.",
+        evidence: "Lock state summary",
+    },
+    RuleDetail {
+        id: "redacted-log-summary-required",
+        decision: "block",
+        requirement: "Run-state evidence must use redacted log summaries only and must not expose raw execution logs or provider payloads.",
+        evidence: "Redacted log summary",
+    },
+    RuleDetail {
+        id: "raw-operation-run-data-not-exposed",
+        decision: "block",
+        requirement: "Operation run-state evidence must not expose raw operation rows, child operation rows, lock rows, retry rows, recipient data, credential values, token values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.",
+        evidence: "Evidence references",
+    },
 ];
 
 #[derive(Debug, Deserialize)]
@@ -1483,7 +1503,9 @@ mod tests {
 
     #[test]
     fn comments_do_not_satisfy_endpoint_assignment() {
-        let program = format!("app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // operationRunStateMode = \"static-operation-run-state\",\n    operationRunStateMode = \"live-operation-run-state\",\n}}));");
+        let program = format!(
+            "app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // operationRunStateMode = \"static-operation-run-state\",\n    operationRunStateMode = \"live-operation-run-state\",\n}}));"
+        );
         let mut errors = Vec::new();
         let block = endpoint_block(&csharp_without_comments(&program), &mut errors);
         assert!(!exact_string_assignment(

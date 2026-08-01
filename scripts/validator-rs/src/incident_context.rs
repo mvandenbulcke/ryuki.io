@@ -148,8 +148,7 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "safe-next-action-required",
         decision: "block",
-        requirement:
-            "Incident context must include safe next actions for the assigned owner or support group.",
+        requirement: "Incident context must include safe next actions for the assigned owner or support group.",
         evidence: "Safe next actions",
     },
 ];

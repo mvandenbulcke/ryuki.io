@@ -851,9 +851,12 @@ fn validate_api_hypervisor_workflow_parity(block: &str, catalog: &Value, errors:
             continue;
         };
         expect(
-            entry.get("workflowEquivalents").map(String::as_str) == Some("snapshotGovernanceWorkflows"),
+            entry.get("workflowEquivalents").map(String::as_str)
+                == Some("snapshotGovernanceWorkflows"),
             errors,
-            format!("API hypervisorWorkflowParity {hypervisor} workflowEquivalents must bind snapshotGovernanceWorkflows"),
+            format!(
+                "API hypervisorWorkflowParity {hypervisor} workflowEquivalents must bind snapshotGovernanceWorkflows"
+            ),
         );
         for field in [
             "actionMode",

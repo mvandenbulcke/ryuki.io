@@ -587,37 +587,52 @@ fn validate_migration_equivalence_matrix(catalog: &Value, errors: &mut Vec<Strin
         expect(
             string_value(&entry, "executionPosture") == Some("blocked-live-execution"),
             errors,
-            format!("migrationEquivalenceMatrix {direction} executionPosture must be blocked-live-execution"),
+            format!(
+                "migrationEquivalenceMatrix {direction} executionPosture must be blocked-live-execution"
+            ),
         );
         expect(
             string_value(&entry, "methodClass") == Some(REQUIRED_MIGRATION_METHOD_CLASS),
             errors,
-            format!("migrationEquivalenceMatrix {direction} methodClass must be {REQUIRED_MIGRATION_METHOD_CLASS}"),
+            format!(
+                "migrationEquivalenceMatrix {direction} methodClass must be {REQUIRED_MIGRATION_METHOD_CLASS}"
+            ),
         );
         expect(
             string_value(&entry, "downtimeClass") == Some(REQUIRED_MIGRATION_DOWNTIME_CLASS),
             errors,
-            format!("migrationEquivalenceMatrix {direction} downtimeClass must be {REQUIRED_MIGRATION_DOWNTIME_CLASS}"),
+            format!(
+                "migrationEquivalenceMatrix {direction} downtimeClass must be {REQUIRED_MIGRATION_DOWNTIME_CLASS}"
+            ),
         );
         expect(
             string_value(&entry, "rollbackModel") == Some(REQUIRED_MIGRATION_ROLLBACK_MODEL),
             errors,
-            format!("migrationEquivalenceMatrix {direction} rollbackModel must be {REQUIRED_MIGRATION_ROLLBACK_MODEL}"),
+            format!(
+                "migrationEquivalenceMatrix {direction} rollbackModel must be {REQUIRED_MIGRATION_ROLLBACK_MODEL}"
+            ),
         );
         expect(
             string_value(&entry, "toolingPosture") == Some(REQUIRED_MIGRATION_TOOLING_POSTURE),
             errors,
-            format!("migrationEquivalenceMatrix {direction} toolingPosture must be {REQUIRED_MIGRATION_TOOLING_POSTURE}"),
+            format!(
+                "migrationEquivalenceMatrix {direction} toolingPosture must be {REQUIRED_MIGRATION_TOOLING_POSTURE}"
+            ),
         );
         expect(
             string_value(&entry, "sourceSafetyPosture") == Some(REQUIRED_MIGRATION_SOURCE_SAFETY),
             errors,
-            format!("migrationEquivalenceMatrix {direction} sourceSafetyPosture must be {REQUIRED_MIGRATION_SOURCE_SAFETY}"),
+            format!(
+                "migrationEquivalenceMatrix {direction} sourceSafetyPosture must be {REQUIRED_MIGRATION_SOURCE_SAFETY}"
+            ),
         );
         expect(
-            string_value(&entry, "targetGuestTooling") == Some(REQUIRED_MIGRATION_TARGET_GUEST_TOOLING),
+            string_value(&entry, "targetGuestTooling")
+                == Some(REQUIRED_MIGRATION_TARGET_GUEST_TOOLING),
             errors,
-            format!("migrationEquivalenceMatrix {direction} targetGuestTooling must be {REQUIRED_MIGRATION_TARGET_GUEST_TOOLING}"),
+            format!(
+                "migrationEquivalenceMatrix {direction} targetGuestTooling must be {REQUIRED_MIGRATION_TARGET_GUEST_TOOLING}"
+            ),
         );
         expect(
             bool_value(&entry, "providerMutationAllowed") == Some(false),
@@ -1043,7 +1058,9 @@ fn validate_api_migration_equivalence_matrix(
             expect(
                 api_rules == catalog_rules,
                 errors,
-                format!("API migrationEquivalenceMatrix {direction} requiredSafetyRules must match catalog"),
+                format!(
+                    "API migrationEquivalenceMatrix {direction} requiredSafetyRules must match catalog"
+                ),
             );
         }
     }

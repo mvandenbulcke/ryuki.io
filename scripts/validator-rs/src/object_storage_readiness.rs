@@ -238,36 +238,31 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-object-storage-actions",
         decision: "block",
-        requirement:
-            "Object storage readiness reports static readiness only and never calls Azure APIs, mutates storage accounts, mutates containers, reads or writes blobs, changes lifecycle policies, changes immutability policies, or changes provider state.",
+        requirement: "Object storage readiness reports static readiness only and never calls Azure APIs, mutates storage accounts, mutates containers, reads or writes blobs, changes lifecycle policies, changes immutability policies, or changes provider state.",
         evidence: "Object storage readiness summary",
     },
     RuleDetail {
         id: "container-retention-purpose-required",
         decision: "block",
-        requirement:
-            "Evidence, export, audit artifact, and CloudNativePG backup use cases must have container purpose, retention, lifecycle, and backup target readiness reviewed before acceptance.",
+        requirement: "Evidence, export, audit artifact, and CloudNativePG backup use cases must have container purpose, retention, lifecycle, and backup target readiness reviewed before acceptance.",
         evidence: "Retention policy review",
     },
     RuleDetail {
         id: "security-and-network-boundary-required",
         decision: "block",
-        requirement:
-            "Public network access, shared key usage, managed identity posture, private endpoint posture, and Vault secret references must be reviewed before object storage readiness can be accepted.",
+        requirement: "Public network access, shared key usage, managed identity posture, private endpoint posture, and Vault secret references must be reviewed before object storage readiness can be accepted.",
         evidence: "Account security review",
     },
     RuleDetail {
         id: "immutability-lifecycle-required",
         decision: "block",
-        requirement:
-            "Versioning, immutability, protected append posture, lifecycle management, and monitoring diagnostics must be reviewed before retained evidence or backups can depend on object storage.",
+        requirement: "Versioning, immutability, protected append posture, lifecycle management, and monitoring diagnostics must be reviewed before retained evidence or backups can depend on object storage.",
         evidence: "Immutability and versioning review",
     },
     RuleDetail {
         id: "raw-object-storage-data-not-exposed",
         decision: "block",
-        requirement:
-            "Object storage readiness evidence must use safe summaries only and must not expose storage account names, container names, blob names, URLs, endpoints, subscription IDs, resource group names, tenant IDs, object IDs, private IPs, access keys, shared keys, SAS tokens, connection strings, raw blob payloads, raw storage payloads, or provider payloads.",
+        requirement: "Object storage readiness evidence must use safe summaries only and must not expose storage account names, container names, blob names, URLs, endpoints, subscription IDs, resource group names, tenant IDs, object IDs, private IPs, access keys, shared keys, SAS tokens, connection strings, raw blob payloads, raw storage payloads, or provider payloads.",
         evidence: "Evidence references",
     },
 ];

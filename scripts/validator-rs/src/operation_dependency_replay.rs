@@ -215,29 +215,25 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "dependency-graph-read-only",
         decision: "block",
-        requirement:
-            "Operation dependency graph summaries are read-only and must not mutate operation runs, child operations, locks, retries, or workflow state.",
+        requirement: "Operation dependency graph summaries are read-only and must not mutate operation runs, child operations, locks, retries, or workflow state.",
         evidence: "Dependency graph summary",
     },
     RuleDetail {
         id: "replay-simulation-dry-run-only",
         decision: "block",
-        requirement:
-            "Replay simulation uses static snapshots only and must not replay live work, call providers, or emit live execution steps.",
+        requirement: "Replay simulation uses static snapshots only and must not replay live work, call providers, or emit live execution steps.",
         evidence: "Replay phase summary",
     },
     RuleDetail {
         id: "operation-mutations-disabled",
         decision: "block",
-        requirement:
-            "Dependency replay cannot create, update, retry, unlock, close, or re-order operation runs or child operations.",
+        requirement: "Dependency replay cannot create, update, retry, unlock, close, or re-order operation runs or child operations.",
         evidence: "Lock evaluation summary",
     },
     RuleDetail {
         id: "raw-activity-data-not-exposed",
         decision: "block",
-        requirement:
-            "Operation dependency replay evidence must use safe summaries only and must not expose raw operation rows, raw execution logs, raw replay payloads, raw provider payloads, recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.",
+        requirement: "Operation dependency replay evidence must use safe summaries only and must not expose raw operation rows, raw execution logs, raw replay payloads, raw provider payloads, recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.",
         evidence: "Evidence references",
     },
 ];

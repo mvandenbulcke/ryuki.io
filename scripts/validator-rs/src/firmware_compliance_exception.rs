@@ -2378,7 +2378,8 @@ fn trimmed_comment_text(line: &str) -> Option<String> {
 }
 
 fn safe_raw_catalog_comment(comment: &str) -> bool {
-    comment == "Firmware compliance exception seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, endpoint names, private IPs, raw hardware inventory rows, exact observed firmware versions, serial numbers, asset tags, raw logs, or vendor payloads."
+    comment
+        == "Firmware compliance exception seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, endpoint names, private IPs, raw hardware inventory rows, exact observed firmware versions, serial numbers, asset tags, raw logs, or vendor payloads."
 }
 
 fn csharp_line_string_literals(line: &str) -> Vec<String> {

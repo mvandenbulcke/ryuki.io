@@ -207,11 +207,36 @@ const SECRET_ASSIGNMENT_KEYS: &[&str] = &[
 ];
 
 const REQUIRED_RULES: &[RuleDetail] = &[
-    RuleDetail { id: "canonical-lifecycle-required", decision: "block", requirement: "Request lifecycle readiness requires intake, validate, plan, approve, lock, execute, verify, protect, publish, maintain, and retire stages to remain explicit.", evidence: "Request payload summary" },
-    RuleDetail { id: "dry-run-before-approval-required", decision: "block", requirement: "Write-capable requests must include a provider-safe dry-run plan before approval readiness can be represented.", evidence: "Provider-safe dry-run plan" },
-    RuleDetail { id: "approval-lock-evidence-required", decision: "block", requirement: "Approval route, lock scope, and redacted evidence references must be ready before a request can move beyond planning.", evidence: "Approval decisions" },
-    RuleDetail { id: "fail-safe-state-required", decision: "block", requirement: "Missing validation, stale data, degraded dependency, or incomplete evidence must block execution readiness and expose safe remediation.", evidence: "Lifecycle handover notes" },
-    RuleDetail { id: "raw-request-data-not-exposed", decision: "block", requirement: "Request lifecycle evidence must use safe summaries only and must not expose direct provider routes, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw request content, raw execution content, raw evidence content, raw provider content, stack traces, recipient details, or implementation internals.", evidence: "Evidence references" },
+    RuleDetail {
+        id: "canonical-lifecycle-required",
+        decision: "block",
+        requirement: "Request lifecycle readiness requires intake, validate, plan, approve, lock, execute, verify, protect, publish, maintain, and retire stages to remain explicit.",
+        evidence: "Request payload summary",
+    },
+    RuleDetail {
+        id: "dry-run-before-approval-required",
+        decision: "block",
+        requirement: "Write-capable requests must include a provider-safe dry-run plan before approval readiness can be represented.",
+        evidence: "Provider-safe dry-run plan",
+    },
+    RuleDetail {
+        id: "approval-lock-evidence-required",
+        decision: "block",
+        requirement: "Approval route, lock scope, and redacted evidence references must be ready before a request can move beyond planning.",
+        evidence: "Approval decisions",
+    },
+    RuleDetail {
+        id: "fail-safe-state-required",
+        decision: "block",
+        requirement: "Missing validation, stale data, degraded dependency, or incomplete evidence must block execution readiness and expose safe remediation.",
+        evidence: "Lifecycle handover notes",
+    },
+    RuleDetail {
+        id: "raw-request-data-not-exposed",
+        decision: "block",
+        requirement: "Request lifecycle evidence must use safe summaries only and must not expose direct provider routes, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw request content, raw execution content, raw evidence content, raw provider content, stack traces, recipient details, or implementation internals.",
+        evidence: "Evidence references",
+    },
 ];
 
 #[derive(Debug, Deserialize)]
@@ -1508,7 +1533,9 @@ mod tests {
 
     #[test]
     fn comments_do_not_satisfy_endpoint_assignment() {
-        let program = format!("app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // lifecycleMode = \"static-request-lifecycle\",\n    lifecycleMode = \"live-request-lifecycle\",\n}}));");
+        let program = format!(
+            "app.MapGet(\"{ENDPOINT}\", () => Results.Json(new\n{{\n    // lifecycleMode = \"static-request-lifecycle\",\n    lifecycleMode = \"live-request-lifecycle\",\n}}));"
+        );
         let mut errors = Vec::new();
         let block = endpoint_block(&csharp_without_comments(&program), &mut errors);
         assert!(!exact_string_assignment(

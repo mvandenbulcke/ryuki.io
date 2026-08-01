@@ -154,8 +154,7 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-automatic-failover",
         decision: "block",
-        requirement:
-            "Degradation mode can suggest safe remediation but must not perform automatic failover.",
+        requirement: "Degradation mode can suggest safe remediation but must not perform automatic failover.",
         evidence: "Safe remediation",
     },
 ];
