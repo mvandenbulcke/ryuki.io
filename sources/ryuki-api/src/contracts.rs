@@ -78542,32 +78542,6 @@ mod emergency_change_unit_tests {
         s
     }
 
-    async fn registered_operator_session(
-        pool: &PgPool,
-        user_id: &str,
-        site_scope: &[&str],
-    ) -> AuthSession {
-        registry_backed_local_test_session(
-            pool,
-            user_id,
-            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
-            site_scope,
-            &[],
-        )
-        .await
-    }
-
-    async fn registered_approver_session(pool: &PgPool, user_id: &str) -> AuthSession {
-        registry_backed_local_test_session(
-            pool,
-            user_id,
-            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
-            &[],
-            &[],
-        )
-        .await
-    }
-
     #[tokio::test]
     async fn test_initiate_fallback_no_db() {
         if crate::database::get_db().is_some() {
@@ -88543,6 +88517,32 @@ mod server_decommission_db_tests {
         s.token_valid = true;
         s.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
         s
+    }
+
+    async fn registered_operator_session(
+        pool: &PgPool,
+        user_id: &str,
+        site_scope: &[&str],
+    ) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            site_scope,
+            &[],
+        )
+        .await
+    }
+
+    async fn registered_approver_session(pool: &PgPool, user_id: &str) -> AuthSession {
+        registry_backed_local_test_session(
+            pool,
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER],
+            &[],
+            &[],
+        )
+        .await
     }
 
     async fn global_pool() -> Option<&'static PgPool> {
