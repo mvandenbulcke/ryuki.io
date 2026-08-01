@@ -10,6 +10,11 @@ target-dir = "../.ryuki-target-ryuki.io"
 # external. Keep it inside the same bounded development cache.
 build-dir = "../.ryuki-target-ryuki.io/build-cache"
 
+# Serialize rustc work even for direct Cargo and CI invocations that do not use
+# a repository launcher. The guarded launchers also overwrite hostile inherited
+# CARGO_BUILD_JOBS values and focused verification rejects CLI job overrides.
+jobs = 1
+
 # Every Cargo entry point (direct commands, Make, cargo-leptos, rust-analyzer,
 # and the disposable verification wrapper) passes rustc through the same hard
 # disk ceiling. The wrapper delegates transparently while the effective target

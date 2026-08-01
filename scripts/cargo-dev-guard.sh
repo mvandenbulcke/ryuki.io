@@ -26,6 +26,8 @@ DEV_SUPERVISOR_PID=""
 SUPERVISED_COMMAND_PID=""
 SUPERVISED_COMMAND_PGID=""
 SUPERVISOR_CONTROL_FILE=""
+FROZEN_PROCESS_PIDS=()
+FROZEN_ROOT_PGID=""
 
 fail() {
   printf 'error: %s\n' "$1" >&2
@@ -248,6 +250,130 @@ process_group_alive() {
   kill -0 -- "-$pgid" 2>/dev/null
 }
 
+is_direct_child() {
+  local parent_pid="$1" child_pid="$2" candidate output status=0
+  if output="$(pgrep -P "$parent_pid" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  (( status <= 1 )) || return 2
+  while IFS= read -r candidate; do
+    [[ "$candidate" == "$child_pid" ]] && return 0
+  done <<< "$output"
+  return 1
+}
+
+collect_process_tree() {
+  local pid="$1"
+  local child
+  while IFS= read -r child; do
+    [[ -n "$child" ]] && collect_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  printf '%s\n' "$pid"
+}
+
+resume_frozen_process_tree() {
+  local wrapper_pid="$1" supervisor_pid="$2"
+  local pid current_snapshot child_status=0 root_safe=0 status=0
+
+  if [[ -z "$FROZEN_ROOT_PGID" && ${#FROZEN_PROCESS_PIDS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  read_supervisor_control "$SUPERVISOR_CONTROL_FILE" "$wrapper_pid" \
+    "$supervisor_pid" || status=75
+  if (( status == 0 )); then
+    is_direct_child "$supervisor_pid" "$SUPERVISED_COMMAND_PID" || child_status=$?
+    (( child_status != 1 )) || status=75
+    (( status != 0 )) || root_safe=1
+  fi
+  if (( status == 0 )); then
+    current_snapshot="$(collect_process_tree "$SUPERVISED_COMMAND_PID" | sort -n -u)"
+    for pid in "${FROZEN_PROCESS_PIDS[@]}"; do
+      [[ "$pid" != "$SUPERVISED_COMMAND_PID" ]] || continue
+      printf '%s\n' "$current_snapshot" | grep -Fxq "$pid" || continue
+      kill -0 "$pid" 2>/dev/null || continue
+      kill -CONT "$pid" 2>/dev/null || status=75
+    done
+  fi
+  if (( root_safe == 1 )) && [[ -n "$FROZEN_ROOT_PGID" ]]; then
+    kill -CONT -- "-$FROZEN_ROOT_PGID" 2>/dev/null || status=75
+  fi
+  FROZEN_PROCESS_PIDS=()
+  FROZEN_ROOT_PGID=""
+  return "$status"
+}
+
+freeze_supervised_process_tree() {
+  local wrapper_pid="$1" supervisor_pid="$2"
+  local pid="${SUPERVISED_COMMAND_PID:-}" pgid="${SUPERVISED_COMMAND_PGID:-}"
+  local snapshot next_snapshot child child_status=0 round stable=0
+
+  FROZEN_PROCESS_PIDS=()
+  FROZEN_ROOT_PGID=""
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$pgid" =~ ^[1-9][0-9]*$ \
+    && "$pid" == "$pgid" ]] || return 75
+  read_supervisor_control "$SUPERVISOR_CONTROL_FILE" "$wrapper_pid" \
+    "$supervisor_pid" || return 75
+  is_direct_child "$supervisor_pid" "$pid" || child_status=$?
+  (( child_status != 1 )) || return 75
+  kill -0 "$pid" 2>/dev/null || return 75
+  process_group_alive "$pgid" || return 75
+  FROZEN_ROOT_PGID="$pgid"
+  if ! kill -STOP -- "-$pgid" 2>/dev/null; then
+    if ! process_group_alive "$pgid"; then
+      FROZEN_ROOT_PGID=""
+      return 0
+    fi
+    return 75
+  fi
+  kill -0 "$pid" 2>/dev/null || {
+    resume_frozen_process_tree "$wrapper_pid" "$supervisor_pid" || true
+    return 75
+  }
+
+  for round in {1..8}; do
+    snapshot="$(collect_process_tree "$pid" | sort -n -u)"
+    [[ -n "$snapshot" ]] || {
+      resume_frozen_process_tree "$wrapper_pid" "$supervisor_pid" || true
+      return 75
+    }
+    while IFS= read -r child; do
+      [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+      kill -0 "$child" 2>/dev/null || continue
+      if ! kill -STOP "$child" 2>/dev/null; then
+        if kill -0 "$child" 2>/dev/null; then
+          resume_frozen_process_tree "$wrapper_pid" "$supervisor_pid" || true
+          return 75
+        fi
+        continue
+      fi
+      kill -0 "$child" 2>/dev/null || continue
+      FROZEN_PROCESS_PIDS+=("$child")
+    done <<< "$snapshot"
+    next_snapshot="$(collect_process_tree "$pid" | sort -n -u)"
+    if [[ "$snapshot" == "$next_snapshot" ]]; then
+      stable=1
+      break
+    fi
+  done
+  if (( stable == 0 )); then
+    resume_frozen_process_tree "$wrapper_pid" "$supervisor_pid" || true
+    return 75
+  fi
+}
+
+disk_guard_while_frozen() {
+  local wrapper_pid="$1" supervisor_pid="$2"
+  local guard_status=0 resume_status=0
+
+  freeze_supervised_process_tree "$wrapper_pid" "$supervisor_pid" || return $?
+  disk_guard || guard_status=$?
+  resume_frozen_process_tree "$wrapper_pid" "$supervisor_pid" || resume_status=$?
+  (( resume_status == 0 )) || return "$resume_status"
+  return "$guard_status"
+}
+
 reclaim_stale_supervisor_controls() {
   local control_file suffix
   for control_file in "$TARGET_DIR"/.cargo-command-control.*; do
@@ -447,7 +573,7 @@ supervise_command() {
       return 75
     fi
     guard_status=0
-    disk_guard || guard_status=$?
+    disk_guard_while_frozen "$wrapper_pid" "$supervisor_pid" || guard_status=$?
     if (( guard_status != 0 )); then
       printf 'error: stopping Cargo command before it can exhaust the disk\n' >&2
       stop_supervised_command

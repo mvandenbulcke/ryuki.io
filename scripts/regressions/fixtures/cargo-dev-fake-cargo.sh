@@ -67,6 +67,20 @@ case "${RYUKI_DEV_TEST_BEHAVIOR:-capture}" in
     : "${RYUKI_DEV_TEST_FILE_PATH:?missing file-limit path}"
     dd if=/dev/zero of="$RYUKI_DEV_TEST_FILE_PATH" bs=1024 count=128 2>/dev/null
     ;;
+  rename)
+    : "${RYUKI_DEV_TEST_RENAME_PID:?missing renamer pid path}"
+    mkdir -p "$CARGO_TARGET_DIR/rename-race"
+    touch "$CARGO_TARGET_DIR/rename-race/a"
+    (
+      for _ in {1..350}; do
+        mv "$CARGO_TARGET_DIR/rename-race/a" "$CARGO_TARGET_DIR/rename-race/b"
+        mv "$CARGO_TARGET_DIR/rename-race/b" "$CARGO_TARGET_DIR/rename-race/a"
+        sleep 0.01
+      done
+    ) &
+    printf '%s\n' "$!" > "$RYUKI_DEV_TEST_RENAME_PID"
+    wait "$!"
+    ;;
   clean-target)
     rm -rf -- "$CARGO_TARGET_DIR"
     ;;

@@ -24,6 +24,8 @@ SYMLINK_TARGET="$TEST_ROOT/symlink-target"
 SYMLINK_OUTSIDE="$TEST_ROOT/symlink-output"
 SYMLINK_OUT_DIR="$SYMLINK_TARGET/debug/deps"
 DU_FAILURE_BIN="$TEST_ROOT/du-failure-bin"
+DU_TRANSIENT_BIN="$TEST_ROOT/du-transient-bin"
+DU_TRANSIENT_MARKER="$TEST_ROOT/du-transient-failed-once"
 REAL_DU="$(command -v du)"
 
 cleanup() {
@@ -201,6 +203,42 @@ grep -q "Cargo compilation refused" "$TEST_ROOT/du-failure.log"
   echo "error: rustc ran after a nonzero partial du measurement" >&2
   exit 1
 }
+
+# rustc publishes output with atomic renames. A strict du traversal can report
+# one vanished entry even though an immediate retry obtains a complete size.
+# The bounded retry must tolerate that single transient failure without
+# weakening the permanent-failure case above.
+mkdir -p "$DU_TRANSIENT_BIN"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -Eeuo pipefail'
+  printf '%s\n' 'for argument in "$@"; do'
+  printf '%s\n' '  if [[ "$argument" == "/dev/null" ]]; then exec '"$(printf '%q' "$REAL_DU")"' "$@"; fi'
+  printf '%s\n' 'done'
+  printf '%s\n' 'if [[ ! -e '"$(printf '%q' "$DU_TRANSIENT_MARKER")"' ]]; then'
+  printf '%s\n' '  printf failed > '"$(printf '%q' "$DU_TRANSIENT_MARKER")"
+  printf '%s\n' '  printf "1\\t%s\\n" "${!#}"'
+  printf '%s\n' '  exit 1'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'exec '"$(printf '%q' "$REAL_DU")"' "$@"'
+} > "$DU_TRANSIENT_BIN/du"
+chmod 700 "$DU_TRANSIENT_BIN/du"
+PATH="$DU_TRANSIENT_BIN:$PATH" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" \
+  2>"$TEST_ROOT/du-transient.log"
+[[ -f "$DU_TRANSIENT_MARKER" && -f "$MARKER" ]] || {
+  echo "error: guard did not recover from a transient du traversal failure" >&2
+  exit 1
+}
+if grep -q "Cargo compilation refused" "$TEST_ROOT/du-transient.log"; then
+  echo "error: transient du traversal failure tripped the Cargo guard" >&2
+  exit 1
+fi
+rm -f "$MARKER"
 
 # Use real allocated blocks so the same `du -sk` semantics are exercised.
 dd if=/dev/zero of="$TARGET/oversized.bin" bs=1024 count=32 status=none

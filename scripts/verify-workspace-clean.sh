@@ -46,6 +46,8 @@ ACTIVE_GATE_PID=""
 SUPERVISED_COMMAND_PID=""
 SUPERVISED_COMMAND_PGID=""
 GATE_SUPERVISOR_ACTUAL_PID=""
+FROZEN_PROCESS_PIDS=()
+FROZEN_ROOT_PGID=""
 RETAIN_CURRENT_TARGET=0
 WRAPPER_PID="$$"
 VERIFY_NAMESPACE="${STATE_BASE_ROOT}/ryuki-verify-$(id -u)"
@@ -634,6 +636,124 @@ process_group_alive() {
   kill -0 -- "-$pgid" 2>/dev/null
 }
 
+is_direct_child() {
+  local parent_pid="$1" child_pid="$2" candidate output status=0
+  if output="$(pgrep -P "$parent_pid" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  # Exit 1 is an authoritative empty child set. Higher statuses mean process
+  # inspection is unavailable (for example in a restricted macOS sandbox),
+  # in which case the validated ownership control and process group remain the
+  # fail-closed identity boundary.
+  (( status <= 1 )) || return 2
+  while IFS= read -r candidate; do
+    [[ "$candidate" == "$child_pid" ]] && return 0
+  done <<< "$output"
+  return 1
+}
+
+resume_frozen_process_tree() {
+  local pid current_snapshot child_status=0 root_safe=0 status=0
+
+  if [[ -z "$FROZEN_ROOT_PGID" && ${#FROZEN_PROCESS_PIDS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  valid_verify_gate_control "$VERIFY_GATE_CONTROL_FILE" "$RUN_ID" \
+    "$GATE_SUPERVISOR_ACTUAL_PID" || status=75
+  if (( status == 0 )); then
+    is_direct_child "$GATE_SUPERVISOR_ACTUAL_PID" \
+      "$SUPERVISED_COMMAND_PID" || child_status=$?
+    (( child_status != 1 )) || status=75
+    (( status != 0 )) || root_safe=1
+  fi
+  if (( status == 0 )); then
+    current_snapshot="$(collect_process_tree "$SUPERVISED_COMMAND_PID" | sort -n -u)"
+    for pid in "${FROZEN_PROCESS_PIDS[@]}"; do
+      [[ "$pid" != "$SUPERVISED_COMMAND_PID" ]] || continue
+      printf '%s\n' "$current_snapshot" | grep -Fxq "$pid" || continue
+      kill -0 "$pid" 2>/dev/null || continue
+      kill -CONT "$pid" 2>/dev/null || status=75
+    done
+  fi
+  if (( root_safe == 1 )) && [[ -n "$FROZEN_ROOT_PGID" ]]; then
+    kill -CONT -- "-$FROZEN_ROOT_PGID" 2>/dev/null || status=75
+  fi
+  FROZEN_PROCESS_PIDS=()
+  FROZEN_ROOT_PGID=""
+  return "$status"
+}
+
+freeze_supervised_process_tree() {
+  local pid="${SUPERVISED_COMMAND_PID:-}"
+  local pgid="${SUPERVISED_COMMAND_PGID:-}"
+  local snapshot next_snapshot child child_status=0 round stable=0
+
+  FROZEN_PROCESS_PIDS=()
+  FROZEN_ROOT_PGID=""
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$pgid" =~ ^[1-9][0-9]*$ \
+    && "$pid" == "$pgid" ]] || return 75
+  valid_verify_gate_control "$VERIFY_GATE_CONTROL_FILE" "$RUN_ID" \
+    "$GATE_SUPERVISOR_ACTUAL_PID" || return 75
+  is_direct_child "$GATE_SUPERVISOR_ACTUAL_PID" "$pid" || child_status=$?
+  (( child_status != 1 )) || return 75
+  kill -0 "$pid" 2>/dev/null || return 75
+  process_group_alive "$pgid" || return 75
+  FROZEN_ROOT_PGID="$pgid"
+  if ! kill -STOP -- "-$pgid" 2>/dev/null; then
+    if ! process_group_alive "$pgid"; then
+      FROZEN_ROOT_PGID=""
+      return 0
+    fi
+    return 75
+  fi
+  kill -0 "$pid" 2>/dev/null || {
+    resume_frozen_process_tree || true
+    return 75
+  }
+
+  for round in {1..8}; do
+    snapshot="$(collect_process_tree "$pid" | sort -n -u)"
+    [[ -n "$snapshot" ]] || {
+      resume_frozen_process_tree || true
+      return 75
+    }
+    while IFS= read -r child; do
+      [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+      kill -0 "$child" 2>/dev/null || continue
+      if ! kill -STOP "$child" 2>/dev/null; then
+        if kill -0 "$child" 2>/dev/null; then
+          resume_frozen_process_tree || true
+          return 75
+        fi
+        continue
+      fi
+      kill -0 "$child" 2>/dev/null || continue
+      FROZEN_PROCESS_PIDS+=("$child")
+    done <<< "$snapshot"
+    next_snapshot="$(collect_process_tree "$pid" | sort -n -u)"
+    if [[ "$snapshot" == "$next_snapshot" ]]; then
+      stable=1
+      break
+    fi
+  done
+  if (( stable == 0 )); then
+    resume_frozen_process_tree || true
+    return 75
+  fi
+}
+
+disk_guard_while_frozen() {
+  local guard_status=0 resume_status=0
+
+  freeze_supervised_process_tree || return $?
+  disk_guard 0 || guard_status=$?
+  resume_frozen_process_tree || resume_status=$?
+  (( resume_status == 0 )) || return "$resume_status"
+  return "$guard_status"
+}
+
 terminate_process_group() {
   local pgid="$1"
   local attempt
@@ -833,7 +953,7 @@ run_gate_command() {
       clear_verify_gate_control "$GATE_SUPERVISOR_ACTUAL_PID" || true
       return 75
     fi
-    if disk_guard 0; then
+    if disk_guard_while_frozen; then
       continue
     else
       guard_status=$?

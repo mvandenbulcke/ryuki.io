@@ -19,6 +19,7 @@ DEFAULT_TARGET_DIR="$(cd "$ROOT_DIR/.." && pwd -P)/.ryuki-target-ryuki.io"
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
 HARD_MAX_CHECK_INTERVAL_SECONDS=2
+MEASUREMENT_MAX_ATTEMPTS=3
 HARD_MAX_TARGET_KIB=$((HARD_MAX_TARGET_GIB * 1024 * 1024))
 MAX_TARGET_GIB="${RYUKI_CARGO_MAX_TARGET_GIB:-24}"
 MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
@@ -40,7 +41,7 @@ fi
 # files and matches macOS Finder's directory-size accounting. Count hard-linked
 # directory entries for the apparent total so a cache cannot hide logical
 # growth behind aliases while retaining normal once-per-inode allocated usage.
-measure_tree_kib() {
+measure_tree_kib_once() {
   local path="$1"
   local allocated_output="" allocated_kib=""
   local apparent_output="" apparent_kib=""
@@ -67,6 +68,25 @@ measure_tree_kib() {
   else
     printf '%s\n' "$allocated_kib"
   fi
+}
+
+# rustc and linkers publish artifacts with atomic renames while the aggregate
+# target measurement is running. `du` is deliberately strict about traversal
+# errors, but a single vanished temporary entry is not evidence that size is
+# unknowable. Retry the complete allocated/apparent pair immediately and only
+# accept a fully successful pair. Persistent errors still fail closed after a
+# small, fixed number of attempts.
+measure_tree_kib() {
+  local path="$1"
+  local attempt measured_kib=""
+
+  for ((attempt = 1; attempt <= MEASUREMENT_MAX_ATTEMPTS; attempt++)); do
+    if measured_kib="$(measure_tree_kib_once "$path")"; then
+      printf '%s\n' "$measured_kib"
+      return 0
+    fi
+  done
+  return 1
 }
 
 require_positive_integer() {

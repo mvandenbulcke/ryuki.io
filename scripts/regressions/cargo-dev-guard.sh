@@ -13,6 +13,7 @@ CAPTURE="$WORK_DIR/cargo-env"
 OUTPUT="$WORK_DIR/output"
 READY="$WORK_DIR/ready"
 PID_FILE="$WORK_DIR/cargo.pid"
+RENAME_PID_FILE="$WORK_DIR/rename.pid"
 LAUNCHER_PID=""
 SUPERVISOR_PID=""
 
@@ -25,6 +26,12 @@ cleanup() {
   done
   if [[ -f "$PID_FILE" ]]; then
     pid="$(sed -n '1p' "$PID_FILE")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$RENAME_PID_FILE" ]]; then
+    pid="$(sed -n '1p' "$RENAME_PID_FILE")"
     if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
       kill -KILL "$pid" 2>/dev/null || true
     fi
@@ -163,6 +170,14 @@ grep -Fxq "ARG=--manifest-path" "$CAPTURE" \
   || fail "run-api did not provide an explicit manifest"
 grep -Fxq "ARG=$ROOT_DIR/sources/ryuki-api/Cargo.toml" "$CAPTURE" \
   || fail "run-api used the wrong manifest"
+
+PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$TARGET" \
+  RYUKI_LEPTOS_SITE_ROOT="$SITE_ROOT" RYUKI_DEV_TEST_CAPTURE="$CAPTURE" \
+  RYUKI_DEV_TEST_BEHAVIOR=rename RYUKI_DEV_TEST_RENAME_PID="$RENAME_PID_FILE" \
+  "$LAUNCHER" run-api > "$OUTPUT" 2>&1 \
+  || fail "development guard false-aborted during continuous artifact renames"
+[[ -f "$RENAME_PID_FILE" ]] || fail "rename-race fake Cargo did not run"
+rm -rf -- "$TARGET/rename-race"
 
 if PATH="$FAKE_BIN:$PATH" RYUKI_DEV_TARGET_DIR="$ROOT_DIR" \
   RYUKI_LEPTOS_SITE_ROOT="$ROOT_DIR/leptos-site" \

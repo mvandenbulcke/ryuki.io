@@ -33,12 +33,14 @@ DETACHED_TARGET_CAPTURE="${WORK_DIR}/detached-target"
 DU_FAILURE_COUNT="${WORK_DIR}/du-failure-count"
 DU_FAILURE_PID_FILE="${WORK_DIR}/du-failure.pid"
 DU_FAILURE_READY_FILE="${WORK_DIR}/du-failure.ready"
+RENAME_PID_FILE="${WORK_DIR}/rename.pid"
 REAL_DU="$(command -v du)"
 
 cleanup() {
   local blocker_pid=""
   local detached_pid=""
   local du_failure_pid=""
+  local rename_pid=""
   if [[ -n "$WRAPPER_PID" ]] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
     kill -KILL "$WRAPPER_PID" 2>/dev/null || true
   fi
@@ -62,6 +64,12 @@ cleanup() {
     if [[ "$du_failure_pid" =~ ^[0-9]+$ ]] \
       && kill -0 "$du_failure_pid" 2>/dev/null; then
       kill -KILL "$du_failure_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$RENAME_PID_FILE" ]]; then
+    rename_pid="$(sed -n '1p' "$RENAME_PID_FILE")"
+    if [[ "$rename_pid" =~ ^[0-9]+$ ]] && kill -0 "$rename_pid" 2>/dev/null; then
+      kill -KILL "$rename_pid" 2>/dev/null || true
     fi
   fi
   rm -rf -- "$WORK_DIR"
@@ -113,6 +121,8 @@ done
 grep -Fqx 'build-dir = "../.ryuki-target-ryuki.io/build-cache"' \
   "$SOURCE_CARGO_CONFIG" \
   || fail "Cargo config does not pin build-dir beneath the external cache"
+grep -Fqx 'jobs = 1' "$SOURCE_CARGO_CONFIG" \
+  || fail "Cargo config does not serialize direct and CI rustc work"
 
 mkdir -p "${FIXTURE_ROOT}/scripts/regressions" "${FIXTURE_ROOT}/.cargo" \
   "$STATE_BASE" "$TMP_A" "$TMP_B" "$FAKE_BIN" "$OUTSIDE_CWD"
@@ -163,6 +173,19 @@ chmod 700 "${FIXTURE_ROOT}/scripts/regressions/verify-workspace-clean.sh"
   printf '%s\n' '} > "$RYUKI_VERIFY_TEST_CARGO_ENV"'
   printf '%s\n' 'if [[ "${RYUKI_VERIFY_TEST_FILE_LIMIT_ATTEMPT:-0}" == "1" ]]; then'
   printf '%s\n' '  dd if=/dev/zero of="$CARGO_TARGET_DIR/file-limit.bin" bs=1024 count=128 2>/dev/null'
+  printf '%s\n' 'elif [[ "${RYUKI_VERIFY_TEST_RENAME:-0}" == "1" ]]; then'
+  printf '%s\n' '  : "${RYUKI_VERIFY_TEST_RENAME_PID:?missing renamer pid path}"'
+  printf '%s\n' '  mkdir -p "$CARGO_TARGET_DIR/rename-race"'
+  printf '%s\n' '  touch "$CARGO_TARGET_DIR/rename-race/a"'
+  printf '%s\n' '  ('
+  printf '%s\n' '    for _ in {1..350}; do'
+  printf '%s\n' '      mv "$CARGO_TARGET_DIR/rename-race/a" "$CARGO_TARGET_DIR/rename-race/b"'
+  printf '%s\n' '      mv "$CARGO_TARGET_DIR/rename-race/b" "$CARGO_TARGET_DIR/rename-race/a"'
+  printf '%s\n' '      sleep 0.01'
+  printf '%s\n' '    done'
+  printf '%s\n' '  ) &'
+  printf '%s\n' '  printf "%s\n" "$!" > "$RYUKI_VERIFY_TEST_RENAME_PID"'
+  printf '%s\n' '  wait "$!"'
   printf '%s\n' 'fi'
 } > "$FAKE_CARGO"
 chmod 700 "$FAKE_CARGO"
@@ -403,6 +426,18 @@ grep -Fxq 'FILE_SIZE_HARD_KIB=64' "$CARGO_ENV_CAPTURE" \
 limited_target="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$CARGO_ENV_CAPTURE")"
 [[ -n "$limited_target" && ! -e "$limited_target" ]] \
   || fail "file-size failure cleanup left its disposable Cargo target"
+
+PATH="${FAKE_BIN}:$PATH" TMPDIR="$TMP_A" \
+  RYUKI_VERIFY_STATE_BASE="$STATE_BASE" RYUKI_VERIFY_TEST_MODE=1 \
+  RYUKI_VERIFY_KEEP_TARGET=0 RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=1 \
+  RYUKI_VERIFY_TEST_CARGO_ENV="$CARGO_ENV_CAPTURE" \
+  RYUKI_VERIFY_TEST_RENAME=1 RYUKI_VERIFY_TEST_RENAME_PID="$RENAME_PID_FILE" \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" -- cargo check \
+  > "$OUTPUT_FILE" 2>&1 \
+  || fail "focused verification false-aborted during continuous artifact renames"
+rename_target="$(sed -n 's/^CARGO_TARGET_DIR=//p' "$CARGO_ENV_CAPTURE")"
+[[ -n "$rename_target" && ! -e "$rename_target" ]] \
+  || fail "rename-race verification left its disposable Cargo target"
 
 TMPDIR="$TMP_A" \
   RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
