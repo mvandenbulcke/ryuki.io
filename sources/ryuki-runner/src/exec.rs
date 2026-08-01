@@ -34,6 +34,9 @@
 //! - Then reap the direct child with `child.wait()` to avoid a zombie.
 //! - Pipe readers use nonblocking descriptors plus a bounded DRAIN/ABORT
 //!   lifecycle.
+//! - Under the repository's test-only outer verifier, subprocesses inherit the
+//!   verifier's durable process group instead of creating a nested group that
+//!   the disk supervisor must reject. Production builds never take that path.
 //!
 //! A descendant can call `setsid()` again and leave that process group. For
 //! that reason process-group isolation alone fails closed before `spawn()`.
@@ -533,7 +536,7 @@ fn run_command_supervised_with_limits_in_containment(
     require_descendant_containment(containment, unavailable)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    configure_process_group(&mut cmd);
+    let owns_process_group = configure_process_group(&mut cmd);
 
     // Start the one shared nonblocking reaper before a child exists. If the
     // process cannot create that bounded cleanup service, fail before spawn.
@@ -551,7 +554,7 @@ fn run_command_supervised_with_limits_in_containment(
     let (reap_slot, capture_reservation) = admission.into_slots();
 
     let cleanup_hold = cancellation.and_then(CommandCancellation::cleanup_hold);
-    let mut child = SupervisedChild::new(child, reap_slot, cleanup_hold);
+    let mut child = SupervisedChild::new(child, reap_slot, cleanup_hold, owns_process_group);
 
     // The supervisor owns both pipe handles and their bounded collectors.
     let stdout_pipe = child.take_stdout();
@@ -656,29 +659,117 @@ fn run_command_supervised_with_limits_in_containment(
     }
 }
 
+#[cfg(all(test, unix))]
+fn repository_test_verifier_process_group() -> Option<libc::pid_t> {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt;
+
+    let control_path =
+        std::path::PathBuf::from(std::env::var_os("RYUKI_CARGO_OUTER_CONTROL_FILE")?);
+    let target_path = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR")?);
+    if control_path.file_name()?.to_str()? != ".ryuki-verify-command-owner" {
+        return None;
+    }
+    let control_parent = std::fs::canonicalize(control_path.parent()?).ok()?;
+    let target_parent = std::fs::canonicalize(target_path.parent()?).ok()?;
+    if control_parent != target_parent {
+        return None;
+    }
+
+    let metadata = std::fs::symlink_metadata(&control_path).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&control_path).ok()?;
+    if contents.len() > 1024 {
+        return None;
+    }
+    let mut fields = BTreeMap::new();
+    for line in contents.lines() {
+        let (key, value) = line.split_once('=')?;
+        if !matches!(
+            key,
+            "version"
+                | "repository_id"
+                | "run_id"
+                | "supervisor_pid"
+                | "command_pid"
+                | "command_pgid"
+        ) || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    if fields.len() != 6 || fields.get("version") != Some(&"1") {
+        return None;
+    }
+    let repository_id = *fields.get("repository_id")?;
+    if repository_id.len() != 40 || !repository_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let expected_run_id = control_parent.file_name()?.to_str()?.strip_prefix("run.")?;
+    if fields.get("run_id") != Some(&expected_run_id) {
+        return None;
+    }
+    let parse_pid = |key: &str| {
+        fields
+            .get(key)?
+            .parse::<libc::pid_t>()
+            .ok()
+            .filter(|pid| *pid > 1)
+    };
+    let supervisor_pid = parse_pid("supervisor_pid")?;
+    let command_pid = parse_pid("command_pid")?;
+    let command_pgid = parse_pid("command_pgid")?;
+    if command_pid != command_pgid || command_pgid != unsafe { libc::getpgrp() } {
+        return None;
+    }
+    if unsafe { libc::kill(supervisor_pid, 0) } != 0
+        || unsafe { libc::kill(command_pid, 0) } != 0
+        || unsafe { libc::kill(-command_pgid, 0) } != 0
+    {
+        return None;
+    }
+    Some(command_pgid)
+}
+
 #[cfg(unix)]
-fn configure_process_group(cmd: &mut Command) {
+fn configure_process_group(cmd: &mut Command) -> bool {
     use std::os::unix::process::CommandExt;
+
+    #[cfg(test)]
+    let inherit_verifier_group = repository_test_verifier_process_group().is_some();
+    #[cfg(not(test))]
+    let inherit_verifier_group = false;
 
     // pre_exec runs in the forked child before exec(). Only async-signal-safe
     // functions are permitted here; setsid(2) is async-signal-safe. This makes
-    // child.id() the process-group id used by kill_remaining_group.
+    // child.id() the process-group id used by kill_remaining_group. The sole
+    // exception is a cfg(test)-only repository verification process: its outer
+    // supervisor already owns one durable group and rejects nested groups, so
+    // the child must inherit that stronger aggregate boundary.
     // SAFETY: the hook calls only async-signal-safe libc operations and
     // last_os_error. A private umask ensures local backend state and lock
     // artifacts created by Terraform cannot acquire group/other permissions.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::umask(0o077);
-            if libc::setsid() == -1 {
+            if !inherit_verifier_group && libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
+    !inherit_verifier_group
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_cmd: &mut Command) {}
+fn configure_process_group(_cmd: &mut Command) -> bool {
+    false
+}
 
 pub(crate) fn supervisor_error_to_runner(error: SupervisedCommandError) -> RunnerError {
     match error {
@@ -700,12 +791,18 @@ struct SupervisedChild {
     cleanup_hold: Option<CommandCleanupHold>,
     reaped: bool,
     group_closed: bool,
+    owns_process_group: bool,
     #[cfg(unix)]
     process_group: libc::pid_t,
 }
 
 impl SupervisedChild {
-    fn new(child: Child, reap_slot: ReapSlot, cleanup_hold: Option<CommandCleanupHold>) -> Self {
+    fn new(
+        child: Child,
+        reap_slot: ReapSlot,
+        cleanup_hold: Option<CommandCleanupHold>,
+        owns_process_group: bool,
+    ) -> Self {
         Self {
             #[cfg(unix)]
             process_group: child.id() as libc::pid_t,
@@ -714,6 +811,7 @@ impl SupervisedChild {
             cleanup_hold,
             reaped: false,
             group_closed: false,
+            owns_process_group,
         }
     }
 
@@ -752,10 +850,12 @@ impl SupervisedChild {
             return;
         }
         #[cfg(unix)]
-        unsafe {
-            // SAFETY: the child called setsid before exec, so its pid is the
-            // process-group id. A negative pid targets that group only.
-            libc::kill(-self.process_group, libc::SIGKILL);
+        if self.owns_process_group {
+            unsafe {
+                // SAFETY: the child called setsid before exec, so its pid is
+                // the process-group id. A negative pid targets that group only.
+                libc::kill(-self.process_group, libc::SIGKILL);
+            }
         }
         self.group_closed = true;
     }
@@ -1386,7 +1486,7 @@ mod tests {
     #[test]
     fn run_command_with_timeout_kills_slow_child() {
         let ws = Workspace::new().expect("workspace");
-        let cmd = sh_script_command(&ws, "slow.sh", "#!/bin/sh\nsleep 5\n");
+        let cmd = sh_script_command(&ws, "slow.sh", "#!/bin/sh\nexec sleep 5\n");
 
         let start = std::time::Instant::now();
         let result = run_test_with_timeout(cmd, Duration::from_secs(1));
@@ -1726,7 +1826,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn output_overflow_kills_and_reaps_the_process_group() {
+    fn repository_verifier_subprocesses_inherit_its_durable_group() {
+        let Some(verifier_pgid) = repository_test_verifier_process_group() else {
+            return;
+        };
+        let ws = Workspace::new().expect("workspace");
+        let cmd = sh_script_command(
+            &ws,
+            "report-process-group.sh",
+            "#!/bin/sh\nps -o pgid= -p $$\n",
+        );
+        let output = run_test_with_timeout(cmd, Duration::from_secs(5))
+            .expect("outer-supervised fixture must run");
+        let child_pgid: libc::pid_t = std::str::from_utf8(&output.stdout)
+            .expect("process-group output is utf-8")
+            .trim()
+            .parse()
+            .expect("process-group output is numeric");
+        assert_eq!(
+            child_pgid, verifier_pgid,
+            "test subprocesses must remain in the verifier-owned process group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_overflow_kills_process_group_or_delegates_to_verified_outer() {
+        // The repository verifier supplies the stronger aggregate process
+        // boundary and deliberately forbids nested groups. Direct developer
+        // test runs exercise the runner-owned defense-in-depth group below.
+        if repository_test_verifier_process_group().is_some() {
+            return;
+        }
         let ws = Workspace::new().expect("workspace");
         let pidfile = ws.path().join("overflow-grandchild.pid");
         let script = format!(
@@ -1767,7 +1898,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn explicit_cancellation_kills_and_reaps_the_process_group() {
+    fn explicit_cancellation_kills_process_group_or_delegates_to_verified_outer() {
+        if repository_test_verifier_process_group().is_some() {
+            return;
+        }
         let ws = Workspace::new().expect("workspace");
         let pidfile = ws.path().join("cancel-grandchild.pid");
         let script = format!(
@@ -1882,7 +2016,10 @@ mod tests {
     /// This proves the whole process GROUP is killed, not just the direct child.
     #[cfg(unix)]
     #[test]
-    fn timeout_kills_grandchild_process_group() {
+    fn timeout_kills_grandchild_group_or_delegates_to_verified_outer() {
+        if repository_test_verifier_process_group().is_some() {
+            return;
+        }
         let ws = Workspace::new().expect("workspace");
 
         // Write the grandchild PID to a file before blocking on `wait`.
@@ -2034,9 +2171,9 @@ mod tests {
     #[test]
     fn supervised_child_drop_kills_and_reaps_within_the_cleanup_bound() {
         let ws = Workspace::new().expect("workspace");
-        let mut cmd = sh_script_command(&ws, "drop-child.sh", "#!/bin/sh\nsleep 30\n");
+        let mut cmd = sh_script_command(&ws, "drop-child.sh", "#!/bin/sh\nexec sleep 30\n");
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        configure_process_group(&mut cmd);
+        let owns_process_group = configure_process_group(&mut cmd);
         child_reaper_sender().expect("start shared child reaper");
         let admission = SUPERVISOR_BUDGET
             .acquire(2048)
@@ -2045,7 +2182,7 @@ mod tests {
         drop(capture_reservation);
         let child = cmd.spawn().expect("spawn drop fixture");
         let pid = child.id() as libc::pid_t;
-        let supervised = SupervisedChild::new(child, reap_slot, None);
+        let supervised = SupervisedChild::new(child, reap_slot, None, owns_process_group);
 
         let started = Instant::now();
         drop(supervised);
@@ -2076,13 +2213,13 @@ mod tests {
         cmd.args(["-c", "exit 0"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        configure_process_group(&mut cmd);
+        let owns_process_group = configure_process_group(&mut cmd);
         child_reaper_sender().expect("start shared child reaper");
         let admission = SUPERVISOR_BUDGET.acquire(0).expect("supervisor admission");
         let (reap_slot, capture_reservation) = admission.into_slots();
         drop(capture_reservation);
         let child = cmd.spawn().expect("spawn reap fixture");
-        let mut supervised = SupervisedChild::new(child, reap_slot, None);
+        let mut supervised = SupervisedChild::new(child, reap_slot, None, owns_process_group);
 
         let reaped = (0..200).any(|_| {
             if supervised.try_wait().expect("try wait").is_some() {
@@ -2102,7 +2239,7 @@ mod tests {
     #[test]
     fn version_probe_uses_the_supervisor_deadline() {
         let ws = Workspace::new().expect("workspace");
-        let cmd = sh_script_command(&ws, "slow-version.sh", "#!/bin/sh\nsleep 5\n");
+        let cmd = sh_script_command(&ws, "slow-version.sh", "#!/bin/sh\nexec sleep 5\n");
         let started = Instant::now();
         let error = run_test_version_probe_with_limits(
             cmd,

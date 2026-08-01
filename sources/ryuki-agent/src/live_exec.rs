@@ -203,6 +203,71 @@ fn cancelled_live_execution() -> LiveExecError {
 // RunnerLiveExecutor — production implementation
 // ---------------------------------------------------------------------------
 
+/// UTF-8 secret text whose allocation is redacted in diagnostics and
+/// zeroized on drop.
+///
+/// `String::into_bytes` transfers the original allocation into
+/// `ResolvedCredentials.material` without copying it. Reusing that audited
+/// zeroize-on-drop owner keeps environment-derived backend HCL and provider
+/// credential components out of ordinary long-lived `String` allocations.
+pub struct ZeroizingSecretString {
+    bytes: ryuki_runner::ResolvedCredentials,
+}
+
+impl ZeroizingSecretString {
+    fn with_descriptor(value: String, descriptor: String) -> Self {
+        let source_allocation = value.as_ptr();
+        let material = value.into_bytes();
+        debug_assert_eq!(
+            source_allocation,
+            material.as_ptr(),
+            "String::into_bytes must transfer the secret allocation without copying"
+        );
+        Self {
+            bytes: ryuki_runner::ResolvedCredentials {
+                material,
+                descriptor,
+            },
+        }
+    }
+
+    /// Borrow the original UTF-8 value without allocating another copy.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes.material)
+            .expect("ZeroizingSecretString is constructed only from valid UTF-8")
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.bytes.material.as_slice()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.material.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.material.is_empty()
+    }
+}
+
+impl From<String> for ZeroizingSecretString {
+    fn from(value: String) -> Self {
+        Self::with_descriptor(value, "zeroizing-secret-text".to_string())
+    }
+}
+
+impl AsRef<str> for ZeroizingSecretString {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Debug for ZeroizingSecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<redacted:{} bytes>", self.len())
+    }
+}
+
 /// Production live executor: maps `JobSpec` → `RunPlan(mode=Live)`, resolves
 /// credentials from the agent's environment, delegates to
 /// `ryuki_runner::run_live_plan` / `run_live_apply`, and returns scrubbed
@@ -247,7 +312,7 @@ fn cancelled_live_execution() -> LiveExecError {
 pub struct RunnerLiveExecutor {
     /// Backend HCL template populated from `RYUKI_AGENT_BACKEND_HCL`.
     /// Terraform live jobs require it to contain `{STATE_KEY}`.
-    pub backend_config: Option<String>,
+    pub backend_config: Option<ZeroizingSecretString>,
     /// Canonical private root required for the local backend. The runner
     /// performs descriptor-bound ownership, mode, and no-follow checks.
     pub local_state_root: Option<std::path::PathBuf>,
@@ -435,7 +500,9 @@ impl RunnerLiveExecutor {
     /// `RYUKI_AGENT_LOCAL_STATE_ROOT`; a local backend requires the latter and
     /// the runner validates it before every Terraform phase.
     pub fn from_env() -> Self {
-        let backend_config = std::env::var("RYUKI_AGENT_BACKEND_HCL").ok();
+        let backend_config = std::env::var("RYUKI_AGENT_BACKEND_HCL").ok().map(|value| {
+            ZeroizingSecretString::with_descriptor(value, "agent:backend-hcl".to_string())
+        });
         let local_state_root = std::env::var("RYUKI_AGENT_LOCAL_STATE_ROOT")
             .ok()
             .map(std::path::PathBuf::from);
@@ -450,7 +517,9 @@ impl RunnerLiveExecutor {
     #[cfg(test)]
     fn for_controlled_test_harness(backend_config: Option<String>) -> Self {
         Self {
-            backend_config,
+            backend_config: backend_config.map(|value| {
+                ZeroizingSecretString::with_descriptor(value, "agent:test-backend-hcl".to_string())
+            }),
             local_state_root: None,
             controlled_agent_preflight: Some(ControlledAgentPreflight),
         }
@@ -462,7 +531,10 @@ impl RunnerLiveExecutor {
         local_state_root: std::path::PathBuf,
     ) -> Self {
         Self {
-            backend_config: Some(backend_config),
+            backend_config: Some(ZeroizingSecretString::with_descriptor(
+                backend_config,
+                "agent:test-backend-hcl".to_string(),
+            )),
             local_state_root: Some(local_state_root),
             controlled_agent_preflight: Some(ControlledAgentPreflight),
         }
@@ -491,15 +563,18 @@ impl RunnerLiveExecutor {
             });
         }
 
-        let mut parts = Vec::with_capacity(secret_names.len());
+        let mut parts: Vec<ZeroizingSecretString> = Vec::with_capacity(secret_names.len());
         for name in secret_names {
             let env_key = format!("RYUKI_LIVE_CRED_{}", name.to_uppercase());
-            let val = std::env::var(&env_key).map_err(|_| {
-                LiveExecError::CredResolution(format!(
-                    "credential env var '{env_key}' is not set — \
-                     live execution requires operator-provisioned host credentials"
-                ))
-            })?;
+            let val = ZeroizingSecretString::with_descriptor(
+                std::env::var(&env_key).map_err(|_| {
+                    LiveExecError::CredResolution(format!(
+                        "credential env var '{env_key}' is not set — \
+                         live execution requires operator-provisioned host credentials"
+                    ))
+                })?,
+                format!("live:env:{env_key}"),
+            );
             // FAIL CLOSED on values the transport cannot carry — the messages
             // name the VARIABLE only, never the value.
             if val.is_empty() {
@@ -508,7 +583,7 @@ impl RunnerLiveExecutor {
                      refusing live execution with a blank credential"
                 )));
             }
-            if val.contains(',') {
+            if val.as_str().contains(',') {
                 return Err(LiveExecError::CredResolution(format!(
                     "credential env var '{env_key}' contains a comma, which the \
                      comma-joined credential transport cannot carry — refusing live \
@@ -518,13 +593,33 @@ impl RunnerLiveExecutor {
             parts.push(val);
         }
 
-        let material = parts.join(",").into_bytes();
         let provider_authority = Self::provider_authority_reference(secret_names)?;
+        let material_len = parts.iter().map(ZeroizingSecretString::len).sum::<usize>()
+            + parts.len().saturating_sub(1);
+        // Allocate the exact final shape while it contains only zeros, then
+        // copy secret bytes directly into their zeroize-on-drop destination.
+        // No ordinary joined String or secret-bearing intermediate Vec exists.
+        let material = vec![0_u8; material_len].into_boxed_slice().into_vec();
+        let mut credentials = ryuki_runner::ResolvedCredentials {
+            material,
+            descriptor: format!("live:env:{}", secret_names.join(",")),
+        };
+        let destination_allocation = credentials.material.as_ptr();
+        let mut cursor = 0;
+        for (index, part) in parts.iter().enumerate() {
+            let end = cursor + part.len();
+            credentials.material[cursor..end].copy_from_slice(part.as_bytes());
+            cursor = end;
+            if index + 1 < parts.len() {
+                credentials.material[cursor] = b',';
+                cursor += 1;
+            }
+        }
+        debug_assert_eq!(cursor, material_len);
+        debug_assert_eq!(credentials.material.len(), credentials.material.capacity());
+        debug_assert_eq!(destination_allocation, credentials.material.as_ptr());
         Ok(ResolvedLiveCredentialBundle {
-            credentials: ryuki_runner::ResolvedCredentials {
-                material,
-                descriptor: format!("live:env:{}", secret_names.join(",")),
-            },
+            credentials,
             provider_authority: Some(provider_authority),
         })
     }
@@ -534,13 +629,17 @@ impl RunnerLiveExecutor {
         &self,
         spec: &JobSpec,
     ) -> Result<ryuki_runner::IsolatedBackendConfig, LiveExecError> {
-        let template = self.backend_config.as_deref().ok_or_else(|| {
-            LiveExecError::BackendIsolation(
-                "RYUKI_AGENT_BACKEND_HCL is not set; live Terraform requires an isolated \
-                 durable backend template containing {STATE_KEY}"
-                    .to_string(),
-            )
-        })?;
+        let template = self
+            .backend_config
+            .as_ref()
+            .map(ZeroizingSecretString::as_str)
+            .ok_or_else(|| {
+                LiveExecError::BackendIsolation(
+                    "RYUKI_AGENT_BACKEND_HCL is not set; live Terraform requires an isolated \
+                     durable backend template containing {STATE_KEY}"
+                        .to_string(),
+                )
+            })?;
         let state_key = spec.state_key.as_deref().ok_or_else(|| {
             LiveExecError::BackendIsolation(
                 "job spec has no state_key (legacy specs may decode but cannot execute live \
@@ -1238,6 +1337,26 @@ mod tests {
     }
 
     #[test]
+    fn zeroizing_secret_string_transfers_allocation_and_redacts_debug() {
+        let source = String::from("backend-secret-lifetime-sentinel");
+        let source_allocation = source.as_ptr();
+        let secret =
+            ZeroizingSecretString::with_descriptor(source, "agent:test-backend-hcl".to_string());
+
+        assert_eq!(
+            source_allocation,
+            secret.as_bytes().as_ptr(),
+            "the source String allocation must transfer into the zeroizing owner"
+        );
+        assert_eq!(secret.as_str(), "backend-secret-lifetime-sentinel");
+        assert!(std::mem::needs_drop::<ZeroizingSecretString>());
+        assert!(std::mem::needs_drop::<ryuki_runner::ResolvedCredentials>());
+        let debug = format!("{secret:?}");
+        assert!(debug.contains("<redacted:"));
+        assert!(!debug.contains("backend-secret-lifetime-sentinel"));
+    }
+
+    #[test]
     fn stub_apply_returns_canned_evidence() {
         let plan_bytes = b"stub-plan";
         let stub = StubLiveExecutor::with_plan(plan_bytes, RunStatus::Applied);
@@ -1889,6 +2008,11 @@ mod tests {
         assert_eq!(
             creds.credentials.material, b"u-val,p-val,s-val",
             "material must be comma-joined in declared order"
+        );
+        assert_eq!(
+            creds.credentials.material.len(),
+            creds.credentials.material.capacity(),
+            "the final zeroizing destination must be exactly sized so assembly cannot reallocate"
         );
         assert!(
             creds.credentials.descriptor.contains("VSPHERE_USER"),

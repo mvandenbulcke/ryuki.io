@@ -63,29 +63,33 @@
 //! `RYUKI_LIVE_CRED_<NAME>` in its own environment — failing closed with the
 //! VARIABLE NAME only, BEFORE the runner is invoked, when one is missing —
 //! and passes the values comma-joined in declared order as
-//! `ResolvedCredentials.material`.  For LIVE modes only, `run_tf_step` injects
-//! each declared name verbatim (the provider-native env var) plus its
-//! `TF_VAR_<lowercased name>` terraform-variable alias on the child process.
-//! The parent env allowlist (PATH/HOME/TMPDIR/LANG/LC_ALL) still never passes
-//! provider-native vars from the HOST environment — only declared, resolved
-//! values reach the child, and every value is scrubbed from all output.  A
-//! declared-vs-resolved arity mismatch fails closed (`CredInjection`) before
-//! any credential-bearing Terraform phase is spawned.  The offline dry-run path
-//! (`run_offline_dry_run`) never receives credentials: the agent always builds
-//! it with an empty `secret_var_names` list and empty credential material.
+//! `ResolvedCredentials.material`. For LIVE modes only, the runner maps each
+//! declared name to its lowercased Terraform input-variable name and writes the
+//! exact mapping to an owner-only `ryuki.secrets.auto.tfvars.json` file in the
+//! per-run workspace. Terraform auto-loads that file for planning/destruction;
+//! the saved plan carries the approved values into exact-plan apply. The parent
+//! env allowlist (PATH/HOME/TMPDIR/LANG/LC_ALL) never passes provider-native
+//! vars from the HOST environment, and resolved credentials are never placed in
+//! the Terraform child environment. Every value remains registered with the
+//! output scrubber. A declared-vs-resolved arity mismatch fails closed
+//! (`CredInjection`) before any credential-bearing Terraform phase is spawned.
+//! The offline dry-run path (`run_offline_dry_run`) never receives credentials:
+//! the agent always builds it with an empty `secret_var_names` list and empty
+//! credential material.
 //!
 //! ## Security invariants (MUST hold — same as `terraform.rs`)
 //!
 //! - The top-level Terraform CLI is locally approved before credentials are
 //!   processed or attached; inherited `PATH` never selects it.
 //! - Secret material is NEVER passed as a command-line argument.
-//! - Secrets are injected as `TF_VAR_<name>` env vars on the child only.
+//! - Secrets are written only to a mode-0600 auto tfvars file; the Terraform
+//!   child environment and command line never contain credential material.
 //! - Output is scrubbed before placement in `RunOutcome.log` / `.summary`.
 //! - Workspace `TempDir` is removed on drop.
 //! - `TF_LOG` is never set to `trace` or any verbose level.
 //! - Raw `tfplan` bytes are opaque binary data and MUST NOT be logged.
 
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -237,6 +241,15 @@ const LIVE_RUNNER_TIMEOUT: Duration = Duration::from_secs(600); // 10 min per st
 /// Saved plan files are process-local integrity artifacts, never evidence.
 /// Bound their allocation independently from subprocess output capture.
 const MAX_TFPLAN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard upper bound for the serialized live-provider credential mapping.
+const MAX_SECRET_TFVARS_BYTES: usize = 256 * 1024;
+
+/// Auto-loaded Terraform variable file containing process-local credentials.
+///
+/// The name is constant, non-secret, and scoped to a mode-0700 workspace. The
+/// file itself is always written through `Workspace::write_file_0600`.
+const LIVE_SECRET_TFVARS_FILE: &str = "ryuki.secrets.auto.tfvars.json";
 
 /// Exact token an operator backend template must contain.
 pub const STATE_KEY_PLACEHOLDER: &str = "{STATE_KEY}";
@@ -3036,7 +3049,6 @@ fn live_terraform_plan_inner(
         backend_config,
     )?;
     let secret_refs = redaction_values.refs();
-    let cred_str = credential_env_string(creds)?;
 
     // Binary availability check — terraform-absent-safe.
     if !binary_available(binary, cancellation)? {
@@ -3075,6 +3087,13 @@ fn live_terraform_plan_inner(
         let vars_json = vars_to_json(&plan.vars);
         ws.write_file_0600("ryuki.auto.tfvars.json", vars_json.as_bytes())?;
     }
+    write_secret_tfvars_file(
+        &ws,
+        &plan.secret_var_names,
+        components.as_slice(),
+        &secret_refs,
+        &plan.vars,
+    )?;
 
     // --- Step 1: terraform init ---
     // FAIL CLOSED: non-zero exit → Failed, no digest computed.
@@ -3083,8 +3102,6 @@ fn live_terraform_plan_inner(
         binary,
         TERRAFORM_INIT_ARGS,
         ws.path(),
-        &plan.secret_var_names,
-        &cred_str,
         &secret_refs,
         TfStepControl {
             truncate: true,
@@ -3118,8 +3135,6 @@ fn live_terraform_plan_inner(
         binary,
         &["plan", "-input=false", "-no-color", "-out=tfplan"],
         ws.path(),
-        &plan.secret_var_names,
-        &cred_str,
         &secret_refs,
         TfStepControl {
             truncate: true,
@@ -3312,7 +3327,6 @@ fn live_terraform_apply_inner(
         backend_config,
     )?;
     let secret_refs = redaction_values.refs();
-    let cred_str = credential_env_string(creds)?;
 
     // Binary availability check.
     if !binary_available(binary, cancellation)? {
@@ -3345,6 +3359,13 @@ fn live_terraform_apply_inner(
         let vars_json = vars_to_json(&plan.vars);
         ws.write_file_0600("ryuki.auto.tfvars.json", vars_json.as_bytes())?;
     }
+    write_secret_tfvars_file(
+        &ws,
+        &plan.secret_var_names,
+        components.as_slice(),
+        &secret_refs,
+        &plan.vars,
+    )?;
 
     // Write the saved tfplan bytes into the workspace (0600 — treat as sensitive).
     // These bytes are opaque binary data; do not log them.
@@ -3356,8 +3377,6 @@ fn live_terraform_apply_inner(
         binary,
         TERRAFORM_INIT_ARGS,
         ws.path(),
-        &plan.secret_var_names,
-        &cred_str,
         &secret_refs,
         TfStepControl {
             truncate: true,
@@ -3389,8 +3408,6 @@ fn live_terraform_apply_inner(
         binary,
         &["apply", "-input=false", "-no-color", "tfplan"],
         ws.path(),
-        &plan.secret_var_names,
-        &cred_str,
         &secret_refs,
         TfStepControl {
             truncate: true,
@@ -3410,14 +3427,7 @@ fn live_terraform_apply_inner(
             // field for the CP to act on (transition to Verified / emit a drift
             // event) without string-parsing.
             backend_config.revalidate_local_state_authority()?;
-            let verdict = post_apply_verdict(
-                binary,
-                ws.path(),
-                &plan.secret_var_names,
-                &cred_str,
-                &secret_refs,
-                cancellation,
-            );
+            let verdict = post_apply_verdict(binary, ws.path(), &secret_refs, cancellation);
             (
                 RunStatus::Applied,
                 format!("{base} | post-apply: {}", post_apply_label(verdict)),
@@ -3450,8 +3460,6 @@ fn live_terraform_apply_inner(
 fn post_apply_verdict(
     binary: &Path,
     ws_path: &std::path::Path,
-    secret_names: &[String],
-    cred_str: &str,
     secret_refs: &[&[u8]],
     cancellation: Option<&CommandCancellation>,
 ) -> ryuki_engine::post_apply::PostApplyOutcome {
@@ -3460,8 +3468,6 @@ fn post_apply_verdict(
         binary,
         &["plan", "-input=false", "-no-color"],
         ws_path,
-        secret_names,
-        cred_str,
         secret_refs,
         TfStepControl {
             truncate: true,
@@ -3555,7 +3561,6 @@ fn live_terraform_destroy_inner(
         backend_config,
     )?;
     let secret_refs = redaction_values.refs();
-    let cred_str = credential_env_string(creds)?;
 
     // Binary availability check — terraform-absent-safe.
     if !binary_available(binary, cancellation)? {
@@ -3591,6 +3596,13 @@ fn live_terraform_destroy_inner(
         let vars_json = vars_to_json(&plan.vars);
         ws.write_file_0600("ryuki.auto.tfvars.json", vars_json.as_bytes())?;
     }
+    write_secret_tfvars_file(
+        &ws,
+        &plan.secret_var_names,
+        components.as_slice(),
+        &secret_refs,
+        &plan.vars,
+    )?;
 
     // --- Step 1: terraform init ---
     // FAIL CLOSED: non-zero exit → Failed, destroy is never attempted.
@@ -3599,8 +3611,6 @@ fn live_terraform_destroy_inner(
         binary,
         TERRAFORM_INIT_ARGS,
         ws.path(),
-        &plan.secret_var_names,
-        &cred_str,
         &secret_refs,
         TfStepControl {
             truncate: true,
@@ -3637,8 +3647,6 @@ fn live_terraform_destroy_inner(
         binary,
         &["destroy", "-input=false", "-no-color", "-auto-approve"],
         ws.path(),
-        &plan.secret_var_names,
-        &cred_str,
         &secret_refs,
         TfStepControl {
             truncate: true,
@@ -3757,46 +3765,152 @@ struct TfStepControl<'a> {
     cancellation: Option<&'a CommandCancellation>,
 }
 
-/// Map each DECLARED secret var name to the env vars injected on the child.
-///
-/// `secret_names` come from the offering's declaration
-/// (`iac::live_secret_var_names`); `cred_str` is the comma-joined resolved
-/// material in DECLARED ORDER (the encoding `resolve_creds` produces and
-/// `credential_components` splits for scrubbing). Pass empty slices/string
-/// when no credential injection is needed.
-///
-/// For every `(name_i, value_i)` pair this yields TWO env entries carrying the
-/// SAME value:
-/// - `<NAME>` verbatim — the provider-native env var the offering declared
-///   (e.g. `VSPHERE_USER`, which the terraform vsphere provider reads);
-/// - `TF_VAR_<name lowercased>` — the terraform input-variable form for
-///   bundles that route the credential through a declared `variable` block
-///   (the vsphere bundles reference `var.vsphere_user` / `var.vsphere_password`
-///   / `var.vsphere_server` in the provider block, so this alias is the
-///   load-bearing one there).
-///
-/// Both names derive strictly from the declaration — no undeclared credential
-/// can flow — and both values are scrubbed from all output. Callers enforce
-/// name↔component arity up front (`credential_arity_error`), so the zip here
-/// can never mis-pair; a var with no matching component would be left unset
-/// and terraform would fail closed on the missing required variable.
-///
-/// BUG FIXED (historical): earlier code set `TF_VAR_<name> = <whole joined
-/// string>` for EVERY name, so a multi-credential offering got ALL credentials
-/// concatenated into EVERY var. The zip maps each name to ITS OWN value.
-fn secret_env_pairs(secret_names: &[String], cred_str: &str) -> Vec<(String, Zeroizing<String>)> {
-    if secret_names.is_empty() || cred_str.is_empty() {
-        return Vec::new();
+/// Counts serialized secret JSON bytes without retaining the output.
+#[derive(Default)]
+struct SecretJsonLengthCounter {
+    len: usize,
+}
+
+impl Write for SecretJsonLengthCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self.len.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "secret tfvars length overflow")
+        })?;
+        Ok(bytes.len())
     }
-    let mut pairs = Vec::with_capacity(secret_names.len() * 2);
-    for (name, value) in secret_names.iter().zip(cred_str.split(',')) {
-        pairs.push((name.clone(), Zeroizing::new(value.to_string())));
-        pairs.push((
-            format!("TF_VAR_{}", name.to_lowercase()),
-            Zeroizing::new(value.to_string()),
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Exact-sized, zeroize-on-drop serializer target for secret tfvars JSON.
+/// Pre-reserving the final length prevents a growing Vec from abandoning an
+/// earlier plaintext allocation during serialization.
+struct BoundedSecretJsonWriter {
+    bytes: Zeroizing<Vec<u8>>,
+    limit: usize,
+}
+
+impl BoundedSecretJsonWriter {
+    fn with_limit(limit: usize) -> Result<Self, RunnerError> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes.try_reserve_exact(limit).map_err(|_| {
+            RunnerError::CredInjection(
+                "failed to reserve live Terraform secret tfvars buffer".to_string(),
+            )
+        })?;
+        Ok(Self { bytes, limit })
+    }
+
+    fn finish(self) -> Result<Zeroizing<Vec<u8>>, RunnerError> {
+        if self.bytes.len() != self.limit {
+            return Err(secret_tfvars_serialization_error());
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Write for BoundedSecretJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "secret tfvars length overflow")
+        })?;
+        if end > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "secret tfvars exceeded preflighted length",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn secret_tfvars_serialization_error() -> RunnerError {
+    RunnerError::CredInjection("failed to serialize live Terraform secret tfvars JSON".to_string())
+}
+
+/// Map declared provider credential sources to the reviewed Terraform input
+/// variables without placing credentials in `Command` or its child env.
+///
+/// Values remain borrowed from the already-zeroizing credential components.
+/// The two-pass serializer owns its only JSON plaintext copy in an exact-sized
+/// zeroizing buffer. Declaration aliases that collide after lowercasing fail
+/// closed rather than silently overwriting a credential.
+fn secret_tfvars_to_json(
+    secret_names: &[String],
+    components: &[Vec<u8>],
+    secret_refs: &[&[u8]],
+    public_vars: &std::collections::BTreeMap<String, String>,
+) -> Result<Zeroizing<Vec<u8>>, RunnerError> {
+    if secret_names.len() != components.len() {
+        return Err(RunnerError::CredInjection(
+            "live Terraform secret tfvars declaration/component arity mismatch".to_string(),
         ));
     }
-    pairs
+
+    let mut mapping = std::collections::BTreeMap::<String, &str>::new();
+    for (name, component) in secret_names.iter().zip(components) {
+        if is_backend_credential_source_name(name) {
+            return Err(RunnerError::CredInjection(format!(
+                "live Terraform credential source {name:?} overlaps a backend credential source; backend authority must remain in validated inline HCL"
+            )));
+        }
+        if !secret_refs.contains(&component.as_slice()) {
+            return Err(RunnerError::CredInjection(format!(
+                "live Terraform credential source {name:?} is not registered in the output redactor; refusing to spawn"
+            )));
+        }
+        let value = std::str::from_utf8(component).map_err(|_| {
+            RunnerError::CredInjection(format!(
+                "live Terraform credential source {name:?} must be UTF-8 for typed variable injection"
+            ))
+        })?;
+        let variable_name = name.to_ascii_lowercase();
+        if public_vars.contains_key(&variable_name) {
+            return Err(RunnerError::CredInjection(format!(
+                "live Terraform credential variable {variable_name:?} collides with a non-secret plan variable"
+            )));
+        }
+        if mapping.insert(variable_name.clone(), value).is_some() {
+            return Err(RunnerError::CredInjection(format!(
+                "live Terraform credential declarations collide at variable {variable_name:?}"
+            )));
+        }
+    }
+
+    let mut counter = SecretJsonLengthCounter::default();
+    serde_json::to_writer(&mut counter, &mapping)
+        .map_err(|_| secret_tfvars_serialization_error())?;
+    if counter.len > MAX_SECRET_TFVARS_BYTES {
+        return Err(RunnerError::CredInjection(format!(
+            "live Terraform secret tfvars exceeds the {MAX_SECRET_TFVARS_BYTES}-byte limit"
+        )));
+    }
+    let mut writer = BoundedSecretJsonWriter::with_limit(counter.len)?;
+    serde_json::to_writer(&mut writer, &mapping)
+        .map_err(|_| secret_tfvars_serialization_error())?;
+    writer.finish()
+}
+
+fn write_secret_tfvars_file(
+    workspace: &Workspace,
+    secret_names: &[String],
+    components: &[Vec<u8>],
+    secret_refs: &[&[u8]],
+    public_vars: &std::collections::BTreeMap<String, String>,
+) -> Result<(), RunnerError> {
+    if secret_names.is_empty() {
+        return Ok(());
+    }
+    let json = secret_tfvars_to_json(secret_names, components, secret_refs, public_vars)?;
+    workspace.write_file_0600(LIVE_SECRET_TFVARS_FILE, json.as_slice())?;
+    Ok(())
 }
 
 /// Process-local scrub registry for one live Terraform operation.
@@ -3914,19 +4028,8 @@ fn credential_arity_error(plan: &RunPlan, components: &[Vec<u8>]) -> Option<Runn
     )))
 }
 
-fn credential_env_string(creds: &ResolvedCredentials) -> Result<Zeroizing<String>, RunnerError> {
-    std::str::from_utf8(creds.material.as_slice())
-        .map(|value| Zeroizing::new(value.to_owned()))
-        .map_err(|_| {
-            RunnerError::CredInjection(
-                "live Terraform credential material must be UTF-8 for typed environment injection"
-                    .to_string(),
-            )
-        })
-}
-
-fn is_backend_credential_env_name(env_key: &str) -> bool {
-    let env_key = env_key.to_ascii_uppercase();
+fn is_backend_credential_source_name(source_name: &str) -> bool {
+    let source_name = source_name.to_ascii_uppercase();
     [
         "AWS_",
         "ARM_",
@@ -3952,16 +4055,17 @@ fn is_backend_credential_env_name(env_key: &str) -> bool {
         "TFE_",
     ]
     .iter()
-    .any(|prefix| env_key.starts_with(prefix))
-        || matches!(env_key.as_str(), "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY")
+    .any(|prefix| source_name.starts_with(prefix))
+        || matches!(
+            source_name.as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY"
+        )
 }
 
 fn run_tf_step(
     binary: &Path,
     args: &[&str],
     ws_path: &std::path::Path,
-    secret_names: &[String],
-    cred_str: &str,
     secret_refs: &[&[u8]],
     control: TfStepControl<'_>,
 ) -> Result<TfStepResult, RunnerError> {
@@ -3972,20 +4076,6 @@ fn run_tf_step(
         .current_dir(ws_path)
         .env("CHECKPOINT_DISABLE", "1")
         .env_remove("TF_LOG");
-
-    for (env_key, value) in secret_env_pairs(secret_names, cred_str) {
-        if is_backend_credential_env_name(&env_key) {
-            return Err(RunnerError::CredInjection(format!(
-                "live Terraform credential env {env_key:?} overlaps a backend credential source; backend authority must remain in validated inline HCL"
-            )));
-        }
-        if !secret_refs.contains(&value.as_bytes()) {
-            return Err(RunnerError::CredInjection(format!(
-                "live Terraform credential env {env_key:?} is not registered in the output redactor; refusing to spawn"
-            )));
-        }
-        cmd.env(&env_key, value.as_str());
-    }
 
     let mut output =
         run_command_with_optional_cancellation(cmd, LIVE_RUNNER_TIMEOUT, control.cancellation)?;
@@ -4244,8 +4334,6 @@ mod tests {
             Path::new("terraform"),
             TERRAFORM_INIT_ARGS,
             workspace.path(),
-            &[],
-            "",
             &secret_refs,
             TfStepControl {
                 truncate: true,
@@ -4264,8 +4352,6 @@ mod tests {
             Path::new("terraform"),
             &["plan", "-input=false", "-no-color", "-out=tfplan"],
             workspace.path(),
-            &[],
-            "",
             &secret_refs,
             TfStepControl {
                 truncate: true,
@@ -6507,47 +6593,52 @@ esac
     }
 
     #[test]
-    fn secret_env_pairs_maps_each_name_to_native_and_tf_var_forms() {
-        // Each declared name yields its verbatim provider-native env var AND the
-        // TF_VAR_<lowercase> terraform-variable alias, each with ITS OWN value
-        // (multi-credential mis-pairing bug guard).
+    fn secret_tfvars_maps_each_declared_name_to_its_lowercase_variable() {
         let names = vec!["VSPHERE_USER".to_string(), "VSPHERE_PASSWORD".to_string()];
-        let pairs = secret_env_pairs(&names, "admin@vsphere.local,hunter2");
-        let projected: Vec<(String, String)> = pairs
-            .iter()
-            .map(|(name, value)| (name.clone(), value.as_str().to_string()))
-            .collect();
+        let components = vec![b"admin@vsphere.local".to_vec(), b"hunter2".to_vec()];
+        let refs = components.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let json = secret_tfvars_to_json(&names, &components, &refs, &BTreeMap::new())
+            .expect("typed secret tfvars");
+        let projected: BTreeMap<String, String> =
+            serde_json::from_slice(&json).expect("valid secret tfvars JSON");
         assert_eq!(
             projected,
-            vec![
+            BTreeMap::from([
                 (
-                    "VSPHERE_USER".to_string(),
+                    "vsphere_user".to_string(),
                     "admin@vsphere.local".to_string()
                 ),
-                (
-                    "TF_VAR_vsphere_user".to_string(),
-                    "admin@vsphere.local".to_string()
-                ),
-                ("VSPHERE_PASSWORD".to_string(), "hunter2".to_string()),
-                ("TF_VAR_vsphere_password".to_string(), "hunter2".to_string()),
-            ]
+                ("vsphere_password".to_string(), "hunter2".to_string()),
+            ])
         );
-        // A lowercase declared name still gets both forms (verbatim + alias).
-        let lowercase_pairs = secret_env_pairs(&["token".to_string()], "abc123");
-        let lowercase_projected: Vec<(String, String)> = lowercase_pairs
-            .iter()
-            .map(|(name, value)| (name.clone(), value.as_str().to_string()))
-            .collect();
-        assert_eq!(
-            lowercase_projected,
-            vec![
-                ("token".to_string(), "abc123".to_string()),
-                ("TF_VAR_token".to_string(), "abc123".to_string()),
-            ]
-        );
-        // No names, or no creds → nothing injected.
-        assert!(secret_env_pairs(&[], "abc").is_empty());
-        assert!(secret_env_pairs(&["x".to_string()], "").is_empty());
+    }
+
+    #[test]
+    fn secret_tfvars_rejects_lowercase_alias_and_public_var_collisions() {
+        let components = vec![b"first".to_vec(), b"second".to_vec()];
+        let refs = components.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let duplicate = secret_tfvars_to_json(
+            &["TOKEN".to_string(), "token".to_string()],
+            &components,
+            &refs,
+            &BTreeMap::new(),
+        )
+        .expect_err("lowercase alias collision must fail closed")
+        .to_string();
+        assert!(duplicate.contains("collide"));
+        assert!(!duplicate.contains("first") && !duplicate.contains("second"));
+
+        let public_vars = BTreeMap::from([("token".to_string(), "public".to_string())]);
+        let public_collision = secret_tfvars_to_json(
+            &["TOKEN".to_string()],
+            &components[..1],
+            &refs[..1],
+            &public_vars,
+        )
+        .expect_err("public/secret variable collision must fail closed")
+        .to_string();
+        assert!(public_collision.contains("non-secret plan variable"));
+        assert!(!public_collision.contains("first"));
     }
 
     #[test]
@@ -6691,22 +6782,13 @@ esac
     }
 
     #[test]
-    fn live_step_refuses_unregistered_credential_env_value_before_spawn() {
+    fn live_secret_tfvars_refuses_unregistered_value_before_spawn() {
         let ws = super::super::workspace::Workspace::new().expect("ws");
         let names = vec!["PROVIDER_TOKEN".to_string()];
-        let error = match run_tf_step(
-            Path::new("/nonexistent/terraform-unregistered-secret"),
-            &["plan"],
-            ws.path(),
-            &names,
-            "unregistered-value",
-            &[],
-            TfStepControl {
-                truncate: true,
-                cancellation: None,
-            },
-        ) {
-            Ok(_) => panic!("unregistered credential env value reached the spawn boundary"),
+        let components = vec![b"unregistered-value".to_vec()];
+        let error = match write_secret_tfvars_file(&ws, &names, &components, &[], &BTreeMap::new())
+        {
+            Ok(_) => panic!("unregistered credential value reached the workspace boundary"),
             Err(error) => error.to_string(),
         };
         assert!(
@@ -6717,8 +6799,8 @@ esac
     }
 
     #[test]
-    fn live_step_refuses_provider_env_names_that_overlap_backend_credentials() {
-        for env_name in [
+    fn live_secret_tfvars_refuses_sources_that_overlap_backend_credentials() {
+        for source_name in [
             "AWS_SECRET_ACCESS_KEY",
             "ARM_CLIENT_SECRET",
             "GOOGLE_APPLICATION_CREDENTIALS",
@@ -6731,35 +6813,27 @@ esac
             "TF_TOKEN_app_terraform_io",
         ] {
             let ws = super::super::workspace::Workspace::new().expect("ws");
-            let names = vec![env_name.to_string()];
-            let error = run_tf_step(
-                Path::new("/nonexistent/terraform-backend-env-overlap"),
-                &["plan"],
-                ws.path(),
-                &names,
-                "registered-test-value",
-                &[b"registered-test-value".as_slice()],
-                TfStepControl {
-                    truncate: true,
-                    cancellation: None,
-                },
-            )
-            .err()
-            .expect("backend credential env overlap must fail before spawn")
-            .to_string();
+            let names = vec![source_name.to_string()];
+            let components = vec![b"registered-test-value".to_vec()];
+            let refs = components.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let error = write_secret_tfvars_file(&ws, &names, &components, &refs, &BTreeMap::new())
+                .err()
+                .expect("backend credential source overlap must fail before spawn")
+                .to_string();
             assert!(
                 error.contains("overlaps a backend credential source"),
                 "{error}"
             );
             assert!(!error.contains("registered-test-value"), "{error}");
         }
-        assert!(!is_backend_credential_env_name("VSPHERE_PASSWORD"));
+        assert!(!is_backend_credential_source_name("VSPHERE_PASSWORD"));
     }
 
     /// End-to-end proof through the production entry points and executable
-    /// admission: the Terraform child sees exactly the declared vSphere env
-    /// vars, while raw, Basic-auth, default-Go-JSON, and
-    /// `SetEscapeHTML(false)` output forms are absent from every durable result.
+    /// admission: every credential-consuming Terraform step sees the exact
+    /// mode-0600 tfvars mapping, while its environment/argv contain no secret.
+    /// Raw, Basic-auth, default-Go-JSON, and `SetEscapeHTML(false)` output forms
+    /// are absent from every durable result.
     #[test]
     fn production_live_operations_scrub_registered_transformed_credentials() {
         let _environment = TERRAFORM_ENV_LOCK
@@ -6784,15 +6858,18 @@ esac
              basic={basic_auth_encoded} go-default={go_json_default} go-no-html={go_json_no_html}"
         );
 
-        // The shim dumps its environment per step, emits transformed provider
-        // credentials through the real stdout scrub boundary, emits valid JSON
-        // for `show`, and writes the stub tfplan for the plan step.
+        // The shim captures environment, argv, and permission-preserving
+        // secret-tfvars bytes per step; emits transformed credentials through the
+        // real stdout scrub boundary; emits valid JSON for `show`; and writes
+        // the stub tfplan for the plan step.
         std::fs::write(
             &shim,
             format!(
                 r#"#!/bin/sh
 if [ "$1" = version ]; then printf '%s\n' 'Terraform v1.9.8'; exit 0; fi
 env > "{probe_dir}/env-$1"
+printf '%s\n' "$@" > "{probe_dir}/args-$1"
+cp -p "$PWD/{LIVE_SECRET_TFVARS_FILE}" "{probe_dir}/tfvars-$1.json"
 if [ "$1" = show ]; then
   echo '{{"format_version":"1.2","resource_changes":[]}}'
   exit 0
@@ -6839,67 +6916,89 @@ exit 0
         };
 
         let backend = test_backend();
+        let expected_mapping = BTreeMap::from([
+            ("vsphere_user".to_string(), provider_user.to_string()),
+            (
+                "vsphere_password".to_string(),
+                provider_password.to_string(),
+            ),
+            ("vsphere_server".to_string(), provider_server.to_string()),
+        ]);
+        let assert_file_boundary = |step: &str| {
+            let dump = std::fs::read_to_string(ws_probe.path().join(format!("env-{step}")))
+                .unwrap_or_else(|e| panic!("env dump for {step} must exist: {e}"));
+            let args = std::fs::read_to_string(ws_probe.path().join(format!("args-{step}")))
+                .unwrap_or_else(|e| panic!("argv dump for {step} must exist: {e}"));
+            for forbidden in [
+                provider_user,
+                provider_password,
+                provider_server,
+                go_json_default,
+                go_json_no_html,
+            ] {
+                assert!(
+                    !dump.contains(forbidden),
+                    "{step} env leaked {forbidden:?}: {dump}"
+                );
+                assert!(
+                    !args.contains(forbidden),
+                    "{step} argv leaked {forbidden:?}: {args}"
+                );
+            }
+            assert!(
+                !dump.contains("VSPHERE_")
+                    && !dump.contains("TF_VAR_")
+                    && !dump.contains("RYUKI_LIVE_CRED")
+                    && !dump.contains("parent-cred-canary")
+                    && !dump.contains("parent-secret-canary"),
+                "{step}: credential namespaces and parent secrets must be absent: {dump}"
+            );
+
+            let tfvars_path = ws_probe.path().join(format!("tfvars-{step}.json"));
+            let tfvars = std::fs::read(&tfvars_path)
+                .unwrap_or_else(|e| panic!("tfvars capture for {step} must exist: {e}"));
+            let mapping: BTreeMap<String, String> = serde_json::from_slice(&tfvars)
+                .unwrap_or_else(|e| panic!("tfvars capture for {step} must be valid JSON: {e}"));
+            assert_eq!(
+                mapping, expected_mapping,
+                "{step}: exact credential mapping"
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&tfvars_path)
+                    .unwrap_or_else(|e| panic!("tfvars metadata for {step} must exist: {e}"))
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o777,
+                    0o600,
+                    "{step}: secret tfvars must be mode 0600"
+                );
+            }
+        };
+
         let result = run_live_plan(&plan, &creds, &backend)
             .expect("production entry plan must admit and run the configured shim");
         assert_eq!(result.outcome.status, RunStatus::Planned);
+        for step in ["init", "plan", "show"] {
+            assert_file_boundary(step);
+        }
 
         let applied = run_live_apply(&plan, &creds, &backend, &result.tfplan)
             .expect("production entry apply must admit and run the configured shim");
         assert_eq!(applied.status, RunStatus::Applied);
+        for step in ["init", "apply", "plan"] {
+            assert_file_boundary(step);
+        }
 
         let destroyed = run_live_destroy(&plan, &creds, &backend)
             .expect("production entry destroy must admit and run the configured shim");
         assert_eq!(destroyed.status, RunStatus::Applied);
-
-        for step in ["init", "plan", "apply", "destroy"] {
-            let dump = std::fs::read_to_string(ws_probe.path().join(format!("env-{step}")))
-                .unwrap_or_else(|e| panic!("env dump for {step} must exist: {e}"));
-            // Declared provider-native vars, each with ITS OWN value.
-            assert!(
-                dump.contains(&format!("VSPHERE_USER={provider_user}")),
-                "{step}: {dump}"
-            );
-            assert!(
-                dump.contains(&format!("VSPHERE_PASSWORD={provider_password}")), // secret-scan-allow: fixture value, not a credential
-                "{step}: {dump}"
-            );
-            assert!(
-                dump.contains(&format!("VSPHERE_SERVER={provider_server}")),
-                "{step}: {dump}"
-            );
-            // Terraform-variable aliases for the bundle's `var.vsphere_*` refs.
-            assert!(
-                dump.contains(&format!("TF_VAR_vsphere_user={provider_user}")),
-                "{step}: {dump}"
-            );
-            assert!(
-                dump.contains(&format!("TF_VAR_vsphere_password={provider_password}")), // secret-scan-allow: fixture value, not a credential
-                "{step}: {dump}"
-            );
-            assert!(
-                dump.contains(&format!("TF_VAR_vsphere_server={provider_server}")),
-                "{step}: {dump}"
-            );
-            // The agent-side env var namespace must NOT pass through, and the
-            // poisoned parent env must not leak (allowlist + env_clear).
-            assert!(
-                !dump.contains("RYUKI_LIVE_CRED"),
-                "{step}: RYUKI_LIVE_CRED_* must never reach the terraform child: {dump}"
-            );
-            assert!(
-                !dump.contains("parent-cred-canary") && !dump.contains("parent-secret-canary"),
-                "{step}: parent env must not leak into the terraform child: {dump}"
-            );
+        for step in ["init", "destroy"] {
+            assert_file_boundary(step);
         }
-
-        // The `show` step gets NO credential injection (it only renders the
-        // saved plan file — no provider contact).
-        let show_dump = std::fs::read_to_string(ws_probe.path().join("env-show"))
-            .expect("env dump for show must exist");
-        assert!(
-            !show_dump.contains("VSPHERE_") && !show_dump.contains("TF_VAR_"),
-            "show step must not receive credentials: {show_dump}"
-        );
 
         // The credential values must be scrubbed from the returned evidence.
         for value in [provider_user, provider_password, provider_server] {

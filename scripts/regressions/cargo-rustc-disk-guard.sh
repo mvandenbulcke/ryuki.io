@@ -41,25 +41,50 @@ OUTER_TERM="$TEST_ROOT/outer-term"
 FAKE_OUTER_RUSTC="$TEST_ROOT/fake-outer-rustc"
 SIGNAL_READY="$TEST_ROOT/signal-ready"
 SIGNAL_COMPILER_PID="$TEST_ROOT/signal-compiler.pid"
+SIGNAL_DESCENDANT_PID="$TEST_ROOT/signal-descendant.pid"
+SIGNAL_DESCENDANT_READY="$TEST_ROOT/signal-descendant-ready"
+FAKE_SIGNAL_DESCENDANT="$TEST_ROOT/fake-signal-descendant"
 FAKE_SIGNAL_RUSTC="$TEST_ROOT/fake-signal-rustc"
+EARLY_LAUNCH_READY="$TEST_ROOT/early-launch-ready"
 REAL_DU="$(command -v du)"
 
+stop_fixture_group_from_file() {
+  local pid_file="$1" pgid="" attempt
+  [[ -f "$pid_file" ]] || return 0
+  read -r pgid < "$pid_file" || return 0
+  [[ "$pgid" =~ ^[1-9][0-9]*$ && "$pgid" -gt 1 ]] || return 0
+  if kill -0 -- "-$pgid" 2>/dev/null; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for attempt in {1..10}; do
+      kill -0 -- "-$pgid" 2>/dev/null || break
+      sleep 0.05
+    done
+  fi
+  if kill -0 -- "-$pgid" 2>/dev/null; then
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
+  trap - EXIT INT TERM
+  set +e
   if [[ -n "${OUTER_WRAPPER_PID:-}" ]] \
     && kill -0 -- "-$OUTER_WRAPPER_PID" 2>/dev/null; then
     kill -KILL -- "-$OUTER_WRAPPER_PID" 2>/dev/null || true
   fi
   if [[ -n "${SIGNAL_WRAPPER_PID:-}" ]] \
     && kill -0 "$SIGNAL_WRAPPER_PID" 2>/dev/null; then
-    kill -KILL "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
+      kill -KILL "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
   fi
-  if [[ -f "$SIGNAL_COMPILER_PID" ]]; then
-    signal_compiler_pid="$(sed -n '1p' "$SIGNAL_COMPILER_PID")"
-    if [[ "$signal_compiler_pid" =~ ^[1-9][0-9]*$ ]] \
-      && kill -0 "$signal_compiler_pid" 2>/dev/null; then
-      kill -KILL "$signal_compiler_pid" 2>/dev/null || true
-    fi
+  if [[ -n "${EARLY_WRAPPER_PID:-}" ]] \
+    && kill -0 "$EARLY_WRAPPER_PID" 2>/dev/null; then
+    kill -KILL "$EARLY_WRAPPER_PID" 2>/dev/null || true
   fi
+  stop_fixture_group_from_file "$SIGNAL_COMPILER_PID"
+  stop_fixture_group_from_file "$EARLY_LAUNCH_READY"
+  [[ -z "${OUTER_WRAPPER_PID:-}" ]] || wait "$OUTER_WRAPPER_PID" 2>/dev/null || true
+  [[ -z "${SIGNAL_WRAPPER_PID:-}" ]] || wait "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
+  [[ -z "${EARLY_WRAPPER_PID:-}" ]] || wait "$EARLY_WRAPPER_PID" 2>/dev/null || true
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT INT TERM
@@ -80,8 +105,11 @@ printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\nif [
   "$OUTER_TERM" "$OUTER_READY" > "$FAKE_OUTER_RUSTC"
 chmod +x "$FAKE_OUTER_RUSTC"
 printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\ntrap "" HUP INT TERM\ntouch %q\nwhile :; do sleep 1; done\n' \
-  "$SIGNAL_COMPILER_PID" "$SIGNAL_READY" > "$FAKE_SIGNAL_RUSTC"
-chmod +x "$FAKE_SIGNAL_RUSTC"
+  "$SIGNAL_DESCENDANT_PID" "$SIGNAL_DESCENDANT_READY" > "$FAKE_SIGNAL_DESCENDANT"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\ntrap "" HUP INT TERM\n%q &\ntouch %q\nwhile :; do sleep 1; done\n' \
+  "$SIGNAL_COMPILER_PID" "$FAKE_SIGNAL_DESCENDANT" "$SIGNAL_READY" \
+  > "$FAKE_SIGNAL_RUSTC"
+chmod +x "$FAKE_SIGNAL_DESCENDANT" "$FAKE_SIGNAL_RUSTC"
 
 # A verifier-owned rustc wrapper must inherit the durable command process
 # group instead of creating the standalone nested compiler PG. This also
@@ -189,9 +217,53 @@ fi
 grep -q "invalid outer supervisor ownership" \
   "$TEST_ROOT/forged-repository-id.log"
 
-# Repeated cleanup signals must not interrupt the TERM-to-KILL deadline. The
-# compiler ignores catchable signals, so the wrapper must force it down within
-# the same bounded two-second cleanup window used by the outer verifier.
+# A signal in the historical post-fork/pre-assignment window must be recorded,
+# then stop the release-gated compiler group without ever executing rustc.
+set +e
+RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  RYUKI_CARGO_GUARD_TEST_LAUNCH_READY_FILE="$EARLY_LAUNCH_READY" \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" \
+  2>"$TEST_ROOT/early-signal-cleanup.log" &
+EARLY_WRAPPER_PID=$!
+set -e
+for _ in {1..100}; do
+  [[ -f "$EARLY_LAUNCH_READY" ]] && break
+  sleep 0.02
+done
+[[ -f "$EARLY_LAUNCH_READY" ]] || {
+  echo "error: early-signal launch window was not reached" >&2
+  exit 1
+}
+early_compiler_pgid="$(<"$EARLY_LAUNCH_READY")"
+[[ "$early_compiler_pgid" =~ ^[1-9][0-9]*$ ]] || {
+  echo "error: early-signal launch published an invalid process group" >&2
+  exit 1
+}
+kill -TERM "$EARLY_WRAPPER_PID"
+set +e
+wait "$EARLY_WRAPPER_PID"
+early_wrapper_status=$?
+set -e
+[[ "$early_wrapper_status" -eq 143 ]] || {
+  echo "error: early launch signal returned status $early_wrapper_status" >&2
+  exit 1
+}
+[[ ! -e "$MARKER" ]] || {
+  echo "error: rustc executed after an early launch signal" >&2
+  exit 1
+}
+kill -0 -- "-$early_compiler_pgid" 2>/dev/null && {
+  echo "error: early launch signal leaked the release-gated compiler group" >&2
+  exit 1
+}
+EARLY_WRAPPER_PID=""
+
+# Repeated cleanup signals must not interrupt the TERM-to-KILL deadline. Freeze
+# the compiler and its signal-ignoring descendant first: bounded cleanup must
+# still kill the entire owned process group and never block in wait.
 set +e
 RYUKI_CARGO_GUARD_TEST_MODE=1 \
   RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
@@ -202,13 +274,21 @@ RYUKI_CARGO_GUARD_TEST_MODE=1 \
 SIGNAL_WRAPPER_PID=$!
 set -e
 for _ in {1..100}; do
-  [[ -f "$SIGNAL_READY" ]] && break
+  [[ -f "$SIGNAL_READY" && -f "$SIGNAL_DESCENDANT_READY" ]] && break
   sleep 0.05
 done
-[[ -f "$SIGNAL_READY" ]] || {
-  echo "error: signal-cleanup compiler did not start" >&2
+[[ -f "$SIGNAL_READY" && -f "$SIGNAL_DESCENDANT_READY" ]] || {
+  echo "error: signal-cleanup process group did not start" >&2
   exit 1
 }
+signal_compiler_pid="$(<"$SIGNAL_COMPILER_PID")"
+signal_descendant_pid="$(<"$SIGNAL_DESCENDANT_PID")"
+[[ "$signal_compiler_pid" =~ ^[1-9][0-9]*$ \
+  && "$signal_descendant_pid" =~ ^[1-9][0-9]*$ ]] || {
+  echo "error: signal-cleanup fixture published an invalid pid" >&2
+  exit 1
+}
+kill -STOP -- "-$signal_compiler_pid"
 kill -TERM "$SIGNAL_WRAPPER_PID"
 kill -INT "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
 kill -HUP "$SIGNAL_WRAPPER_PID" 2>/dev/null || true
@@ -221,19 +301,18 @@ set -e
   echo "error: interrupted cleanup returned status $signal_wrapper_status" >&2
   exit 1
 }
-signal_compiler_pid="$(sed -n '1p' "$SIGNAL_COMPILER_PID")"
-[[ "$signal_compiler_pid" =~ ^[1-9][0-9]*$ ]] || {
-  echo "error: signal-cleanup compiler published an invalid pid" >&2
-  exit 1
-}
 for _ in {1..50}; do
-  kill -0 "$signal_compiler_pid" 2>/dev/null || break
+  if ! kill -0 -- "-$signal_compiler_pid" 2>/dev/null \
+    && ! kill -0 "$signal_descendant_pid" 2>/dev/null; then
+    break
+  fi
   sleep 0.05
 done
-kill -0 "$signal_compiler_pid" 2>/dev/null && {
-  echo "error: repeated signals interrupted compiler cleanup deadline" >&2
+if kill -0 -- "-$signal_compiler_pid" 2>/dev/null \
+  || kill -0 "$signal_descendant_pid" 2>/dev/null; then
+  echo "error: frozen signal cleanup leaked a compiler-group member" >&2
   exit 1
-}
+fi
 SIGNAL_WRAPPER_PID=""
 
 if RYUKI_CARGO_MAX_TARGET_GIB=25 \

@@ -92,27 +92,28 @@ struct OfferingIac {
     /// Ansible files `(filename, content)`; empty = no Ansible.
     ansible: &'static [(&'static str, &'static str)],
     binding: VarBinding,
-    /// Secret ENVIRONMENT VARIABLE names this offering's LIVE execution
-    /// requires (provider credentials). Empty = the offering needs none.
+    /// Secret source names this offering's LIVE execution requires (provider
+    /// credentials). Empty = the offering needs none.
     ///
     /// Contract (see [`live_secret_var_names`]):
-    /// - The DECLARED name is the provider-native env var the offering's IaC
-    ///   reads (e.g. the terraform vsphere provider reads `VSPHERE_USER` /
-    ///   `VSPHERE_PASSWORD` / `VSPHERE_SERVER`).
+    /// - The DECLARED name is the operator credential source name (for example
+    ///   `VSPHERE_USER` / `VSPHERE_PASSWORD` / `VSPHERE_SERVER`). The runner
+    ///   maps it to the offering's lowercased Terraform variable name.
     /// - The agent resolves each name from `RYUKI_LIVE_CRED_<NAME>` in ITS OWN
     ///   environment (fail-closed BEFORE any runner invocation when one is
     ///   missing) and passes the values as `ResolvedCredentials` material,
     ///   comma-joined in DECLARED ORDER — the order of this slice is the
     ///   pairing contract with the runner.
-    /// - The runner injects each declared name (plus its `TF_VAR_<lowercase>`
-    ///   terraform-variable alias) on the terraform child env for LIVE modes
-    ///   ONLY. The offline dry-run path never receives credential material.
+    /// - For LIVE modes only, the runner writes the lowercased variable mapping
+    ///   to a mode-0600 auto tfvars file. It never puts resolved credentials in
+    ///   the Terraform child environment. The offline dry-run path never
+    ///   receives credential material.
     live_secret_env: &'static [&'static str],
 }
 
-/// Secret env var names required by the vSphere server-deployment offerings.
-/// The terraform vsphere provider reads exactly these provider-native vars.
-/// Order is the credential pairing order (see `OfferingIac::live_secret_env`).
+/// Secret source names required by the vSphere server-deployment offerings.
+/// The runner maps these to the reviewed `var.vsphere_*` inputs. Order is the
+/// credential pairing order (see `OfferingIac::live_secret_env`).
 const VSPHERE_LIVE_SECRET_ENV: &[&str] = &["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"];
 
 /// The offering → IaC registry (the single source of truth, see `OfferingIac`).
@@ -286,12 +287,12 @@ pub fn offering_step_template(offering_id: &str) -> &'static [StepTemplate] {
     }
 }
 
-/// Secret env var names the given offering's LIVE execution requires.
+/// Secret source names the given offering's LIVE execution requires.
 ///
-/// Returns the offering's declared provider-credential ENVIRONMENT VARIABLE
-/// names (e.g. `["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"]` for
-/// the vSphere server-deployment offerings), or an empty slice for offerings
-/// that declare none and for unknown offering ids.
+/// Returns the offering's declared provider-credential source names (e.g.
+/// `["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"]` for the vSphere
+/// server-deployment offerings), or an empty slice for offerings that declare
+/// none and for unknown offering ids.
 ///
 /// End-to-end contract:
 /// 1. The agent's live executor populates `RunPlan.secret_var_names` from this
@@ -300,10 +301,9 @@ pub fn offering_step_template(offering_id: &str) -> &'static [StepTemplate] {
 /// 2. The agent resolves each declared `<NAME>` from `RYUKI_LIVE_CRED_<NAME>`
 ///    in its own environment, failing closed with the VARIABLE NAME (never a
 ///    value) BEFORE any runner/terraform invocation when one is missing.
-/// 3. The runner injects each declared name verbatim (provider-native, e.g.
-///    `VSPHERE_USER`) plus its `TF_VAR_<lowercased name>` terraform-variable
-///    alias on the terraform child process env — live modes only, values
-///    scrubbed from all output.
+/// 3. For live modes only, the runner maps each declared name to its lowercased
+///    Terraform input variable in a mode-0600 auto tfvars file. Credentials are
+///    absent from the child environment and scrubbed from all output.
 ///
 /// SLICE ORDER IS THE PAIRING CONTRACT: credential material travels as a
 /// comma-joined string in declared order; agent and runner both iterate this
@@ -532,7 +532,8 @@ pub fn validate_live_placement_vars(
 /// raw-metadata passthrough so their behavior is unchanged.
 ///
 /// Secret-valued variables (e.g. `vsphere_password`) are NEVER produced here;
-/// the runner injects those from `ResolvedCredentials` as `TF_VAR_*` at run time.
+/// the live runner writes those from `ResolvedCredentials` to its separate
+/// mode-0600 auto tfvars file at run time.
 pub fn render_vars(inputs: &DeploymentInputs) -> BTreeMap<String, String> {
     let binding = lookup(inputs.offering_id)
         .map(|o| o.binding)
@@ -880,9 +881,8 @@ mod tests {
         assert!(lock.contains("constraints = \"2.16.1\""));
         assert!(lock.contains("h1:"), "lock must include platform hashes");
         assert!(lock.contains("zh:"), "lock must include release hashes");
-        // Credentials are injected at apply time (TF_VAR_vsphere_password / the
-        // VSPHERE_PASSWORD env var) — never embedded, never obfuscated to dodge
-        // the secret scan. Guard against regression of all three.
+        // Credentials are supplied through the runner's private auto tfvars
+        // file — never embedded and never obfuscated to dodge the secret scan.
         assert!(
             !content.contains("changeme"),
             "linux-server-deployment main.tf must not embed a default credential"
@@ -937,9 +937,8 @@ mod tests {
         assert!(lock.contains("constraints = \"2.16.1\""));
         assert!(lock.contains("h1:"), "lock must include platform hashes");
         assert!(lock.contains("zh:"), "lock must include release hashes");
-        // Credentials are injected at apply time (TF_VAR_vsphere_password / the
-        // VSPHERE_PASSWORD env var) — never embedded, never obfuscated to dodge
-        // the secret scan. Guard against regression of all three.
+        // Credentials are supplied through the runner's private auto tfvars
+        // file — never embedded and never obfuscated to dodge the secret scan.
         assert!(
             !content.contains("changeme"),
             "windows-server-deployment main.tf must not embed a default credential"
@@ -1417,8 +1416,9 @@ mod tests {
     }
 
     /// The declaration only makes sense for offerings whose LIVE path is
-    /// Terraform: declared names feed the terraform child env. Guard that no
-    /// ansible-only offering grows a declaration without the wiring to use it.
+    /// Terraform: declared names feed the private auto tfvars mapping. Guard
+    /// that no ansible-only offering grows a declaration without the wiring to
+    /// use it.
     #[test]
     fn declared_live_secret_names_require_a_terraform_bundle() {
         for o in OFFERINGS {

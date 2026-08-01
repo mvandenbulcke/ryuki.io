@@ -30,6 +30,7 @@ MIN_FREE_GIB="${RYUKI_CARGO_MIN_FREE_GIB:-30}"
 CHECK_INTERVAL_SECONDS="${RYUKI_CARGO_GUARD_INTERVAL_SECONDS:-2}"
 TEST_MODE="${RYUKI_CARGO_GUARD_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_CARGO_GUARD_TEST_MAX_KIB:-}"
+TEST_LAUNCH_READY_FILE="${RYUKI_CARGO_GUARD_TEST_LAUNCH_READY_FILE:-}"
 
 if du --apparent-size --count-links -s -k /dev/null >/dev/null 2>&1; then
   APPARENT_DU_STYLE=gnu
@@ -139,6 +140,10 @@ fi
 
 if [[ -n "$TEST_MAX_KIB" && "$TEST_MODE" != "1" ]]; then
   echo "error: RYUKI_CARGO_GUARD_TEST_MAX_KIB is reserved for regression tests" >&2
+  exit 64
+fi
+if [[ -n "$TEST_LAUNCH_READY_FILE" && "$TEST_MODE" != "1" ]]; then
+  echo "error: RYUKI_CARGO_GUARD_TEST_LAUNCH_READY_FILE is reserved for regression tests" >&2
   exit 64
 fi
 if [[ -n "$TEST_MAX_KIB" ]]; then
@@ -299,6 +304,22 @@ if [[ "$TEST_MODE" == "1" ]]; then
       exit 75
       ;;
   esac
+  if [[ -n "$TEST_LAUNCH_READY_FILE" ]]; then
+    if [[ "$TEST_LAUNCH_READY_FILE" != /* \
+      || -L "$TEST_LAUNCH_READY_FILE" \
+      || ! -d "$(dirname "$TEST_LAUNCH_READY_FILE")" ]]; then
+      echo "error: Cargo disk-guard launch marker is not a safe test destination" >&2
+      exit 75
+    fi
+    test_launch_ready_parent="$(cd "$(dirname "$TEST_LAUNCH_READY_FILE")" && pwd -P)"
+    case "$test_launch_ready_parent" in
+      "$test_tmp"/ryuki-cargo-guard.*|"$test_tmp"/ryuki-cargo-guard.*/*) ;;
+      *)
+        echo "error: Cargo disk-guard launch marker must remain inside its private regression fixture" >&2
+        exit 75
+        ;;
+    esac
+  fi
 fi
 
 state_dir="$target_root/.ryuki-cargo-disk-guard"
@@ -561,6 +582,10 @@ guard_check() (
 
 compiler_pid=""
 compiler_pgid=""
+compiler_group_owned=0
+compiler_release_file="$state_dir/compiler-release.$$.$RANDOM"
+compiler_release_tmp="${compiler_release_file}.tmp"
+pending_launch_signal=""
 
 safe_process_group_id() {
   local pgid="${1:-}"
@@ -574,47 +599,61 @@ compiler_process_group_alive() {
   kill -0 -- "-$pgid" 2>/dev/null
 }
 
+compiler_process_group_owned() {
+  (( compiler_group_owned == 1 )) || return 1
+  [[ -n "${compiler_pid:-}" && "$compiler_pgid" == "$compiler_pid" ]] || return 1
+  safe_process_group_id "$compiler_pgid"
+}
+
+clear_compiler_release() {
+  rm -f -- "$compiler_release_file" "$compiler_release_tmp"
+}
+
 stop_compiler_tree() {
   local pid="${compiler_pid:-}"
   local pgid="${compiler_pgid:-}"
   local attempt status=0
   [[ -n "$pid" ]] || return 0
 
-  if safe_process_group_id "$pgid"; then
+  clear_compiler_release
+  if compiler_process_group_owned; then
     kill -TERM -- "-$pgid" 2>/dev/null || true
   else
     kill -TERM "$pid" 2>/dev/null || true
   fi
   for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
-    if safe_process_group_id "$pgid"; then
+    if compiler_process_group_owned; then
       compiler_process_group_alive "$pgid" || break
     else
       kill -0 "$pid" 2>/dev/null || break
     fi
     sleep 0.1
   done
-  if safe_process_group_id "$pgid" && compiler_process_group_alive "$pgid"; then
+  if compiler_process_group_owned && compiler_process_group_alive "$pgid"; then
     kill -KILL -- "-$pgid" 2>/dev/null || true
   elif kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
   fi
   for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
-    if safe_process_group_id "$pgid"; then
+    if compiler_process_group_owned; then
       compiler_process_group_alive "$pgid" || break
     else
       kill -0 "$pid" 2>/dev/null || break
     fi
     sleep 0.1
   done
-  if safe_process_group_id "$pgid" && compiler_process_group_alive "$pgid"; then
-    status=75
-  elif [[ -z "$pgid" ]] && kill -0 "$pid" 2>/dev/null; then
+  if compiler_process_group_owned; then
+    compiler_process_group_alive "$pgid" && status=75
+  elif kill -0 "$pid" 2>/dev/null; then
     status=75
   fi
-  wait "$pid" 2>/dev/null || true
   if (( status == 0 )); then
+    # Liveness has already reached zero, so reaping cannot extend the bounded
+    # TERM/KILL deadline. Never call wait while an owned process is still live.
+    wait "$pid" 2>/dev/null || true
     compiler_pid=""
     compiler_pgid=""
+    compiler_group_owned=0
   fi
   return "$status"
 }
@@ -631,9 +670,15 @@ compiler_exit_cleanup() {
 
 handle_signal() {
   local status="$1"
+  local cleanup_status=0
   trap '' HUP INT TERM
-  stop_compiler_tree
+  stop_compiler_tree || cleanup_status=$?
+  (( cleanup_status == 0 )) || status="$cleanup_status"
   exit "$status"
+}
+
+record_launch_signal() {
+  pending_launch_signal="$1"
 }
 
 # The outer verifier already performs frozen aggregate checks and owns a
@@ -654,21 +699,65 @@ if ! guard_check 1; then
 fi
 
 # Monitor mode gives this one compiler and every inherited linker/descendant a
-# dedicated process group. Turning monitor mode off immediately preserves the
-# wrapper's normal non-interactive behavior while retaining group ownership.
+# dedicated process group. The child waits behind a parent-owned release file,
+# so a signal delivered between fork and PID/PGID assignment cannot let rustc
+# start without durable ownership. Turning monitor mode off immediately
+# preserves normal non-interactive behavior while retaining group ownership.
 trap compiler_exit_cleanup EXIT
-trap 'handle_signal 130' INT
-trap 'handle_signal 143' TERM
-trap 'handle_signal 129' HUP
+trap 'record_launch_signal 130' INT
+trap 'record_launch_signal 143' TERM
+trap 'record_launch_signal 129' HUP
 set -m
 (
   trap - EXIT HUP INT TERM
   exec 9>&-
+  released=0
+  for release_attempt in {1..200}; do
+    if [[ -e "$compiler_release_file" || -L "$compiler_release_file" ]]; then
+      [[ -f "$compiler_release_file" && ! -L "$compiler_release_file" \
+        && -O "$compiler_release_file" ]] || exit 75
+      rm -f -- "$compiler_release_file"
+      released=1
+      break
+    fi
+    kill -0 "$$" 2>/dev/null || exit 75
+    sleep 0.01
+  done
+  (( released == 1 )) || exit 75
   exec "$@"
 ) &
+if [[ -n "$TEST_LAUNCH_READY_FILE" ]]; then
+  # This deterministic regression hook holds the parent inside the historical
+  # signal window. The child remains release-gated and publishes only its PGID.
+  printf '%s\n' "$!" > "$TEST_LAUNCH_READY_FILE"
+  sleep 1
+fi
 compiler_pid=$!
 compiler_pgid="$compiler_pid"
 set +m
+if compiler_process_group_alive "$compiler_pgid"; then
+  compiler_group_owned=1
+else
+  echo "error: Cargo compiler process group could not be established" >&2
+  exit 75
+fi
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 129' HUP
+if [[ -n "$pending_launch_signal" ]]; then
+  handle_signal "$pending_launch_signal"
+fi
+if [[ -e "$compiler_release_file" || -L "$compiler_release_file" \
+  || -e "$compiler_release_tmp" || -L "$compiler_release_tmp" ]]; then
+  echo "error: Cargo compiler release ownership already exists" >&2
+  exit 75
+fi
+(set -o noclobber; : > "$compiler_release_tmp") || {
+  echo "error: Cargo compiler release ownership could not be created" >&2
+  exit 75
+}
+chmod 600 "$compiler_release_tmp"
+mv -- "$compiler_release_tmp" "$compiler_release_file"
 
 next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
 while compiler_process_group_alive "$compiler_pgid"; do
@@ -698,6 +787,8 @@ else
 fi
 compiler_pid=""
 compiler_pgid=""
+compiler_group_owned=0
+clear_compiler_release
 trap - EXIT HUP INT TERM
 if ! guard_check 1; then
   echo "error: Cargo compiler output crossed the repository disk ceiling" >&2
