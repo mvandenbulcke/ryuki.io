@@ -30,10 +30,15 @@ DETACHED_PID_FILE="${WORK_DIR}/detached.pid"
 DETACHED_READY_FILE="${WORK_DIR}/detached.ready"
 DETACHED_ATTEMPTED_FILE="${WORK_DIR}/detached-attempted"
 DETACHED_TARGET_CAPTURE="${WORK_DIR}/detached-target"
+DU_FAILURE_COUNT="${WORK_DIR}/du-failure-count"
+DU_FAILURE_PID_FILE="${WORK_DIR}/du-failure.pid"
+DU_FAILURE_READY_FILE="${WORK_DIR}/du-failure.ready"
+REAL_DU="$(command -v du)"
 
 cleanup() {
   local blocker_pid=""
   local detached_pid=""
+  local du_failure_pid=""
   if [[ -n "$WRAPPER_PID" ]] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
     kill -KILL "$WRAPPER_PID" 2>/dev/null || true
   fi
@@ -50,6 +55,13 @@ cleanup() {
     detached_pid="$(sed -n '1p' "$DETACHED_PID_FILE")"
     if [[ "$detached_pid" =~ ^[0-9]+$ ]] && kill -0 "$detached_pid" 2>/dev/null; then
       kill -KILL "$detached_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$DU_FAILURE_PID_FILE" ]]; then
+    du_failure_pid="$(sed -n '1p' "$DU_FAILURE_PID_FILE")"
+    if [[ "$du_failure_pid" =~ ^[0-9]+$ ]] \
+      && kill -0 "$du_failure_pid" 2>/dev/null; then
+      kill -KILL "$du_failure_pid" 2>/dev/null || true
     fi
   fi
   rm -rf -- "$WORK_DIR"
@@ -269,11 +281,11 @@ grep -q "RYUKI_VERIFY_MIN_FREE_GIB must not be less than 30" "$OUTPUT_FILE" \
 
 if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
   RYUKI_VERIFY_TEST_MODE=1 RYUKI_VERIFY_PREFLIGHT_ONLY=1 \
-  RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=6 \
+  RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=3 \
   "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" > "$OUTPUT_FILE" 2>&1; then
   fail "verification accepted a watcher interval above the repository maximum"
 fi
-grep -q "RYUKI_VERIFY_WATCH_INTERVAL_SECONDS must not exceed 5" "$OUTPUT_FILE" \
+grep -q "RYUKI_VERIFY_WATCH_INTERVAL_SECONDS must not exceed 2" "$OUTPUT_FILE" \
   || fail "weakened verification watcher refusal was not reported"
 
 hostile_target="${WORK_DIR}/hostile-target"
@@ -571,6 +583,70 @@ if TMPDIR="$TMP_A" RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
 fi
 grep -q "accepts only cargo build, check, clippy, run, or test" "$OUTPUT_FILE" \
   || fail "focused Cargo subcommand refusal was not reported"
+
+# A nonzero du result may still contain a plausible partial total while Cargo
+# concurrently renames artifacts. The verifier must reject that total and stop
+# the complete command process group instead of allowing descendants to run.
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -Eeuo pipefail'
+  printf '%s\n' ': "${RYUKI_VERIFY_TEST_DU_COUNT:?missing du counter}"'
+  printf '%s\n' 'for argument in "$@"; do'
+  printf '%s\n' '  if [[ "$argument" == "/dev/null" ]]; then exec '"$(printf '%q' "$REAL_DU")"' "$@"; fi'
+  printf '%s\n' 'done'
+  printf '%s\n' 'count=0'
+  printf '%s\n' '[[ ! -f "$RYUKI_VERIFY_TEST_DU_COUNT" ]] || read -r count < "$RYUKI_VERIFY_TEST_DU_COUNT"'
+  printf '%s\n' 'count=$((count + 1))'
+  printf '%s\n' 'printf "%s\n" "$count" > "$RYUKI_VERIFY_TEST_DU_COUNT"'
+  printf '%s\n' 'if (( count > 4 )); then'
+  printf '%s\n' '  printf "1\\t%s\\n" "${!#}"'
+  printf '%s\n' '  exit 1'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'exec '"$(printf '%q' "$REAL_DU")"' "$@"'
+} > "$FAKE_BIN/du"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -Eeuo pipefail'
+  printf '%s\n' ': "${RYUKI_VERIFY_TEST_DU_FAILURE_PID:?missing descendant pid path}"'
+  printf '%s\n' ': "${RYUKI_VERIFY_TEST_DU_FAILURE_READY:?missing ready path}"'
+  printf '%s\n' '('
+  printf '%s\n' '  touch "$RYUKI_VERIFY_TEST_DU_FAILURE_READY"'
+  printf '%s\n' '  while :; do sleep 1; done'
+  printf '%s\n' ') &'
+  printf '%s\n' 'descendant_pid=$!'
+  printf '%s\n' 'printf "%s\n" "$descendant_pid" > "$RYUKI_VERIFY_TEST_DU_FAILURE_PID"'
+  printf '%s\n' 'wait "$descendant_pid"'
+} > "$FAKE_CARGO"
+chmod 700 "$FAKE_BIN/du" "$FAKE_CARGO"
+set +e
+PATH="$FAKE_BIN:$PATH" \
+  TMPDIR="$TMP_A" \
+  RYUKI_VERIFY_STATE_BASE="$STATE_BASE" \
+  RYUKI_VERIFY_TEST_MODE=1 \
+  RYUKI_VERIFY_KEEP_TARGET=0 \
+  RYUKI_VERIFY_WATCH_INTERVAL_SECONDS=1 \
+  RYUKI_VERIFY_TEST_DU_COUNT="$DU_FAILURE_COUNT" \
+  RYUKI_VERIFY_TEST_DU_FAILURE_PID="$DU_FAILURE_PID_FILE" \
+  RYUKI_VERIFY_TEST_DU_FAILURE_READY="$DU_FAILURE_READY_FILE" \
+  "${FIXTURE_ROOT}/scripts/verify-workspace-clean.sh" -- cargo check \
+  > "$OUTPUT_FILE" 2>&1
+du_failure_status=$?
+set -e
+[[ "$du_failure_status" -eq 75 ]] \
+  || fail "focused verification accepted a nonzero partial du measurement"
+wait_for_file "$DU_FAILURE_READY_FILE" \
+  || fail "du-failure command descendant did not start"
+du_failure_pid="$(sed -n '1p' "$DU_FAILURE_PID_FILE")"
+[[ "$du_failure_pid" =~ ^[0-9]+$ ]] \
+  || fail "du-failure command published an invalid descendant pid"
+wait_for_exit "$du_failure_pid" \
+  || fail "du-failure command descendant survived fail-closed measurement"
+grep -q "allocated/apparent size or free space could not be measured" "$OUTPUT_FILE" \
+  || fail "nonzero partial du measurement failure was not reported"
+grep -q "stopping focused verification before it can exhaust the disk" "$OUTPUT_FILE" \
+  || fail "du measurement failure did not report process-group shutdown"
+rm -f "$FAKE_BIN/du" "$DU_FAILURE_COUNT" "$DU_FAILURE_PID_FILE" \
+  "$DU_FAILURE_READY_FILE"
 
 cp "$DETACHED_CARGO_FIXTURE" "$FAKE_CARGO"
 chmod 700 "$FAKE_CARGO"

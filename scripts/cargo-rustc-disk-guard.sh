@@ -46,17 +46,17 @@ measure_tree_kib() {
   local apparent_output="" apparent_kib=""
 
   if ! allocated_output="$(du -s -k "$path" 2>/dev/null)"; then
-    : # Concurrent Cargo renames may make du nonzero while retaining its total.
+    return 1
   fi
   allocated_kib="$(printf '%s\n' "$allocated_output" | awk 'END {print $1}')"
 
   if [[ "$APPARENT_DU_STYLE" == "gnu" ]]; then
     if ! apparent_output="$(du --apparent-size --count-links -s -k "$path" 2>/dev/null)"; then
-      :
+      return 1
     fi
   else
     if ! apparent_output="$(du -A -l -s -k "$path" 2>/dev/null)"; then
-      :
+      return 1
     fi
   fi
   apparent_kib="$(printf '%s\n' "$apparent_output" | awk 'END {print $1}')"

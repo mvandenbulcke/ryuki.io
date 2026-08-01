@@ -23,6 +23,8 @@ BUILD_ESCAPE="$TEST_ROOT/build-escape"
 SYMLINK_TARGET="$TEST_ROOT/symlink-target"
 SYMLINK_OUTSIDE="$TEST_ROOT/symlink-output"
 SYMLINK_OUT_DIR="$SYMLINK_TARGET/debug/deps"
+DU_FAILURE_BIN="$TEST_ROOT/du-failure-bin"
+REAL_DU="$(command -v du)"
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -166,6 +168,37 @@ grep -q "unable to identify the target root" "$TEST_ROOT/missing-target.log"
 
 [[ ! -e "$MARKER" ]] || {
   echo "error: rustc ran while a weakened production guard was rejected" >&2
+  exit 1
+}
+
+# A failing du may still print a plausible partial total. Treat its nonzero
+# status as a measurement failure instead of trusting the truncated number.
+mkdir -p "$DU_FAILURE_BIN"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -Eeuo pipefail'
+  printf '%s\n' 'for argument in "$@"; do'
+  printf '%s\n' '  if [[ "$argument" == "/dev/null" ]]; then exec '"$(printf '%q' "$REAL_DU")"' "$@"; fi'
+  printf '%s\n' 'done'
+  printf '%s\n' 'printf "1\\t%s\\n" "${!#}"'
+  printf '%s\n' 'exit 1'
+} > "$DU_FAILURE_BIN/du"
+chmod 700 "$DU_FAILURE_BIN/du"
+if PATH="$DU_FAILURE_BIN:$PATH" \
+  RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR" \
+  2>"$TEST_ROOT/du-failure.log"; then
+  echo "error: guard accepted a nonzero partial du measurement" >&2
+  exit 1
+fi
+grep -q "allocated/apparent size or free space could not be measured" \
+  "$TEST_ROOT/du-failure.log"
+grep -q "Cargo compilation refused" "$TEST_ROOT/du-failure.log"
+[[ ! -e "$MARKER" ]] || {
+  echo "error: rustc ran after a nonzero partial du measurement" >&2
   exit 1
 }
 
@@ -353,13 +386,31 @@ for index in {1..32}; do
     2>"$TEST_ROOT/stress-${index}.log" &
   stress_pids+=("$!")
 done
-for stress_pid in "${stress_pids[@]}"; do
-  wait "$stress_pid"
+set +e
+for index in "${!stress_pids[@]}"; do
+  wait "${stress_pids[$index]}"
+  stress_status=$?
+  if [[ "$stress_status" -ne 0 && "$stress_status" -ne 75 ]]; then
+    echo "error: concurrent compiler guard exited with unexpected status ${stress_status}" >&2
+    exit 1
+  fi
+  if [[ "$stress_status" -eq 75 ]] \
+    && ! grep -Eq "allocated/apparent size or free space could not be measured|Cargo compilation refused" \
+      "$TEST_ROOT/stress-$((index + 1)).log"; then
+    echo "error: concurrent compiler guard failed without a fail-closed measurement report" >&2
+    exit 1
+  fi
 done
+set -e
 if grep -q "No such file or directory" "$TEST_ROOT"/stress-*.log; then
   echo "error: concurrent checker handoff deleted live lock state" >&2
   exit 1
 fi
+RYUKI_CARGO_GUARD_TEST_MODE=1 \
+  RYUKI_CARGO_GUARD_TEST_MAX_KIB=1024 \
+  RYUKI_CARGO_MIN_FREE_GIB=30 \
+  RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+  "$GUARD" "$FAKE_RUSTC" --out-dir "$OUT_DIR"
 [[ ! -e "$TARGET/.ryuki-cargo-disk-guard/check.lock" \
   && ! -L "$TARGET/.ryuki-cargo-disk-guard/check.lock" ]] || {
   echo "error: checker lock remained after concurrent compilers exited" >&2

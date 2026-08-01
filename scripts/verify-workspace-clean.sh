@@ -16,7 +16,7 @@ ROOT_PARENT="$(cd "${ROOT_DIR}/.." && pwd -P)"
 RUSTC_GUARD="${ROOT_DIR}/scripts/cargo-rustc-disk-guard.sh"
 HARD_MAX_TARGET_GIB=24
 HARD_MIN_FREE_GIB=30
-HARD_MAX_WATCH_INTERVAL_SECONDS=5
+HARD_MAX_WATCH_INTERVAL_SECONDS=2
 TEST_MODE="${RYUKI_VERIFY_TEST_MODE:-0}"
 TEST_MAX_KIB="${RYUKI_VERIFY_TEST_MAX_KIB:-}"
 STATE_BASE_INPUT="${RYUKI_VERIFY_STATE_BASE:-/tmp}"
@@ -35,7 +35,7 @@ REPOSITORY_ID="$(printf '%s' "$GIT_COMMON_DIR" | git -C "$ROOT_DIR" hash-object 
 MIN_FREE_GIB="${RYUKI_VERIFY_MIN_FREE_GIB:-30}"
 MAX_TARGET_GIB="${RYUKI_VERIFY_MAX_TARGET_GIB:-24}"
 KEEP_TARGET="${RYUKI_VERIFY_KEEP_TARGET:-0}"
-WATCH_INTERVAL_SECONDS="${RYUKI_VERIFY_WATCH_INTERVAL_SECONDS:-5}"
+WATCH_INTERVAL_SECONDS="${RYUKI_VERIFY_WATCH_INTERVAL_SECONDS:-2}"
 ACTIVE_GATE_PID=""
 SUPERVISED_COMMAND_PID=""
 SUPERVISED_COMMAND_PGID=""
@@ -171,17 +171,17 @@ measure_tree_kib() {
   local apparent_output="" apparent_kib=""
 
   if ! allocated_output="$(du -s -k "$path" 2>/dev/null)"; then
-    : # Concurrent Cargo renames may make du nonzero while retaining its total.
+    return 1
   fi
   allocated_kib="$(printf '%s\n' "$allocated_output" | awk 'END {print $1}')"
 
   if [[ "$APPARENT_DU_STYLE" == "gnu" ]]; then
     if ! apparent_output="$(du --apparent-size --count-links -s -k "$path" 2>/dev/null)"; then
-      :
+      return 1
     fi
   else
     if ! apparent_output="$(du -A -l -s -k "$path" 2>/dev/null)"; then
-      :
+      return 1
     fi
   fi
   apparent_kib="$(printf '%s\n' "$apparent_output" | awk 'END {print $1}')"
