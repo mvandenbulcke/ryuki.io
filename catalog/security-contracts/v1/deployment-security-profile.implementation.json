@@ -42,14 +42,14 @@
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:5dbe3b76d73a3f3dc0973d651800720f92884fca7c0b5092ce678b660024406c",
+    "content_digest": "sha256:f2e32ce7d27cd19e160e1e16cd4f0a537b00b1be412c8e73902c1cf5390e98fe",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json"
   },
   "provider_lifecycle_snapshot_ref": {
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:5dbe3b76d73a3f3dc0973d651800720f92884fca7c0b5092ce678b660024406c",
+    "content_digest": "sha256:f2e32ce7d27cd19e160e1e16cd4f0a537b00b1be412c8e73902c1cf5390e98fe",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json",
     "projection": "provider_lifecycle",
     "required_states": ["active"]
@@ -58,14 +58,14 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 2,
-    "content_digest": "sha256:c43e79ec4430d423910b594a764ddad45de44dbba8431296ac60b32a495bfb6c",
+    "content_digest": "sha256:7157002e623e5bfdb0f12d5533d3ce53dcb9ea32263214d3bd6cdcdca3234c1e",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {
     "artifact_kind": "security-limit-profile",
     "document_id": "security-limit-profile:repository-implementation-v1",
     "document_version": 3,
-    "content_digest": "sha256:2c0e23b97122d6f0f93346dd083b9137f6803267350789f939332a1ba8d765a4",
+    "content_digest": "sha256:11135c77f83834b30219188feba3fbcdbc8c63b62670b8617420a09b321ecc41",
     "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
   },
   "control_plane_topology_ref": {

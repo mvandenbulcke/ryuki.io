@@ -2683,7 +2683,7 @@ fn canonicalize_plan_json(raw: &str) -> Option<Zeroizing<String>> {
     let initial_capacity = output.capacity();
     {
         let mut writer = FixedCapacityJsonWriter {
-            output: &mut *output,
+            output: &mut output,
             exact_length,
         };
         serde_json::to_writer(&mut writer, members.as_map()).ok()?;

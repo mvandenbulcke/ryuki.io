@@ -890,6 +890,12 @@ fn validate_protected_cargo_tool_lifecycle(
         ));
         return;
     }
+    if dockerfile_uses_heredoc_instruction_framing(content) {
+        errors.push(format!(
+            "{label}: protected tool lifecycle does not allow Docker heredoc instruction framing"
+        ));
+        return;
+    }
 
     let tool_root = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}");
     let tool_path = format!("{tool_root}/bin/{package}");
@@ -1409,7 +1415,10 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 
 fn dockerfile_uses_nondefault_escape_directive(content: &str) -> bool {
     for raw in content.lines() {
-        let line = raw.trim();
+        // Docker accepts a UTF-8 BOM at the beginning of a Dockerfile. Strip it
+        // before interpreting parser directives so a BOM cannot make Docker use
+        // backtick continuations while this validator still assumes backslash.
+        let line = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim();
         if line.is_empty() {
             continue;
         }
@@ -1428,7 +1437,7 @@ fn dockerfile_uses_nondefault_escape_directive(content: &str) -> bool {
 
 fn dockerfile_uses_syntax_frontend_directive(content: &str) -> bool {
     for raw in content.lines() {
-        let line = raw.trim();
+        let line = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim();
         if line.is_empty() {
             continue;
         }
@@ -1443,6 +1452,24 @@ fn dockerfile_uses_syntax_frontend_directive(content: &str) -> bool {
         }
     }
     false
+}
+
+/// Heredoc bodies are Dockerfile payload, not Dockerfile instructions. The
+/// lifecycle validator deliberately parses a small closed instruction grammar;
+/// allowing heredocs would let payload lines impersonate reviewed FROM/RUN
+/// stages and satisfy that grammar without Docker executing those instructions.
+///
+/// The default escape character can also splice the two `<` bytes across a
+/// physical line boundary (`<\\\n<`). Detect both forms before constructing any
+/// logical instructions. Protected checked-in Dockerfiles do not require shell
+/// redirection, so this ambiguity is rejected rather than reimplemented.
+fn dockerfile_uses_heredoc_instruction_framing(content: &str) -> bool {
+    content.lines().any(|raw| {
+        let line = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim();
+        !line.is_empty()
+            && !line.starts_with('#')
+            && (line.contains("<<") || line.trim_end().ends_with("<\\"))
+    })
 }
 
 /// Join Dockerfile line continuations so policy applies to logical RUN
@@ -2146,7 +2173,12 @@ name = "ryuki-integration-tests"
             ("cargo-chef", CARGO_CHEF_VERSION),
             ("cargo-leptos", CARGO_LEPTOS_VERSION),
         ] {
-            for directive in ["# escape=`\n", "#escape=`\n", "# ESCAPE = `\n"] {
+            for directive in [
+                "# escape=`\n",
+                "#escape=`\n",
+                "# ESCAPE = `\n",
+                "\u{feff}# escape=`\n",
+            ] {
                 let dockerfile = format!(
                     "{directive}{}",
                     canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ")
@@ -2164,6 +2196,43 @@ name = "ryuki-integration-tests"
                         .iter()
                         .any(|error| error.contains("default Dockerfile escape")),
                     "nondefault Dockerfile escape {directive:?} was accepted for {package}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_tool_lifecycle_rejects_heredoc_instruction_spoofing() {
+        for (package, version) in [
+            ("cargo-chef", CARGO_CHEF_VERSION),
+            ("cargo-leptos", CARGO_LEPTOS_VERSION),
+        ] {
+            let phantom_lifecycle =
+                canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ");
+            for heredoc_start in [
+                "RUN <<'RYUKI_TOOL_LIFECYCLE'\n",
+                "RUN <\\\n<'RYUKI_TOOL_LIFECYCLE'\n",
+            ] {
+                // Without an explicit heredoc rejection, the payload's FROM/RUN
+                // lines are misread as real Dockerfile stages. The trailing
+                // `true` makes the actual shell-form heredoc succeed even though
+                // none of the apparent protected-tool instructions ran.
+                let dockerfile = format!(
+                    "FROM rust:1.96-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS actual\n{heredoc_start}{phantom_lifecycle}true\nRYUKI_TOOL_LIFECYCLE\n"
+                );
+                let mut errors = Vec::new();
+                validate_protected_cargo_tool_lifecycle(
+                    &dockerfile,
+                    "Dockerfile",
+                    package,
+                    version,
+                    &mut errors,
+                );
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.contains("heredoc instruction framing")),
+                    "heredoc lifecycle spoof was accepted for {package}: {dockerfile:?}; {errors:?}"
                 );
             }
         }

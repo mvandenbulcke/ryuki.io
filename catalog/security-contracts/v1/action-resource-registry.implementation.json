@@ -29,7 +29,7 @@
       {
         "document_id": "source:ryuki-api-build-identity",
         "document_version": 1,
-        "content_digest": "sha256:a56fec113a3dbc68bf6a5ae4bd0ee3818e182c329ab01f85c463eb8cff396993",
+        "content_digest": "sha256:c51777685a5110e7090c74ec7afed63dac89ea4fb4e11d48607978871ec9aa8e",
         "artifact_locator": "sources/ryuki-api/src/build_identity.rs"
       },
       {
