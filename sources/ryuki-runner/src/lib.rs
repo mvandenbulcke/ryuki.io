@@ -50,7 +50,7 @@ pub use executable::{approved_terraform_executable_provenance, ApprovedExecutabl
 pub use live::{
     run_live_apply, run_live_apply_with_cancellation, run_live_destroy,
     run_live_destroy_with_cancellation, run_live_plan, run_live_plan_with_cancellation,
-    IsolatedBackendConfig, LivePlanArtifacts, STATE_KEY_PLACEHOLDER,
+    IsolatedBackendConfig, LivePlanArtifacts, ZeroizingTfPlan, STATE_KEY_PLACEHOLDER,
 };
 pub use live_ansible::{
     run_ansible_live_apply, run_ansible_live_apply_with_cancellation, run_ansible_live_plan,

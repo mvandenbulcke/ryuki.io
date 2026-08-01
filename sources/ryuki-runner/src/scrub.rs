@@ -19,7 +19,7 @@
 //! found against the original output and overlapping ranges are merged before
 //! replacement, so the result is independent of secret ordering.
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum log excerpt stored in `RunOutcome.log`. Outputs longer than this
 /// are truncated with a suffix indicating the truncation.
@@ -96,18 +96,14 @@ fn secret_variants(secret_values: &[&[u8]]) -> Vec<Zeroizing<String>> {
         .copied()
         .filter(|value| !value.is_empty())
     {
-        let upper_percent = percent_encode(secret, true, false);
-        let lower_percent = percent_encode(secret, false, false);
-        let upper_form_percent = percent_encode(secret, true, true);
-        let lower_form_percent = percent_encode(secret, false, true);
-        variants.push(Zeroizing::new(upper_percent));
-        variants.push(Zeroizing::new(lower_percent));
-        variants.push(Zeroizing::new(upper_form_percent));
-        variants.push(Zeroizing::new(lower_form_percent));
+        variants.push(percent_encode(secret, true, false));
+        variants.push(percent_encode(secret, false, false));
+        variants.push(percent_encode(secret, true, true));
+        variants.push(percent_encode(secret, false, true));
 
         for escape_html in [true, false] {
             if let Some(go_json) = go_json_escape_variant(secret, escape_html) {
-                variants.push(Zeroizing::new(go_json));
+                variants.push(go_json);
             }
         }
 
@@ -118,25 +114,15 @@ fn secret_variants(secret_values: &[&[u8]]) -> Vec<Zeroizing<String>> {
                 // `String::from_utf8_lossy` before this boundary. Register the
                 // same single, bounded representation so malformed provider
                 // bytes cannot survive capture as literal U+FFFD characters.
-                variants.push(Zeroizing::new(String::from_utf8_lossy(secret).into_owned()));
+                variants.push(lossy_utf8_variant(secret));
                 continue;
             }
         };
-        variants.push(Zeroizing::new(secret_str.to_string()));
-
-        if let Ok(quoted) = serde_json::to_string(secret_str).map(Zeroizing::new) {
-            if let Some(inner) = quoted
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-            {
-                variants.push(Zeroizing::new(inner.to_string()));
-            }
-        }
-
-        let shell_single = secret_str.replace('\'', "'\\''");
-        variants.push(Zeroizing::new(shell_single));
-        variants.push(Zeroizing::new(shell_backslash_escape(secret_str)));
-        variants.push(Zeroizing::new(shell_mixed_escape(secret_str)));
+        variants.push(zeroizing_copy(secret_str));
+        variants.push(serde_json_escape_variant(secret_str));
+        variants.push(shell_single_escape(secret_str));
+        variants.push(shell_backslash_escape(secret_str));
+        variants.push(shell_mixed_escape(secret_str));
     }
 
     variants.retain(|variant| !variant.is_empty());
@@ -183,11 +169,33 @@ pub(crate) fn basic_auth_canonical_variants(
     Some([combined, encoded])
 }
 
-fn percent_encode(value: &[u8], uppercase: bool, space_as_plus: bool) -> String {
+fn zeroizing_copy(value: &str) -> Zeroizing<String> {
+    let mut copied = Zeroizing::new(String::with_capacity(value.len()));
+    let allocation = copied.as_ptr();
+    copied.push_str(value);
+    debug_assert_eq!(copied.len(), value.len());
+    debug_assert_eq!(copied.as_ptr(), allocation);
+    copied
+}
+
+fn percent_encode(value: &[u8], uppercase: bool, space_as_plus: bool) -> Zeroizing<String> {
     const UPPER: &[u8; 16] = b"0123456789ABCDEF";
     const LOWER: &[u8; 16] = b"0123456789abcdef";
     let hex = if uppercase { UPPER } else { LOWER };
-    let mut encoded = String::with_capacity(value.len());
+    let encoded_len = value.iter().try_fold(0usize, |length, byte| {
+        let byte_len = if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (space_as_plus && *byte == b' ')
+        {
+            1
+        } else {
+            3
+        };
+        length.checked_add(byte_len)
+    });
+    let encoded_len = encoded_len.expect("secret representation length must fit in address space");
+    let mut encoded = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = encoded.as_ptr();
     for byte in value {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             encoded.push(char::from(*byte));
@@ -199,7 +207,105 @@ fn percent_encode(value: &[u8], uppercase: bool, space_as_plus: bool) -> String 
             encoded.push(char::from(hex[usize::from(*byte & 0x0f)]));
         }
     }
+    debug_assert_eq!(encoded.len(), encoded_len);
+    debug_assert_eq!(encoded.as_ptr(), allocation);
     encoded
+}
+
+fn lossy_utf8_variant(value: &[u8]) -> Zeroizing<String> {
+    let encoded_len = lossy_utf8_len(value);
+    let mut encoded = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = encoded.as_ptr();
+    let mut remaining = value;
+
+    loop {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                encoded.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                encoded.push_str(
+                    std::str::from_utf8(&remaining[..valid_up_to])
+                        .expect("Utf8Error valid prefix must be valid UTF-8"),
+                );
+                encoded.push('\u{fffd}');
+                let Some(invalid_len) = error.error_len() else {
+                    break;
+                };
+                remaining = &remaining[valid_up_to + invalid_len..];
+            }
+        }
+    }
+
+    debug_assert_eq!(encoded.len(), encoded_len);
+    debug_assert_eq!(encoded.as_ptr(), allocation);
+    encoded
+}
+
+fn lossy_utf8_len(value: &[u8]) -> usize {
+    let mut encoded_len = 0usize;
+    let mut remaining = value;
+    loop {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                encoded_len = encoded_len
+                    .checked_add(valid.len())
+                    .expect("secret representation length must fit in address space");
+                break;
+            }
+            Err(error) => {
+                encoded_len = encoded_len
+                    .checked_add(error.valid_up_to())
+                    .and_then(|length| length.checked_add('\u{fffd}'.len_utf8()))
+                    .expect("secret representation length must fit in address space");
+                let Some(invalid_len) = error.error_len() else {
+                    break;
+                };
+                remaining = &remaining[error.valid_up_to() + invalid_len..];
+            }
+        }
+    }
+    encoded_len
+}
+
+fn serde_json_escape_variant(value: &str) -> Zeroizing<String> {
+    let encoded_len = value.chars().try_fold(0usize, |length, character| {
+        length.checked_add(match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            character if character <= '\u{001f}' => 6,
+            _ => character.len_utf8(),
+        })
+    });
+    let encoded_len = encoded_len.expect("secret representation length must fit in address space");
+    let mut escaped = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = escaped.as_ptr();
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character <= '\u{001f}' => {
+                append_ascii_control_escape(&mut escaped, character as u8);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    debug_assert_eq!(escaped.len(), encoded_len);
+    debug_assert_eq!(escaped.as_ptr(), allocation);
+    escaped
+}
+
+fn append_ascii_control_escape(escaped: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    escaped.push_str("\\u00");
+    escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+    escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
 }
 
 pub(crate) fn standard_base64(value: &[u8]) -> Vec<u8> {
@@ -232,15 +338,16 @@ pub(crate) fn standard_base64(value: &[u8]) -> Vec<u8> {
 /// replace every invalid UTF-8 byte with `\ufffd`. Registering both closes the
 /// mixed-representation case (`<` left literal while U+2028 is escaped)
 /// without guessing encodings or recursively expanding variants.
-fn go_json_escape_variant(value: &[u8], escape_html: bool) -> Option<String> {
-    let mut escaped = String::with_capacity(value.len());
-    let mut changed = false;
+fn go_json_escape_variant(value: &[u8], escape_html: bool) -> Option<Zeroizing<String>> {
+    let (encoded_len, changed) = go_json_escape_len(value, escape_html);
+    let mut escaped = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = escaped.as_ptr();
     let mut index = 0usize;
     while index < value.len() {
         let byte = value[index];
         if byte.is_ascii() {
             index += 1;
-            append_go_json_character(&mut escaped, char::from(byte), escape_html, &mut changed);
+            append_go_json_character(&mut escaped, char::from(byte), escape_html);
             continue;
         }
 
@@ -248,7 +355,7 @@ fn go_json_escape_variant(value: &[u8], escape_html: bool) -> Option<String> {
         let valid_prefix_len = match std::str::from_utf8(remaining) {
             Ok(valid) => {
                 for character in valid.chars() {
-                    append_go_json_character(&mut escaped, character, escape_html, &mut changed);
+                    append_go_json_character(&mut escaped, character, escape_html);
                 }
                 break;
             }
@@ -258,7 +365,7 @@ fn go_json_escape_variant(value: &[u8], escape_html: bool) -> Option<String> {
             let valid = std::str::from_utf8(&remaining[..valid_prefix_len])
                 .expect("Utf8Error::valid_up_to identifies a valid prefix");
             for character in valid.chars() {
-                append_go_json_character(&mut escaped, character, escape_html, &mut changed);
+                append_go_json_character(&mut escaped, character, escape_html);
             }
             index += valid_prefix_len;
             continue;
@@ -267,72 +374,128 @@ fn go_json_escape_variant(value: &[u8], escape_html: bool) -> Option<String> {
         // Go's utf8.DecodeRuneInString reports size 1 for malformed input, so
         // encoding/json emits one replacement escape per invalid byte.
         escaped.push_str("\\ufffd");
+        index += 1;
+    }
+
+    debug_assert_eq!(escaped.len(), encoded_len);
+    debug_assert_eq!(escaped.as_ptr(), allocation);
+    if changed {
+        Some(escaped)
+    } else {
+        // This representation duplicates the literal variant. Wipe the
+        // populated allocation explicitly instead of passing it through an
+        // eager `then_some`, whose `None` branch would immediately drop it.
+        escaped.zeroize();
+        None
+    }
+}
+
+fn go_json_escape_len(value: &[u8], escape_html: bool) -> (usize, bool) {
+    let mut encoded_len = 0usize;
+    let mut changed = false;
+    let mut index = 0usize;
+    while index < value.len() {
+        let byte = value[index];
+        if byte.is_ascii() {
+            let (character_len, character_changed) =
+                go_json_character_len(char::from(byte), escape_html);
+            encoded_len = encoded_len
+                .checked_add(character_len)
+                .expect("secret representation length must fit in address space");
+            changed |= character_changed;
+            index += 1;
+            continue;
+        }
+
+        let remaining = &value[index..];
+        let valid_prefix_len = match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    let (character_len, character_changed) =
+                        go_json_character_len(character, escape_html);
+                    encoded_len = encoded_len
+                        .checked_add(character_len)
+                        .expect("secret representation length must fit in address space");
+                    changed |= character_changed;
+                }
+                break;
+            }
+            Err(error) => error.valid_up_to(),
+        };
+        if valid_prefix_len > 0 {
+            let valid = std::str::from_utf8(&remaining[..valid_prefix_len])
+                .expect("Utf8Error::valid_up_to identifies a valid prefix");
+            for character in valid.chars() {
+                let (character_len, character_changed) =
+                    go_json_character_len(character, escape_html);
+                encoded_len = encoded_len
+                    .checked_add(character_len)
+                    .expect("secret representation length must fit in address space");
+                changed |= character_changed;
+            }
+            index += valid_prefix_len;
+            continue;
+        }
+
+        encoded_len = encoded_len
+            .checked_add("\\ufffd".len())
+            .expect("secret representation length must fit in address space");
         changed = true;
         index += 1;
     }
-    changed.then_some(escaped)
+    (encoded_len, changed)
 }
 
-fn append_go_json_character(
-    escaped: &mut String,
-    character: char,
-    escape_html: bool,
-    changed: &mut bool,
-) {
-    use std::fmt::Write as _;
+fn go_json_character_len(character: char, escape_html: bool) -> (usize, bool) {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => (2, true),
+        '<' | '>' | '&' if escape_html => (6, true),
+        '\u{2028}' | '\u{2029}' => (6, true),
+        character if character <= '\u{001f}' => (6, true),
+        _ => (character.len_utf8(), false),
+    }
+}
 
+fn append_go_json_character(escaped: &mut String, character: char, escape_html: bool) {
     match character {
         '"' => {
             escaped.push_str("\\\"");
-            *changed = true;
         }
         '\\' => {
             escaped.push_str("\\\\");
-            *changed = true;
         }
         '\u{0008}' => {
             escaped.push_str("\\b");
-            *changed = true;
         }
         '\u{000c}' => {
             escaped.push_str("\\f");
-            *changed = true;
         }
         '\n' => {
             escaped.push_str("\\n");
-            *changed = true;
         }
         '\r' => {
             escaped.push_str("\\r");
-            *changed = true;
         }
         '\t' => {
             escaped.push_str("\\t");
-            *changed = true;
         }
         '<' if escape_html => {
             escaped.push_str("\\u003c");
-            *changed = true;
         }
         '>' if escape_html => {
             escaped.push_str("\\u003e");
-            *changed = true;
         }
         '&' if escape_html => {
             escaped.push_str("\\u0026");
-            *changed = true;
         }
         '\u{2028}' => {
             escaped.push_str("\\u2028");
-            *changed = true;
         }
         '\u{2029}' => {
             escaped.push_str("\\u2029");
-            *changed = true;
         }
         character if character <= '\u{001f}' => {
-            write!(escaped, "\\u{:04x}", character as u32).expect("writing to String cannot fail");
-            *changed = true;
+            append_ascii_control_escape(escaped, character as u8);
         }
         _ => escaped.push(character),
     }
@@ -340,14 +503,48 @@ fn append_go_json_character(
 
 pub(crate) fn append_go_json_escape_variants(values: &mut Vec<Vec<u8>>, value: &[u8]) {
     for escape_html in [true, false] {
-        if let Some(escaped) = go_json_escape_variant(value, escape_html) {
-            values.push(escaped.into_bytes());
+        if let Some(mut escaped) = go_json_escape_variant(value, escape_html) {
+            values.push(std::mem::take(&mut *escaped).into_bytes());
         }
     }
 }
 
-fn shell_backslash_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
+fn shell_single_escape(value: &str) -> Zeroizing<String> {
+    let encoded_len = value.chars().try_fold(value.len(), |length, character| {
+        if character == '\'' {
+            length.checked_add(3)
+        } else {
+            Some(length)
+        }
+    });
+    let encoded_len = encoded_len.expect("secret representation length must fit in address space");
+    let mut escaped = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = escaped.as_ptr();
+    for character in value.chars() {
+        if character == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(character);
+        }
+    }
+    debug_assert_eq!(escaped.len(), encoded_len);
+    debug_assert_eq!(escaped.as_ptr(), allocation);
+    escaped
+}
+
+fn shell_backslash_escape(value: &str) -> Zeroizing<String> {
+    let encoded_len = value.chars().try_fold(0usize, |length, character| {
+        length.checked_add(character.len_utf8()).and_then(|length| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/') {
+                Some(length)
+            } else {
+                length.checked_add(1)
+            }
+        })
+    });
+    let encoded_len = encoded_len.expect("secret representation length must fit in address space");
+    let mut escaped = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = escaped.as_ptr();
     for character in value.chars() {
         if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/') {
             escaped.push(character);
@@ -356,11 +553,25 @@ fn shell_backslash_escape(value: &str) -> String {
             escaped.push(character);
         }
     }
+    debug_assert_eq!(escaped.len(), encoded_len);
+    debug_assert_eq!(escaped.as_ptr(), allocation);
     escaped
 }
 
-fn shell_mixed_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
+fn shell_mixed_escape(value: &str) -> Zeroizing<String> {
+    let encoded_len = value.chars().try_fold(0usize, |length, character| {
+        let additional = match character {
+            '\'' => 3,
+            '$' | '`' | '"' | '\\' => 1,
+            _ => 0,
+        };
+        length
+            .checked_add(character.len_utf8())
+            .and_then(|length| length.checked_add(additional))
+    });
+    let encoded_len = encoded_len.expect("secret representation length must fit in address space");
+    let mut escaped = Zeroizing::new(String::with_capacity(encoded_len));
+    let allocation = escaped.as_ptr();
     for character in value.chars() {
         match character {
             '\'' => escaped.push_str("'\\''"),
@@ -371,6 +582,8 @@ fn shell_mixed_escape(value: &str) -> String {
             _ => escaped.push(character),
         }
     }
+    debug_assert_eq!(escaped.len(), encoded_len);
+    debug_assert_eq!(escaped.as_ptr(), allocation);
     escaped
 }
 
@@ -384,6 +597,107 @@ fn shell_mixed_escape(value: &str) -> String {
 /// The scrubbed and truncated output as a `String`.
 pub fn scrub_output(output: &str, secret_values: &[&[u8]]) -> String {
     truncate_log(&scrub(output, secret_values))
+}
+
+/// Copy captured stdout/stderr into one exactly pre-sized zeroizing string and
+/// clear the source buffers immediately.
+///
+/// `std::process::Output` owns ordinary `Vec<u8>` buffers. Runner output can
+/// contain credentials before scrubbing, so callers must not leave those
+/// allocations populated until ordinary drop. The source allocations and
+/// lossy UTF-8 projections are placed under zeroizing ownership before the
+/// destination is allocated. Its complete final capacity is reserved before
+/// either stream is copied, so appending stderr cannot free a plaintext stdout
+/// allocation during reallocation.
+fn take_lossy_utf8(bytes: &mut Vec<u8>) -> Zeroizing<String> {
+    let mut owned = Zeroizing::new(std::mem::take(bytes));
+    match String::from_utf8(std::mem::take(&mut *owned)) {
+        Ok(text) => Zeroizing::new(text),
+        Err(error) => {
+            let mut invalid = Zeroizing::new(error.into_bytes());
+            // Each invalid input byte can expand to at most one three-byte
+            // replacement character. Reserve that full bound before copying so
+            // a valid plaintext prefix is never released by reallocation.
+            let capacity = invalid
+                .len()
+                .checked_mul('\u{fffd}'.len_utf8())
+                .expect("captured output length must fit in address space");
+            let mut text = Zeroizing::new(String::with_capacity(capacity));
+            let allocation = text.as_ptr();
+            let mut remaining = invalid.as_slice();
+            loop {
+                match std::str::from_utf8(remaining) {
+                    Ok(valid) => {
+                        text.push_str(valid);
+                        break;
+                    }
+                    Err(utf8_error) => {
+                        let valid_up_to = utf8_error.valid_up_to();
+                        text.push_str(
+                            std::str::from_utf8(&remaining[..valid_up_to])
+                                .expect("Utf8Error valid prefix must be valid UTF-8"),
+                        );
+                        text.push('\u{fffd}');
+                        let Some(invalid_len) = utf8_error.error_len() else {
+                            break;
+                        };
+                        remaining = &remaining[valid_up_to + invalid_len..];
+                    }
+                }
+            }
+            debug_assert_eq!(text.as_ptr(), allocation);
+            invalid.zeroize();
+            text
+        }
+    }
+}
+
+pub(crate) fn take_captured_output(
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) -> Zeroizing<String> {
+    let mut stdout_text = take_lossy_utf8(stdout);
+    let mut stderr_text = take_lossy_utf8(stderr);
+
+    let separator_len = usize::from(
+        !stdout_text.is_empty() && !stdout_text.ends_with('\n') && !stderr_text.is_empty(),
+    );
+    let combined_len = stdout_text
+        .len()
+        .checked_add(separator_len)
+        .and_then(|len| len.checked_add(stderr_text.len()))
+        .expect("captured output length must fit in address space");
+    let mut combined = Zeroizing::new(String::with_capacity(combined_len));
+    let combined_allocation = combined.as_ptr();
+    combined.push_str(&stdout_text);
+    if !stderr_text.is_empty() {
+        if separator_len != 0 {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr_text);
+    }
+    debug_assert_eq!(combined.len(), combined_len);
+    debug_assert_eq!(combined.as_ptr(), combined_allocation);
+
+    stdout_text.zeroize();
+    stderr_text.zeroize();
+    combined
+}
+
+/// Scrub a subprocess capture and clear its raw byte owners before returning
+/// durable evidence.
+pub(crate) fn scrub_captured_output(
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    secret_values: &[&[u8]],
+    truncate: bool,
+) -> String {
+    let raw = take_captured_output(stdout, stderr);
+    if truncate {
+        scrub_output(&raw, secret_values)
+    } else {
+        scrub(&raw, secret_values)
+    }
 }
 
 /// Truncate `log` to `MAX_LOG_BYTES`, appending a note if truncation occurred.
@@ -528,6 +842,67 @@ mod tests {
     }
 
     #[test]
+    fn variant_builders_match_percent_json_and_shell_wire_formats() {
+        // Each builder also carries an internal pointer-stability assertion,
+        // proving its checked precomputed capacity does not grow while the
+        // plaintext representation is being written.
+        assert_eq!(
+            percent_encode(b"api key/+~", true, false).as_str(),
+            "api%20key%2F%2B~"
+        );
+        assert_eq!(
+            percent_encode(b"api key/+~", false, false).as_str(),
+            "api%20key%2f%2b~"
+        );
+        assert_eq!(
+            percent_encode(b"api key/+~", true, true).as_str(),
+            "api+key%2F%2B~"
+        );
+
+        let json_value = "q\"\\\u{0000}\u{0008}\u{000c}\n\r\té";
+        assert_eq!(
+            serde_json_escape_variant(json_value).as_str(),
+            r#"q\"\\\u0000\b\f\n\r\té"#
+        );
+
+        assert_eq!(shell_single_escape("a'b").as_str(), r"a'\''b");
+        assert_eq!(shell_backslash_escape("a b$é/").as_str(), r"a\ b\$\é/");
+        assert_eq!(
+            shell_mixed_escape("a'b$`\"\\ é").as_str(),
+            r#"a'\''b\$\`\"\\ é"#
+        );
+    }
+
+    #[test]
+    fn lossy_and_go_json_builders_match_invalid_and_both_html_modes() {
+        let invalid = b"a\xf0(\x8c(z";
+        assert_eq!(lossy_utf8_variant(invalid).as_str(), "a\u{fffd}(\u{fffd}(z");
+        assert_eq!(
+            go_json_escape_variant(invalid, true)
+                .expect("invalid UTF-8 changes Go JSON output")
+                .as_str(),
+            r"a\ufffd(\ufffd(z"
+        );
+
+        let go_value = "p\"\\\n<>&\u{2028}\u{2029}";
+        assert_eq!(
+            go_json_escape_variant(go_value.as_bytes(), true)
+                .expect("HTML-safe Go JSON changes output")
+                .as_str(),
+            r#"p\"\\\n\u003c\u003e\u0026\u2028\u2029"#
+        );
+        assert_eq!(
+            go_json_escape_variant(go_value.as_bytes(), false)
+                .expect("HTML-disabled Go JSON still changes output")
+                .as_str(),
+            r#"p\"\\\n<>&\u2028\u2029"#
+        );
+
+        assert!(go_json_escape_variant(b"unchanged-canary", true).is_none());
+        assert!(go_json_escape_variant(b"unchanged-canary", false).is_none());
+    }
+
+    #[test]
     fn scrub_redacts_go_json_provider_wire_representation() {
         let secret = "provider\"\\\n<>&\u{2028}\u{2029}";
         let output = r#"diagnostic=provider\"\\\n\u003c\u003e\u0026\u2028\u2029 status=failed"#;
@@ -561,6 +936,52 @@ mod tests {
         let scrubbed = scrub(output, &[secret.as_slice()]);
         assert_eq!(scrubbed, "diagnostic=[REDACTED] status=failed");
         assert!(!scrubbed.contains("provider-\u{fffd}-canary"));
+    }
+
+    #[test]
+    fn scrub_captured_output_clears_raw_owners() {
+        let secret = b"capture-secret-canary";
+        let mut stdout = b"stdout capture-secret-canary".to_vec();
+        let mut stderr = b"stderr capture-secret-canary".to_vec();
+        let scrubbed = scrub_captured_output(&mut stdout, &mut stderr, &[secret.as_slice()], true);
+
+        assert!(stdout.is_empty(), "raw stdout owner must be cleared");
+        assert!(stderr.is_empty(), "raw stderr owner must be cleared");
+        assert_eq!(scrubbed, "stdout [REDACTED]\nstderr [REDACTED]");
+    }
+
+    #[test]
+    fn take_captured_output_preallocates_for_both_streams_and_preserves_lossy_text() {
+        let mut stdout = Vec::from(b"short-stdout".as_slice());
+        stdout.shrink_to_fit();
+        let mut stderr = [b'X'; 4096].to_vec();
+        stderr.extend_from_slice(b"-invalid-\xff");
+        stderr.shrink_to_fit();
+
+        let combined = take_captured_output(&mut stdout, &mut stderr);
+
+        assert!(stdout.is_empty(), "raw stdout owner must be cleared");
+        assert!(stderr.is_empty(), "raw stderr owner must be cleared");
+        assert!(combined.starts_with("short-stdout\n"));
+        assert!(combined.ends_with("-invalid-\u{fffd}"));
+        assert_eq!(
+            combined.len(),
+            "short-stdout\n".len() + 4096 + "-invalid-\u{fffd}".len()
+        );
+    }
+
+    #[test]
+    fn lossy_capture_conversion_preallocates_for_invalid_byte_expansion() {
+        let mut bytes = b"plaintext-prefix\xff\xfe\xfd".to_vec();
+        let input_len = bytes.len();
+        let text = take_lossy_utf8(&mut bytes);
+
+        assert!(bytes.is_empty(), "raw capture owner must be cleared");
+        assert_eq!(text.as_str(), "plaintext-prefix\u{fffd}\u{fffd}\u{fffd}");
+        assert!(
+            text.capacity() >= input_len * '\u{fffd}'.len_utf8(),
+            "lossy conversion must reserve its no-growth expansion bound"
+        );
     }
 
     #[test]

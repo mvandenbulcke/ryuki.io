@@ -21,7 +21,8 @@
 //! re-runs the playbook against live infrastructure — Ansible's idempotency
 //! guarantee makes this safe.
 //!
-//! The `tfplan` field in `LivePlanArtifacts` is set to an **empty `Vec<u8>`**
+//! The `tfplan` field in `LivePlanArtifacts` is set to an **empty
+//! `ZeroizingTfPlan`**
 //! for ansible plans.  Callers of `run_ansible_live_apply` MUST NOT pass a
 //! `tfplan` byte buffer and instead just re-run the playbook.
 //!
@@ -61,12 +62,14 @@ use std::time::Duration;
 use ryuki_engine::runners::{
     ResolvedCredentials, RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind,
 };
+use zeroize::Zeroizing;
 
 use super::{
+    ansible::secrets_to_json,
     exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
     executable::{ApprovedExecutable, ApprovedTool},
     iac,
-    scrub::scrub_output,
+    scrub::scrub_captured_output,
     terraform::{
         credential_components, pin_home_tmpdir_to_workspace, validate_offering_slug,
         validate_var_name, ENV_ALLOWLIST,
@@ -96,7 +99,7 @@ const ANSIBLE_BLOCKED_PREFIX: &str = "ANSIBLE_";
 /// `--check --diff` output.
 ///
 /// There is no saved plan artifact for Ansible (unlike Terraform's `tfplan`).
-/// The `LivePlanArtifacts.tfplan` field is always an empty `Vec<u8>`.
+/// The `LivePlanArtifacts.tfplan` field is always an empty `ZeroizingTfPlan`.
 ///
 /// # Errors
 ///
@@ -238,7 +241,7 @@ fn live_ansible_plan_inner(
     }
 
     // Build secret components for scrubbing.
-    let components = credential_components(creds.material.as_slice());
+    let components = Zeroizing::new(credential_components(creds.material.as_slice()));
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
     // Binary availability check — ansible-absent-safe.
@@ -272,10 +275,11 @@ fn live_ansible_plan_inner(
     let mut cmd = build_ansible_command(binary, &playbook_ref, ws.path(), &vars_arg, &secrets_arg);
     cmd.arg("--check").arg("--diff");
 
-    let output = run_command_with_optional_cancellation(cmd, LIVE_ANSIBLE_TIMEOUT, cancellation)?;
+    let mut output =
+        run_command_with_optional_cancellation(cmd, LIVE_ANSIBLE_TIMEOUT, cancellation)?;
 
-    let raw = combine_output(&output.stdout, &output.stderr);
-    let scrubbed_log = scrub_output(&raw, &secret_refs);
+    let scrubbed_log =
+        scrub_captured_output(&mut output.stdout, &mut output.stderr, &secret_refs, true);
 
     let (status, summary) = match output.status.code() {
         Some(0) => (
@@ -348,7 +352,7 @@ fn live_ansible_apply_inner(
     }
 
     // Secret scrubbing components.
-    let components = credential_components(creds.material.as_slice());
+    let components = Zeroizing::new(credential_components(creds.material.as_slice()));
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
     // Binary availability check.
@@ -382,10 +386,11 @@ fn live_ansible_apply_inner(
     let mut cmd = build_ansible_command(binary, &playbook_ref, ws.path(), &vars_arg, &secrets_arg);
     cmd.arg("--diff");
 
-    let output = run_command_with_optional_cancellation(cmd, LIVE_ANSIBLE_TIMEOUT, cancellation)?;
+    let mut output =
+        run_command_with_optional_cancellation(cmd, LIVE_ANSIBLE_TIMEOUT, cancellation)?;
 
-    let raw = combine_output(&output.stdout, &output.stderr);
-    let scrubbed_log = scrub_output(&raw, &secret_refs);
+    let scrubbed_log =
+        scrub_captured_output(&mut output.stdout, &mut output.stderr, &secret_refs, true);
 
     let (status, summary) = match output.status.code() {
         Some(0) => (
@@ -476,11 +481,13 @@ fn write_extra_vars_files(
     };
 
     let secrets_arg = if !secret_var_names.is_empty() {
-        let cred_str = std::str::from_utf8(creds.material.as_slice())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        let json = secrets_to_json(secret_var_names, &cred_str);
-        let path = ws.write_file_0600("ryuki-secrets.json", json.as_bytes())?;
+        let cred_str = Zeroizing::new(
+            std::str::from_utf8(creds.material.as_slice())
+                .map(str::to_owned)
+                .unwrap_or_default(),
+        );
+        let json = secrets_to_json(secret_var_names, &cred_str)?;
+        let path = ws.write_file_0600("ryuki-secrets.json", json.as_slice())?;
         Some(format!("@{}", path.to_string_lossy()))
     } else {
         None
@@ -520,43 +527,11 @@ fn build_ansible_command(
     cmd
 }
 
-/// Merge stdout and stderr into a single string (stderr appended after stdout).
-fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut s = String::new();
-    if !stdout.is_empty() {
-        s.push_str(&String::from_utf8_lossy(stdout));
-    }
-    if !stderr.is_empty() {
-        if !s.is_empty() && !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s.push_str(&String::from_utf8_lossy(stderr));
-    }
-    s
-}
-
 /// Serialize non-secret vars to JSON for `--extra-vars @file.json`.
 fn vars_to_json(vars: &std::collections::BTreeMap<String, String>) -> String {
     let map: serde_json::Map<String, serde_json::Value> = vars
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-        .collect();
-    serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Serialize secret vars (name → resolved cred material) to JSON.
-///
-/// Maps every `secret_var_name` to the same `cred_str` (Slice 6: shared
-/// material per run; per-name credentials are a later slice).
-fn secrets_to_json(secret_var_names: &[String], cred_str: &str) -> String {
-    let map: serde_json::Map<String, serde_json::Value> = secret_var_names
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                serde_json::Value::String(cred_str.to_string()),
-            )
-        })
         .collect();
     serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
 }

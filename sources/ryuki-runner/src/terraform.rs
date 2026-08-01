@@ -26,11 +26,12 @@ use std::time::Duration;
 use ryuki_engine::runners::{
     ResolvedCredentials, RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind,
 };
+use zeroize::Zeroizing;
 
 use super::{
     exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
     executable::{ApprovedExecutable, ApprovedTool},
-    scrub::scrub_output,
+    scrub::scrub_captured_output,
     workspace::Workspace,
     Runner,
 };
@@ -305,7 +306,7 @@ impl Runner for TerraformRunner {
         // Build the per-component secret values for scrubbing.
         // Splitting into components ensures each comma-separated value is
         // redacted individually — prevents partial leakage.
-        let components: Vec<Vec<u8>> = credential_components(creds.material.as_slice());
+        let components = Zeroizing::new(credential_components(creds.material.as_slice()));
         let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
         // --- Binary availability check ---
@@ -342,9 +343,11 @@ impl Runner for TerraformRunner {
         // Build the credential string (UTF-8 interpretation of raw material).
         // For Slice 1 we use the full material as a single credential value and
         // inject it as TF_VAR_<name> for each secret_var_name in the plan.
-        let cred_str = std::str::from_utf8(creds.material.as_slice())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| String::new());
+        let cred_str = Zeroizing::new(
+            std::str::from_utf8(creds.material.as_slice())
+                .map(str::to_owned)
+                .unwrap_or_default(),
+        );
 
         // --- Step 1: terraform init ---
         // env_clear() + allowlist applied; CHECKPOINT_DISABLE and TF_LOG
@@ -367,19 +370,23 @@ impl Runner for TerraformRunner {
         // Inject credential material for each named secret var.
         for secret_name in &plan.secret_var_names {
             let env_key = format!("TF_VAR_{}", secret_name);
-            init_cmd.env(&env_key, &cred_str);
+            init_cmd.env(&env_key, cred_str.as_str());
         }
 
-        let init_output = run_command_with_optional_cancellation(
+        let mut init_output = run_command_with_optional_cancellation(
             init_cmd,
             RUNNER_TIMEOUT,
             self.cancellation.as_ref(),
         )
         .map_err(|error| terraform_phase_error("init", error))?;
+        let init_log = scrub_captured_output(
+            &mut init_output.stdout,
+            &mut init_output.stderr,
+            &secret_refs,
+            true,
+        );
 
         if !init_output.status.success() {
-            let raw = combine_output(&init_output.stdout, &init_output.stderr);
-            let scrubbed = scrub_output(&raw, &secret_refs);
             return Ok(RunOutcome {
                 runner_kind: RunnerKind::Terraform,
                 mode: plan.mode,
@@ -388,7 +395,7 @@ impl Runner for TerraformRunner {
                     "terraform init failed (exit {})",
                     init_output.status.code().unwrap_or(-1)
                 ),
-                log: scrubbed,
+                log: init_log,
                 exit_code: init_output.status.code(),
                 post_apply: None,
             });
@@ -407,15 +414,19 @@ impl Runner for TerraformRunner {
             .env("CHECKPOINT_DISABLE", "1")
             .env_remove("TF_LOG");
 
-        let validate_output = run_command_with_optional_cancellation(
+        let mut validate_output = run_command_with_optional_cancellation(
             validate_cmd,
             RUNNER_TIMEOUT,
             self.cancellation.as_ref(),
         )
         .map_err(|error| terraform_phase_error("validate", error))?;
 
-        let validate_raw = combine_output(&validate_output.stdout, &validate_output.stderr);
-        let validate_log = scrub_output(&validate_raw, &secret_refs);
+        let validate_log = scrub_captured_output(
+            &mut validate_output.stdout,
+            &mut validate_output.stderr,
+            &secret_refs,
+            true,
+        );
 
         if !validate_output.status.success() {
             // Validate failed — configuration is invalid against the provider
@@ -452,7 +463,7 @@ impl Runner for TerraformRunner {
 
         for secret_name in &plan.secret_var_names {
             let env_key = format!("TF_VAR_{}", secret_name);
-            plan_cmd.env(&env_key, &cred_str);
+            plan_cmd.env(&env_key, cred_str.as_str());
         }
 
         let plan_result = run_command_with_optional_cancellation(
@@ -501,9 +512,13 @@ impl Runner for TerraformRunner {
                     post_apply: None,
                 })
             }
-            Ok(plan_output) => {
-                let plan_raw = combine_output(&plan_output.stdout, &plan_output.stderr);
-                let plan_log = scrub_output(&plan_raw, &secret_refs);
+            Ok(mut plan_output) => {
+                let plan_log = scrub_captured_output(
+                    &mut plan_output.stdout,
+                    &mut plan_output.stderr,
+                    &secret_refs,
+                    true,
+                );
 
                 // Terraform exit codes:
                 //   0 — succeeded, no changes
@@ -555,6 +570,7 @@ impl Runner for TerraformRunner {
 // ---------------------------------------------------------------------------
 
 /// Combine stdout and stderr into a single string for scrubbing.
+#[cfg(test)]
 pub(crate) fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
     let mut s = String::new();
     if !stdout.is_empty() {

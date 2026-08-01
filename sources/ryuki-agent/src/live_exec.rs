@@ -44,6 +44,7 @@ use ryuki_protocol::{
     EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION, EXECUTION_TRUST_PROFILE_SCHEMA_VERSION,
     PROVIDER_CREDENTIAL_AUTHORITY_MODE, TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
 };
+use ryuki_runner::ZeroizingTfPlan;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -73,7 +74,7 @@ pub struct LivePlanOutcome {
     pub raw_plan_digest: String,
     /// Raw binary `tfplan` bytes from `terraform plan -out=tfplan`.
     /// Thread these through to `apply()` unchanged to close the TOCTOU hole.
-    pub tfplan: Vec<u8>,
+    pub tfplan: ZeroizingTfPlan,
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +727,7 @@ impl RunnerLiveExecutor {
                     raw_plan_digest,
                     // Ansible has no saved plan artifact — tfplan is empty.
                     // apply() re-runs the same playbook + vars (AWX model).
-                    tfplan: vec![],
+                    tfplan: ZeroizingTfPlan::empty(),
                 })
             }
         }
@@ -955,7 +956,7 @@ pub struct StubLiveExecutor {
     destroy_calls: std::sync::atomic::AtomicU32,
     /// The tfplan bytes most recently received by `apply()`.
     /// Wrapped in a Mutex so tests can read it from the outside.
-    last_apply_tfplan: std::sync::Mutex<Vec<u8>>,
+    last_apply_tfplan: std::sync::Mutex<ZeroizingTfPlan>,
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -979,7 +980,7 @@ impl StubLiveExecutor {
             plan_calls: std::sync::atomic::AtomicU32::new(0),
             apply_calls: std::sync::atomic::AtomicU32::new(0),
             destroy_calls: std::sync::atomic::AtomicU32::new(0),
-            last_apply_tfplan: std::sync::Mutex::new(vec![]),
+            last_apply_tfplan: std::sync::Mutex::new(ZeroizingTfPlan::empty()),
         }
     }
 
@@ -1006,7 +1007,7 @@ impl StubLiveExecutor {
             LivePlanOutcome {
                 evidence: plan_evidence,
                 raw_plan_digest,
-                tfplan: plan_bytes.to_vec(),
+                tfplan: ZeroizingTfPlan::from(plan_bytes),
             },
             apply_evidence,
         )
@@ -1035,7 +1036,7 @@ impl StubLiveExecutor {
     /// stub.apply(&spec, &outcome.tfplan).unwrap();
     /// assert_eq!(stub.last_apply_tfplan(), outcome.tfplan);
     /// ```
-    pub fn last_apply_tfplan(&self) -> Vec<u8> {
+    pub fn last_apply_tfplan(&self) -> ZeroizingTfPlan {
         self.last_apply_tfplan
             .lock()
             .expect("mutex not poisoned")
@@ -1054,7 +1055,7 @@ impl StubLiveExecutor {
                 evidence_json: None,
             },
             raw_plan_digest: String::new(),
-            tfplan: vec![],
+            tfplan: ZeroizingTfPlan::empty(),
         };
         let dummy_apply = Evidence {
             status: RunStatus::Failed,
@@ -1074,7 +1075,7 @@ impl StubLiveExecutor {
             plan_calls: std::sync::atomic::AtomicU32::new(0),
             apply_calls: std::sync::atomic::AtomicU32::new(0),
             destroy_calls: std::sync::atomic::AtomicU32::new(0),
-            last_apply_tfplan: std::sync::Mutex::new(vec![]),
+            last_apply_tfplan: std::sync::Mutex::new(ZeroizingTfPlan::empty()),
         }
     }
 }
@@ -1145,7 +1146,7 @@ impl LiveExecutor for StubLiveExecutor {
         self.apply_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Record the tfplan bytes for thread-through assertion in tests.
-        *self.last_apply_tfplan.lock().expect("mutex not poisoned") = tfplan.to_vec();
+        *self.last_apply_tfplan.lock().expect("mutex not poisoned") = ZeroizingTfPlan::from(tfplan);
         Ok(self.apply_evidence.clone())
     }
 
@@ -1217,7 +1218,23 @@ mod tests {
         // raw_plan_digest == sha256_hex(plan_bytes)
         assert_eq!(outcome.raw_plan_digest, sha256_hex(plan_bytes));
         // tfplan bytes must be the same as plan_bytes (stub threads them through).
-        assert_eq!(outcome.tfplan, plan_bytes);
+        assert_eq!(outcome.tfplan.as_slice(), plan_bytes);
+    }
+
+    #[test]
+    fn live_plan_outcome_debug_redacts_tfplan_bytes() {
+        let outcome = LivePlanOutcome {
+            evidence: Evidence {
+                status: RunStatus::Planned,
+                evidence_bytes: b"safe evidence".to_vec(),
+                evidence_json: None,
+            },
+            raw_plan_digest: sha256_hex(b"safe evidence"),
+            tfplan: ZeroizingTfPlan::from(&b"raw-tfplan-debug-sentinel"[..]),
+        };
+        let debug = format!("{outcome:?}");
+        assert!(debug.contains("<redacted:"));
+        assert!(!debug.contains("raw-tfplan-debug-sentinel"));
     }
 
     #[test]
@@ -1304,8 +1321,9 @@ mod tests {
             .expect("apply must succeed");
 
         // The stub recorded what it received.
+        let recorded = stub.last_apply_tfplan();
         assert_eq!(
-            stub.last_apply_tfplan(),
+            recorded.as_slice(),
             PLAN_BYTES,
             "apply must receive the exact tfplan bytes produced by plan"
         );

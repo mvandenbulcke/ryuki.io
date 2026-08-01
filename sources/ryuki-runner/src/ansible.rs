@@ -23,17 +23,19 @@
 //! - `-vvv` (verbose) is never passed.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::process::Command;
 use std::time::Duration;
 
 use ryuki_engine::runners::{
     ResolvedCredentials, RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind,
 };
+use zeroize::Zeroizing;
 
 use super::{
     exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
     executable::{ApprovedExecutable, ApprovedTool},
-    scrub::scrub_output,
+    scrub::scrub_captured_output,
     terraform::{
         credential_components, pin_home_tmpdir_to_workspace, validate_offering_slug,
         validate_var_name, ENV_ALLOWLIST,
@@ -169,20 +171,6 @@ fn apply_env_allowlist(cmd: &mut Command) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut s = String::new();
-    if !stdout.is_empty() {
-        s.push_str(&String::from_utf8_lossy(stdout));
-    }
-    if !stderr.is_empty() {
-        if !s.is_empty() && !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s.push_str(&String::from_utf8_lossy(stderr));
-    }
-    s
-}
-
 /// Serialize vars to valid JSON for `--extra-vars @file.json`.
 ///
 /// Uses `serde_json` to guarantee correct escaping of all values, including
@@ -195,26 +183,109 @@ fn vars_to_json(vars: &BTreeMap<String, String>) -> String {
     serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Serialize secret vars (name → value) to valid JSON for `--extra-vars @<secrets-file>`.
-/// This is a separate file written at 0600; the values are the resolved credential
-/// material mapped to each secret_var_name in the plan.
+/// Counts serialized bytes without retaining any secret-bearing output.
+#[derive(Default)]
+struct JsonLengthCounter {
+    len: usize,
+}
+
+impl Write for JsonLengthCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self.len.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "secret JSON length overflow")
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A secret-owning JSON writer which rejects any write beyond its preflighted
+/// byte count. The backing allocation is reserved before serialization starts,
+/// so plaintext can never be abandoned by a `Vec` reallocation.
+struct BoundedZeroizingWriter {
+    bytes: Zeroizing<Vec<u8>>,
+    limit: usize,
+}
+
+impl BoundedZeroizingWriter {
+    fn with_limit(limit: usize) -> Result<Self, RunnerError> {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes.try_reserve_exact(limit).map_err(|_| {
+            RunnerError::CredInjection(
+                "failed to reserve Ansible secret extra-vars JSON buffer".to_string(),
+            )
+        })?;
+        Ok(Self { bytes, limit })
+    }
+
+    fn finish(self) -> Result<Zeroizing<Vec<u8>>, RunnerError> {
+        if self.bytes.len() != self.limit {
+            return Err(secret_json_serialization_error());
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Write for BoundedZeroizingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "secret JSON length overflow")
+        })?;
+        if end > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "secret JSON exceeded preflighted length",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn secret_json_serialization_error() -> RunnerError {
+    RunnerError::CredInjection("failed to serialize Ansible secret extra-vars JSON".to_string())
+}
+
+/// Serialize secret vars (name → value) to valid JSON for
+/// `--extra-vars @<secrets-file>`.
+///
+/// This is a separate file written at 0600; the values are the resolved
+/// credential material mapped to each secret variable name in the plan. The
+/// returned bytes own plaintext only inside a zeroizing, non-growing buffer.
 ///
 /// Uses `serde_json` to guarantee correct escaping of all values, including
-/// credential material containing `"`, `\`, newlines, and arbitrary Unicode/control chars.
+/// credential material containing `"`, `\`, newlines, and arbitrary
+/// Unicode/control chars.
 ///
-/// For Slice 1 all secret vars share the same credential material. A future slice
-/// with per-name credentials will extend this mapping.
-fn secrets_to_json(secret_var_names: &[String], cred_str: &str) -> String {
-    let map: serde_json::Map<String, serde_json::Value> = secret_var_names
+/// For Slice 1 all secret vars share the same credential material. A future
+/// slice with per-name credentials will extend this mapping.
+pub(super) fn secrets_to_json(
+    secret_var_names: &[String],
+    cred_str: &str,
+) -> Result<Zeroizing<Vec<u8>>, RunnerError> {
+    let map: BTreeMap<&str, &str> = secret_var_names
         .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                serde_json::Value::String(cred_str.to_string()),
-            )
-        })
+        .map(|name| (name.as_str(), cred_str))
         .collect();
-    serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string())
+
+    // The first pass retains only a byte count. The second pass writes into a
+    // zeroizing buffer whose hard limit matches that count, so it cannot grow
+    // and leave an old plaintext allocation behind.
+    let mut counter = JsonLengthCounter::default();
+    serde_json::to_writer_pretty(&mut counter, &map)
+        .map_err(|_| secret_json_serialization_error())?;
+
+    let mut writer = BoundedZeroizingWriter::with_limit(counter.len)?;
+    serde_json::to_writer_pretty(&mut writer, &map)
+        .map_err(|_| secret_json_serialization_error())?;
+    writer.finish()
 }
 
 /// Extract a one-line summary from scrubbed ansible output.
@@ -292,7 +363,7 @@ impl Runner for AnsibleRunner {
         };
 
         // Build per-component secret values for scrubbing.
-        let components: Vec<Vec<u8>> = credential_components(creds.material.as_slice());
+        let components = Zeroizing::new(credential_components(creds.material.as_slice()));
         let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
         // --- Binary availability check ---
@@ -336,11 +407,13 @@ impl Runner for AnsibleRunner {
         // Using an extra-vars file means a var named `ANSIBLE_CONFIG` becomes
         // a playbook variable, not an env var that overrides Ansible's config.
         let secrets_file_arg: Option<String> = if !plan.secret_var_names.is_empty() {
-            let cred_str = std::str::from_utf8(creds.material.as_slice())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| String::new());
-            let secrets_json = secrets_to_json(&plan.secret_var_names, &cred_str);
-            let secrets_path = ws.write_file_0600("ryuki-secrets.json", secrets_json.as_bytes())?;
+            let cred_str = Zeroizing::new(
+                std::str::from_utf8(creds.material.as_slice())
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            );
+            let secrets_json = secrets_to_json(&plan.secret_var_names, &cred_str)?;
+            let secrets_path = ws.write_file_0600("ryuki-secrets.json", secrets_json.as_slice())?;
             Some(format!("@{}", secrets_path.to_string_lossy()))
         } else {
             None
@@ -385,12 +458,12 @@ impl Runner for AnsibleRunner {
 
         // Execute with bounded timeout. A hung ansible (unreachable host, etc.)
         // is killed and returns Err(RunnerError::Timeout) to the caller.
-        let output =
+        let mut output =
             run_command_with_optional_cancellation(cmd, RUNNER_TIMEOUT, self.cancellation.as_ref())
                 .map_err(ansible_check_error)?;
 
-        let raw = combine_output(&output.stdout, &output.stderr);
-        let scrubbed_log = scrub_output(&raw, &secret_refs);
+        let scrubbed_log =
+            scrub_captured_output(&mut output.stdout, &mut output.stderr, &secret_refs, true);
 
         // Ansible exit codes:
         //   0 — success (no changes in --check mode)
@@ -859,10 +932,26 @@ mod tests {
     #[test]
     fn secrets_to_json_contains_secret_value() {
         let names = vec!["api_key".to_string(), "db_pass".to_string()];
-        let json = secrets_to_json(&names, "s3cr3t");
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let json = secrets_to_json(&names, "s3cr3t").expect("serialize secret JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(json.as_slice()).expect("valid JSON");
         assert_eq!(parsed["api_key"], "s3cr3t");
         assert_eq!(parsed["db_pass"], "s3cr3t");
+    }
+
+    #[test]
+    fn secret_json_writer_never_reallocates_or_exceeds_its_limit() {
+        let mut writer = BoundedZeroizingWriter::with_limit(4).expect("reserve buffer");
+        let allocation = writer.bytes.as_ptr();
+        let capacity = writer.bytes.capacity();
+
+        writer.write_all(b"abcd").expect("write within limit");
+        assert_eq!(writer.bytes.as_ptr(), allocation);
+        assert_eq!(writer.bytes.capacity(), capacity);
+        assert!(writer.write_all(b"e").is_err());
+        assert_eq!(writer.bytes.as_slice(), b"abcd");
+        assert_eq!(writer.bytes.as_ptr(), allocation);
+        assert_eq!(writer.bytes.capacity(), capacity);
     }
 
     /// Round-trip test: an ansible extra-var value containing `"`, `\`, a
@@ -893,8 +982,8 @@ mod tests {
     fn secrets_to_json_roundtrips_special_chars() {
         let tricky_cred = "cred\"with\\newline\nunicode\u{1F525}end";
         let names = vec!["api_key".to_string(), "db_pass".to_string()];
-        let json = secrets_to_json(&names, tricky_cred);
-        let parsed: serde_json::Value = serde_json::from_str(&json)
+        let json = secrets_to_json(&names, tricky_cred).expect("serialize secret JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(json.as_slice())
             .expect("secrets_to_json must produce valid JSON for special chars");
         assert_eq!(
             parsed["api_key"].as_str().unwrap(),

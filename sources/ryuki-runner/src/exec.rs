@@ -54,6 +54,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use ryuki_engine::runners::RunnerError;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default timeout used for both terraform init+plan and ansible --check.
 pub const RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -539,8 +540,14 @@ fn run_command_supervised_with_limits_in_containment(
     child_reaper_sender()?;
     let admission = SUPERVISOR_BUDGET.acquire(capture_reservation_bytes(limits))?;
 
-    let child = retry_on_etxtbsy(|| cmd.spawn())
-        .map_err(|error| SupervisedCommandError::Spawn(error.to_string()))?;
+    let child = retry_on_etxtbsy(|| cmd.spawn());
+    // `Command` retains owned copies of explicitly injected environment
+    // values. They are no longer needed after the spawn attempt, so release
+    // them immediately instead of retaining credential copies for the entire
+    // subprocess lifetime. `std::process::Command` does not expose mutable
+    // access to the backing `OsString` bytes for explicit zeroization.
+    cmd.env_clear();
+    let child = child.map_err(|error| SupervisedCommandError::Spawn(error.to_string()))?;
     let (reap_slot, capture_reservation) = admission.into_slots();
 
     let cleanup_hold = cancellation.and_then(CommandCancellation::cleanup_hold);
@@ -580,10 +587,14 @@ fn run_command_supervised_with_limits_in_containment(
         Ok(task) => task,
         Err(error) => {
             capture_control.store(CAPTURE_ABORT, Ordering::Release);
-            let stopped = receive_capture(Some(stdout_thread), capture_shutdown_deadline());
+            let mut stopped = receive_capture(Some(stdout_thread), capture_shutdown_deadline());
             if capture_stop_unconfirmed(&stopped) {
                 std::mem::forget(capture_reservation);
             }
+            // The stdout collector may already have returned provider output.
+            // A stderr-thread spawn failure must discard that plaintext through
+            // the same zeroizing path as every other aborted capture.
+            zeroize_capture_result(&mut stopped);
             return Err(error);
         }
     };
@@ -1002,6 +1013,12 @@ fn child_reaper_loop(receiver: Receiver<DeferredChild>) {
 
 type CaptureResult = Result<Vec<u8>, SupervisedCommandError>;
 
+fn zeroize_capture_result(result: &mut CaptureResult) {
+    if let Ok(captured) = result {
+        captured.zeroize();
+    }
+}
+
 struct CaptureTask {
     result: Receiver<CaptureResult>,
     scope: OutputScope,
@@ -1028,7 +1045,10 @@ fn spawn_capture<R: Read + Send + 'static>(
                 &stop_reason,
                 &capture_control,
             );
-            let _ = sender.send(captured);
+            if let Err(error) = sender.send(captured) {
+                let mut abandoned = error.0;
+                zeroize_capture_result(&mut abandoned);
+            }
         })
         .map_err(|error| {
             SupervisedCommandError::Capture(format!(
@@ -1047,24 +1067,24 @@ fn read_capped(
     capture_control: &AtomicU8,
 ) -> CaptureResult {
     // The process-wide budget reserved the worst-case stream capacity before
-    // spawn. Start smaller so ordinary short outputs do not retain a full-cap
-    // allocation after they leave the active supervisor.
-    let mut captured = Vec::with_capacity(limits.per_stream.min(64 * 1024));
-    let mut chunk = [0u8; 8192];
+    // spawn. Allocate it once so captured plaintext can never be copied into a
+    // larger allocation while an old, unwiped buffer is released by `Vec`.
+    let mut captured = Zeroizing::new(Vec::with_capacity(limits.per_stream));
+    let mut chunk = Zeroizing::new([0u8; 8192]);
     loop {
         if capture_control.load(Ordering::Acquire) == CAPTURE_ABORT {
-            return Ok(captured);
+            return Ok(std::mem::take(&mut *captured));
         }
         if stop_reason.load(Ordering::Acquire) != STOP_NONE {
-            return Ok(captured);
+            return Ok(std::mem::take(&mut *captured));
         }
-        let read = match reader.read(&mut chunk) {
-            Ok(0) => return Ok(captured),
+        let read = match reader.read(&mut chunk[..]) {
+            Ok(0) => return Ok(std::mem::take(&mut *captured)),
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if capture_control.load(Ordering::Acquire) != CAPTURE_RUNNING {
-                    return Ok(captured);
+                    return Ok(std::mem::take(&mut *captured));
                 }
                 std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
                 continue;
@@ -1157,16 +1177,25 @@ impl CaptureThreads {
         self.finish_reservation(uncertain);
         match (stdout, stderr) {
             (Ok(stdout), Ok(stderr)) => Ok((stdout, stderr)),
-            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Err(error), mut other) => {
+                zeroize_capture_result(&mut other);
+                Err(error)
+            }
+            (mut other, Err(error)) => {
+                zeroize_capture_result(&mut other);
+                Err(error)
+            }
         }
     }
 
     fn abort_discard(&mut self) {
         self.control.store(CAPTURE_ABORT, Ordering::Release);
         let deadline = capture_shutdown_deadline();
-        let stdout = receive_capture(self.stdout.take(), deadline);
-        let stderr = receive_capture(self.stderr.take(), deadline);
+        let mut stdout = receive_capture(self.stdout.take(), deadline);
+        let mut stderr = receive_capture(self.stderr.take(), deadline);
         let uncertain = capture_stop_unconfirmed(&stdout) || capture_stop_unconfirmed(&stderr);
+        zeroize_capture_result(&mut stdout);
+        zeroize_capture_result(&mut stderr);
         self.finish_reservation(uncertain);
     }
 
@@ -1646,6 +1675,39 @@ mod tests {
         .expect_err("reader failure must be terminal");
         assert!(matches!(error, SupervisedCommandError::Capture(_)));
         assert_eq!(stop_reason.load(Ordering::Acquire), STOP_CAPTURE);
+    }
+
+    #[test]
+    fn successful_capture_result_is_zeroized_before_discard() {
+        let mut result = Ok(b"capture-plaintext-canary".to_vec());
+        zeroize_capture_result(&mut result);
+        assert!(matches!(result, Ok(ref captured) if captured.is_empty()));
+    }
+
+    #[test]
+    fn capture_preallocates_the_admitted_stream_limit() {
+        let total = AtomicUsize::new(0);
+        let stop_reason = AtomicU8::new(STOP_NONE);
+        let capture_control = AtomicU8::new(CAPTURE_RUNNING);
+        let per_stream = 128 * 1024;
+        let captured = read_capped(
+            io::Cursor::new(b"short provider output"),
+            OutputScope::Stdout,
+            CaptureLimits {
+                per_stream,
+                combined: per_stream * 2,
+            },
+            &total,
+            &stop_reason,
+            &capture_control,
+        )
+        .expect("capture must succeed");
+
+        assert_eq!(captured, b"short provider output");
+        assert!(
+            captured.capacity() >= per_stream,
+            "capture must never reallocate plaintext below its admitted limit"
+        );
     }
 
     #[test]

@@ -97,8 +97,87 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 // ---------------------------------------------------------------------------
-// LivePlanArtifacts — returned by run_live_plan
+// ZeroizingTfPlan / LivePlanArtifacts — returned by run_live_plan
 // ---------------------------------------------------------------------------
+
+/// Process-local saved Terraform plan bytes.
+///
+/// This opaque owner keeps the artifact in a zeroize-on-drop allocation from
+/// the bounded file read through the exact-plan apply handoff. It intentionally
+/// implements neither `Serialize` nor `Deserialize`, and its `Debug` output
+/// never exposes the plan contents.
+///
+/// ```compile_fail
+/// let plan = ryuki_runner::ZeroizingTfPlan::from(&b"opaque plan"[..]);
+/// let _ = serde_json::to_string(&plan);
+/// ```
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct ZeroizingTfPlan {
+    bytes: Vec<u8>,
+}
+
+impl ZeroizingTfPlan {
+    /// Take ownership of saved-plan bytes and zeroize their allocation on drop.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// Construct an empty saved-plan owner for non-Terraform and failed plans.
+    pub fn empty() -> Self {
+        Self::new(Vec::new())
+    }
+
+    fn zeroed(length: usize) -> Self {
+        Self::new(vec![0; length])
+    }
+
+    /// Borrow the exact saved-plan bytes without transferring ownership.
+    pub fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    /// Return the current saved-plan length.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the saved plan contains no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for ZeroizingTfPlan {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl From<&[u8]> for ZeroizingTfPlan {
+    fn from(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_vec())
+    }
+}
+
+impl AsRef<[u8]> for ZeroizingTfPlan {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for ZeroizingTfPlan {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for ZeroizingTfPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<redacted:{} bytes>", self.len())
+    }
+}
 
 /// Artifacts produced by a successful `run_live_plan` call.
 ///
@@ -120,7 +199,7 @@ pub struct LivePlanArtifacts {
     /// redaction. Present only when `outcome.status == Planned`.
     pub raw_plan_digest: Option<String>,
     /// Raw binary `tfplan` file. Pass to `run_live_apply` unchanged.
-    pub tfplan: Vec<u8>,
+    pub tfplan: ZeroizingTfPlan,
 }
 
 impl std::fmt::Debug for LivePlanArtifacts {
@@ -140,9 +219,12 @@ impl std::fmt::Debug for LivePlanArtifacts {
 use super::{
     exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
     executable::{ApprovedExecutable, ApprovedTool},
-    scrub::{append_go_json_escape_variants, basic_auth_canonical_variants, scrub, scrub_output},
+    scrub::{
+        append_go_json_escape_variants, basic_auth_canonical_variants, scrub_captured_output,
+        scrub_output, take_captured_output,
+    },
     terraform::{
-        apply_env_allowlist, combine_output, credential_components, pin_home_tmpdir_to_workspace,
+        apply_env_allowlist, credential_components, pin_home_tmpdir_to_workspace,
         validate_offering_slug, validate_var_name, TERRAFORM_INIT_ARGS,
     },
     workspace::Workspace,
@@ -166,7 +248,7 @@ pub const STATE_KEY_PLACEHOLDER: &str = "{STATE_KEY}";
 /// in-cluster credential discovery before Terraform can be spawned.
 pub const BACKEND_CREDENTIAL_AUTHORITY_POLICY_VERSION: &str = "ryuki.closed-schema-inline-scalars-no-file-ambient-metadata-cli-workload-in-cluster-no-remote-execution.v1";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 enum BackendHclToken {
     Ident(String),
     Quoted(String),
@@ -187,6 +269,39 @@ enum BackendSecretKind {
     ConnectionString,
     PrivateKey,
     Certificate,
+}
+
+/// Own a parsed URL behind a destructor that wipes the parser's normalized
+/// serialization on every exit path, including validation failures.
+///
+/// `url::Url` owns a normalized `String` that can contain credentials even
+/// when the original input was only borrowed. Converting it back into a
+/// `String` transfers that allocation without copying so `Zeroizing` can clear
+/// it before deallocation.
+struct ZeroizingUrl(Option<url::Url>);
+
+impl ZeroizingUrl {
+    fn new(url: url::Url) -> Self {
+        Self(Some(url))
+    }
+}
+
+impl std::ops::Deref for ZeroizingUrl {
+    type Target = url::Url;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("zeroizing URL remains present until drop")
+    }
+}
+
+impl Drop for ZeroizingUrl {
+    fn drop(&mut self) {
+        if let Some(url) = self.0.take() {
+            let _normalized = Zeroizing::new(String::from(url));
+        }
+    }
 }
 
 fn backend_secret_kind(backend_type: &str, attribute: &str) -> Option<BackendSecretKind> {
@@ -483,7 +598,7 @@ fn backend_public_url_attribute(backend_type: &str, attribute: &str) -> bool {
 fn backend_redaction_values(
     rendered_hcl: &str,
     backend_type: &str,
-) -> Result<Vec<Vec<u8>>, RunnerError> {
+) -> Result<Zeroizing<Vec<Vec<u8>>>, RunnerError> {
     let tokens = tokenize_backend_hcl(rendered_hcl)?;
     let (located_backend_type, open, close) = locate_backend_block(&tokens)?;
     if located_backend_type != backend_type {
@@ -496,7 +611,7 @@ fn backend_redaction_values(
             "live Terraform backend type {backend_type:?} has no approved attribute schema"
         ))
     })?;
-    let mut values = Vec::new();
+    let mut values = Zeroizing::new(Vec::new());
     let mut depth = 0usize;
     let mut index = open + 1;
     while index < close {
@@ -606,15 +721,16 @@ fn backend_redaction_values(
     for (index, token) in tokens.iter().enumerate().take(close).skip(open + 1) {
         if let BackendHclToken::Quoted(value) = token {
             let decoded_value = decode_backend_quoted_value(value);
-            if let Ok(parsed) = url::Url::parse(&decoded_value) {
+            if let Ok(parsed) = url::Url::parse(decoded_value.as_str()) {
+                let parsed = ZeroizingUrl::new(parsed);
                 let direct_secret = direct_backend_attribute_for_value(&tokens, open, index)
                     .and_then(|attribute| backend_secret_kind(backend_type, attribute));
-                if direct_secret.is_none()
+                let forbidden_public_components = direct_secret.is_none()
                     && (!parsed.username().is_empty()
                         || parsed.password().is_some()
                         || parsed.query().is_some()
-                        || parsed.fragment().is_some())
-                {
+                        || parsed.fragment().is_some());
+                if forbidden_public_components {
                     return Err(RunnerError::Spawn(format!(
                         "live Terraform {backend_type:?} backend public URL values cannot contain userinfo, query parameters, or fragments"
                     )));
@@ -631,13 +747,21 @@ fn backend_redaction_values(
         let decoded_password = password.map(decode_backend_quoted_value); // secret-scan-allow: parsed credential reference, not a literal
         append_basic_auth_variants(
             &mut values,
-            decoded_username.as_deref(),
-            decoded_password.as_deref(),
+            decoded_username.as_ref().map(|value| value.as_str()),
+            decoded_password.as_ref().map(|value| value.as_str()), // secret-scan-allow: parsed credential reference, not a literal
         );
     }
     validate_backend_credential_authority(backend_type, &tokens, open, close)?;
     values.sort_unstable();
-    values.dedup();
+    values.dedup_by(|removed, retained| {
+        let duplicate = removed == retained;
+        if duplicate {
+            // `Vec::dedup_by` removes its first argument. Clear the duplicate
+            // allocation before the collection drops it normally.
+            removed.zeroize();
+        }
+        duplicate
+    });
     Ok(values)
 }
 
@@ -895,12 +1019,13 @@ fn append_backend_secret_value(
     values.push(value.as_bytes().to_vec());
     append_go_json_escape_variants(values, value.as_bytes());
     append_backend_secret_components(values, value, secret_kind);
-    let quoted_json = format!("\"{value}\"");
-    if let Ok(decoded) = serde_json::from_str::<String>(&quoted_json) {
+    let quoted_json = zeroizing_json_quoted(value);
+    if let Ok(decoded) = serde_json::from_str::<String>(quoted_json.as_str()) {
+        let decoded = Zeroizing::new(decoded);
         if !decoded.is_empty() && decoded.as_bytes() != value.as_bytes() {
-            append_backend_secret_components(values, &decoded, secret_kind);
+            append_backend_secret_components(values, decoded.as_str(), secret_kind);
             append_go_json_escape_variants(values, decoded.as_bytes());
-            values.push(decoded.into_bytes());
+            values.push(decoded.as_bytes().to_vec());
         }
     }
 }
@@ -930,31 +1055,34 @@ fn append_connection_string_components(values: &mut Vec<Vec<u8>>, connection_str
     let Ok(parsed) = url::Url::parse(connection_string) else {
         return;
     };
+    let parsed = ZeroizingUrl::new(parsed);
     if !parsed.username().is_empty() {
         values.push(parsed.username().as_bytes().to_vec());
-        let decoded = percent_decode_url_component(parsed.username());
+        let decoded = Zeroizing::new(percent_decode_url_component(parsed.username()));
         if decoded.as_slice() != parsed.username().as_bytes() {
-            values.push(decoded);
+            values.push(decoded.to_vec());
         }
     }
     if let Some(password) = parsed.password().filter(|value| !value.is_empty()) {
         values.push(password.as_bytes().to_vec());
-        let decoded = percent_decode_url_component(password);
+        let decoded = Zeroizing::new(percent_decode_url_component(password));
         if decoded.as_slice() != password.as_bytes() {
-            values.push(decoded);
+            values.push(decoded.to_vec());
         }
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         let raw_username = parsed.username();
         let raw_password = parsed.password(); // secret-scan-allow: parsed credential reference, not a literal
         append_basic_auth_variants(values, Some(raw_username), raw_password);
-        let decoded_username = percent_decode_url_component(raw_username);
-        let decoded_password = raw_password.map(percent_decode_url_component); // secret-scan-allow: parsed credential reference, not a literal
+        let decoded_username = Zeroizing::new(percent_decode_url_component(raw_username));
+        // secret-scan-allow: parsed credential reference, not a literal
+        let decoded_password =
+            raw_password.map(|value| Zeroizing::new(percent_decode_url_component(value)));
         if let (Ok(decoded_username), Ok(decoded_password)) = (
-            std::str::from_utf8(&decoded_username),
+            std::str::from_utf8(decoded_username.as_slice()),
             decoded_password
-                .as_deref()
-                .map(std::str::from_utf8)
+                .as_ref()
+                .map(|value| std::str::from_utf8(value.as_slice()))
                 .transpose(),
         ) {
             append_basic_auth_variants(values, Some(decoded_username), decoded_password);
@@ -976,13 +1104,14 @@ fn append_query_string_components(values: &mut Vec<Vec<u8>>, query: &str) {
         }
         values.push(raw_value.as_bytes().to_vec());
         append_go_json_escape_variants(values, raw_value.as_bytes());
-        let decoded = percent_decode_url_component(raw_value);
+        let decoded = Zeroizing::new(percent_decode_url_component(raw_value));
         if decoded.as_slice() != raw_value.as_bytes() {
-            append_go_json_escape_variants(values, &decoded);
-            values.push(decoded);
+            append_go_json_escape_variants(values, decoded.as_slice());
+            values.push(decoded.to_vec());
         }
     }
     for (_, decoded_value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let decoded_value = Zeroizing::new(decoded_value.into_owned());
         if !decoded_value.is_empty() {
             append_go_json_escape_variants(values, decoded_value.as_bytes());
             values.push(decoded_value.as_bytes().to_vec());
@@ -1159,8 +1288,8 @@ fn validate_backend_quoted_syntax(value: &str) -> Result<(), RunnerError> {
         ));
     }
     if value.contains('\\') {
-        let quoted_json = format!("\"{value}\"");
-        if serde_json::from_str::<String>(&quoted_json).is_err() {
+        let quoted_json = zeroizing_json_quoted(value);
+        if serde_json::from_str::<&serde_json::value::RawValue>(quoted_json.as_str()).is_err() {
             return Err(RunnerError::Spawn(
                 "live Terraform backend quoted value uses an unsupported escape sequence"
                     .to_string(),
@@ -1531,18 +1660,26 @@ fn backend_secret_kind_name(kind: BackendSecretKind) -> &'static str {
     }
 }
 
-fn decode_backend_quoted_value(value: &str) -> String {
+fn zeroizing_json_quoted(value: &str) -> Zeroizing<String> {
+    let mut quoted = Zeroizing::new(String::with_capacity(value.len().saturating_add(2)));
+    quoted.push('"');
+    quoted.push_str(value);
+    quoted.push('"');
+    quoted
+}
+
+fn decode_backend_quoted_value(value: &str) -> Zeroizing<String> {
     if value.contains('\\') {
-        let quoted_json = format!("\"{value}\"");
-        if let Ok(decoded) = serde_json::from_str::<String>(&quoted_json) {
-            return decoded;
+        let quoted_json = zeroizing_json_quoted(value);
+        if let Ok(decoded) = serde_json::from_str::<String>(quoted_json.as_str()) {
+            return Zeroizing::new(decoded);
         }
     }
-    value.to_string()
+    Zeroizing::new(value.to_string())
 }
 
 fn sanitized_backend_url_authority(value: &str) -> Option<Vec<u8>> {
-    let parsed = url::Url::parse(value).ok()?;
+    let parsed = ZeroizingUrl::new(url::Url::parse(value).ok()?);
     let mut canonical = Vec::new();
     append_backend_authority_component(&mut canonical, b'S', parsed.scheme().as_bytes());
     if !parsed.username().is_empty() {
@@ -1558,9 +1695,15 @@ fn sanitized_backend_url_authority(value: &str) -> Option<Vec<u8>> {
         append_backend_authority_component(&mut canonical, b'P', &port.to_be_bytes());
     }
     append_backend_authority_component(&mut canonical, b'/', parsed.path().as_bytes());
-    for (name, _) in parsed.query_pairs() {
+    for (name, value) in parsed.query_pairs() {
         append_backend_authority_component(&mut canonical, b'N', name.as_bytes());
         append_backend_authority_component(&mut canonical, b'V', b"secret-query-value");
+        if let std::borrow::Cow::Owned(mut name) = name {
+            name.zeroize();
+        }
+        if let std::borrow::Cow::Owned(mut value) = value {
+            value.zeroize();
+        }
     }
     if parsed.fragment().is_some() {
         append_backend_authority_component(&mut canonical, b'F', b"redacted-fragment");
@@ -1610,7 +1753,7 @@ fn validate_backend_template(template: &str) -> Result<(String, usize, usize), R
             ));
         }
         validate_canonical_local_state_path(&decoded_path)?;
-        backend_redaction_values(template, &backend_type)?;
+        drop(backend_redaction_values(template, &backend_type)?);
         return Ok((backend_type, open, close));
     }
 
@@ -1621,14 +1764,14 @@ fn validate_backend_template(template: &str) -> Result<(String, usize, usize), R
             )));
         };
         validate_canonical_http_state_address(&decode_backend_quoted_value(address))?;
-        backend_redaction_values(template, &backend_type)?;
+        drop(backend_redaction_values(template, &backend_type)?);
         validate_http_locking_contract(&tokens, open, close)?;
         return Ok((backend_type, open, close));
     }
 
     match backend_location_contains_state_key(&backend_type, &tokens, open, close) {
         Some(true) => {
-            backend_redaction_values(template, &backend_type)?;
+            drop(backend_redaction_values(template, &backend_type)?);
             if backend_type == "s3" {
                 validate_s3_locking_contract(&tokens, open, close)?;
             }
@@ -1730,15 +1873,15 @@ fn validate_http_locking_contract(
                 "live Terraform \"http\" backend requires exactly one quoted address".to_string(),
             )
         })?;
-    let state = url::Url::parse(&state_address).map_err(|_| {
+    let state = ZeroizingUrl::new(url::Url::parse(&state_address).map_err(|_| {
         RunnerError::Spawn("live Terraform \"http\" backend address is invalid".to_string())
-    })?;
+    })?);
     for (label, endpoint) in [("lock", &lock_address), ("unlock", &unlock_address)] {
-        let endpoint = url::Url::parse(endpoint).map_err(|_| {
+        let endpoint = ZeroizingUrl::new(url::Url::parse(endpoint).map_err(|_| {
             RunnerError::Spawn(format!(
                 "live Terraform \"http\" backend {label}_address is invalid"
             ))
-        })?;
+        })?);
         if endpoint.scheme() != state.scheme()
             || endpoint.host_str() != state.host_str()
             || endpoint.port_or_known_default() != state.port_or_known_default()
@@ -1792,12 +1935,12 @@ fn validate_canonical_local_state_path(path: &str) -> Result<(), RunnerError> {
 }
 
 fn validate_canonical_http_state_address(address: &str) -> Result<(), RunnerError> {
-    let parsed = url::Url::parse(address).map_err(|_| {
+    let parsed = ZeroizingUrl::new(url::Url::parse(address).map_err(|_| {
         RunnerError::Spawn(
             "live Terraform \"http\" backend address must be an absolute canonical HTTP(S) URL"
                 .to_string(),
         )
-    })?;
+    })?);
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err(RunnerError::Spawn(
             "live Terraform \"http\" backend address must be an absolute canonical HTTP(S) URL"
@@ -2044,6 +2187,50 @@ fn validate_private_local_state_artifact(_path: &Path) -> Result<(), RunnerError
     ))
 }
 
+/// Render every state-key placeholder directly into its final wiping owner.
+///
+/// The exact output size is computed first, so appending can never reallocate
+/// and free a plaintext predecessor buffer. This deliberately avoids
+/// `str::replace`, whose ordinary temporary `String` would contain the full
+/// secret-bearing backend configuration before it could be wrapped.
+fn render_backend_hcl(template: &str, state_key: &str) -> Result<Zeroizing<String>, RunnerError> {
+    let placeholder_count = template.matches(STATE_KEY_PLACEHOLDER).count();
+    let removed_bytes = placeholder_count
+        .checked_mul(STATE_KEY_PLACEHOLDER.len())
+        .ok_or_else(|| {
+            RunnerError::Spawn("live Terraform backend render size overflow".to_string())
+        })?;
+    let inserted_bytes = placeholder_count
+        .checked_mul(state_key.len())
+        .ok_or_else(|| {
+            RunnerError::Spawn("live Terraform backend render size overflow".to_string())
+        })?;
+    let rendered_len = template
+        .len()
+        .checked_sub(removed_bytes)
+        .and_then(|length| length.checked_add(inserted_bytes))
+        .ok_or_else(|| {
+            RunnerError::Spawn("live Terraform backend render size overflow".to_string())
+        })?;
+
+    let mut rendered = Zeroizing::new(String::with_capacity(rendered_len));
+    let initial_capacity = rendered.capacity();
+    let mut remainder = template;
+    while let Some(index) = remainder.find(STATE_KEY_PLACEHOLDER) {
+        rendered.push_str(&remainder[..index]);
+        rendered.push_str(state_key);
+        remainder = &remainder[index + STATE_KEY_PLACEHOLDER.len()..];
+    }
+    rendered.push_str(remainder);
+
+    if rendered.len() != rendered_len || rendered.capacity() != initial_capacity {
+        return Err(RunnerError::Spawn(
+            "live Terraform backend render violated its fixed-allocation contract".to_string(),
+        ));
+    }
+    Ok(rendered)
+}
+
 /// A backend HCL config whose state-key placeholder has been safely rendered.
 ///
 /// The fields stay private so live Terraform callers cannot bypass
@@ -2082,11 +2269,12 @@ impl IsolatedBackendConfig {
         validate_state_key(state_key)?;
         let (backend_type, _, _) = validate_backend_template(template)?;
 
-        let hcl = template.replace(STATE_KEY_PLACEHOLDER, state_key);
+        let mut hcl = render_backend_hcl(template, state_key)?;
         // Re-tokenize and re-locate the single active backend after rendering;
         // no pre-render token position is trusted across substitution.
-        let redaction_values = backend_redaction_values(&hcl, &backend_type)?;
-        let backend_authority_digest = compute_backend_authority_digest(&hcl, &backend_type)?;
+        let mut redaction_values = backend_redaction_values(hcl.as_str(), &backend_type)?;
+        let backend_authority_digest =
+            compute_backend_authority_digest(hcl.as_str(), &backend_type)?;
         let local_state_authority = if backend_type == "local" {
             let root = local_state_root.ok_or_else(|| {
                 RunnerError::Spawn(
@@ -2094,7 +2282,7 @@ impl IsolatedBackendConfig {
                         .to_string(),
                 )
             })?;
-            let rendered_tokens = tokenize_backend_hcl(&hcl)?;
+            let rendered_tokens = tokenize_backend_hcl(hcl.as_str())?;
             let (_, open, close) = locate_backend_block(&rendered_tokens)?;
             let target = direct_attribute_value(&rendered_tokens, open, close, "path")
                 .map(decode_backend_quoted_value)
@@ -2110,11 +2298,11 @@ impl IsolatedBackendConfig {
         };
 
         Ok(Self {
-            hcl,
+            hcl: std::mem::take(&mut *hcl),
             state_key: state_key.to_string(),
             backend_kind: backend_type,
             backend_authority_digest,
-            redaction_values,
+            redaction_values: std::mem::take(&mut *redaction_values),
             local_state_authority,
         })
     }
@@ -2408,16 +2596,153 @@ fn run_live_destroy_inner(
 /// un-stripped `timestamp` differs on every re-plan, so every apply is refused)
 /// or — for output that was truncated before it arrived — collide across plans
 /// that differ only past the cut point.
-fn canonicalize_plan_json(raw: &str) -> Option<String> {
-    use serde_json::value::RawValue;
-    use std::collections::BTreeMap;
-    match serde_json::from_str::<BTreeMap<String, &RawValue>>(raw) {
-        Ok(mut members) => {
-            members.remove("timestamp");
-            serde_json::to_string(&members).ok()
-        }
-        Err(_) => None,
+struct CanonicalPlanMembers<'a>(
+    std::collections::BTreeMap<&'a str, &'a serde_json::value::RawValue>,
+);
+
+impl<'a> CanonicalPlanMembers<'a> {
+    fn parse(raw: &'a str) -> Option<Self> {
+        // Terraform's top-level schema keys are fixed unescaped ASCII. Borrow
+        // them from the already-zeroizing raw plan instead of allocating key
+        // Strings that could be dropped normally on a parser error or duplicate.
+        // Escaped top-level spellings are not Terraform schema fields and fail
+        // closed because serde cannot lend them from the input.
+        serde_json::from_str(raw).ok().map(Self)
     }
+
+    fn remove_timestamp(&mut self) {
+        self.0.remove("timestamp");
+    }
+
+    fn as_map(&self) -> &std::collections::BTreeMap<&'a str, &'a serde_json::value::RawValue> {
+        &self.0
+    }
+}
+
+#[derive(Default)]
+struct JsonLengthCounter {
+    length: usize,
+}
+
+impl std::io::Write for JsonLengthCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.length = self.length.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical Terraform plan size overflow",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct FixedCapacityJsonWriter<'a> {
+    output: &'a mut Vec<u8>,
+    exact_length: usize,
+}
+
+impl std::io::Write for FixedCapacityJsonWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let end = self.output.len().checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical Terraform plan size overflow",
+            )
+        })?;
+        if end > self.exact_length || end > self.output.capacity() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "canonical Terraform plan exceeded its fixed allocation",
+            ));
+        }
+        self.output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonicalize_plan_json(raw: &str) -> Option<Zeroizing<String>> {
+    let mut members = CanonicalPlanMembers::parse(raw)?;
+    members.remove_timestamp();
+
+    // Count without retaining output, then serialize directly into one
+    // zeroize-on-drop allocation whose writer refuses to grow it. This avoids
+    // ever creating a normal growable canonical-plan `String` that could free
+    // a plaintext predecessor allocation during reallocation.
+    let mut counter = JsonLengthCounter::default();
+    serde_json::to_writer(&mut counter, members.as_map()).ok()?;
+    let exact_length = counter.length;
+    let mut output = Zeroizing::new(Vec::with_capacity(exact_length));
+    let initial_capacity = output.capacity();
+    {
+        let mut writer = FixedCapacityJsonWriter {
+            output: &mut *output,
+            exact_length,
+        };
+        serde_json::to_writer(&mut writer, members.as_map()).ok()?;
+    }
+    if output.len() != exact_length || output.capacity() != initial_capacity {
+        return None;
+    }
+
+    let bytes = std::mem::take(&mut *output);
+    match String::from_utf8(bytes) {
+        Ok(canonical) => Some(Zeroizing::new(canonical)),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            None
+        }
+    }
+}
+
+/// Own an untrusted parsed plan only behind a destructor that recursively
+/// clears every JSON string, including object keys, before ordinary drop.
+struct ZeroizingJsonValue(serde_json::Value);
+
+impl ZeroizingJsonValue {
+    fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingJsonValue {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.0);
+    }
+}
+
+fn zeroize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(elements) => {
+            for element in elements.iter_mut() {
+                zeroize_json_value(element);
+            }
+            elements.clear();
+        }
+        serde_json::Value::Object(members) => {
+            // Map keys cannot be mutated in place. Move every pair out so each
+            // key receives an explicit zeroizing owner before it is dropped.
+            for (mut key, mut member) in std::mem::take(members) {
+                key.zeroize();
+                zeroize_json_value(&mut member);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    *value = serde_json::Value::Null;
 }
 
 /// Convert the full canonical Terraform plan into the only representation
@@ -2432,10 +2757,12 @@ fn canonicalize_plan_json(raw: &str) -> Option<String> {
 /// treating an incomplete projection as an approvable plan.
 fn project_plan_evidence(canonical_plan: &str, plan: &RunPlan) -> Result<String, String> {
     let canonical_plan_sha256 = sha256_hex(canonical_plan.as_bytes());
-    let parsed = serde_json::from_str::<serde_json::Value>(canonical_plan).ok();
+    let parsed = serde_json::from_str::<serde_json::Value>(canonical_plan)
+        .ok()
+        .map(ZeroizingJsonValue::new);
     let raw_changes = parsed
         .as_ref()
-        .and_then(|value| value.get("resource_changes"))
+        .and_then(|value| value.as_value().get("resource_changes"))
         .and_then(serde_json::Value::as_array);
 
     let mut projection_complete = raw_changes.is_some();
@@ -2690,7 +3017,7 @@ fn live_terraform_plan_inner(
         return Ok(LivePlanArtifacts {
             outcome: refusal,
             raw_plan_digest: None,
-            tfplan: vec![],
+            tfplan: ZeroizingTfPlan::empty(),
         });
     }
 
@@ -2727,7 +3054,7 @@ fn live_terraform_plan_inner(
                 post_apply: None,
             },
             raw_plan_digest: None,
-            tfplan: vec![],
+            tfplan: ZeroizingTfPlan::empty(),
         });
     }
 
@@ -2780,7 +3107,7 @@ fn live_terraform_plan_inner(
                 post_apply: None,
             },
             raw_plan_digest: None,
-            tfplan: vec![],
+            tfplan: ZeroizingTfPlan::empty(),
         });
     }
 
@@ -2817,7 +3144,7 @@ fn live_terraform_plan_inner(
                     post_apply: None,
                 },
                 raw_plan_digest: None,
-                tfplan: vec![],
+                tfplan: ZeroizingTfPlan::empty(),
             });
         }
     }
@@ -2847,7 +3174,7 @@ fn live_terraform_plan_inner(
                 post_apply: None,
             },
             raw_plan_digest: None,
-            tfplan: vec![],
+            tfplan: ZeroizingTfPlan::empty(),
         });
     }
 
@@ -2860,7 +3187,7 @@ fn live_terraform_plan_inner(
     // zeroizing buffers; only the digest and allowlisted projection below may
     // cross the durable evidence boundary.
     let canonical_plan = match canonicalize_plan_json(&show_outcome.raw) {
-        Some(json) => Zeroizing::new(json),
+        Some(json) => json,
         None => {
             return Ok(LivePlanArtifacts {
                 outcome: RunOutcome {
@@ -2877,7 +3204,7 @@ fn live_terraform_plan_inner(
                     post_apply: None,
                 },
                 raw_plan_digest: None,
-                tfplan: vec![],
+                tfplan: ZeroizingTfPlan::empty(),
             });
         }
     };
@@ -2897,7 +3224,7 @@ fn live_terraform_plan_inner(
                     post_apply: None,
                 },
                 raw_plan_digest: None,
-                tfplan: vec![],
+                tfplan: ZeroizingTfPlan::empty(),
             });
         }
     };
@@ -3362,7 +3689,7 @@ fn binary_available(
     run_version_probe(cmd, cancellation)
 }
 
-fn read_bounded_tfplan(path: &Path) -> Result<Vec<u8>, RunnerError> {
+fn read_bounded_tfplan(path: &Path) -> Result<ZeroizingTfPlan, RunnerError> {
     read_bounded_file(path, MAX_TFPLAN_BYTES, "tfplan")
 }
 
@@ -3370,8 +3697,8 @@ fn read_bounded_file(
     path: &Path,
     max_bytes: usize,
     artifact_name: &str,
-) -> Result<Vec<u8>, RunnerError> {
-    let file = std::fs::File::open(path).map_err(|error| {
+) -> Result<ZeroizingTfPlan, RunnerError> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
         RunnerError::WorkspaceSetup(format!("failed to open {artifact_name}: {error}"))
     })?;
     let declared_len = file
@@ -3386,15 +3713,24 @@ fn read_bounded_file(
         )));
     }
 
-    let mut bytes = Vec::with_capacity(declared_len as usize);
-    file.take((max_bytes as u64) + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            RunnerError::WorkspaceSetup(format!("failed to read {artifact_name}: {error}"))
-        })?;
-    if bytes.len() > max_bytes {
+    // Read into one fixed-size, zeroize-on-drop allocation. `read_to_end`
+    // cannot be used here: its EOF probe may reallocate a full Vec and free a
+    // plaintext predecessor allocation before the final owner is dropped.
+    let mut bytes = ZeroizingTfPlan::zeroed(declared_len as usize);
+    file.read_exact(&mut bytes.bytes).map_err(|error| {
+        RunnerError::WorkspaceSetup(format!("failed to read {artifact_name}: {error}"))
+    })?;
+
+    // Terraform has exited before this read, so any post-metadata growth is an
+    // integrity race. Probe without extending the Vec and fail closed; the
+    // stack probe is itself zeroized on every exit path.
+    let mut growth_probe = Zeroizing::new([0u8; 1]);
+    let grew = file.read(&mut growth_probe[..]).map_err(|error| {
+        RunnerError::WorkspaceSetup(format!("failed to finish reading {artifact_name}: {error}"))
+    })? != 0;
+    if grew {
         return Err(RunnerError::WorkspaceSetup(format!(
-            "{artifact_name} exceeds safe artifact limit ({max_bytes} bytes)"
+            "{artifact_name} changed while being read; refusing an unstable artifact"
         )));
     }
     Ok(bytes)
@@ -3654,17 +3990,15 @@ fn run_tf_step(
     let mut output =
         run_command_with_optional_cancellation(cmd, LIVE_RUNNER_TIMEOUT, control.cancellation)?;
 
-    let raw = Zeroizing::new(combine_output(&output.stdout, &output.stderr));
-    output.stdout.zeroize();
-    output.stderr.zeroize();
     // Human-readable diagnostic logs are scrubbed and normally truncated to
     // bound evidence size. Raw `terraform show -json` never enters this type;
     // its dedicated zeroizing path commits before redaction.
-    let scrubbed = if control.truncate {
-        scrub_output(&raw, secret_refs)
-    } else {
-        scrub(&raw, secret_refs)
-    };
+    let scrubbed = scrub_captured_output(
+        &mut output.stdout,
+        &mut output.stderr,
+        secret_refs,
+        control.truncate,
+    );
 
     Ok(TfStepResult {
         log: scrubbed,
@@ -3691,11 +4025,9 @@ fn run_tf_show_json_step(
 
     let mut output =
         run_command_with_optional_cancellation(cmd, LIVE_RUNNER_TIMEOUT, cancellation)?;
-    let raw = combine_output(&output.stdout, &output.stderr);
-    output.stdout.zeroize();
-    output.stderr.zeroize();
+    let raw = take_captured_output(&mut output.stdout, &mut output.stderr);
     Ok(RawTfShowResult {
-        raw: Zeroizing::new(raw),
+        raw,
         exit_code: output.status.code(),
     })
 }
@@ -3757,10 +4089,42 @@ fn extract_destroy_summary(log: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrub::scrub;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static NEXT_STATE_KEY: AtomicU64 = AtomicU64::new(1);
+    static TERRAFORM_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn dummy_creds() -> ResolvedCredentials {
         ResolvedCredentials {
@@ -3846,7 +4210,7 @@ mod tests {
     /// without pretending the provider-less `terraform_data` change is an
     /// approvable server projection. Production LivePlan continues to reject
     /// that unsupported durable evidence shape.
-    fn execution_e2e_tfplan(plan: &RunPlan, backend: &IsolatedBackendConfig) -> Vec<u8> {
+    fn execution_e2e_tfplan(plan: &RunPlan, backend: &IsolatedBackendConfig) -> ZeroizingTfPlan {
         assert_eq!(plan.offering_id, "request-preflight");
         let iac_files = super::super::iac::resolve(&plan.offering_id)
             .expect("request-preflight IaC must be embedded");
@@ -4177,6 +4541,23 @@ mod tests {
     }
 
     #[test]
+    fn backend_hcl_render_uses_one_fixed_zeroizing_owner() {
+        fn require_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let template = "first={STATE_KEY};secret=backend-canary;second={STATE_KEY}"; // secret-scan-allow: inert unit-test fixture
+        let rendered = render_backend_hcl(template, "request-a").expect("fixed render");
+        require_zeroizing_string(&rendered);
+        assert_eq!(
+            rendered.as_str(),
+            "first=request-a;secret=backend-canary;second=request-a" // secret-scan-allow: inert unit-test fixture
+        );
+        assert_eq!(
+            rendered.len(),
+            template.len() - (2 * STATE_KEY_PLACEHOLDER.len()) + (2 * "request-a".len())
+        );
+    }
+
+    #[test]
     fn backend_authority_digest_tracks_authority_not_secret_rotation_or_layout() {
         let template_a = r#"terraform {
   backend "s3" {
@@ -4361,6 +4742,24 @@ resource "terraform_data" "decoy" {
     }
 
     #[test]
+    fn canonical_http_address_rejects_every_post_parse_error_class() {
+        for rejected in [
+            "ftp://state.invalid/{STATE_KEY}",
+            "https://user:password@state.invalid/{STATE_KEY}", // secret-scan-allow: inert unit-test fixture
+            "https://state.invalid/{STATE_KEY}?token=canary", // secret-scan-allow: inert unit-test fixture
+            "https://state.invalid/{STATE_KEY}#fragment",
+            "https:state.invalid/{STATE_KEY}",
+            "https://state.invalid/%FF/{STATE_KEY}",
+            "https://state.invalid/%7BSTATE_KEY%7D",
+        ] {
+            assert!(
+                validate_canonical_http_state_address(rejected).is_err(),
+                "non-canonical URL must fail closed: {rejected}"
+            );
+        }
+    }
+
+    #[test]
     fn backend_config_tracks_only_typed_secret_attributes_for_redaction() {
         let template = r#"terraform {
   backend "s3" {
@@ -4457,6 +4856,15 @@ resource "terraform_data" "decoy" {
             .redaction_values()
             .iter()
             .any(|value| value == b"YmFzaWMtdXNlcjo="));
+        assert_eq!(
+            username_only
+                .redaction_values()
+                .iter()
+                .filter(|value| value.as_slice() == b"basic-user".as_slice())
+                .count(),
+            1,
+            "raw username registered by both scalar and Basic-auth paths must be deduplicated"
+        );
 
         let http = IsolatedBackendConfig::from_template(
             "terraform { backend \"http\" { address = \"https://state.invalid/{STATE_KEY}\" lock_address = \"https://state.invalid/{STATE_KEY}/lock\" unlock_address = \"https://state.invalid/{STATE_KEY}/lock\" lock_method = \"LOCK\" unlock_method = \"UNLOCK\" password = \"<>&\u{2028}\u{2029}\" } }", // secret-scan-allow: inert unit-test fixture
@@ -5729,6 +6137,9 @@ esac
         let plan_b = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:06Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}]}"#;
         let ca = canonicalize_plan_json(plan_a).unwrap();
         let cb = canonicalize_plan_json(plan_b).unwrap();
+        fn require_zeroizing_string(_: &Zeroizing<String>) {}
+        require_zeroizing_string(&ca);
+        require_zeroizing_string(&cb);
         assert_eq!(
             ca, cb,
             "plans differing only by timestamp must be equal after canonicalization"
@@ -5783,6 +6194,25 @@ esac
             canonicalize_plan_json("not json").is_none(),
             "unparseable plan JSON must fail closed (no digest)"
         );
+        assert!(
+            canonicalize_plan_json(r#"{"time\u0073tamp":"not-a-schema-key"}"#).is_none(),
+            "escaped top-level schema keys must fail closed rather than allocate owned keys"
+        );
+    }
+
+    #[test]
+    fn canonical_plan_writer_refuses_to_grow_its_zeroizing_allocation() {
+        use std::io::Write as _;
+
+        let mut output = Zeroizing::new(Vec::with_capacity(2));
+        let initial_capacity = output.capacity();
+        let mut writer = FixedCapacityJsonWriter {
+            output: &mut *output,
+            exact_length: 2,
+        };
+        assert!(writer.write_all(b"abc").is_err());
+        assert!(output.is_empty());
+        assert_eq!(output.capacity(), initial_capacity);
     }
 
     #[test]
@@ -5880,6 +6310,22 @@ esac
                 "raw plan field {forbidden:?} must not enter durable evidence"
             );
         }
+    }
+
+    #[test]
+    fn parsed_plan_zeroizer_recursively_clears_values_and_object_keys() {
+        let mut parsed = serde_json::json!({
+            "provider-secret-key-canary": {
+                "nested": ["provider-secret-value-canary", {"leaf-key": "leaf-value"}]
+            }
+        });
+
+        zeroize_json_value(&mut parsed);
+
+        assert!(
+            parsed.is_null(),
+            "the recursive wipe must leave no owned JSON tree"
+        );
     }
 
     #[test]
@@ -6026,10 +6472,13 @@ esac
         let ws = super::super::workspace::Workspace::new().expect("workspace");
         let exact = ws.path().join("exact-plan");
         std::fs::write(&exact, vec![b'x'; 16]).expect("write exact fixture");
-        assert_eq!(
-            read_bounded_file(&exact, 16, "test plan").expect("exact limit"),
-            vec![b'x'; 16]
-        );
+        let mut exact_bytes = read_bounded_file(&exact, 16, "test plan").expect("exact limit");
+        fn requires_zeroize_on_drop<T: ZeroizeOnDrop>(_: &T) {}
+        requires_zeroize_on_drop(&exact_bytes);
+        assert_eq!(exact_bytes.as_slice(), &[b'x'; 16]);
+        assert_eq!(format!("{exact_bytes:?}"), "<redacted:16 bytes>");
+        exact_bytes.zeroize();
+        assert!(exact_bytes.is_empty());
 
         let over = ws.path().join("over-plan");
         std::fs::write(&over, vec![b'y'; 17]).expect("write over fixture");
@@ -6050,7 +6499,7 @@ esac
                 post_apply: None,
             },
             raw_plan_digest: Some(sha256_hex(b"canonical-plan")),
-            tfplan: b"raw-tfplan-debug-sentinel".to_vec(),
+            tfplan: ZeroizingTfPlan::from(&b"raw-tfplan-debug-sentinel"[..]),
         };
         let debug = format!("{artifacts:?}");
         assert!(!debug.contains("raw-tfplan-debug-sentinel"));
@@ -6307,12 +6756,15 @@ esac
         assert!(!is_backend_credential_env_name("VSPHERE_PASSWORD"));
     }
 
-    /// End-to-end injection proof on the LIVE path: the terraform child sees
-    /// exactly the DECLARED vsphere env vars (provider-native + TF_VAR alias),
-    /// each paired with its own value — and nothing else credential-shaped:
-    /// no RYUKI_LIVE_CRED_* passthrough and no undeclared parent env leakage.
+    /// End-to-end proof through the production entry points and executable
+    /// admission: the Terraform child sees exactly the declared vSphere env
+    /// vars, while raw, Basic-auth, default-Go-JSON, and
+    /// `SetEscapeHTML(false)` output forms are absent from every durable result.
     #[test]
-    fn live_operations_inject_only_registered_secret_env_vars() {
+    fn production_live_operations_scrub_registered_transformed_credentials() {
+        let _environment = TERRAFORM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ws_probe = super::super::workspace::Workspace::new().expect("ws");
         let probe_dir = ws_probe.path().to_string_lossy().to_string();
         let shim = ws_probe.path().join("fake-tf-env-dump");
@@ -6328,7 +6780,8 @@ esac
         let go_json_default = r"vcenter\u003c\u2028canary";
         let go_json_no_html = r"vcenter<\u2028canary";
         let encoded_diagnostic = format!(
-            "basic={basic_auth_encoded} go-default={go_json_default} go-no-html={go_json_no_html}"
+            "raw-a={provider_user} raw-b={provider_password} raw-c={provider_server} \
+             basic={basic_auth_encoded} go-default={go_json_default} go-no-html={go_json_no_html}"
         );
 
         // The shim dumps its environment per step, emits transformed provider
@@ -6338,7 +6791,7 @@ esac
             &shim,
             format!(
                 r#"#!/bin/sh
-if [ "$1" = version ]; then exit 0; fi
+if [ "$1" = version ]; then printf '%s\n' 'Terraform v1.9.8'; exit 0; fi
 env > "{probe_dir}/env-$1"
 if [ "$1" = show ]; then
   echo '{{"format_version":"1.2","resource_changes":[]}}'
@@ -6361,11 +6814,17 @@ exit 0
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
+        let canonical_shim = std::fs::canonicalize(&shim).expect("canonical terraform shim");
+        let _configured_executable =
+            TestEnvVar::set("RYUKI_TERRAFORM_EXECUTABLE", canonical_shim.as_os_str());
+        let _configured_version = TestEnvVar::set("RYUKI_TERRAFORM_EXPECTED_VERSION", "1.9.8");
+        let _configured_digest = TestEnvVar::remove("RYUKI_TERRAFORM_EXECUTABLE_SHA256");
 
         // Poison the PARENT environment: neither the operator-side cred var nor
         // an arbitrary parent secret may reach the child (env_clear allowlist).
-        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "parent-cred-canary");
-        std::env::set_var("RYUKI_TEST_PARENT_SECRET", "parent-secret-canary");
+        let _parent_credential =
+            TestEnvVar::set("RYUKI_LIVE_CRED_VSPHERE_USER", "parent-cred-canary");
+        let _parent_secret = TestEnvVar::set("RYUKI_TEST_PARENT_SECRET", "parent-secret-canary");
 
         // Declaration plumbing: names come from the OFFERINGS registry.
         let mut plan = live_plan("linux-server-deployment");
@@ -6380,22 +6839,16 @@ exit 0
         };
 
         let backend = test_backend();
-        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &creds, &backend)
-            .expect("env-dump shim plan must not error");
+        let result = run_live_plan(&plan, &creds, &backend)
+            .expect("production entry plan must admit and run the configured shim");
         assert_eq!(result.outcome.status, RunStatus::Planned);
 
-        let applied = live_terraform_apply(
-            &shim.to_string_lossy(),
-            &plan,
-            &creds,
-            &backend,
-            &result.tfplan,
-        )
-        .expect("env-dump shim apply must not error");
+        let applied = run_live_apply(&plan, &creds, &backend, &result.tfplan)
+            .expect("production entry apply must admit and run the configured shim");
         assert_eq!(applied.status, RunStatus::Applied);
 
-        let destroyed = live_terraform_destroy(&shim.to_string_lossy(), &plan, &creds, &backend)
-            .expect("env-dump shim destroy must not error");
+        let destroyed = run_live_destroy(&plan, &creds, &backend)
+            .expect("production entry destroy must admit and run the configured shim");
         assert_eq!(destroyed.status, RunStatus::Applied);
 
         for step in ["init", "plan", "apply", "destroy"] {
@@ -6478,8 +6931,5 @@ exit 0
         assert!(result.outcome.summary.contains("[REDACTED]"));
         assert!(applied.log.contains("[REDACTED]"));
         assert!(destroyed.log.contains("[REDACTED]"));
-
-        std::env::remove_var("RYUKI_LIVE_CRED_VSPHERE_USER");
-        std::env::remove_var("RYUKI_TEST_PARENT_SECRET");
     }
 }

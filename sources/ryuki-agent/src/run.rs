@@ -2648,7 +2648,8 @@ mod tests {
         // plan() produces outcome with tfplan = PLAN_BYTES.
         let plan_outcome = live_exec.plan(&job.spec).expect("plan");
         assert_eq!(
-            plan_outcome.tfplan, PLAN_BYTES,
+            plan_outcome.tfplan.as_slice(),
+            PLAN_BYTES,
             "stub plan_outcome.tfplan must equal the plan bytes"
         );
 
@@ -2663,8 +2664,9 @@ mod tests {
             .expect("apply");
 
         // The stub recorded what it got — must equal PLAN_BYTES.
+        let recorded = live_exec.last_apply_tfplan();
         assert_eq!(
-            live_exec.last_apply_tfplan(),
+            recorded.as_slice(),
             PLAN_BYTES,
             "apply() must receive the exact tfplan bytes from plan_outcome"
         );
