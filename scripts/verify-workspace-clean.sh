@@ -855,12 +855,34 @@ freeze_supervised_process_tree() {
 }
 
 disk_guard_while_frozen() {
-  local guard_status=0 resume_status=0
+  local guard_status=0 resume_status=0 stage_status=0
 
-  reject_regrouped_descendants || return $?
-  freeze_supervised_process_tree || return $?
-  disk_guard 0 || guard_status=$?
-  resume_frozen_process_tree || resume_status=$?
+  if reject_regrouped_descendants; then
+    :
+  else
+    stage_status=$?
+    echo "error: disk guard could not validate the supervised process group" >&2
+    return "$stage_status"
+  fi
+  if freeze_supervised_process_tree; then
+    :
+  else
+    stage_status=$?
+    echo "error: disk guard could not freeze the supervised process group" >&2
+    return "$stage_status"
+  fi
+  if disk_guard 0; then
+    :
+  else
+    guard_status=$?
+    echo "error: disk guard measurement or configured ceiling failed" >&2
+  fi
+  if resume_frozen_process_tree; then
+    :
+  else
+    resume_status=$?
+    echo "error: disk guard could not resume the supervised process group" >&2
+  fi
   (( resume_status == 0 )) || return "$resume_status"
   return "$guard_status"
 }
