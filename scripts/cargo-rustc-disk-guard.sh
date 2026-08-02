@@ -698,10 +698,6 @@ outer_process_group_pinned() {
   safe_process_group_id "$OUTER_COMMAND_PGID"
 }
 
-clear_outer_compiler_state() {
-  clear_compiler_release
-}
-
 stop_outer_process_group() {
   local attempt
 
@@ -711,7 +707,6 @@ stop_outer_process_group() {
   # KILL also terminates this monitor. The verifier supervisor lives outside
   # the group and performs the final reap/recovery.
   trap '' HUP INT TERM
-  clear_outer_compiler_state || true
   kill -TERM -- "-$OUTER_COMMAND_PGID" 2>/dev/null || true
   for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
     sleep 0.1 || true
@@ -736,16 +731,12 @@ outer_exit_cleanup() {
 
 # Valid outer metadata permits reuse of one already durable command process
 # group; it does not replace this wrapper's disk checks. Keep a parent monitor
-# in that inherited group, and turn job control off explicitly so its compiler
-# reporter cannot create an unrecorded nested group.
+# in that inherited group, arm its cleanup before launch, and turn job control
+# off explicitly so its compiler reporter cannot create an unrecorded nested
+# group. Bash retains the launched child's status for wait(1), so outer mode
+# needs no same-UID-mutable release or status pathname.
 if (( OUTER_SUPERVISED == 1 )); then
   exec 9>&-
-  if [[ -e "$compiler_release_file" || -L "$compiler_release_file" \
-    || -e "$compiler_release_tmp" || -L "$compiler_release_tmp" ]]; then
-    echo "error: Cargo compiler monitor state already exists" >&2
-    exit 75
-  fi
-
   trap 'record_launch_signal 130' INT
   trap 'record_launch_signal 143' TERM
   trap 'record_launch_signal 129' HUP
@@ -754,20 +745,6 @@ if (( OUTER_SUPERVISED == 1 )); then
   (
     trap - EXIT HUP INT TERM
     exec 9>&-
-    released=0
-    for release_attempt in {1..200}; do
-      if [[ -e "$compiler_release_file" || -L "$compiler_release_file" ]]; then
-        [[ -f "$compiler_release_file" && ! -L "$compiler_release_file" \
-          && -O "$compiler_release_file" ]] || exit 75
-        rm -f -- "$compiler_release_file"
-        released=1
-        break
-      fi
-      kill -0 "$$" 2>/dev/null || exit 75
-      sleep 0.01
-    done
-    (( released == 1 )) || exit 75
-
     set +e
     "$@"
     compiler_status=$?
@@ -780,22 +757,6 @@ if (( OUTER_SUPERVISED == 1 )); then
   trap 'handle_outer_signal 129' HUP
   if [[ -n "$pending_launch_signal" ]]; then
     handle_outer_signal "$pending_launch_signal"
-  fi
-  if ! kill -0 "$compiler_pid" 2>/dev/null; then
-    echo "error: Cargo compiler monitor could not be established" >&2
-    stop_outer_process_group
-    exit 75
-  fi
-  (set -o noclobber; : > "$compiler_release_tmp") || {
-    echo "error: Cargo compiler release ownership could not be created" >&2
-    stop_outer_process_group
-    exit 75
-  }
-  if ! chmod 600 "$compiler_release_tmp" \
-    || ! mv -- "$compiler_release_tmp" "$compiler_release_file"; then
-    echo "error: Cargo compiler release ownership could not be published" >&2
-    stop_outer_process_group
-    exit 75
   fi
 
   next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
@@ -823,11 +784,6 @@ if (( OUTER_SUPERVISED == 1 )); then
   fi
   if [[ ! "$compiler_wait_status" =~ ^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then
     echo "error: Cargo compiler did not return a valid status" >&2
-    stop_outer_process_group
-    exit 75
-  fi
-  if ! clear_outer_compiler_state; then
-    echo "error: Cargo compiler monitor state could not be cleared" >&2
     stop_outer_process_group
     exit 75
   fi
