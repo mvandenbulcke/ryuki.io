@@ -21,6 +21,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 const CONTRACT_DIR: &str = "catalog/security-contracts/v1";
+const PLATFORM_SECURITY_BOUNDARY_LOCATOR: &str = "docs/architecture/platform-security-boundary.md";
+const MAX_PLATFORM_SECURITY_BOUNDARY_BYTES: u64 = 2 * 1024 * 1024;
 const CONFORMANCE_BUNDLE_LOCATOR_PREFIX: &str =
     "catalog/security-contracts/v1/conformance-bundles/";
 const PACKAGE_EXIT_RECEIPT_LOCATOR_PREFIX: &str =
@@ -170,7 +172,7 @@ const INSTANCES: [(&str, &str); 6] = [
 
 // This list is intentionally independent of control-trace.implementation.json.
 // Editing the ledger cannot silently redefine the normative control inventory.
-const CANONICAL_CONTROL_IDS: [&str; 140] = [
+const CANONICAL_CONTROL_IDS: [&str; 141] = [
     "SB-BOUND-01",
     "SB-BOUND-02",
     "SB-IDL-01",
@@ -238,6 +240,7 @@ const CANONICAL_CONTROL_IDS: [&str; 140] = [
     "SB-AZ-09",
     "SB-AZ-09A",
     "SB-AZ-09B",
+    "SB-AZ-09C",
     "SB-AZ-10",
     "SB-APR-01",
     "SB-APR-02",
@@ -507,6 +510,7 @@ pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
     reject_untrusted_closure_documents(&bundles, &receipts, &mut errors);
 
     if let Some(ledger) = instances.get("control-trace.implementation.json") {
+        validate_boundary_control_inventory(root, &mut errors);
         validate_ledger_semantics(ledger, &mut errors);
         validate_closure_semantics(root, ledger, &bundles, &receipts, &mut errors);
     }
@@ -932,6 +936,85 @@ fn validate_deployment_security_profile_semantics(
 struct Owner {
     package: String,
     team: String,
+}
+
+fn is_boundary_control_id(candidate: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix("SB-") else {
+        return false;
+    };
+    let Some((family, ordinal)) = rest.split_once('-') else {
+        return false;
+    };
+    !family.is_empty()
+        && family
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && family
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && matches!(ordinal.len(), 2 | 3)
+        && ordinal.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        && (ordinal.len() == 2 || ordinal.as_bytes()[2].is_ascii_uppercase())
+}
+
+fn extract_boundary_control_ids(document: &str) -> BTreeSet<String> {
+    document
+        .split(|character: char| {
+            !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '-')
+        })
+        .filter(|candidate| is_boundary_control_id(candidate))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Bind the independently maintained validator inventory to the authoritative
+/// normative Markdown. Without this check the validator constant and
+/// ControlTrace could drift together and silently omit a newly added invariant.
+fn validate_boundary_control_inventory(root: &Path, errors: &mut Vec<String>) {
+    let path = root.join(PLATFORM_SECURITY_BOUNDARY_LOCATOR);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            errors.push(format!(
+                "cannot inspect authoritative platform security boundary {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PLATFORM_SECURITY_BOUNDARY_BYTES {
+        errors.push(format!(
+            "authoritative platform security boundary must be a regular file no larger than {MAX_PLATFORM_SECURITY_BOUNDARY_BYTES} bytes: {}",
+            path.display()
+        ));
+        return;
+    }
+    let document = match fs::read_to_string(&path) {
+        Ok(document) => document,
+        Err(error) => {
+            errors.push(format!(
+                "cannot read authoritative platform security boundary {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let documented = extract_boundary_control_ids(&document);
+    let validator = CANONICAL_CONTROL_IDS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect::<BTreeSet<_>>();
+    for missing in documented.difference(&validator) {
+        errors.push(format!(
+            "validator canonical inventory omits authoritative boundary control {missing}"
+        ));
+    }
+    for unknown in validator.difference(&documented) {
+        errors.push(format!(
+            "validator canonical inventory contains control absent from the authoritative boundary {unknown}"
+        ));
+    }
 }
 
 fn validate_ledger_semantics(ledger: &Value, errors: &mut Vec<String>) {
@@ -10015,6 +10098,30 @@ mod tests {
         assert!(error
             .to_string()
             .contains("duplicate JSON object key \"id\""));
+    }
+
+    #[test]
+    fn authoritative_boundary_control_inventory_is_exact_and_suffix_aware() {
+        let document = fs::read_to_string(root().join(PLATFORM_SECURITY_BOUNDARY_LOCATOR))
+            .expect("authoritative platform security boundary");
+        let documented = extract_boundary_control_ids(&document);
+        let expected = CANONICAL_CONTROL_IDS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(documented, expected);
+        assert!(documented.contains("SB-AZ-09C"));
+
+        let syntax = extract_boundary_control_ids(
+            "SB-0 SB-9 SB-* SB-AZ-09 SB-AZ-09A SB-AZ-09C SB-AZ-009 SB-az-01",
+        );
+        assert_eq!(
+            syntax,
+            ["SB-AZ-09", "SB-AZ-09A", "SB-AZ-09C"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
     }
 
     #[test]

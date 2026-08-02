@@ -34,8 +34,8 @@
   "control_trace_ref": {
     "artifact_kind": "control-trace",
     "document_id": "control-trace:ryuki-security-boundary-v1",
-    "document_version": 1,
-    "content_digest": "sha256:05481eabc6155262ed54d3d837d019a722218a14c0af963f6d6401d271a8609f",
+    "document_version": 2,
+    "content_digest": "sha256:b905dc693d18df58ef053abf99f25a6ba756d20795ff7b6587c05e756c7fbe32",
     "artifact_locator": "catalog/security-contracts/v1/control-trace.implementation.json"
   },
   "provider_registry_ref": {
@@ -58,7 +58,7 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 2,
-    "content_digest": "sha256:418c20a3c331ff8e29d40187c4b128588865e19fd203d567469d50c94b7a7833",
+    "content_digest": "sha256:024078092476924391af54e48986049b0caeb3c32d1392831a585e6089db6f67",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {

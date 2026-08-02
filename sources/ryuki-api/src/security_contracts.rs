@@ -209,7 +209,7 @@ const MAX_REFERENCE_DEPTH: usize = 32;
 const MAX_REFERENCE_BINDINGS: usize = 16_384;
 const MAX_JSON_DEPTH: usize = 64;
 // A complete applicability projection can legitimately exceed 4,096 rows
-// (for example 140 active traces across roughly 95 shipped subjects). Raw-byte
+// (for example 141 active traces across roughly 95 shipped subjects). Raw-byte
 // and schema limits remain the primary allocation bounds.
 const MAX_JSON_NODES: usize = 262_144;
 const MAX_JSON_ARRAY_ITEMS: usize = 16_384;
@@ -15759,7 +15759,7 @@ mod tests {
             profile["control_trace_ref"] = json!({
                 "artifact_kind": "control-trace",
                 "document_id": "control-trace:ryuki-security-boundary-v1",
-                "document_version": 1,
+                "document_version": 2,
                 "content_digest": control_trace_digest,
                 "artifact_locator": CONTROL_TRACE_PATH
             });

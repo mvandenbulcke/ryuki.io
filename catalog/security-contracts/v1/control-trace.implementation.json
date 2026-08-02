@@ -3,9 +3,9 @@
   "schema_version": "1.0.0",
   "contract_kind": "control-trace",
   "document_id": "control-trace:ryuki-security-boundary-v1",
-  "document_version": 1,
+  "document_version": 2,
   "ledger_id": "ryuki-security-boundary",
-  "ledger_version": "1.0.0",
+  "ledger_version": "1.1.0",
   "acceptance_status": "implementation_only",
   "production_accepted": false,
   "controls": [
@@ -474,6 +474,13 @@
     {
       "control_id": "SB-AZ-09B",
       "title": "Global recertification control and bounded collection reads",
+      "owning_work_package": "SB-2",
+      "owning_team": "authorization-platform",
+      "waivable": false
+    },
+    {
+      "control_id": "SB-AZ-09C",
+      "title": "Global audit collections require explicit Global authority",
       "owning_work_package": "SB-2",
       "owning_team": "authorization-platform",
       "waivable": false
@@ -3620,6 +3627,40 @@
       },
       "fixture_or_probe_id": "security_conformance::ac_007",
       "pass_condition": "Authorization matrix tests cover every actor kind, registered action and resource resolver, role, site, environment, owner, lifecycle state, assurance level, collection-versus-instance path, and DB/no-DB mode.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-09C-AC-007",
+      "control_id": "SB-AZ-09C",
+      "acceptance_case_id": "AC-007",
+      "owning_work_package": "SB-2",
+      "owning_team": "authorization-platform",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": []
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": null
+      },
+      "fixture_or_probe_id": "security_conformance::ac_007",
+      "pass_condition": "Global audit collection tests prove the audit capability is insufficient without explicit Global site and environment authority, scoped or malformed axes deny before database and cursor work, platform administration does not widen scope, and explicitly Global workload Auditors remain admitted.",
       "trace_lifecycle": "active",
       "supersedes_trace_id": null
     },

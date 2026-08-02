@@ -119,7 +119,7 @@
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:dbc2e3fa0b25be11190b6a1c6763ae5435420021ffb1931efbc4e3bacd953ea5",
+        "content_digest": "sha256:068b39e3e3bb12761a2c851131c36316933d53f525b89975372cf7b7d0a2db98",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {
