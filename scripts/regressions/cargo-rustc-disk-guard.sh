@@ -47,6 +47,19 @@ OUTER_COMPILER_PID="$TEST_ROOT/outer-compiler.pid"
 OUTER_FD_STATE="$TEST_ROOT/outer-fd9"
 OUTER_TERM="$TEST_ROOT/outer-term"
 FAKE_OUTER_RUSTC="$TEST_ROOT/fake-outer-rustc"
+OUTER_LIMIT_VERIFY_DIR="$TEST_ROOT/run.1.1.2"
+OUTER_LIMIT_TARGET="$OUTER_LIMIT_VERIFY_DIR/target"
+OUTER_LIMIT_OUT_DIR="$OUTER_LIMIT_TARGET/debug/deps"
+OUTER_LIMIT_CONTROL="$OUTER_LIMIT_VERIFY_DIR/.ryuki-verify-command-owner"
+OUTER_LIMIT_STARTED="$TEST_ROOT/outer-limit-started"
+OUTER_LIMIT_FINISHED="$TEST_ROOT/outer-limit-finished"
+FAKE_OUTER_LIMIT_RUSTC="$TEST_ROOT/fake-outer-limit-rustc"
+OUTER_FAST_VERIFY_DIR="$TEST_ROOT/run.1.1.3"
+OUTER_FAST_TARGET="$OUTER_FAST_VERIFY_DIR/target"
+OUTER_FAST_OUT_DIR="$OUTER_FAST_TARGET/debug/deps"
+OUTER_FAST_CONTROL="$OUTER_FAST_VERIFY_DIR/.ryuki-verify-command-owner"
+OUTER_FAST_FINISHED="$TEST_ROOT/outer-fast-finished"
+FAKE_OUTER_FAST_RUSTC="$TEST_ROOT/fake-outer-fast-rustc"
 SIGNAL_READY="$TEST_ROOT/signal-ready"
 SIGNAL_COMPILER_PID="$TEST_ROOT/signal-compiler.pid"
 SIGNAL_DESCENDANT_PID="$TEST_ROOT/signal-descendant.pid"
@@ -71,6 +84,24 @@ stop_fixture_group_from_file() {
   if kill -0 -- "-$pgid" 2>/dev/null; then
     kill -KILL -- "-$pgid" 2>/dev/null || true
   fi
+}
+
+wait_for_fixture_pid_exit() {
+  local pid="$1" attempt
+  for attempt in {1..100}; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_fixture_group_exit() {
+  local pgid="$1" attempt
+  for attempt in {1..100}; do
+    kill -0 -- "-$pgid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 cleanup() {
@@ -112,6 +143,13 @@ printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\nif [
   "$OUTER_COMPILER_PID" "$OUTER_FD_STATE" "$OUTER_FD_STATE" \
   "$OUTER_TERM" "$OUTER_READY" > "$FAKE_OUTER_RUSTC"
 chmod +x "$FAKE_OUTER_RUSTC"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ntrap "" HUP INT TERM\nprintf started > %q\ndd if=/dev/zero of=%q bs=1024 count=128 status=none\nwhile :; do sleep 1; done\nprintf finished > %q\n' \
+  "$OUTER_LIMIT_STARTED" "$OUTER_LIMIT_TARGET/runtime-oversized.bin" \
+  "$OUTER_LIMIT_FINISHED" > "$FAKE_OUTER_LIMIT_RUSTC"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\ndd if=/dev/zero of=%q bs=1024 count=128 status=none\nprintf finished > %q\nexit 0\n' \
+  "$OUTER_FAST_TARGET/fast-oversized.bin" "$OUTER_FAST_FINISHED" \
+  > "$FAKE_OUTER_FAST_RUSTC"
+chmod +x "$FAKE_OUTER_LIMIT_RUSTC" "$FAKE_OUTER_FAST_RUSTC"
 printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\ntrap "" HUP INT TERM\ntouch %q\nwhile :; do sleep 1; done\n' \
   "$SIGNAL_DESCENDANT_PID" "$SIGNAL_DESCENDANT_READY" > "$FAKE_SIGNAL_DESCENDANT"
 printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf "%%s\\n" "$$" > %q\ntrap "" HUP INT TERM\n%q &\ntouch %q\nwhile :; do sleep 1; done\n' \
@@ -175,6 +213,125 @@ done
   echo "error: outer-supervised compiler escaped the durable root process group" >&2
   exit 1
 }
+OUTER_WRAPPER_PID=""
+
+# Exact-valid outer metadata may select the inherited durable process group,
+# but it must not bypass this wrapper's periodic target ceiling. The looping
+# compiler ignores TERM so the bounded whole-group KILL path is exercised.
+mkdir -p "$OUTER_LIMIT_OUT_DIR"
+printf '%s\n' \
+  'version=1' \
+  "repository_id=$REPOSITORY_ID" \
+  'run_id=1.1.2' \
+  "workspace=$ROOT_DIR" \
+  'keep_target=0' > "$OUTER_LIMIT_VERIFY_DIR/.ryuki-verify-owner"
+set -m
+(
+  while [[ ! -f "$OUTER_LIMIT_CONTROL" ]]; do sleep 0.01; done
+  CARGO_TARGET_DIR="$OUTER_LIMIT_TARGET" \
+    CARGO_BUILD_JOBS=1 \
+    RYUKI_CARGO_OUTER_CONTROL_FILE="$OUTER_LIMIT_CONTROL" \
+    RYUKI_CARGO_GUARD_TEST_MODE=1 \
+    RYUKI_CARGO_GUARD_TEST_MAX_KIB=64 \
+    RYUKI_CARGO_MIN_FREE_GIB=30 \
+    RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+    "$GUARD" "$FAKE_OUTER_LIMIT_RUSTC" --out-dir "$OUTER_LIMIT_OUT_DIR"
+) 2>"$TEST_ROOT/outer-limit.log" &
+OUTER_WRAPPER_PID=$!
+set +m
+printf '%s\n' \
+  'version=1' \
+  "repository_id=$REPOSITORY_ID" \
+  'run_id=1.1.2' \
+  "supervisor_pid=$$" \
+  "command_pid=$OUTER_WRAPPER_PID" \
+  "command_pgid=$OUTER_WRAPPER_PID" > "$OUTER_LIMIT_CONTROL.next"
+mv "$OUTER_LIMIT_CONTROL.next" "$OUTER_LIMIT_CONTROL"
+if ! wait_for_fixture_pid_exit "$OUTER_WRAPPER_PID"; then
+  echo "error: outer-supervised runtime breach did not terminate in time" >&2
+  sed 's/^/  | /' "$TEST_ROOT/outer-limit.log" >&2 || true
+  exit 1
+fi
+set +e
+wait "$OUTER_WRAPPER_PID"
+outer_limit_status=$?
+set -e
+[[ "$outer_limit_status" -ne 0 ]] || {
+  echo "error: outer-supervised runtime breach returned success" >&2
+  exit 1
+}
+wait_for_fixture_group_exit "$OUTER_WRAPPER_PID" || {
+  echo "error: outer-supervised runtime breach left its command group alive" >&2
+  exit 1
+}
+[[ -f "$OUTER_LIMIT_STARTED" && ! -e "$OUTER_LIMIT_FINISHED" ]] || {
+  echo "error: outer-supervised looping compiler escaped runtime termination" >&2
+  exit 1
+}
+[[ -f "$OUTER_LIMIT_TARGET/.ryuki-cargo-disk-guard/target-limit-tripped" ]] || {
+  echo "error: outer-supervised runtime breach did not persist its trip" >&2
+  exit 1
+}
+grep -q "Cargo target exceeded" "$TEST_ROOT/outer-limit.log"
+grep -q "stopping Cargo compiler processes before they can exhaust the disk" \
+  "$TEST_ROOT/outer-limit.log"
+OUTER_WRAPPER_PID=""
+
+# A compiler that exits zero before the periodic sample must still be rejected
+# by the forced postflight when exact-valid outer metadata is present.
+mkdir -p "$OUTER_FAST_OUT_DIR"
+printf '%s\n' \
+  'version=1' \
+  "repository_id=$REPOSITORY_ID" \
+  'run_id=1.1.3' \
+  "workspace=$ROOT_DIR" \
+  'keep_target=0' > "$OUTER_FAST_VERIFY_DIR/.ryuki-verify-owner"
+set -m
+(
+  while [[ ! -f "$OUTER_FAST_CONTROL" ]]; do sleep 0.01; done
+  CARGO_TARGET_DIR="$OUTER_FAST_TARGET" \
+    CARGO_BUILD_JOBS=1 \
+    RYUKI_CARGO_OUTER_CONTROL_FILE="$OUTER_FAST_CONTROL" \
+    RYUKI_CARGO_GUARD_TEST_MODE=1 \
+    RYUKI_CARGO_GUARD_TEST_MAX_KIB=64 \
+    RYUKI_CARGO_MIN_FREE_GIB=30 \
+    RYUKI_CARGO_GUARD_INTERVAL_SECONDS=1 \
+    "$GUARD" "$FAKE_OUTER_FAST_RUSTC" --out-dir "$OUTER_FAST_OUT_DIR"
+) 2>"$TEST_ROOT/outer-fast.log" &
+OUTER_WRAPPER_PID=$!
+set +m
+printf '%s\n' \
+  'version=1' \
+  "repository_id=$REPOSITORY_ID" \
+  'run_id=1.1.3' \
+  "supervisor_pid=$$" \
+  "command_pid=$OUTER_WRAPPER_PID" \
+  "command_pgid=$OUTER_WRAPPER_PID" > "$OUTER_FAST_CONTROL.next"
+mv "$OUTER_FAST_CONTROL.next" "$OUTER_FAST_CONTROL"
+if ! wait_for_fixture_pid_exit "$OUTER_WRAPPER_PID"; then
+  echo "error: outer-supervised postflight breach did not terminate in time" >&2
+  sed 's/^/  | /' "$TEST_ROOT/outer-fast.log" >&2 || true
+  exit 1
+fi
+set +e
+wait "$OUTER_WRAPPER_PID"
+outer_fast_status=$?
+set -e
+[[ "$outer_fast_status" -ne 0 && -f "$OUTER_FAST_FINISHED" ]] || {
+  echo "error: outer-supervised short-lived growth escaped postflight" >&2
+  exit 1
+}
+wait_for_fixture_group_exit "$OUTER_WRAPPER_PID" || {
+  echo "error: outer-supervised postflight breach left its command group alive" >&2
+  exit 1
+}
+[[ -f "$OUTER_FAST_TARGET/.ryuki-cargo-disk-guard/target-limit-tripped" ]] || {
+  echo "error: outer-supervised postflight breach did not persist its trip" >&2
+  exit 1
+}
+grep -q "Cargo target exceeded" "$TEST_ROOT/outer-fast.log"
+grep -q "Cargo compiler output crossed the repository disk ceiling" \
+  "$TEST_ROOT/outer-fast.log"
 OUTER_WRAPPER_PID=""
 
 if CARGO_TARGET_DIR="$TARGET" \

@@ -335,6 +335,8 @@ if [[ -n "$TEST_MAX_KIB" ]]; then
 fi
 
 OUTER_SUPERVISED=0
+OUTER_COMMAND_PID=""
+OUTER_COMMAND_PGID=""
 
 validate_outer_supervision() {
   local control_file="${RYUKI_CARGO_OUTER_CONTROL_FILE:-}"
@@ -420,10 +422,10 @@ validate_outer_supervision() {
   trap - WINCH
   (( group_probe == 1 )) || return 75
 
-  # Where ps is available, additionally prove the command leader is the
-  # supervisor's child and the wrapper descends from that leader. The signed
-  # control/sentinel and group-membership proof remain authoritative on hosts
-  # that deny process-table inspection.
+  # Where ps is available, additionally reject metadata that disagrees with
+  # the live command topology. The same-UID records are reproducible and are
+  # not an authentication mechanism; they are used only to establish whether
+  # this wrapper can safely reuse the verifier's durable process group.
   command_ppid="$(/bin/ps -o ppid= -p "$command_pid" 2>/dev/null \
     | awk 'NF == 1 { print $1 }')" || command_ppid=""
   if [[ -n "$command_ppid" ]]; then
@@ -442,6 +444,8 @@ validate_outer_supervision() {
       [[ "$ancestor" == "$command_pid" ]] || return 75
     fi
   fi
+  OUTER_COMMAND_PID="$command_pid"
+  OUTER_COMMAND_PGID="$command_pgid"
   OUTER_SUPERVISED=1
 }
 
@@ -585,6 +589,8 @@ compiler_pgid=""
 compiler_group_owned=0
 compiler_release_file="$state_dir/compiler-release.$$.$RANDOM"
 compiler_release_tmp="${compiler_release_file}.tmp"
+outer_compiler_status_file="$state_dir/compiler-status.$$.$RANDOM"
+outer_compiler_status_tmp="${outer_compiler_status_file}.tmp"
 pending_launch_signal=""
 
 safe_process_group_id() {
@@ -681,21 +687,186 @@ record_launch_signal() {
   pending_launch_signal="$1"
 }
 
-# The outer verifier already performs frozen aggregate checks and owns a
-# durable process group recorded on disk. Inheriting that group prevents the
-# rustc wrapper from creating an unrecorded compiler/linker PG that could
-# survive supervisor recovery. The strict control/sentinel validation above
-# prevents a caller from selecting this mode with an arbitrary environment
-# flag.
-if (( OUTER_SUPERVISED == 1 )); then
-  exec 9>&-
-  exec "$@"
-fi
-
 if ! guard_check 1; then
   echo "error: Cargo compilation refused by the repository disk guard" >&2
   echo "error: run 'make clean' or use the disposable verification wrapper" >&2
   exit 75
+fi
+
+outer_process_group_pinned() {
+  (( OUTER_SUPERVISED == 1 )) || return 1
+  [[ -n "$OUTER_COMMAND_PID" \
+    && "$OUTER_COMMAND_PID" == "$OUTER_COMMAND_PGID" ]] || return 1
+  safe_process_group_id "$OUTER_COMMAND_PGID"
+}
+
+clear_outer_compiler_state() {
+  clear_compiler_release
+  rm -f -- "$outer_compiler_status_file" "$outer_compiler_status_tmp"
+}
+
+stop_outer_process_group() {
+  local attempt
+
+  outer_process_group_pinned || return 75
+  # This monitor is a member of the pinned group. Ignore catchable signals so
+  # TERM can reach the compiler and every sibling before the unconditional
+  # KILL also terminates this monitor. The verifier supervisor lives outside
+  # the group and performs the final reap/recovery.
+  trap '' HUP INT TERM
+  clear_outer_compiler_state || true
+  kill -TERM -- "-$OUTER_COMMAND_PGID" 2>/dev/null || true
+  for ((attempt = 0; attempt < HARD_STOP_PHASE_ATTEMPTS; attempt++)); do
+    sleep 0.1 || true
+  done
+  kill -KILL -- "-$OUTER_COMMAND_PGID" 2>/dev/null || return 75
+  return 75
+}
+
+handle_outer_signal() {
+  local status="$1"
+  stop_outer_process_group
+  exit "$status"
+}
+
+outer_exit_cleanup() {
+  local status=$?
+  trap - EXIT
+  trap '' HUP INT TERM
+  stop_outer_process_group || true
+  exit "$status"
+}
+
+# Valid outer metadata permits reuse of one already durable command process
+# group; it does not replace this wrapper's disk checks. Keep a parent monitor
+# in that inherited group, and turn job control off explicitly so its compiler
+# reporter cannot create an unrecorded nested group.
+if (( OUTER_SUPERVISED == 1 )); then
+  exec 9>&-
+  if [[ -e "$compiler_release_file" || -L "$compiler_release_file" \
+    || -e "$compiler_release_tmp" || -L "$compiler_release_tmp" \
+    || -e "$outer_compiler_status_file" || -L "$outer_compiler_status_file" \
+    || -e "$outer_compiler_status_tmp" || -L "$outer_compiler_status_tmp" ]]; then
+    echo "error: Cargo compiler monitor state already exists" >&2
+    exit 75
+  fi
+
+  trap 'record_launch_signal 130' INT
+  trap 'record_launch_signal 143' TERM
+  trap 'record_launch_signal 129' HUP
+  trap outer_exit_cleanup EXIT
+  set +m
+  (
+    trap - EXIT HUP INT TERM
+    exec 9>&-
+    released=0
+    for release_attempt in {1..200}; do
+      if [[ -e "$compiler_release_file" || -L "$compiler_release_file" ]]; then
+        [[ -f "$compiler_release_file" && ! -L "$compiler_release_file" \
+          && -O "$compiler_release_file" ]] || exit 75
+        rm -f -- "$compiler_release_file"
+        released=1
+        break
+      fi
+      kill -0 "$$" 2>/dev/null || exit 75
+      sleep 0.01
+    done
+    (( released == 1 )) || exit 75
+
+    set +e
+    "$@"
+    compiler_status=$?
+    set -e
+    (set -o noclobber; printf '%s\n' "$compiler_status" \
+      > "$outer_compiler_status_tmp") || exit 75
+    chmod 600 "$outer_compiler_status_tmp"
+    mv -- "$outer_compiler_status_tmp" "$outer_compiler_status_file"
+    exit "$compiler_status"
+  ) &
+  compiler_pid=$!
+  set +m
+  trap 'handle_outer_signal 130' INT
+  trap 'handle_outer_signal 143' TERM
+  trap 'handle_outer_signal 129' HUP
+  if [[ -n "$pending_launch_signal" ]]; then
+    handle_outer_signal "$pending_launch_signal"
+  fi
+  if ! kill -0 "$compiler_pid" 2>/dev/null; then
+    echo "error: Cargo compiler monitor could not be established" >&2
+    stop_outer_process_group
+    exit 75
+  fi
+  (set -o noclobber; : > "$compiler_release_tmp") || {
+    echo "error: Cargo compiler release ownership could not be created" >&2
+    stop_outer_process_group
+    exit 75
+  }
+  if ! chmod 600 "$compiler_release_tmp" \
+    || ! mv -- "$compiler_release_tmp" "$compiler_release_file"; then
+    echo "error: Cargo compiler release ownership could not be published" >&2
+    stop_outer_process_group
+    exit 75
+  fi
+
+  next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
+  while kill -0 "$compiler_pid" 2>/dev/null; do
+    # Completion is determined only from the actual reporter child. A status
+    # path is mutable same-UID state and must never act as a liveness oracle.
+    sleep 0.2
+    kill -0 "$compiler_pid" 2>/dev/null || break
+    if (( SECONDS < next_guard_check )); then
+      continue
+    fi
+    next_guard_check=$((SECONDS + CHECK_INTERVAL_SECONDS))
+    if guard_check 0; then
+      continue
+    fi
+    echo "error: stopping Cargo compiler processes before they can exhaust the disk" >&2
+    stop_outer_process_group
+    exit 75
+  done
+
+  if wait "$compiler_pid"; then
+    compiler_wait_status=0
+  else
+    compiler_wait_status=$?
+  fi
+  compiler_status=""
+  compiler_status_extra=""
+  compiler_status_extra_seen=0
+  if [[ -f "$outer_compiler_status_file" \
+    && ! -L "$outer_compiler_status_file" \
+    && -O "$outer_compiler_status_file" ]]; then
+    if ! {
+      IFS= read -r compiler_status || compiler_status=""
+      if IFS= read -r compiler_status_extra \
+        || [[ -n "$compiler_status_extra" ]]; then
+        compiler_status_extra_seen=1
+      fi
+    } < "$outer_compiler_status_file"; then
+      compiler_status=""
+    fi
+  fi
+  if [[ ! "$compiler_status" =~ ^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ \
+    || "$compiler_status_extra_seen" -ne 0 \
+    || "$compiler_status" != "$compiler_wait_status" ]]; then
+    echo "error: Cargo compiler did not publish a valid status" >&2
+    stop_outer_process_group
+    exit 75
+  fi
+  if ! clear_outer_compiler_state; then
+    echo "error: Cargo compiler monitor state could not be cleared" >&2
+    stop_outer_process_group
+    exit 75
+  fi
+  compiler_pid=""
+  if ! guard_check 1; then
+    echo "error: Cargo compiler output crossed the repository disk ceiling" >&2
+    stop_outer_process_group
+    exit 75
+  fi
+  trap - EXIT HUP INT TERM
+  exit "$compiler_status"
 fi
 
 # Monitor mode gives this one compiler and every inherited linker/descendant a
