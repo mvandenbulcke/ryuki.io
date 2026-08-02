@@ -27916,6 +27916,10 @@ async fn request_evidence_pack(
     })))
 }
 
+fn session_has_exact_global_scope(session: &AuthSession) -> bool {
+    session.site_scope.is_empty() && session.environment_scope.is_empty()
+}
+
 /// GET /api/activity/audit — the global-only, newest-first, actor-attributed
 /// audit feed across all requests. Same audit-tier gate as the per-request
 /// trail: who-acted-when is sensitive identity data. Principals carrying any
@@ -27931,7 +27935,7 @@ async fn activity_audit_feed(
             Json(json!({"error": "Audit-tier access is required to read the activity audit feed"})),
         ));
     }
-    if !session.site_scope.is_empty() || !session.environment_scope.is_empty() {
+    if !session_has_exact_global_scope(&session) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -28271,14 +28275,15 @@ struct AuditExportParams {
     limit: Option<i64>,
 }
 
-/// GET /api/audit/export — export the audit trail for SIEM ingestion. Audit-tier.
-/// Cursor-paginated by the monotonic row id (`after_id` → `next_after_id`), with
-/// an optional `[since, until]` time window. Detail is redacted; each entry
-/// carries its hash-chain `entry_hash` so the SIEM can correlate with the verify
-/// endpoint. In dry-run / no-DB mode there is no durable chain, so this returns
-/// an empty export. The cursor yields no duplicates; for guaranteed completeness
-/// (no gaps under concurrency) periodically re-export a CLOSED time window — see
-/// `audit::export_audit`. Use the cursor with a stable window, or id-only.
+/// GET /api/audit/export — global-only audit-trail export for SIEM ingestion.
+/// Audit-tier. Cursor-paginated by the monotonic row id (`after_id` →
+/// `next_after_id`), with an optional `[since, until]` time window. Detail is
+/// redacted; each entry carries its hash-chain `entry_hash` so the SIEM can
+/// correlate with the verify endpoint. In dry-run / no-DB mode there is no
+/// durable chain, so this returns an empty export. The cursor yields no
+/// duplicates; for guaranteed completeness (no gaps under concurrency)
+/// periodically re-export a CLOSED time window — see `audit::export_audit`. Use
+/// the cursor with a stable window, or id-only.
 async fn audit_export(
     AuthExtractor(session): AuthExtractor,
     Query(params): Query<AuditExportParams>,
@@ -28287,6 +28292,14 @@ async fn audit_export(
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "Audit-tier access is required to export the audit trail"})),
+        ));
+    }
+    if !session_has_exact_global_scope(&session) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Global audit-export access requires an explicit global scope"
+            })),
         ));
     }
     let Some(pool) = get_db() else {
@@ -55390,6 +55403,84 @@ mod unit_tests {
                 body,
                 json!({
                     "error": "Global audit-feed access requires an explicit global scope"
+                }),
+                "{case} denial must remain value-free"
+            );
+        }
+    }
+
+    /// The SIEM export reads the platform-wide audit_log, which has no scope
+    /// columns. Audit-capable principals therefore need exact global scope;
+    /// workload identity remains valid because SIEM ingestion is not a human
+    /// sign-off operation.
+    #[tokio::test]
+    async fn audit_export_requires_explicit_global_scope() {
+        let auditor =
+            single_role_session("audit-export-global", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let Json(export) = audit_export(
+            AuthExtractor(auditor.clone()),
+            Query(AuditExportParams::default()),
+        )
+        .await
+        .expect("a global auditor must reach the normal no-DB audit export");
+        assert_eq!(
+            export,
+            json!({
+                "durable": false,
+                "entries": [],
+                "count": 0,
+                "next_after_id": null,
+                "note": "no database configured; the durable audit log only exists in DB mode"
+            })
+        );
+
+        let mut siem_service = auditor.clone();
+        siem_service.actor_class = ryuki_engine::auth::ActorClass::Workload;
+        assert!(
+            audit_export(
+                AuthExtractor(siem_service),
+                Query(AuditExportParams::default()),
+            )
+            .await
+            .is_ok(),
+            "a globally scoped Auditor workload must retain SIEM export access"
+        );
+
+        let mut site_scoped_auditor = auditor.clone();
+        site_scoped_auditor.site_scope = vec!["DEFRA".to_string()];
+        let mut environment_scoped_auditor = auditor.clone();
+        environment_scoped_auditor.environment_scope = vec!["production".to_string()];
+        let mut dual_scoped_auditor = auditor.clone();
+        dual_scoped_auditor.site_scope = vec!["DEFRA".to_string()];
+        dual_scoped_auditor.environment_scope = vec!["production".to_string()];
+        let mut blank_scoped_auditor = auditor;
+        blank_scoped_auditor.site_scope = vec![" ".to_string()];
+        let mut scoped_admin = single_role_session(
+            "audit-export-admin",
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+        );
+        scoped_admin.site_scope = vec!["DEFRA".to_string()];
+
+        for (case, scoped_session) in [
+            ("site-scoped auditor", site_scoped_auditor),
+            ("environment-scoped auditor", environment_scoped_auditor),
+            ("dual-scoped auditor", dual_scoped_auditor),
+            ("malformed blank-scoped auditor", blank_scoped_auditor),
+            ("site-scoped platform admin", scoped_admin),
+        ] {
+            let Err((status, Json(body))) = audit_export(
+                AuthExtractor(scoped_session),
+                Query(AuditExportParams::default()),
+            )
+            .await
+            else {
+                panic!("{case} must not export the global audit log");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN, "{case}");
+            assert_eq!(
+                body,
+                json!({
+                    "error": "Global audit-export access requires an explicit global scope"
                 }),
                 "{case} denial must remain value-free"
             );
