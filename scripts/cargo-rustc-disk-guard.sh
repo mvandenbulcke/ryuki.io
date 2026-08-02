@@ -589,8 +589,6 @@ compiler_pgid=""
 compiler_group_owned=0
 compiler_release_file="$state_dir/compiler-release.$$.$RANDOM"
 compiler_release_tmp="${compiler_release_file}.tmp"
-outer_compiler_status_file="$state_dir/compiler-status.$$.$RANDOM"
-outer_compiler_status_tmp="${outer_compiler_status_file}.tmp"
 pending_launch_signal=""
 
 safe_process_group_id() {
@@ -702,7 +700,6 @@ outer_process_group_pinned() {
 
 clear_outer_compiler_state() {
   clear_compiler_release
-  rm -f -- "$outer_compiler_status_file" "$outer_compiler_status_tmp"
 }
 
 stop_outer_process_group() {
@@ -744,9 +741,7 @@ outer_exit_cleanup() {
 if (( OUTER_SUPERVISED == 1 )); then
   exec 9>&-
   if [[ -e "$compiler_release_file" || -L "$compiler_release_file" \
-    || -e "$compiler_release_tmp" || -L "$compiler_release_tmp" \
-    || -e "$outer_compiler_status_file" || -L "$outer_compiler_status_file" \
-    || -e "$outer_compiler_status_tmp" || -L "$outer_compiler_status_tmp" ]]; then
+    || -e "$compiler_release_tmp" || -L "$compiler_release_tmp" ]]; then
     echo "error: Cargo compiler monitor state already exists" >&2
     exit 75
   fi
@@ -776,11 +771,6 @@ if (( OUTER_SUPERVISED == 1 )); then
     set +e
     "$@"
     compiler_status=$?
-    set -e
-    (set -o noclobber; printf '%s\n' "$compiler_status" \
-      > "$outer_compiler_status_tmp") || exit 75
-    chmod 600 "$outer_compiler_status_tmp"
-    mv -- "$outer_compiler_status_tmp" "$outer_compiler_status_file"
     exit "$compiler_status"
   ) &
   compiler_pid=$!
@@ -831,26 +821,8 @@ if (( OUTER_SUPERVISED == 1 )); then
   else
     compiler_wait_status=$?
   fi
-  compiler_status=""
-  compiler_status_extra=""
-  compiler_status_extra_seen=0
-  if [[ -f "$outer_compiler_status_file" \
-    && ! -L "$outer_compiler_status_file" \
-    && -O "$outer_compiler_status_file" ]]; then
-    if ! {
-      IFS= read -r compiler_status || compiler_status=""
-      if IFS= read -r compiler_status_extra \
-        || [[ -n "$compiler_status_extra" ]]; then
-        compiler_status_extra_seen=1
-      fi
-    } < "$outer_compiler_status_file"; then
-      compiler_status=""
-    fi
-  fi
-  if [[ ! "$compiler_status" =~ ^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ \
-    || "$compiler_status_extra_seen" -ne 0 \
-    || "$compiler_status" != "$compiler_wait_status" ]]; then
-    echo "error: Cargo compiler did not publish a valid status" >&2
+  if [[ ! "$compiler_wait_status" =~ ^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then
+    echo "error: Cargo compiler did not return a valid status" >&2
     stop_outer_process_group
     exit 75
   fi
@@ -866,7 +838,7 @@ if (( OUTER_SUPERVISED == 1 )); then
     exit 75
   fi
   trap - EXIT HUP INT TERM
-  exit "$compiler_status"
+  exit "$compiler_wait_status"
 fi
 
 # Monitor mode gives this one compiler and every inherited linker/descendant a
