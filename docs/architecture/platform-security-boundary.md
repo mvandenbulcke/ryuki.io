@@ -2,8 +2,8 @@
 
 - Status: **proposed normative production boundary**
 - Owner: platform and security engineering
-- Evidence revision: `8212748308372e92d9cf794907d85fe103afd1da`
-- Last updated: 2026-07-31
+- Evidence revision: `f4f9858cb2aa78f169c8660ee020038522b13ac4`
+- Last updated: 2026-08-02
 - Production gate: **blocking until the required invariants are implemented and verified**
 
 This specification defines one security boundary for every Ryuki caller and
@@ -91,12 +91,16 @@ pinned revision. The later completed Codex Security diff scan
 `34dd2f56-f231-4e6f-a99f-1490a30b93d4` sealed 28 indexed findings for its
 validated change set. The remediation ledger reproduces only the scan-34
 identifiers that survived in repository evidence; missing identifiers are not
-inferred. Current working-tree remediations remain implementation evidence,
-not verified closure, until the focused PostgreSQL, clean repository, and final
-working-tree security-diff gates pass. These are source-level results, not
-claims about a rendered production deployment. The requirements below treat
-repeated root controls as platform-boundary work rather than asking each route
-or adapter to rediscover the same invariant.
+inferred. A later remediation-range review reached final reporting but failed
+before sealing because its generated Git-diff manifest omitted the required
+snapshot digest; its unsealed artifacts are not canonical scan evidence. The
+repository-local audit-export and Cargo outer-supervision fixes were therefore
+revalidated through their focused executable boundaries and committed
+independently. They remain subject to the closing clean repository and fresh
+security-diff gates. These are source-level results, not claims about a rendered
+production deployment. The requirements below treat repeated root controls as
+platform-boundary work rather than asking each route or adapter to rediscover
+the same invariant.
 
 | Risk theme | Source areas inspected | Structural concern |
 | --- | --- | --- |
@@ -2068,6 +2072,18 @@ The words **must**, **must not**, **should**, and **may** are normative.
   bound the horizon to at most 3,650 days, the page to at most 1,000 rows, and
   the offset to at most 10,000 rows, with a stable order and an identically
   scoped count.
+- **SB-AZ-09C — Global audit collections require explicit Global authority.**
+  A relation without authoritative site and environment columns cannot safely
+  serve a scoped collection read. The global activity feed and SIEM audit
+  export therefore require the `audit` capability plus explicitly Global
+  effective authority on both axes before database selection, cursor parsing,
+  or materialization. A nonempty scope remains scoped even when an element is
+  blank or malformed, and platform administration does not widen it. Workload
+  Auditors retain access when both axes are explicitly Global because SIEM
+  ingestion is not a verified-human sign-off operation. A future scoped audit
+  export must add authoritative scope provenance to every row and bind a
+  kernel-issued `QueryPermit` into SQL before ordering and limiting; optional
+  audit-detail JSON is never an authorization index.
 - **SB-AZ-10 — Monitoring configuration and alerts retain resource authority.**
   Every alert route created by the API is an immutable dual-axis
   site/environment resource whose canonical site must have a current active
@@ -2547,13 +2563,27 @@ evidence lives in `sources/ryuki-engine/src/evidence_pipeline.rs` and
 Current build-artifact containment evidence remains pending final verification.
 Cargo target and build directories are structurally external to the checkout:
 focused and clean verification use one supervised disposable run directory, and
-human development uses `../.ryuki-target-ryuki.io`. The process-group
-supervisors clean normal and interrupted runs; the target ceiling is 24 GiB and
-the free-space reserve is 30 GiB, and configuration may only tighten those
+human development uses `../.ryuki-target-ryuki.io`. The rustc wrapper retains
+its own preflight, periodic, and postflight disk checks even when it safely
+reuses the verifier's inherited process group; reproducible same-UID control
+records are topology evidence, not authentication. The target ceiling is 24 GiB
+and the free-space reserve is 30 GiB, and configuration may only tighten those
 bounds. Tracked regular-file `target` and `debug` blockers prevent checkout-local
 fallback. Docker build contexts exclude the blockers while container stages keep
 their normal `/app/target`, preserving the closed immutable tool lifecycle
 without copying host build artifacts into an image.
+
+Native process groups and sampled process-table ancestry remain best-effort
+reliability controls, not an adversarial lifetime boundary: a same-UID
+descendant can change session, reparent, and disappear between observations.
+Strict verification evidence therefore requires authority-backed membership,
+atomic kill-all, durable empty-state recovery, and aggregate storage enforcement
+that contained code cannot escape. Linux may satisfy that contract with a
+protected cgroup v2 or container plus a quota-backed disposable filesystem.
+macOS requires a container, VM, or another independently proven higher-authority
+job primitive for the same guarantee. Until the platform backend is selected and
+its real detach/reparent and recovery tests pass, native verification must not
+claim complete descendant or aggregate-storage containment.
 
 ## Options considered
 
