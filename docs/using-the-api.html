@@ -181,19 +181,22 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <table><thead><tr><th>Header</th><th>When to send it</th></tr></thead><tbody>
 <tr><td><code>Authorization: Bearer ...</code></td><td>Human API routes accept exactly one applicable credential: a <code>ryk_...</code> API token, a validated Entra JWT, or an opaque <code>rys_...</code> persisted-session token. Token minting rejects <code>ryk_...</code> credentials and requires an interactive administrator. Agent routes use their own <code>rya_...</code> bearer tokens.</td></tr>
 <tr><td><code>X-Ryuki-Session-Id</code></td><td>Compatibility carrier for the opaque <code>rys_...</code> session token used by the portal and scripts. Despite the header name, an administrative session UUID is never valid here. HTTPS uses the <code>__Host-ryuki_session</code> cookie; explicitly configured non-Secure loopback development uses <code>ryuki_session</code>. Either cookie can authorize safe reads only in its matching mode; cookie-only <code>POST</code>, <code>PUT</code>, <code>PATCH</code>, and <code>DELETE</code> requests are rejected as a CSRF defense.</td></tr>
-<tr><td><code>Content-Type: application/json</code></td><td>Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: the v1 webhook message covers the exact-body SHA-256 digest.</td></tr>
+<tr><td><code>Content-Type: application/json</code></td><td>Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: the v2 webhook message covers the exact-body SHA-256 digest.</td></tr>
 <tr><td><code>x-ryuki-protocol-version</code></td><td>Required on agent registration, poll, acknowledgement, heartbeat, and result requests. This build accepts version <code>2</code>; missing, duplicate, malformed, or unsupported values return <code>400</code>. The public-key and OpenAPI bootstrap reads do not require it.</td></tr>
-<tr><td><code>X-Hub-Signature-256</code></td><td>Required by the inbound webhook receiver. Send the hex HMAC-SHA256 of the Ryuki v1 canonical message (fixed POST path, connection ID, timestamp, delivery ID, and exact-body SHA-256), optionally prefixed with <code>sha256=</code>.</td></tr>
+<tr><td><code>X-Hub-Signature-256</code></td><td>Required by the inbound webhook receiver. Send the hex HMAC-SHA256 of the Ryuki v2 canonical message (fixed POST path, connection ID, credential generation, authority digest, timestamp, delivery ID, and exact-body SHA-256), optionally prefixed with <code>sha256=</code>.</td></tr>
 <tr><td><code>X-Ryuki-Webhook-Timestamp</code></td><td>Required by the inbound webhook receiver. Send canonical Unix time in seconds; it is signed and accepted only within five minutes of both receiver clocks.</td></tr>
 <tr><td><code>X-Ryuki-Webhook-Delivery-Id</code></td><td>Required by the inbound webhook receiver. Send a unique 1-128 byte identifier using <code>[A-Za-z0-9._-]</code>; it is signed and atomically deduplicated per connection.</td></tr>
 <tr><td><code>Idempotency-Key</code></td><td>Enables durable deduplication for authenticated, DB-backed human mutations. Use a unique, unguessable key for each logical operation; the emergency-initiate route requires one.</td></tr>
 </tbody></table>
 <p>During the secure-cookie migration, successful login/callback and logout responses send the <code>__Host-ryuki_session</code> field and a separate <code>ryuki_session</code> expiry field. Proxies must preserve these as independent <code>Set-Cookie</code> header fields; they must not comma-join them. The expired legacy name is never accepted as an HTTPS credential.</p>
-<p>For inbound webhooks, compute the HMAC over this exact UTF-8 v1 message with no trailing newline (replace the placeholders with the header/path values and the lowercase hex SHA-256 of the exact body bytes):</p>
-<pre><code class="lang-text">ryuki-webhook-v1
+<p>Provision or rotate a connection's dedicated inbound credential with <code>POST /api/integrations/{id}/webhook-secret</code>. Preserve the returned <code>webhook_secret_generation</code> and <code>authority_context_sha256</code> alongside the secret in the sender configuration. Changing a connection's vendor or site revokes the active credential; re-provision it before resuming delivery. The v2 migration also revokes legacy v1 credentials because their historical authority context cannot be proven.</p>
+<p>Compute the HMAC over this exact UTF-8 v2 message with no trailing newline (replace the placeholders with the returned authority fields, header/path values, and lowercase hex SHA-256 of the exact body bytes):</p>
+<pre><code class="lang-text">ryuki-webhook-v2
 method:POST
 path:/api/integrations/{connection_id}/webhook
 connection-id:{connection_id}
+credential-generation:{webhook_secret_generation}
+authority-context-sha256:{authority_context_sha256}
 timestamp:{unix_seconds}
 delivery-id:{delivery_id}
 body-sha256:{lowercase_hex_digest}</code></pre>
@@ -394,7 +397,7 @@ body-sha256:{lowercase_hex_digest}</code></pre>
 <p>If you selected the live branch, <code>completed</code> is not final acceptance. Record the state/provider disposition after the apply, then immediately perform the mandatory state-keyed cleanup and direct vSphere absence check in Gate 6 of <a href="first-test.html">First Test Acceptance</a>. Preserve the database and agent state until that evidence is accepted. An uncertain apply follows that document's reconcile-and-fail procedure and is never retried on the same request.</p>
 <p>Every transition is CAS-guarded (a conflicting transition answers 409), attributed, and appended to the hash-chained audit trail. A successful LivePlan records an agent-attributed approval pause while the request remains <code>executing</code>; only the accepted execution result for the selected branch moves the request to <code>verifying</code>.</p>
 <p>From here: multi-step requests and per-step live approvals are covered in <a href="orchestration.html">Multi-Step Orchestration</a>, and taking execution to real infrastructure in <a href="agents-and-live-execution.html">Agents &amp; Live Execution</a>.</p>
-<div class="page-meta">Last updated 2026-07-16 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/using-the-api.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/notifications.html">&larr; Notifications</a><a href="/api-reference.html">API Reference &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-08-01 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/using-the-api.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/notifications.html">&larr; Notifications</a><a href="/api-reference.html">API Reference &rarr;</a></nav>
 </main>
   </div>
   <footer class="site-footer">

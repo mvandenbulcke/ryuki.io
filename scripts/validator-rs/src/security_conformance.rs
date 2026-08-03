@@ -16,11 +16,16 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 const CONTRACT_DIR: &str = "catalog/security-contracts/v1";
+const MAX_SECURITY_CONTRACT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_REFERENCED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const PLATFORM_SECURITY_BOUNDARY_LOCATOR: &str = "docs/architecture/platform-security-boundary.md";
 const MAX_PLATFORM_SECURITY_BOUNDARY_BYTES: u64 = 2 * 1024 * 1024;
 const CONFORMANCE_BUNDLE_LOCATOR_PREFIX: &str =
@@ -72,7 +77,7 @@ const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
 
-const SCHEMAS: [(&str, &str); 17] = [
+const SCHEMAS: [(&str, &str); 18] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -100,6 +105,10 @@ const SCHEMAS: [(&str, &str); 17] = [
     (
         "control-trace.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json",
+    ),
+    (
+        "control-trace-status-overlay.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/control-trace-status-overlay.schema.json",
     ),
     (
         "deployment-security-profile.schema.json",
@@ -143,7 +152,7 @@ const SCHEMAS: [(&str, &str); 17] = [
     ),
 ];
 
-const INSTANCES: [(&str, &str); 6] = [
+const INSTANCES: [(&str, &str); 7] = [
     (
         "action-resource-registry.implementation.json",
         "action-resource-registry.schema.json",
@@ -151,6 +160,10 @@ const INSTANCES: [(&str, &str); 6] = [
     (
         "control-trace.implementation.json",
         "control-trace.schema.json",
+    ),
+    (
+        "control-trace-status-overlay.implementation.json",
+        "control-trace-status-overlay.schema.json",
     ),
     (
         "conformance-trust-root-registry.implementation.json",
@@ -440,7 +453,43 @@ pub(crate) fn parse_json_strict(bytes: &[u8]) -> Result<Value, serde_json::Error
 /// this gate.  With no conformance bundles or receipts checked in, the only
 /// honest state is `implementation_only` and `production_accepted: false`.
 pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
-    let contract_dir = root.join(CONTRACT_DIR);
+    validate_repository_internal(root).map(|(errors, _)| errors)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedControlTraceStatusSnapshot {
+    pub(crate) control_trace: Value,
+    pub(crate) control_trace_raw_sha256: String,
+    pub(crate) status_overlay: Value,
+    pub(crate) status_overlay_raw_sha256: String,
+}
+
+/// Validate the repository and return the exact parsed catalog values whose
+/// schema, binding, and semantic checks produced the returned error set. Matrix
+/// projection must consume this snapshot instead of reopening either path.
+pub(crate) fn validate_repository_with_matrix_snapshot(
+    root: &Path,
+) -> Result<(Vec<String>, Option<ValidatedControlTraceStatusSnapshot>), String> {
+    validate_repository_internal(root)
+}
+
+fn validate_repository_internal(
+    root: &Path,
+) -> Result<(Vec<String>, Option<ValidatedControlTraceStatusSnapshot>), String> {
+    let canonical_root = fs::canonicalize(root).map_err(|error| {
+        format!(
+            "failed to resolve repository root {}: {error}",
+            root.display()
+        )
+    })?;
+    if !canonical_root.is_dir() {
+        return Err(format!(
+            "repository root is not a regular directory: {}",
+            canonical_root.display()
+        ));
+    }
+    let root = canonical_root.as_path();
+    let contract_dir = resolve_confined_contract_directory(root)?;
     let mut errors = Vec::new();
 
     validate_contract_file_inventory(&contract_dir, &mut errors)?;
@@ -448,19 +497,22 @@ pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
     let mut schemas = BTreeMap::new();
     for (file_name, expected_id) in SCHEMAS {
         let path = contract_dir.join(file_name);
-        let Some(schema) = read_json_if_present(&path, &mut errors)? else {
+        let Some(loaded) = read_json_if_present(&path, &mut errors)? else {
             continue;
         };
+        let schema = loaded.value;
         validate_schema_document(file_name, expected_id, &schema, &mut errors);
         schemas.insert(file_name, schema);
     }
 
     let mut instances = BTreeMap::new();
+    let mut instance_raw_sha256 = BTreeMap::new();
     for (file_name, schema_name) in INSTANCES {
         let path = contract_dir.join(file_name);
-        let Some(instance) = read_json_if_present(&path, &mut errors)? else {
+        let Some(loaded) = read_json_if_present(&path, &mut errors)? else {
             continue;
         };
+        let instance = loaded.value;
         if let Some(schema) = schemas.get(schema_name) {
             validate_instance(file_name, schema_name, schema, &instance, &mut errors);
         }
@@ -483,6 +535,7 @@ pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
             _ => {}
         }
         validate_recursive_content_references(root, file_name, &instance, "", &mut errors);
+        instance_raw_sha256.insert(file_name, loaded.raw_sha256);
         instances.insert(file_name, instance);
     }
 
@@ -512,14 +565,107 @@ pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
     if let Some(ledger) = instances.get("control-trace.implementation.json") {
         validate_boundary_control_inventory(root, &mut errors);
         validate_ledger_semantics(ledger, &mut errors);
-        validate_closure_semantics(root, ledger, &bundles, &receipts, &mut errors);
+        if let Some(overlay) = instances.get("control-trace-status-overlay.implementation.json") {
+            if let Some(ledger_raw_sha256) =
+                instance_raw_sha256.get("control-trace.implementation.json")
+            {
+                validate_control_trace_status_overlay_semantics(
+                    root,
+                    ledger,
+                    ledger_raw_sha256,
+                    overlay,
+                    &mut errors,
+                );
+            } else {
+                errors.push(
+                    "control-trace-status-overlay.implementation.json:/control_trace_ref/raw_sha256: authoritative ControlTrace raw-byte digest was not captured"
+                        .to_string(),
+                );
+            }
+        }
+        let ledger_raw_sha256 = instance_raw_sha256
+            .get("control-trace.implementation.json")
+            .map(String::as_str);
+        if ledger_raw_sha256.is_none() {
+            errors.push(
+                "control-trace.implementation.json: exact raw-byte digest was not captured for closure validation"
+                    .to_string(),
+            );
+        }
+        validate_closure_semantics_at_with_digest(
+            root,
+            ledger,
+            ledger_raw_sha256,
+            &bundles,
+            &receipts,
+            Utc::now(),
+            &mut errors,
+        );
     }
     validate_cross_document_semantics(root, &instances, &mut errors);
     validate_implementation_only_honesty(&instances, &bundles, &receipts, &mut errors);
 
+    let matrix_snapshot = match (
+        instances.get("control-trace.implementation.json"),
+        instance_raw_sha256.get("control-trace.implementation.json"),
+        instances.get("control-trace-status-overlay.implementation.json"),
+        instance_raw_sha256.get("control-trace-status-overlay.implementation.json"),
+    ) {
+        (
+            Some(control_trace),
+            Some(control_trace_raw_sha256),
+            Some(status_overlay),
+            Some(status_overlay_raw_sha256),
+        ) => Some(ValidatedControlTraceStatusSnapshot {
+            control_trace: control_trace.clone(),
+            control_trace_raw_sha256: control_trace_raw_sha256.clone(),
+            status_overlay: status_overlay.clone(),
+            status_overlay_raw_sha256: status_overlay_raw_sha256.clone(),
+        }),
+        _ => None,
+    };
+
     errors.sort();
     errors.dedup();
-    Ok(errors)
+    Ok((errors, matrix_snapshot))
+}
+
+fn resolve_confined_contract_directory(root: &Path) -> Result<PathBuf, String> {
+    let mut candidate = root.to_path_buf();
+    for component in Path::new(CONTRACT_DIR).components() {
+        let Component::Normal(name) = component else {
+            return Err(format!(
+                "security contract directory is not a normalized repository-relative path: {CONTRACT_DIR}"
+            ));
+        };
+        candidate.push(name);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+            format!(
+                "failed to inspect security contract directory component {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "security contract directory must remain inside the repository and must not traverse a symlink: {}",
+                candidate.display()
+            ));
+        }
+    }
+
+    let canonical_candidate = fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "failed to resolve security contract directory {}: {error}",
+            candidate.display()
+        )
+    })?;
+    if !canonical_candidate.starts_with(root) {
+        return Err(format!(
+            "security contract directory escapes the repository root: {}",
+            canonical_candidate.display()
+        ));
+    }
+    Ok(canonical_candidate)
 }
 
 fn reject_untrusted_closure_documents(
@@ -535,33 +681,227 @@ fn reject_untrusted_closure_documents(
     }
 }
 
-fn read_json_if_present(path: &Path, errors: &mut Vec<String>) -> Result<Option<Value>, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+#[derive(Clone, Debug)]
+struct LoadedJsonFile {
+    value: Value,
+    raw_sha256: String,
+}
+
+#[derive(Debug)]
+enum StrictJsonLoadError {
+    Missing,
+    Invalid(String),
+    Io(String),
+}
+
+fn read_json_if_present(
+    path: &Path,
+    errors: &mut Vec<String>,
+) -> Result<Option<LoadedJsonFile>, String> {
+    match load_bounded_strict_json(path) {
+        Ok(loaded) => Ok(Some(loaded)),
+        Err(StrictJsonLoadError::Missing) => {
             errors.push(format!("missing required contract file {}", path.display()));
-            return Ok(None);
-        }
-        Err(error) => {
-            return Err(format!("failed to inspect {}: {error}", path.display()));
-        }
-    };
-    if !metadata.file_type().is_file() {
-        errors.push(format!(
-            "contract path must be a regular file: {}",
-            path.display()
-        ));
-        return Ok(None);
-    }
-    let raw =
-        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    match parse_json_strict(&raw) {
-        Ok(value) => Ok(Some(value)),
-        Err(error) => {
-            errors.push(format!("invalid JSON in {}: {error}", path.display()));
             Ok(None)
         }
+        Err(StrictJsonLoadError::Invalid(error)) => {
+            errors.push(error);
+            Ok(None)
+        }
+        Err(StrictJsonLoadError::Io(error)) => Err(error),
     }
+}
+
+fn load_bounded_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>, StrictJsonLoadError> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(StrictJsonLoadError::Missing);
+        }
+        Err(error) => {
+            return Err(StrictJsonLoadError::Io(format!(
+                "failed to inspect {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !path_metadata.file_type().is_file() {
+        return Err(StrictJsonLoadError::Invalid(format!(
+            "contract path must be a regular file and not a symlink: {}",
+            path.display()
+        )));
+    }
+
+    let mut file = open_read_only_no_follow(path).map_err(|error| {
+        StrictJsonLoadError::Io(format!("failed to open {} safely: {error}", path.display()))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        StrictJsonLoadError::Io(format!(
+            "failed to inspect opened contract {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !opened_metadata.file_type().is_file()
+        || !same_file_identity(&path_metadata, &opened_metadata)
+    {
+        return Err(StrictJsonLoadError::Invalid(format!(
+            "contract path changed during safe open or is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if opened_metadata.len() > max_bytes {
+        return Err(StrictJsonLoadError::Invalid(format!(
+            "contract file exceeds the {} byte limit: {}",
+            max_bytes,
+            path.display()
+        )));
+    }
+
+    let mut raw = Vec::with_capacity(opened_metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| {
+            StrictJsonLoadError::Io(format!("failed to read {}: {error}", path.display()))
+        })?;
+    if raw.len() as u64 > max_bytes {
+        return Err(StrictJsonLoadError::Invalid(format!(
+            "contract file exceeds the {} byte limit: {}",
+            max_bytes,
+            path.display()
+        )));
+    }
+
+    let post_read_metadata = file.metadata().map_err(|error| {
+        StrictJsonLoadError::Io(format!(
+            "failed to re-inspect opened contract {}: {error}",
+            path.display()
+        ))
+    })?;
+    let final_path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        StrictJsonLoadError::Io(format!(
+            "failed to re-inspect contract path {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !post_read_metadata.file_type().is_file()
+        || !final_path_metadata.file_type().is_file()
+        || !same_file_identity(&opened_metadata, &post_read_metadata)
+        || !same_file_identity(&opened_metadata, &final_path_metadata)
+        || post_read_metadata.len() != raw.len() as u64
+    {
+        return Err(StrictJsonLoadError::Invalid(format!(
+            "contract path or bytes changed while being read: {}",
+            path.display()
+        )));
+    }
+
+    Ok(raw)
+}
+
+fn load_bounded_strict_json(path: &Path) -> Result<LoadedJsonFile, StrictJsonLoadError> {
+    let raw = load_bounded_bytes(path, MAX_SECURITY_CONTRACT_BYTES)?;
+    let value = parse_json_strict(&raw).map_err(|error| {
+        StrictJsonLoadError::Invalid(format!("invalid JSON in {}: {error}", path.display()))
+    })?;
+    Ok(LoadedJsonFile {
+        value,
+        raw_sha256: raw_sha256_digest(&raw),
+    })
+}
+
+fn read_bounded_repository_bytes(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    match load_bounded_bytes(path, max_bytes) {
+        Ok(bytes) => Some(bytes),
+        Err(StrictJsonLoadError::Missing) => {
+            errors.push(format!(
+                "{label}: required file is missing: {}",
+                path.display()
+            ));
+            None
+        }
+        Err(StrictJsonLoadError::Invalid(error) | StrictJsonLoadError::Io(error)) => {
+            errors.push(format!("{label}: {error}"));
+            None
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW_FLAG: i32 = 0x0002_0000;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK_FLAG: i32 = 0x0000_0800;
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0000_0100;
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NONBLOCK_FLAG: i32 = 0x0000_0004;
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn open_read_only_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG);
+    options.open(path)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+fn open_read_only_no_follow(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(not(unix))]
+fn open_read_only_no_follow(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type() && left.len() == right.len()
 }
 
 #[derive(Clone, Debug)]
@@ -601,15 +941,21 @@ fn load_closure_documents(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        let value: Value = match parse_json_strict(&bytes) {
-            Ok(value) => value,
-            Err(error) => {
-                errors.push(format!("invalid JSON in {relative}: {error}"));
+        let loaded = match load_bounded_strict_json(&path) {
+            Ok(loaded) => loaded,
+            Err(StrictJsonLoadError::Missing) => {
+                errors.push(format!(
+                    "closure evidence file disappeared during validation: {relative}"
+                ));
                 continue;
             }
+            Err(StrictJsonLoadError::Invalid(error)) => {
+                errors.push(error);
+                continue;
+            }
+            Err(StrictJsonLoadError::Io(error)) => return Err(error),
         };
+        let value = loaded.value;
         if let Some(schema) = schema {
             validate_instance(&relative, schema_name, schema, &value, errors);
         }
@@ -617,7 +963,7 @@ fn load_closure_documents(
         documents.push(LoadedDocument {
             label: relative,
             value,
-            digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            digest: loaded.raw_sha256,
         });
     }
     Ok(documents)
@@ -972,35 +1318,32 @@ fn extract_boundary_control_ids(document: &str) -> BTreeSet<String> {
 /// normative Markdown. Without this check the validator constant and
 /// ControlTrace could drift together and silently omit a newly added invariant.
 fn validate_boundary_control_inventory(root: &Path, errors: &mut Vec<String>) {
-    let path = root.join(PLATFORM_SECURITY_BOUNDARY_LOCATOR);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            errors.push(format!(
-                "cannot inspect authoritative platform security boundary {}: {error}",
-                path.display()
-            ));
-            return;
-        }
-    };
-    if !metadata.file_type().is_file() || metadata.len() > MAX_PLATFORM_SECURITY_BOUNDARY_BYTES {
-        errors.push(format!(
-            "authoritative platform security boundary must be a regular file no larger than {MAX_PLATFORM_SECURITY_BOUNDARY_BYTES} bytes: {}",
-            path.display()
-        ));
+    let Some(path) = validate_confined_repository_file(
+        root,
+        PLATFORM_SECURITY_BOUNDARY_LOCATOR,
+        "authoritative platform security boundary",
+        errors,
+    ) else {
         return;
-    }
-    let document = match fs::read_to_string(&path) {
+    };
+    let Some(bytes) = read_bounded_repository_bytes(
+        &path,
+        MAX_PLATFORM_SECURITY_BOUNDARY_BYTES,
+        "authoritative platform security boundary",
+        errors,
+    ) else {
+        return;
+    };
+    let document = match std::str::from_utf8(&bytes) {
         Ok(document) => document,
         Err(error) => {
             errors.push(format!(
-                "cannot read authoritative platform security boundary {}: {error}",
-                path.display()
+                "authoritative platform security boundary is not UTF-8: {error}"
             ));
             return;
         }
     };
-    let documented = extract_boundary_control_ids(&document);
+    let documented = extract_boundary_control_ids(document);
     let validator = CANONICAL_CONTROL_IDS
         .iter()
         .map(|id| (*id).to_string())
@@ -1209,9 +1552,469 @@ fn validate_ledger_semantics(ledger: &Value, errors: &mut Vec<String>) {
     }
 }
 
+/// Validate the repository-maintained implementation-status overlay against
+/// the independently authoritative ControlTrace document. The overlay is
+/// deliberately tracking-only: this function verifies repository evidence
+/// paths and dependency bookkeeping, but it never derives production
+/// acceptance or feeds the production-closure verifier.
+fn validate_control_trace_status_overlay_semantics(
+    root: &Path,
+    ledger: &Value,
+    ledger_raw_sha256: &str,
+    overlay: &Value,
+    errors: &mut Vec<String>,
+) {
+    const OVERLAY_FILE: &str = "control-trace-status-overlay.implementation.json";
+    const LEDGER_FILE: &str = "control-trace.implementation.json";
+
+    require_exact_string(
+        overlay,
+        "contract_kind",
+        "ControlTraceStatusOverlay",
+        OVERLAY_FILE,
+        errors,
+    );
+    require_exact_string(
+        overlay,
+        "authority_scope",
+        "repository-implementation-tracking-only",
+        OVERLAY_FILE,
+        errors,
+    );
+    require_exact_string(
+        overlay,
+        "status_assurance",
+        "source-audited-declaration-without-conformance-receipt",
+        OVERLAY_FILE,
+        errors,
+    );
+
+    let reference = overlay.get("control_trace_ref").unwrap_or(&Value::Null);
+    for field in [
+        "document_id",
+        "document_version",
+        "ledger_id",
+        "ledger_version",
+    ] {
+        let context = format!("{OVERLAY_FILE}:/control_trace_ref/{field}");
+        let Some(expected) = ledger.get(field) else {
+            errors.push(format!(
+                "{context}: authoritative {LEDGER_FILE} omits {field}"
+            ));
+            continue;
+        };
+        if reference.get(field) != Some(expected) {
+            errors.push(format!(
+                "{context}: must exactly match {LEDGER_FILE}:/{field}"
+            ));
+        }
+    }
+
+    if string_field(reference, "raw_sha256") != Some(ledger_raw_sha256) {
+        errors.push(format!(
+            "{OVERLAY_FILE}:/control_trace_ref/raw_sha256: must match the exact raw bytes parsed as {LEDGER_FILE}; expected {ledger_raw_sha256}"
+        ));
+    }
+
+    let active_traces = array(ledger, "traces")
+        .iter()
+        .filter(|trace| string_field(trace, "trace_lifecycle") == Some("active"))
+        .filter_map(|trace| {
+            Some((
+                string_field(trace, "trace_id")?.to_string(),
+                string_field(trace, "control_id")?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let expected_trace_ids = active_traces
+        .iter()
+        .map(|(trace_id, _)| trace_id.clone())
+        .collect::<Vec<_>>();
+    let trace_controls = active_traces.into_iter().collect::<BTreeMap<_, _>>();
+
+    let rows = array(overlay, "rows");
+    let actual_trace_ids = rows
+        .iter()
+        .filter_map(|row| string_field(row, "trace_id").map(str::to_string))
+        .collect::<Vec<_>>();
+    if rows.len() != expected_trace_ids.len() {
+        errors.push(format!(
+            "{OVERLAY_FILE}:/rows: must contain exactly one row for each active trace; expected {}, found {}",
+            expected_trace_ids.len(),
+            rows.len()
+        ));
+    }
+    if let Some((index, (expected, actual))) = expected_trace_ids
+        .iter()
+        .zip(actual_trace_ids.iter())
+        .enumerate()
+        .find(|(_, (expected, actual))| expected != actual)
+    {
+        errors.push(format!(
+            "{OVERLAY_FILE}:/rows/{index}/trace_id: active traces must remain in exact ControlTrace order; expected {expected}, found {actual}"
+        ));
+    }
+
+    let expected_trace_set = expected_trace_ids.into_iter().collect::<BTreeSet<_>>();
+    let mut actual_trace_set = BTreeSet::new();
+    for (index, trace_id) in actual_trace_ids.iter().enumerate() {
+        if !actual_trace_set.insert(trace_id.clone()) {
+            errors.push(format!(
+                "{OVERLAY_FILE}:/rows/{index}/trace_id: duplicate active trace row {trace_id}"
+            ));
+        }
+    }
+    report_set_delta(
+        "status-overlay active trace",
+        &expected_trace_set,
+        &actual_trace_set,
+        errors,
+    );
+
+    let canonical_controls = CANONICAL_CONTROL_IDS
+        .iter()
+        .map(|control_id| (*control_id).to_string())
+        .collect::<BTreeSet<_>>();
+    let mut dependency_graph = canonical_controls
+        .iter()
+        .map(|control_id| (control_id.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for (index, row) in rows.iter().enumerate() {
+        let row_context = format!("{OVERLAY_FILE}:/rows/{index}");
+        let trace_id = string_field(row, "trace_id").unwrap_or("");
+        let control_id = trace_controls.get(trace_id).map(String::as_str);
+
+        for field in ["source_paths", "migration_paths", "test_paths"] {
+            validate_status_overlay_path_array(root, row, field, &row_context, errors);
+        }
+
+        let blockers = array(row, "blockers");
+        let mut has_repository_implementation_blocker = false;
+        for (blocker_index, blocker) in blockers.iter().enumerate() {
+            let blocker_context = format!("{row_context}/blockers/{blocker_index}");
+            if string_field(blocker, "kind") == Some("repository_implementation") {
+                has_repository_implementation_blocker = true;
+            }
+            if string_field(blocker, "detail").is_none_or(|detail| detail.trim().is_empty()) {
+                errors.push(format!(
+                    "{blocker_context}/detail: blocker detail must be nonblank"
+                ));
+            }
+        }
+
+        let has_implementation_path =
+            !array(row, "source_paths").is_empty() || !array(row, "migration_paths").is_empty();
+        let has_test_path = !array(row, "test_paths").is_empty();
+        match string_field(row, "implementation_status") {
+            Some("implemented") => {
+                if !has_implementation_path {
+                    errors.push(format!(
+                        "{row_context}/implementation_status: implemented requires at least one source_paths or migration_paths entry"
+                    ));
+                }
+                if !has_test_path {
+                    errors.push(format!(
+                        "{row_context}/implementation_status: implemented requires at least one test_paths entry"
+                    ));
+                }
+                if has_repository_implementation_blocker {
+                    errors.push(format!(
+                        "{row_context}/implementation_status: implemented forbids a repository_implementation blocker"
+                    ));
+                }
+            }
+            Some("partial" | "not_implemented") => {
+                if !has_repository_implementation_blocker {
+                    errors.push(format!(
+                        "{row_context}/implementation_status: partial and not_implemented require a repository_implementation blocker"
+                    ));
+                }
+            }
+            Some(status) => errors.push(format!(
+                "{row_context}/implementation_status: unknown repository implementation status {status:?}"
+            )),
+            None => errors.push(format!(
+                "{row_context}/implementation_status: repository implementation status is required"
+            )),
+        }
+
+        let mut dependencies = BTreeSet::new();
+        for (dependency_index, dependency) in
+            array(row, "dependency_control_ids").iter().enumerate()
+        {
+            let dependency_context =
+                format!("{row_context}/dependency_control_ids/{dependency_index}");
+            let Some(dependency) = dependency.as_str() else {
+                errors.push(format!(
+                    "{dependency_context}: dependency must be a canonical control ID"
+                ));
+                continue;
+            };
+            if !dependencies.insert(dependency.to_string()) {
+                errors.push(format!(
+                    "{dependency_context}: duplicate dependency control {dependency}"
+                ));
+            }
+            if !canonical_controls.contains(dependency) {
+                errors.push(format!(
+                    "{dependency_context}: dependency references unknown canonical control {dependency}"
+                ));
+                continue;
+            }
+            if control_id == Some(dependency) {
+                errors.push(format!(
+                    "{dependency_context}: control {dependency} cannot depend on itself"
+                ));
+                continue;
+            }
+            if let Some(control_id) = control_id {
+                dependency_graph
+                    .entry(control_id.to_string())
+                    .or_default()
+                    .insert(dependency.to_string());
+            }
+        }
+    }
+
+    detect_control_dependency_cycles(&dependency_graph, errors);
+}
+
+fn validate_status_overlay_path_array(
+    root: &Path,
+    row: &Value,
+    field: &str,
+    row_context: &str,
+    errors: &mut Vec<String>,
+) {
+    let mut seen = BTreeSet::new();
+    for (index, value) in array(row, field).iter().enumerate() {
+        let context = format!("{row_context}/{field}/{index}");
+        let Some(locator) = value.as_str() else {
+            errors.push(format!(
+                "{context}: repository evidence path must be a string"
+            ));
+            continue;
+        };
+        if !seen.insert(locator.to_string()) {
+            errors.push(format!(
+                "{context}: duplicate repository evidence path {locator}"
+            ));
+        }
+        let _ = validate_confined_repository_file(root, locator, &context, errors);
+    }
+}
+
+fn validate_confined_repository_file(
+    root: &Path,
+    locator: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let relative = Path::new(locator);
+    let components = relative.components().collect::<Vec<_>>();
+    let normalized = components
+        .iter()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if locator.is_empty()
+        || locator.contains('\\')
+        || components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || normalized != locator
+    {
+        errors.push(format!(
+            "{context}: repository evidence path must be a normalized repo-relative path: {locator:?}"
+        ));
+        return None;
+    }
+
+    let mut candidate = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("the normalized repository path shape was checked above")
+        };
+        candidate.push(name);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: repository evidence path does not resolve to a regular file {locator}: {error}"
+                ));
+                return None;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            errors.push(format!(
+                "{context}: repository evidence path must not traverse a symlink: {locator}"
+            ));
+            return None;
+        }
+        let is_final = index + 1 == components.len();
+        if (!is_final && !metadata.is_dir()) || (is_final && !metadata.file_type().is_file()) {
+            errors.push(format!(
+                "{context}: repository evidence path is not an existing regular file: {locator}"
+            ));
+            return None;
+        }
+    }
+
+    let inspected_metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot inspect repository evidence path before safe open {locator}: {error}"
+            ));
+            return None;
+        }
+    };
+    let descriptor = match open_read_only_no_follow(&candidate) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot safely open repository evidence file without following a symlink {locator}: {error}"
+            ));
+            return None;
+        }
+    };
+    let descriptor_metadata = match descriptor.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot inspect opened repository evidence file {locator}: {error}"
+            ));
+            return None;
+        }
+    };
+    let final_path_metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot re-inspect repository evidence path after safe open {locator}: {error}"
+            ));
+            return None;
+        }
+    };
+    if !inspected_metadata.file_type().is_file()
+        || !descriptor_metadata.file_type().is_file()
+        || !final_path_metadata.file_type().is_file()
+        || !same_file_identity(&inspected_metadata, &descriptor_metadata)
+        || !same_file_identity(&descriptor_metadata, &final_path_metadata)
+    {
+        errors.push(format!(
+            "{context}: repository evidence path changed during safe open or is not a regular file: {locator}"
+        ));
+        return None;
+    }
+
+    let canonical_root = match fs::canonicalize(root) {
+        Ok(path) => path,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot canonicalize repository root: {error}"
+            ));
+            return None;
+        }
+    };
+    let canonical_target = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(error) => {
+            errors.push(format!("{context}: cannot canonicalize {locator}: {error}"));
+            return None;
+        }
+    };
+    if !canonical_target.starts_with(&canonical_root) {
+        errors.push(format!(
+            "{context}: repository evidence path escapes the repository: {locator}"
+        ));
+        return None;
+    }
+    let post_canonical_metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot re-inspect repository evidence path after confinement check {locator}: {error}"
+            ));
+            return None;
+        }
+    };
+    if !post_canonical_metadata.file_type().is_file()
+        || !same_file_identity(&descriptor_metadata, &post_canonical_metadata)
+    {
+        errors.push(format!(
+            "{context}: repository evidence path changed during confinement validation: {locator}"
+        ));
+        return None;
+    }
+    Some(candidate)
+}
+
+fn detect_control_dependency_cycles(
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    errors: &mut Vec<String>,
+) {
+    let mut states = BTreeMap::<String, u8>::new();
+    let mut stack = Vec::new();
+    let mut reported = BTreeSet::new();
+    for control_id in graph.keys() {
+        if states.get(control_id).copied().unwrap_or(0) == 0 {
+            visit_control_dependencies(
+                control_id,
+                graph,
+                &mut states,
+                &mut stack,
+                &mut reported,
+                errors,
+            );
+        }
+    }
+}
+
+fn visit_control_dependencies(
+    control_id: &str,
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    states: &mut BTreeMap<String, u8>,
+    stack: &mut Vec<String>,
+    reported: &mut BTreeSet<Vec<String>>,
+    errors: &mut Vec<String>,
+) {
+    states.insert(control_id.to_string(), 1);
+    stack.push(control_id.to_string());
+    if let Some(dependencies) = graph.get(control_id) {
+        for dependency in dependencies {
+            match states.get(dependency).copied().unwrap_or(0) {
+                0 => visit_control_dependencies(dependency, graph, states, stack, reported, errors),
+                1 => {
+                    if let Some(position) = stack.iter().position(|item| item == dependency) {
+                        let mut cycle = stack[position..].to_vec();
+                        cycle.push(dependency.clone());
+                        let canonical = canonical_cycle(&cycle);
+                        if reported.insert(canonical.clone()) {
+                            errors.push(format!(
+                                "control-trace-status-overlay.implementation.json: control dependency cycle: {}",
+                                canonical.join(" -> ")
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    stack.pop();
+    states.insert(control_id.to_string(), 2);
+}
+
 /// Validate diagnostic relationships inside untrusted draft closure files.
 /// Passing this function never makes a bundle or receipt authoritative; the
 /// repository gate rejects all such files until trusted closure mode exists.
+#[cfg(test)]
 fn validate_closure_semantics(
     root: &Path,
     ledger: &Value,
@@ -1222,9 +2025,40 @@ fn validate_closure_semantics(
     validate_closure_semantics_at(root, ledger, bundles, receipts, Utc::now(), errors);
 }
 
+#[cfg(test)]
 fn validate_closure_semantics_at(
     root: &Path,
     ledger: &Value,
+    bundles: &[LoadedDocument],
+    receipts: &[LoadedDocument],
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
+    let ledger_path = root
+        .join(CONTRACT_DIR)
+        .join("control-trace.implementation.json");
+    let ledger_bytes = read_bounded_repository_bytes(
+        &ledger_path,
+        MAX_SECURITY_CONTRACT_BYTES,
+        "authoritative ControlTrace for closure validation",
+        errors,
+    );
+    let ledger_digest = ledger_bytes.as_deref().map(raw_sha256_digest);
+    validate_closure_semantics_at_with_digest(
+        root,
+        ledger,
+        ledger_digest.as_deref(),
+        bundles,
+        receipts,
+        now,
+        errors,
+    );
+}
+
+fn validate_closure_semantics_at_with_digest(
+    root: &Path,
+    ledger: &Value,
+    ledger_digest: Option<&str>,
     bundles: &[LoadedDocument],
     receipts: &[LoadedDocument],
     now: DateTime<Utc>,
@@ -1407,15 +2241,9 @@ fn validate_closure_semantics_at(
     }
     detect_single_edge_cycles("evidence supersession", &evidence_supersession, errors);
 
-    let ledger_digest = fs::read(
-        root.join(CONTRACT_DIR)
-            .join("control-trace.implementation.json"),
-    )
-    .ok()
-    .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
     validate_receipts(
         ledger,
-        ledger_digest.as_deref(),
+        ledger_digest,
         &traces,
         &controls,
         &evidence,
@@ -2201,14 +3029,14 @@ fn validate_exact_digest_set(
 }
 
 fn load_deployment_profile_binding(root: &Path) -> Option<Value> {
-    let bytes = fs::read(root.join(DEPLOYMENT_PROFILE_LOCATOR)).ok()?;
-    let profile = parse_json_strict(&bytes).ok()?;
-    deployment_profile_binding(&profile)
+    let loaded = load_bounded_strict_json(&root.join(DEPLOYMENT_PROFILE_LOCATOR)).ok()?;
+    deployment_profile_binding(&loaded.value)
 }
 
 fn load_deployment_profile_version_bindings(root: &Path) -> Option<(Value, Value)> {
-    let bytes = fs::read(root.join(DEPLOYMENT_PROFILE_LOCATOR)).ok()?;
-    let profile = parse_json_strict(&bytes).ok()?;
+    let profile = load_bounded_strict_json(&root.join(DEPLOYMENT_PROFILE_LOCATOR))
+        .ok()?
+        .value;
     let policies = profile_reference_version_bindings(
         &profile,
         &[
@@ -3768,20 +4596,18 @@ fn load_conformance_trust_root_registry_lineage(
     }
 
     let schema_path = root.join(CONTRACT_DIR).join(TRUST_REGISTRY_SCHEMA_NAME);
-    let schema = match fs::read(&schema_path) {
-        Ok(bytes) => match parse_json_strict(&bytes) {
-            Ok(schema) => Some(schema),
-            Err(error) => {
-                errors.push(format!(
-                    "{}: cannot strict-parse lineage schema: {error}",
-                    schema_path.display()
-                ));
-                None
-            }
-        },
-        Err(error) => {
+    let schema = match load_bounded_strict_json(&schema_path) {
+        Ok(loaded) => Some(loaded.value),
+        Err(StrictJsonLoadError::Missing) => {
             errors.push(format!(
-                "{}: cannot read lineage schema: {error}",
+                "{}: lineage schema is missing",
+                schema_path.display()
+            ));
+            None
+        }
+        Err(StrictJsonLoadError::Invalid(error) | StrictJsonLoadError::Io(error)) => {
+            errors.push(format!(
+                "{}: cannot safely load lineage schema: {error}",
                 schema_path.display()
             ));
             None
@@ -3999,26 +4825,7 @@ fn read_bounded_trust_registry(
     label: &str,
     errors: &mut Vec<String>,
 ) -> Option<Vec<u8>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            errors.push(format!("{label}: cannot inspect trust registry: {error}"));
-            return None;
-        }
-    };
-    if metadata.len() > MAX_TRUST_REGISTRY_BYTES {
-        errors.push(format!(
-            "{label}: trust registry exceeds {MAX_TRUST_REGISTRY_BYTES} bytes"
-        ));
-        return None;
-    }
-    match fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) => {
-            errors.push(format!("{label}: cannot read trust registry: {error}"));
-            None
-        }
-    }
+    read_bounded_repository_bytes(path, MAX_TRUST_REGISTRY_BYTES, label, errors)
 }
 
 fn safe_trust_registry_path(
@@ -6360,14 +7167,13 @@ fn validate_authenticator_runtime_binding_refs(
         let Some(target) = safe_repository_path(root, locator, &context, errors) else {
             continue;
         };
-        let raw_bytes = match fs::read(&target) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                errors.push(format!(
-                    "{context}: cannot read authenticator runtime binding {locator}: {error}"
-                ));
-                continue;
-            }
+        let Some(raw_bytes) = read_bounded_repository_bytes(
+            &target,
+            MAX_SECURITY_CONTRACT_BYTES,
+            &format!("{context}: authenticator runtime binding {locator}"),
+            errors,
+        ) else {
+            continue;
         };
         let actual_digest = format!("sha256:{:x}", Sha256::digest(&raw_bytes));
         if reference.get("content_digest").and_then(Value::as_str) != Some(actual_digest.as_str()) {
@@ -6614,14 +7420,13 @@ fn validate_secret_provider_runtime_binding_refs(
         let Some(target) = safe_repository_path(root, locator, &context, errors) else {
             continue;
         };
-        let raw_bytes = match fs::read(&target) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                errors.push(format!(
-                    "{context}: cannot read secret-provider runtime binding {locator}: {error}"
-                ));
-                continue;
-            }
+        let Some(raw_bytes) = read_bounded_repository_bytes(
+            &target,
+            MAX_SECURITY_CONTRACT_BYTES,
+            &format!("{context}: secret-provider runtime binding {locator}"),
+            errors,
+        ) else {
+            continue;
         };
         let actual_digest = format!("sha256:{:x}", Sha256::digest(&raw_bytes));
         if reference.get("content_digest").and_then(Value::as_str) != Some(actual_digest.as_str()) {
@@ -7060,14 +7865,13 @@ fn validate_action_inventory_sources(root: &Path, closure: &Value, errors: &mut 
         let Some(path) = safe_repository_path(root, locator, &context, errors) else {
             continue;
         };
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                errors.push(format!(
-                    "{context}: cannot read inventory source {locator}: {error}"
-                ));
-                continue;
-            }
+        let Some(bytes) = read_bounded_repository_bytes(
+            &path,
+            MAX_REFERENCED_ARTIFACT_BYTES,
+            &format!("{context}: inventory source {locator}"),
+            errors,
+        ) else {
+            continue;
         };
         let actual_digest = raw_sha256_digest(&bytes);
         if expected_digest != Some(actual_digest.as_str()) {
@@ -7254,14 +8058,13 @@ fn validate_content_reference(
     let Some(target) = safe_repository_path(root, locator, context, errors) else {
         return;
     };
-    let bytes = match fs::read(&target) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            errors.push(format!(
-                "{context}: cannot read artifact_locator {locator}: {error}"
-            ));
-            return;
-        }
+    let Some(bytes) = read_bounded_repository_bytes(
+        &target,
+        MAX_REFERENCED_ARTIFACT_BYTES,
+        &format!("{context}: artifact_locator {locator}"),
+        errors,
+    ) else {
+        return;
     };
     let actual_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
     let digest_field = [
@@ -7333,14 +8136,13 @@ fn validate_source_path(
         return;
     }
 
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            errors.push(format!(
-                "{context}: cannot read source_file {source}: {error}"
-            ));
-            return;
-        }
+    let Some(bytes) = read_bounded_repository_bytes(
+        &path,
+        MAX_REFERENCED_ARTIFACT_BYTES,
+        &format!("{context}: source_file {source}"),
+        errors,
+    ) else {
+        return;
     };
 
     if let Some(symbol) = symbol {
@@ -7631,6 +8433,255 @@ mod tests {
     fn load(relative: &str) -> Value {
         serde_json::from_slice(&fs::read(root().join(relative)).expect("read fixture"))
             .expect("parse fixture")
+    }
+
+    fn status_overlay_fixture(temporary_root: &TemporaryRoot) -> (Value, Value, String) {
+        let contract_dir = temporary_root.path().join(CONTRACT_DIR);
+        fs::create_dir_all(&contract_dir).expect("create fixture contract directory");
+        fs::create_dir_all(temporary_root.path().join("sources")).expect("create source directory");
+        fs::create_dir_all(temporary_root.path().join("tests")).expect("create test directory");
+        fs::write(
+            temporary_root.path().join("sources/fixture.rs"),
+            b"pub fn fixture() {}\n",
+        )
+        .expect("write source evidence");
+        fs::write(
+            temporary_root.path().join("tests/fixture.rs"),
+            b"#[test] fn fixture() {}\n",
+        )
+        .expect("write test evidence");
+
+        let ledger = json!({
+            "document_id": "control-trace:ryuki-security-boundary-v1",
+            "document_version": 2,
+            "ledger_id": "ryuki-security-boundary",
+            "ledger_version": "1.1.0",
+            "traces": [{
+                "trace_id": "TRACE-SB-BOUND-01-AC-040",
+                "control_id": "SB-BOUND-01",
+                "trace_lifecycle": "active"
+            }, {
+                "trace_id": "TRACE-SB-BOUND-02-AC-041",
+                "control_id": "SB-BOUND-02",
+                "trace_lifecycle": "active"
+            }, {
+                "trace_id": "TRACE-SB-BOUND-01-RETIRED",
+                "control_id": "SB-BOUND-01",
+                "trace_lifecycle": "retired"
+            }]
+        });
+        let ledger_bytes = serde_json::to_vec_pretty(&ledger).expect("serialize fixture ledger");
+        let ledger_raw_sha256 = raw_sha256_digest(&ledger_bytes);
+        fs::write(
+            contract_dir.join("control-trace.implementation.json"),
+            &ledger_bytes,
+        )
+        .expect("write fixture ledger");
+
+        let overlay = json!({
+            "contract_kind": "ControlTraceStatusOverlay",
+            "authority_scope": "repository-implementation-tracking-only",
+            "status_assurance": "source-audited-declaration-without-conformance-receipt",
+            "control_trace_ref": {
+                "document_id": ledger["document_id"].clone(),
+                "document_version": ledger["document_version"].clone(),
+                "ledger_id": ledger["ledger_id"].clone(),
+                "ledger_version": ledger["ledger_version"].clone(),
+                "raw_sha256": ledger_raw_sha256.clone()
+            },
+            "rows": [{
+                "trace_id": "TRACE-SB-BOUND-01-AC-040",
+                "implementation_status": "implemented",
+                "source_paths": ["sources/fixture.rs"],
+                "migration_paths": [],
+                "test_paths": ["tests/fixture.rs"],
+                "blockers": [],
+                "dependency_control_ids": []
+            }, {
+                "trace_id": "TRACE-SB-BOUND-02-AC-041",
+                "implementation_status": "implemented",
+                "source_paths": ["sources/fixture.rs"],
+                "migration_paths": [],
+                "test_paths": ["tests/fixture.rs"],
+                "blockers": [{
+                    "kind": "runtime_evidence",
+                    "detail": "Runtime evidence remains separately unproven."
+                }],
+                "dependency_control_ids": []
+            }]
+        });
+        (ledger, overlay, ledger_raw_sha256)
+    }
+
+    #[test]
+    fn status_overlay_accepts_exact_tracking_only_repository_evidence() {
+        let temporary_root = TemporaryRoot::new();
+        let (ledger, overlay, ledger_raw_sha256) = status_overlay_fixture(&temporary_root);
+        let mut errors = Vec::new();
+        validate_control_trace_status_overlay_semantics(
+            temporary_root.path(),
+            &ledger,
+            &ledger_raw_sha256,
+            &overlay,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn checked_in_status_overlay_matches_the_current_control_trace() {
+        let repository_root = root();
+        let ledger_bytes = fs::read(
+            repository_root.join("catalog/security-contracts/v1/control-trace.implementation.json"),
+        )
+        .expect("read ControlTrace fixture");
+        let ledger = parse_json_strict(&ledger_bytes).expect("strict-parse ControlTrace fixture");
+        let ledger_raw_sha256 = raw_sha256_digest(&ledger_bytes);
+        let overlay =
+            load("catalog/security-contracts/v1/control-trace-status-overlay.implementation.json");
+        let mut errors = Vec::new();
+        validate_control_trace_status_overlay_semantics(
+            &repository_root,
+            &ledger,
+            &ledger_raw_sha256,
+            &overlay,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn status_overlay_rejects_stale_binding_and_non_authoritative_order() {
+        let temporary_root = TemporaryRoot::new();
+        let (ledger, mut overlay, ledger_raw_sha256) = status_overlay_fixture(&temporary_root);
+        overlay["status_assurance"] = json!("verified");
+        overlay["control_trace_ref"]["ledger_version"] = json!("1.0.0");
+        overlay["control_trace_ref"]["raw_sha256"] =
+            json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        overlay["rows"]
+            .as_array_mut()
+            .expect("overlay rows")
+            .swap(0, 1);
+
+        let mut errors = Vec::new();
+        validate_control_trace_status_overlay_semantics(
+            temporary_root.path(),
+            &ledger,
+            &ledger_raw_sha256,
+            &overlay,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("ledger_version") && error.contains("must exactly match")));
+        assert!(errors.iter().any(|error| error.contains("status_assurance")
+            && error.contains("must be source-audited-declaration-without-conformance-receipt")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("raw_sha256") && error.contains("exact raw bytes")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exact ControlTrace order")));
+    }
+
+    #[test]
+    fn status_overlay_rejects_status_without_required_repository_proof() {
+        let temporary_root = TemporaryRoot::new();
+        let (ledger, mut overlay, ledger_raw_sha256) = status_overlay_fixture(&temporary_root);
+        let rows = overlay["rows"].as_array_mut().expect("overlay rows");
+        rows[0]["source_paths"] = json!([]);
+        rows[0]["test_paths"] = json!([]);
+        rows[0]["blockers"] = json!([{
+            "kind": "repository_implementation",
+            "detail": "Repository implementation remains incomplete."
+        }]);
+        rows[1]["implementation_status"] = json!("partial");
+        rows[1]["blockers"] = json!([{
+            "kind": "platform_decision",
+            "detail": "   "
+        }]);
+
+        let mut errors = Vec::new();
+        validate_control_trace_status_overlay_semantics(
+            temporary_root.path(),
+            &ledger,
+            &ledger_raw_sha256,
+            &overlay,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("requires at least one source_paths or migration_paths")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("requires at least one test_paths")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("forbids a repository_implementation blocker")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("require a repository_implementation blocker")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("blocker detail must be nonblank")));
+    }
+
+    #[test]
+    fn status_overlay_rejects_unsafe_paths_and_dependency_cycles() {
+        let temporary_root = TemporaryRoot::new();
+        let (ledger, mut overlay, ledger_raw_sha256) = status_overlay_fixture(&temporary_root);
+        let rows = overlay["rows"].as_array_mut().expect("overlay rows");
+        rows[0]["source_paths"] = json!(["sources//fixture.rs"]);
+        rows[0]["dependency_control_ids"] = json!(["SB-BOUND-02", "SB-BOUND-02"]);
+        rows[1]["dependency_control_ids"] = json!(["SB-BOUND-01", "SB-FAKE-99"]);
+
+        let mut errors = Vec::new();
+        validate_control_trace_status_overlay_semantics(
+            temporary_root.path(),
+            &ledger,
+            &ledger_raw_sha256,
+            &overlay,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("normalized repo-relative path")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicate dependency control SB-BOUND-02")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown canonical control SB-FAKE-99")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("control dependency cycle")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_overlay_repository_evidence_must_not_traverse_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temporary_root = TemporaryRoot::new();
+        let (ledger, mut overlay, ledger_raw_sha256) = status_overlay_fixture(&temporary_root);
+        symlink(
+            temporary_root.path().join("sources/fixture.rs"),
+            temporary_root.path().join("sources/linked.rs"),
+        )
+        .expect("create source symlink");
+        overlay["rows"][0]["source_paths"] = json!(["sources/linked.rs"]);
+
+        let mut errors = Vec::new();
+        validate_control_trace_status_overlay_semantics(
+            temporary_root.path(),
+            &ledger,
+            &ledger_raw_sha256,
+            &overlay,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must not traverse a symlink")));
     }
 
     fn authenticator_runtime_binding_document(
@@ -13988,5 +15039,33 @@ mod tests {
         };
         refresh_receipt_digest_projections(&mut receipt);
         receipt
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contract_catalog_rejects_an_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should follow the Unix epoch")
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "ryuki-security-contract-symlink-{}-{unique}",
+            std::process::id()
+        ));
+        let repository = scratch.join("repository");
+        let outside = scratch.join("outside/security-contracts/v1");
+        fs::create_dir_all(&repository).expect("repository fixture should be created");
+        fs::create_dir_all(&outside).expect("outside fixture should be created");
+        symlink(scratch.join("outside"), repository.join("catalog"))
+            .expect("catalog symlink fixture should be created");
+
+        let error = resolve_confined_contract_directory(&repository)
+            .expect_err("a symlinked catalog must not be admitted");
+        assert!(error.contains("must not traverse a symlink"), "{error}");
+
+        fs::remove_dir_all(&scratch).expect("symlink fixture should be removed");
     }
 }

@@ -2409,9 +2409,9 @@ name = "ryuki-integration-tests"
                     &mut errors,
                 );
                 assert!(
-                    errors.iter().any(|error| error.contains(
-                        "expected one canonical JSON-exec"
-                    )),
+                    errors
+                        .iter()
+                        .any(|error| error.contains("expected one canonical JSON-exec")),
                     "dynamic canonical install position {position} was accepted for {package}: {errors:?}"
                 );
             }
@@ -2452,9 +2452,7 @@ name = "ryuki-integration-tests"
             let tool_path = format!("{PROTECTED_TOOL_ROOT}/{package}-{version}/bin/{package}");
             let canonical = canonical_lifecycle_fixture(package, version, "", "RUN ", "RUN ");
             let replacements = [
-                format!(
-                    "COPY --link --chown={BUILD_USER} fake-protected-tool {tool_path}\n"
-                ),
+                format!("COPY --link --chown={BUILD_USER} fake-protected-tool {tool_path}\n"),
                 format!(
                     "RUN [\"/usr/bin/install\", \"-m\", \"0755\", \"/tmp/fake-protected-tool\", \"{tool_path}\"]\n"
                 ),

@@ -126,6 +126,7 @@ mod ryuki_engine;
 mod scaffold_docs;
 mod secret_reference;
 mod security_baseline;
+mod security_boundary_matrix;
 mod security_conformance;
 mod sensitive_output_guardrails;
 mod server_lifecycle;
@@ -2353,6 +2354,12 @@ fn run() -> Result<ExitCode, String> {
             }
             print_json(&output)
         }
+        "security-boundary-matrix" => {
+            let root = parse_security_boundary_matrix_args(&args[1..])?;
+            let document = security_boundary_matrix::render(&root)?;
+            println!("{document}");
+            Ok(())
+        }
         "generate-endpoints-doc" => {
             let (root, _) = parse_root_args(&args[1..])?;
             let (document, route_count) = generate_endpoints_doc(&root)?;
@@ -2403,7 +2410,7 @@ fn run() -> Result<ExitCode, String> {
 }
 
 fn usage() -> String {
-    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|validate-release-image-render|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|generate-endpoints-doc|generate-api-doc|scaffold-docs|check-config> <slice> [options]"
+    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|validate-release-image-render|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|security-boundary-matrix|generate-endpoints-doc|generate-api-doc|scaffold-docs|check-config> [<slice>] [options]\n       ryuki-validator security-boundary-matrix [--root <path>]"
         .to_string()
 }
 
@@ -2579,6 +2586,48 @@ fn parse_root_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), String
             .map_err(|error| format!("failed to resolve current directory: {error}"))?,
     };
     Ok((root, context_json))
+}
+
+fn parse_security_boundary_matrix_args(args: &[String]) -> Result<PathBuf, String> {
+    let mut root = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" => {
+                if root.is_some() {
+                    return Err("security-boundary-matrix accepts --root at most once".to_string());
+                }
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "security-boundary-matrix --root requires a path".to_string())?;
+                if value.is_empty() {
+                    return Err(
+                        "security-boundary-matrix --root requires a nonempty path".to_string()
+                    );
+                }
+                if value.starts_with("--") {
+                    return Err(
+                        "security-boundary-matrix --root requires a path before another flag"
+                            .to_string(),
+                    );
+                }
+                root = Some(PathBuf::from(value));
+            }
+            unknown => {
+                return Err(format!(
+                    "security-boundary-matrix accepts only the optional --root argument; found {unknown}"
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    match root {
+        Some(path) => Ok(path),
+        None => env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}")),
+    }
 }
 
 fn parse_final_render_args(args: &[String]) -> Result<(PathBuf, String, String), String> {
@@ -4592,6 +4641,44 @@ mod tests {
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    #[test]
+    fn security_boundary_matrix_arguments_are_strict() {
+        let valid = vec!["--root".to_string(), "/tmp/repository".to_string()];
+        assert_eq!(
+            parse_security_boundary_matrix_args(&valid).unwrap(),
+            PathBuf::from("/tmp/repository")
+        );
+
+        let missing = vec!["--root".to_string()];
+        assert!(parse_security_boundary_matrix_args(&missing)
+            .unwrap_err()
+            .contains("requires a path"));
+
+        let empty = vec!["--root".to_string(), String::new()];
+        assert!(parse_security_boundary_matrix_args(&empty)
+            .unwrap_err()
+            .contains("nonempty path"));
+
+        let duplicate = vec![
+            "--root".to_string(),
+            "/tmp/first".to_string(),
+            "--root".to_string(),
+            "/tmp/second".to_string(),
+        ];
+        assert!(parse_security_boundary_matrix_args(&duplicate)
+            .unwrap_err()
+            .contains("at most once"));
+
+        let unsupported = vec!["--context-json".to_string()];
+        assert!(parse_security_boundary_matrix_args(&unsupported)
+            .unwrap_err()
+            .contains("accepts only"));
+
+        let usage = usage();
+        assert!(usage.contains("security-boundary-matrix [--root <path>]"));
+        assert!(!usage.contains("security-boundary-matrix <slice>"));
     }
 
     #[test]

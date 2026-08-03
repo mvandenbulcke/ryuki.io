@@ -10,10 +10,13 @@ implementing **all 66**. This file tracks execution.
   migration (sequential number) → engine/API/portal → tests → gate → adversarial
   review → commit + push. Features are NOT built in parallel — they collide on
   migration numbers and on the hot shared files (`contracts.rs`, `main.rs`).
-- **Gate per slice:** `cargo fmt --all`; `cargo clippy --workspace --all-targets
-  -- -D warnings`; `cargo test -p ryuki-api --bins`; the relevant `*_db_tests`
-  with `RYUKI_DATABASE_URL`; `bash scripts/dependency-audit.sh`;
-  `bash scripts/no-secret-scan.sh`. Then an adversarial review before commit.
+- **Gate per slice:** run focused Rust checks only through
+  `rtk ./scripts/verify-workspace-clean.sh -- cargo …`; use
+  `rtk make verify-clean` for each completed milestone. The clean wave owns
+  formatting, build, tests, clippy, validator execution, dependency audit, and
+  secret scanning in one supervised disposable target. Run relevant database
+  tests only with an explicitly approved disposable `RYUKI_DATABASE_URL`, then
+  complete an adversarial review before commit.
 - **Engines stay pure** (validator-enforced no-IO); record co-authorship
   where applicable.
 
@@ -51,6 +54,25 @@ Track the convergence as one dependency-ordered P0 program:
 | SB-8 Distributed security operations and recovery | `[ ]` | Governed policy/config changes, cryptographic inventory, authority epochs/fencing, trusted time, fair distributed budgets, degraded modes, explicit RTO/RPO, authenticated recovery media, compromise response, and restore-without-resurrection are implemented and rehearsed, including separately governed strongly consistent trust-checkpoint custody and recovery reconciliation. |
 | SB-9 Security-state migration, bypass retirement, and production acceptance | `[ ]` | Expand/migrate/verify/contract and rollback fencing are proven, legacy fallbacks are removed, and local plus operator-owned identity-provider, secret-manager/PKI, and live acceptance evidence passes. |
 
+These checkboxes are package-closure gates, not implementation percentages.
+Repository status totals come only from the validated
+`ControlTraceStatusOverlay` projection; neither a checked box nor a repository
+`implemented` row substitutes for runtime, deployment, operator, or production
+evidence. The current `status_assurance` is
+`source-audited-declaration-without-conformance-receipt`: 141 active traces
+contain 14 `implemented`, 118 `partial`, and 9 `not_implemented` declarations,
+but all 141 implementation evidence assessments remain `required_unproven`
+without revision- and digest-bound accepted receipts, and
+`production_acceptance_asserted` remains `false`. The projection also exposes
+`working_tree_concurrency_assurance: trusted-stable-checkout-required`; final
+receipts require an exclusively owned immutable checkout or stronger platform
+snapshot. It also exposes
+an authoritative ledger defect rather than hiding it: all 141 deployment
+expressions are `always`, while 139 have a null minimum deployment tier and
+therefore no deployable scope under SB-CONF-04. Only
+`TRACE-SB-OPS-07-AC-016` and `TRACE-SB-CONF-05-AC-055` currently have non-null
+deployment tiers.
+
 SB-2 now has a first permit-bearing instance slice for
 `GET /api/requests/{id}`. Authentication middleware retains exact session or
 federated credential evidence; the request repository revalidates it, resolves
@@ -84,15 +106,14 @@ Multi-replica Recreate/rollback rehearsal also remains trusted-access evidence.
 Those residuals are not a reason to remove the provider-neutral OIDC, brokered
 SAML/LDAP, passkey, or workload-identity boundary.
 
-Centralized validation is complete for the pinned revision. Attack-path
-analysis is complete for the 320 candidates that entered that phase: 232 remain
-reportable (3 High, 169 Medium, and 60 Low) and 88 were rejected after
-calibration; 48 candidates did not enter attack-path analysis. These interim
-counts come from the strict attack-path aggregate. Until the
-top-level manifest, finding/coverage records, and generated report are
-finalized, that checksummed aggregate is the per-instance policy source; the
-canonical report becomes authoritative only after finalization. Neither source
-claims that a rendered production deployment was tested.
+Repository scan `130831dd-558e-46db-8ec5-20f929ddefe6` finalized the original
+231-finding remediation baseline. Completed diff scan
+`c65842cb-b0b3-42ad-9f34-8cc5c8524f4e` later sealed the exact remediation range
+`dbe0efaaffa307e534d43e6a9b5226bd45dac129..c696bdd8a0ae1ce1f233ca1f6a16afa524520483`
+with complete coverage and zero reportable findings. That scan supersedes the
+unsealed `f4a2d210-200e-4671-ae69-32a2742e20a9` attempt only for the sealed
+range; it did not test live PostgreSQL, providers, hosted CI/release controls,
+or a production deployment, and it does not cover later commits.
 
 SB-0 gates every later package; SB-1 and SB-2 gate SB-3; SB-3 through SB-7 gate
 any live pilot; SB-8 gates production; and SB-9 requires a machine-readable
@@ -108,6 +129,11 @@ leaving their behavior implicit:
   evaluated provider/deployment evidence instance through a separate
   `ConformanceBundle`; it rejects missing, orphaned, duplicate, expired,
   downgraded, wrong-revision, insufficient-tier, or silently skipped controls;
+- a `ControlTraceStatusOverlay` bound to the exact raw ledger bytes, with one
+  active-trace-ordered row that records repository implementation paths, tests,
+  and blockers without asserting runtime, deployment, or production
+  acceptance; its deterministic matrix projection is the only source for
+  repository status totals;
 - published schemas for the deployment-security-profile root, provider
   registry, closed action/resource/resolver registry, `ControlTrace`,
   `ConformanceBundle`, package exit receipt, external conformance trust-

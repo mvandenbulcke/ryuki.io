@@ -2,8 +2,8 @@
 
 - Status: **proposed normative production boundary**
 - Owner: platform and security engineering
-- Evidence revision: `f4f9858cb2aa78f169c8660ee020038522b13ac4`
-- Last updated: 2026-08-02
+- Sealed scan evidence head: `c696bdd8a0ae1ce1f233ca1f6a16afa524520483`
+- Last updated: 2026-08-03
 - Production gate: **blocking until the required invariants are implemented and verified**
 
 This specification defines one security boundary for every Ryuki caller and
@@ -91,16 +91,17 @@ pinned revision. The later completed Codex Security diff scan
 `34dd2f56-f231-4e6f-a99f-1490a30b93d4` sealed 28 indexed findings for its
 validated change set. The remediation ledger reproduces only the scan-34
 identifiers that survived in repository evidence; missing identifiers are not
-inferred. A later remediation-range review reached final reporting but failed
-before sealing because its generated Git-diff manifest omitted the required
-snapshot digest; its unsealed artifacts are not canonical scan evidence. The
-repository-local audit-export and Cargo outer-supervision fixes were therefore
-revalidated through their focused executable boundaries and committed
-independently. They remain subject to the closing clean repository and fresh
-security-diff gates. These are source-level results, not claims about a rendered
-production deployment. The requirements below treat repeated root controls as
-platform-boundary work rather than asking each route or adapter to rediscover
-the same invariant.
+inferred. Completed scan `c65842cb-b0b3-42ad-9f34-8cc5c8524f4e` sealed the
+exact range
+`dbe0efaaffa307e534d43e6a9b5226bd45dac129..c696bdd8a0ae1ce1f233ca1f6a16afa524520483`
+with complete coverage and zero reportable findings. It supersedes the
+unsealed `f4a2d210-200e-4671-ae69-32a2742e20a9` review only for that range. It
+did not exercise live PostgreSQL, providers, hosted CI or release controls, or
+production infrastructure and is not production-acceptance evidence. Commit
+`0a2f6f75e24d811b45243a4821d49df20a894398` and later matrix work are outside
+that scan and remain subject to the final deep and diff scans. The requirements
+below treat repeated root controls as platform-boundary work rather than asking
+each route or adapter to rediscover the same invariant.
 
 | Risk theme | Source areas inspected | Structural concern |
 | --- | --- | --- |
@@ -1052,6 +1053,7 @@ reviewable records:
 | Incident and recovery evidence | Proves revocation, quarantine, key compromise, restored-state reconciliation, and dormant/activation/aftercare break-glass drills. |
 | Deployment security profile | Is the executable root that binds deployment/profile version, deployment id, tenancy mode, trust topology, provider-registry/lifecycle snapshot, policy/configuration versions, and active security-limit profile. |
 | Production build manifest | Binds the measured executable and source revision to the exact shipped component, adapter/capability surface, authenticated ControlTrace, and independently derived implementation-applicability v2 inventory. It does not assert deployment/provider applicability. |
+| Repository implementation status overlay | Binds repository-only implementation status, source and migration paths, test references, blockers, and optional control dependencies to the exact raw `ControlTrace`. It cannot assert implementation truth, runtime, deployment, operator, external, or production acceptance. |
 | Security-limit profile | Is the sole normative owner of selected values, platform-enforced hard bounds, units, scopes, failure behavior, telemetry, and change authority for every bounded resource; code and manifests consume or validate its version rather than redefining limits. |
 | External conformance trust checkpoint and acceptance ledger | Independently anchors the highest admitted trust-registry head, the exact current SB-9 production root, and exact accepted-document events under one deployment/trust-domain/registry namespace sequence. Its custody and authentication are outside the rollbackable contract/profile channel. |
 | Production conformance report | Binds all permanent acceptance-case evidence to an exact source revision, config/provider/limit-profile version, image digest, and deployment. |
@@ -1111,6 +1113,42 @@ acceptance case maps back to at least one control and exactly one owning
 package. The ledger rejects orphan rows, circular supersession, conflicting
 owners, duplicate mapping tuples, and a package receipt that cites a trace or
 evidence instance outside its evaluated applicability set.
+
+`control-trace-status-overlay.implementation.json` is repository
+implementation tracking only. It binds the exact raw `ControlTrace`, contains
+one row in active-trace order, and records implementation status, source,
+migration, test, blocker, and optional dependency paths. An `implemented` row
+is not runtime, deployment, operator, external, or production-acceptance
+evidence; package closure still requires accepted conformance evidence. Its
+declared `status_assurance` is
+`source-audited-declaration-without-conformance-receipt`: the referenced paths
+and status judgments were audited against source, but they are not revision-
+and digest-bound accepted `ConformanceBundle` evidence. The milestone baseline
+contains 141 active trace rows: 14 `implemented`, 118 `partial`, and 9
+`not_implemented`. Because no conformance receipts are joined, all 141
+implementation evidence assessments remain `required_unproven`, and the
+projection sets `production_acceptance_asserted` to `false`.
+The projection also declares `working_tree_concurrency_assurance` as
+`trusted-stable-checkout-required`. Static symlinks, non-regular files,
+oversized inputs, and observed path, inode, or length drift fail validation,
+but this repository-local tool is not an adversarial concurrent-writer
+boundary. A
+revision-bound receipt must run from an exclusively owned immutable checkout or
+stronger platform snapshot.
+
+The authoritative `ControlTrace` also has a deployment-contract gap: all 141
+active traces declare deployment applicability `always`, but 139 have a null
+minimum deployment evidence tier. SB-CONF-04 defines null as absent scope, so
+the projection records `deployment_always_without_evidence_tier_count: 139`
+instead of inventing deployment obligations. Only `TRACE-SB-OPS-07-AC-016` and
+`TRACE-SB-CONF-05-AC-055` have non-null deployment tiers. Production closure
+requires a corrected authoritative trace plus accepted deployment evidence;
+the repository overlay cannot repair either. The schema, instance, and
+deterministic joined projection are validated with:
+
+```bash
+rtk ./scripts/verify-workspace-clean.sh -- cargo run --manifest-path scripts/validator-rs/Cargo.toml -- security-boundary-matrix --root .
+```
 
 Applicability is evaluated twice. **Implementation applicability** includes
 every adapter kind and capability shipped in the artifact. **Deployment
@@ -2560,8 +2598,12 @@ evidence lives in `sources/ryuki-engine/src/evidence_pipeline.rs` and
   dynamic command construction, mutable copies, root re-entry, mount shadowing,
   later replacement, and detached-stage use fail admission.
 
-Current build-artifact containment evidence remains pending final verification.
-Cargo target and build directories are structurally external to the checkout:
+Repository-local build-artifact controls passed focused disk-guard regressions
+and `make verify-clean` at the sealed range head; scan
+`c65842cb-b0b3-42ad-9f34-8cc5c8524f4e` subsequently reviewed that range with
+zero reportable findings. Neither evidence type proves strict platform-backed
+descendant containment. Cargo target and build directories are structurally
+external to the checkout:
 focused and clean verification use one supervised disposable run directory, and
 human development uses `../.ryuki-target-ryuki.io`. The rustc wrapper retains
 its own preflight, periodic, and postflight disk checks even when it safely

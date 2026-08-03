@@ -1,0 +1,4032 @@
+{
+  "$schema": "https://ryuki.io/schemas/security-contracts/v1/control-trace-status-overlay.schema.json",
+  "contract_kind": "ControlTraceStatusOverlay",
+  "schema_version": 1,
+  "document_id": "control-trace-status-overlay:ryuki-security-boundary-v1",
+  "document_version": 1,
+  "authority_scope": "repository-implementation-tracking-only",
+  "status_assurance": "source-audited-declaration-without-conformance-receipt",
+  "control_trace_ref": {
+    "document_id": "control-trace:ryuki-security-boundary-v1",
+    "document_version": 2,
+    "ledger_id": "ryuki-security-boundary",
+    "ledger_version": "1.1.0",
+    "raw_sha256": "sha256:b905dc693d18df58ef053abf99f25a6ba756d20795ff7b6587c05e756c7fbe32"
+  },
+  "rows": [
+    {
+      "trace_id": "TRACE-SB-BOUND-01-AC-040",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/action-resource-registry.implementation.json",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/repos/requests.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/194_request_resource_version.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/repos/requests.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Sealed kernel permits and QueryPermit collection filters cover request.read and request.list, but protected repositories, query builders, and transitions outside that slice still use legacy capability or raw-predicate paths; obligation receipts and currentness bindings are not enforced end to end for the full action/resource inventory."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-BOUND-02-AC-041",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Admission rejects simultaneous selected cookie, session-header, and parsed Authorization carriers, but does not implement the complete carrier-pair, duplicate-Authorization, provider-hint, ambiguous-prefix, DPoP, and mTLS-composite matrix required by AC-041."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_041 fixture and a revision-bound execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-IDL-01-AC-004",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "migration_paths": [
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The retained runtime binds one exact Entra authority and rejects generic OIDC before construction, but there is no common versioned Authenticator/CredentialEvidence interface or registry dispatch across multiple admitted implementations."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The standards-only non-Entra multi-provider security_conformance::ac_004 fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-14-AC-041",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Credential selection is failure-final for the currently parsed session, cookie, and bearer paths, but coverage and implementation are incomplete for duplicate headers, provider hints, ambiguous prefixes, every carrier pair, and configured composite proof profiles."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_041 fixture and a revision-bound execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-15-AC-041",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/oidc_callback.rs"
+      ],
+      "migration_paths": [
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/oidc_callback.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Exact provider/configuration/origin provenance is retained for the current Entra path, but simultaneous provider resolution and collision isolation for issuer, kid, subject, audience, client id, discovery, JWKS, and replay caches are not implemented."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_041 collision/conflict fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-16-AC-043",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "migration_paths": [
+        "migrations/090_oidc_login_states.sql",
+        "migrations/091_oidc_login_state_binding.sql",
+        "migrations/164_oidc_login_state_admission.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The Entra BFF path implements authorization code, PKCE S256, state, nonce, and server-side exchange, while native/public, device, and service client profile runtimes and their prohibited-grant/redirect negative suites are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_043 multi-profile fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-17-AC-044",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "catalog/local-auth-contract.yaml",
+        "catalog/security-contracts/v1/provider-registry.schema.json"
+      ],
+      "migration_paths": [],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Only declarative schema/contract references exist; no WebAuthn enrollment, exact RP/origin verification, one-time challenge storage, authenticator lifecycle, purpose isolation, recovery, or break-glass ceremony runtime exists."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_044 passkey fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-IDL-02-AC-004",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "catalog/security-contracts/v1/provider-registry.implementation.json",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/tests/security_startup_process.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The closed schema, immutable implementation fixture, lifecycle/reference validation, digest binding, legacy conflict rejection, and startup validation are present, but the checked-in registry activates only a non-production static dry-run fixture and does not provide the AC-004 multi-provider adapter proof."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_004 fixture and a revision-bound execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXT-04-AC-050",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-runner/src/exec.rs",
+        "deploy/kubernetes/base/deployments.yaml",
+        "deploy/kubernetes/base/networkpolicies.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-runner/src/exec.rs",
+        "scripts/validator-rs/src/kubernetes_manifest.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The runner refuses production subprocess execution without a sealed OS-containment capability, but no production constructor or plugin host exists. Implement per-plugin cgroup/container/VM-equivalent attach-before-exec containment, a versioned mutually authenticated workload protocol, provider-specific capability grants, deny-by-default filesystem and network access, no ambient credentials, bounded CPU/memory/process/output/concurrency, quarantine, operator kill, and wait-empty semantics."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No deployed plugin sandbox, workload-identity readback, sandbox-escape exercise, kill/quarantine drill, or accepted SB-7 receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXT-05-AC-050",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-runner/src/exec.rs",
+        "sources/ryuki-engine/src/adapter_framework.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-runner/src/exec.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Vault, OIDC, and runner subsets enforce useful bounds, but the generic ProviderAdapter interface has no mandatory operation context. Require every adapter call to receive an end-to-end deadline and cancellation token, bounded request and response sizes, one retry or idempotency owner, and durable uncertain-outcome reconciliation; add executable security_conformance::ac_050 adversity and prove dropped HTTP futures and subprocesses cannot continue unowned."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No integrated cross-adapter cancellation receipt or live uncertain-outcome reconciliation evidence exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EGR-03-AC-018",
+      "implementation_status": "partial",
+      "source_paths": [
+        "portal/portal-ui/src/upstream.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-agent/src/client.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "portal/portal-ui/src/upstream.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-agent/src/client.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Known credential-bearing clients disable redirects individually, but no closed client/adapter/subprocess inventory enforces the rule. Centralize typed redirect policy and prove credentials, cookies, assertions, secrets, query credentials, and client-certificate authority cannot cross scheme, origin, proxy, or trust-root changes. Agent HTTPS can still inherit ambient proxy configuration. Add executable security_conformance::ac_018 coverage."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No complete credential-bearing-client runtime coverage receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MIG-01-AC-049",
+      "implementation_status": "not_implemented",
+      "source_paths": [],
+      "migration_paths": [],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "No repository type, durable store, or runtime admission path implements the normative ProviderMigrationPlan with immutable source/destination versions, mappings, cohorts, owner/deadline, drain-limit identifiers, acceptance receipts, irreversible edge, and permitted rollback; no AC-049 migration-plan test exists."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No authenticated operator-environment SB-9 receipt for the current immutable source revision proves an admitted migration plan."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MIG-02-AC-049",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "migration_paths": [
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Provider lifecycle transition validation, single-active-version selection, and exact authenticator-origin version pinning exist, but there is no ProviderMigrationPlan-bound planned-to-validated-to-shadow/dual-to-cutover-ready-to-cutover-to-draining-to-retired coordinator, cohort routing, concurrent cutover transaction, pinned session/lease drain orchestration, SecretVersionPublisher/key-reissue path, or complete AC-049 test."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No authenticated operator-environment receipt proves shadow/dual operation, cutover concurrency, pinned-authority draining, or post-cutover destination-only issuance on the current immutable revision."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MIG-03-AC-049",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/conformance_closure.rs"
+      ],
+      "migration_paths": [
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/conformance_closure.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Provider tombstones, one-way lifecycle removal, authority-version invalidation, and strict SB-9 retirement-closure validation exist, but no migration-plan irreversible-edge transaction enforces the rollback cutoff across identity, secret, key, and workload-trust migrations. There is no runtime writer/readback path proving zero consumers, zero live authority, and retired bypasses, nor a complete AC-049 test proving rollback cannot resurrect every retired carrier."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No accepted operator-environment zero-consumer, zero-live-authority, and retired-bypass package-exit receipt exists for the current immutable revision."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-07-AC-016",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-engine/src/self_health.rs",
+        "sources/ryuki-api/src/production_dependencies.rs",
+        "catalog/security-contracts/v1/security-limit-profile.implementation.json"
+      ],
+      "migration_paths": [
+        "migrations/095_scheduler.sql",
+        "migrations/120_connection_health_sweep.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-engine/src/self_health.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Public readiness is bounded and value-free, but authenticated dependency health still performs uncached database and scheduler probes and most component or adapter probes remain simulated."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "The trace requires externally attested operator probe evidence, and no production probe receipt exists."
+        },
+        {
+          "kind": "external_access",
+          "detail": "Live identity-provider, secret-manager or PKI, TLS, key-custody, migration, and disposable-target evidence requires authorized operator access."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-08-AC-021",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "catalog/security-contracts/v1/action-resource-registry.implementation.json"
+      ],
+      "migration_paths": [
+        "migrations/174_request_approval_lifecycle_epoch.sql",
+        "migrations/205_patch_wave_maker_checker.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "There is no canonical value-free preview for actor and effective subject, action, resource, scope, maximum authority, obligations, and evidence state; production step-up and maker-checker receipt issuers are intentionally absent."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "No uniform confirmation, partial-failure, or uncertain-outcome receipt is produced across dangerous operator actions."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No incident or disaster-recovery operator-interaction drill receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CONF-01-AC-048",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "catalog/security-contracts/v1/conformance-bundle.schema.json",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CONF-02-AC-048",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "catalog/security-contracts/v1/conformance-bundle.schema.json",
+        "catalog/security-contracts/v1/package-exit-receipt.schema.json",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CONF-03-AC-048",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-core/src/conformance_applicability.rs",
+        "sources/ryuki-core/src/production_applicability.rs",
+        "sources/ryuki-core/src/production_deployment_applicability.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-core/src/conformance_applicability.rs",
+        "sources/ryuki-core/src/production_applicability.rs",
+        "sources/ryuki-core/src/production_deployment_applicability.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CONF-04-AC-048",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "catalog/security-contracts/v1/control-trace.schema.json",
+        "catalog/security-contracts/v1/control-trace.implementation.json",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-core/src/conformance_closure.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CONF-05-AC-055",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "catalog/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json",
+        "catalog/security-contracts/v1/conformance-trust-root-registry.schema.json",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/boundary/trust_checkpoint_transport.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/boundary/trust_checkpoint_transport.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "deployment_evidence",
+          "detail": "The active trace requires externally_attested rank-3 deployment evidence; repository fixtures and tests cannot satisfy that tier."
+        },
+        {
+          "kind": "external_access",
+          "detail": "Evidence requires the SB-8-operated strongly consistent checkpoint authority, independently governed pin custody, trusted time, key and epoch rotation, compare-and-swap administration, and recovery reconciliation."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CTX-01-AC-046",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-protocol/src/types.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/run.rs"
+      ],
+      "migration_paths": [
+        "migrations/193_first_owner_closure_records.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/run.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Authorization, authenticator-provenance, and live-grant slices distinguish deployment, trust-domain, and tenant identifiers where represented, but namespace propagation and persistence are not complete across all applicable sessions, token families, caches, replay and idempotency stores, queues, audit, backups, bootstrap state, secrets, leases, and keys, and no exhaustive collision suite proves their isolation."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-08-AC-045",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-api/src/session_lookup_admission.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/004_sessions.sql",
+        "migrations/044_session_provider.sql",
+        "migrations/159_session_bearer_verifiers.sql",
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-api/src/session_lookup_admission.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Durable session issuance, digest lookup, lifecycle fencing, metadata administration, and revocation slices exist, but no single SessionRepository owns CAS rotation, idle/touch semantics, refresh-family compromise, complete watermarks, cleanup, and all required revocation selectors atomically."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named multi-replica security_conformance::ac_045 fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CFG-01-AC-002",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/tests/security_startup_process.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CFG-02-AC-002",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/tests/security_startup_process.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CFG-03-AC-002",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/production_dependencies.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/tests/security_startup_process.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/production_dependencies.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Production has six live runtime-guard witnesses but remains deliberately unable to publish its database or serve: ExternalSigningKeyMaterial and MockDependenciesDisabled guards and their aggregate publication authority are not implemented."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CFG-04-AC-002",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "deploy/compose/compose.yaml",
+        "deploy/kubernetes/base/deployments.yaml",
+        "deploy/proving-ground/compose.yaml",
+        ".github/workflows/release.yml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "scripts/validator-rs/src/compose.rs",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "scripts/validator-rs/src/release_engineering.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Compose and proving-ground set RYUKI_AUTH_MODE=local, but runtime admission rejects live local or Entra authority under a migration overlay and rejects the legacy selector against the provider registry without one. The manifest launch shapes therefore do not pass the process's typed startup validation."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CFG-05-AC-002",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Startup enforces one snapshot's typed configuration, lifecycle transitions, active-only selection, and same-snapshot tombstones, but the provider-registry contract has no predecessor lineage or durable mutation authority proving provider and configuration tombstones persist across registry versions. Cross-version non-reuse is not enforced."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CFG-06-AC-002",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "catalog/security-contracts/v1/deployment-security-profile.schema.json",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/tests/security_startup_process.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-BOOT-01-AC-023",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/first_owner_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/193_first_owner_closure_records.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/first_owner_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The repository can store and verify permanent closure evidence, but no executable first-owner claim path verifies expiry, consumes one capability atomically, calls the owner-only SQL writer, or proves concurrent-winner and replay behavior."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-BOOT-02-AC-023",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/first_owner_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/193_first_owner_closure_records.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/first_owner_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Immutable closure readback exists, but initial claim consumption, restore and rollback reconciliation, explicit recovery, and end-to-end proof that no state transition reopens bootstrap are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-BOOT-03-AC-023",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/first_owner_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/193_first_owner_closure_records.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-api/src/first_owner_runtime.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Five signed initial domain assignments are verified, but distinct privileged actions and roles, ownership transfer, step-up, maker-checker, last-owner protection, recovery, and break-glass workflows are not implemented."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-01-AC-003",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "migration_paths": [
+        "migrations/090_oidc_login_states.sql",
+        "migrations/091_oidc_login_state_binding.sql",
+        "migrations/164_oidc_login_state_admission.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "OIDC validators enforce signature, RS256 policy, issuer, audience, temporal claims, subject, HTTPS endpoints, bounded JWKS behavior, state, nonce, and PKCE, but the complete AC-003 standards-only negative suite and explicit end-to-end ID-token-as-API-bearer refusal/custody proof are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_003 fixture and a revision-bound execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-02-AC-043",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "migration_paths": [
+        "migrations/090_oidc_login_states.sql",
+        "migrations/091_oidc_login_state_binding.sql",
+        "migrations/164_oidc_login_state_admission.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The browser BFF authorization-code flow persists single-use state, nonce, PKCE verifier, and exact origin binding, but AC-043 requires additional native, device, and service profile suites plus complete prohibited-flow and redirect coverage."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_043 fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-03-AC-034",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/human_authority.rs"
+      ],
+      "migration_paths": [
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/human_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Opaque principal keys, monotonic authority, tombstones, and session/token invalidation are durable, but production SCIM/back-channel/logout/security-event connectors, bounded reconciliation, authenticated ordering, and atomic audit/outbox handling are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named first-seen/lifecycle security_conformance::ac_034 fixture and execution receipt are absent."
+        },
+        {
+          "kind": "external_access",
+          "detail": "No operator-owned IdP lifecycle delivery, assignment population, or revocation-lag readback evidence was available to this repository-only audit."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-04-AC-044",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/local-auth-contract.yaml",
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Production posture rejects password-local authentication and schemas describe passkey purpose, but no WebAuthn credential/challenge runtime or separately governed Argon2id fallback recovery ceremony is implemented."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_044 passkey/recovery fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-05-AC-003",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "migration_paths": [
+        "migrations/090_oidc_login_states.sql",
+        "migrations/091_oidc_login_state_binding.sql",
+        "migrations/164_oidc_login_state_admission.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Local-login process admission and durable OIDC-state quotas are bounded, but atomic fleet-wide throttling per account and trusted client, anti-lockout behavior, explicit audited recovery, and uniform account-enumeration resistance are incomplete."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_003 abuse/negative fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-06-AC-005",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Typed assurance levels, expiry checks, and authorization obligations exist, but a recent approved step-up ceremony is not comprehensively enforced across every listed privileged action and the decision does not retain a complete separately bounded assurance source."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_005 session/step-up fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-07-AC-004",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/request_authority.rs"
+      ],
+      "migration_paths": [
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/request_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Current Entra browser/direct bearer paths normalize into provider-qualified principal authority and generic OIDC fails closed, but multiple admitted human IdPs do not yet share one executable authenticator contract and baseline suite."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The standards-only non-Entra security_conformance::ac_004 fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-08-AC-042",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/principal_registry.rs"
+      ],
+      "migration_paths": [
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/identity_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Provider-qualified keys and exact origin/configuration binding prevent several substitutions, but two simultaneous issuers with colliding kid, subject, email, client id, and audience plus isolated cache/logout/lifecycle behavior are not implemented or tested end to end."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_042 multi-issuer collision fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-09-AC-042",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/request_authority.rs"
+      ],
+      "migration_paths": [
+        "migrations/199_principal_registry.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/request_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Stable opaque principal ids, provider-qualified external keys, collision-safe uniqueness, authority versions, and tombstones are durable, but the production link/unlink state machine with dual-identity proof or maker/checker recovery is absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_042 identity-collision/linking fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-10-AC-005",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The authorization model carries a typed assurance level and expiry, but it does not preserve immutable original authentication separately from actor/session/action-bound step-up method, purpose, time, and expiry."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_005 assurance-separation fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-11-AC-044",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/auth.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/auth.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The repository currently implements the opposite standing-authority posture: BreakGlassAdmin carries admin and is treated as a coarse superuser. Ordinary approval sinks exclude it, but no dormant eligibility credential, WebAuthn proof, time-bounded maker/checker activation, maximum-authority record, or immediate alerting runtime exists."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_044 emergency activation fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-12-AC-034",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/human_authority.rs"
+      ],
+      "migration_paths": [
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/human_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "First-seen provider-qualified key creation is unique and concurrency-fenced, but executable preprovisioned_only/jit_pending/policy_jit behavior, complete claim-state semantics, bounded authenticated enrichment, and production admission audit are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_034 admission-mode/collision fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUTH-13-AC-034",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/human_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/human_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Authority versions, assignment status, scopes, token/session invalidation, and tombstones exist, but grants and links lack the complete owner, purpose, provenance, expiry/review-date, review-state, suspension, and production recertification workflow."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_034 governance/recertification fixture and execution receipt are absent."
+        },
+        {
+          "kind": "external_access",
+          "detail": "No operator-owned identity assignment population or recertification readback evidence was available to this repository-only audit."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-01-AC-005",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [
+        "migrations/004_sessions.sql",
+        "migrations/159_session_bearer_verifiers.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Opaque high-entropy rys_ bearers, keyed fixed-width verifier storage, and separate random management ids are implemented, but the trace remains incomplete because AC-005 also requires unimplemented idle, rotation, assurance, family, and concurrency proofs."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_005 fixture and a revision-bound execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-02-AC-005",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-api/src/session_lookup_admission.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/004_sessions.sql",
+        "migrations/044_session_provider.sql",
+        "migrations/159_session_bearer_verifiers.sql",
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-api/src/session_lookup_admission.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Absolute expiry, immutable issued credentials, logout/admin deletion, and authority-change invalidation exist, but idle expiry, CAS rotation after step-up/authority change, dedicated verifier keyring states, bounded overlap, and audited rollout/rollback are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_005 rotation/revocation fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-03-AC-006",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/cookie_runtime.rs",
+        "sources/ryuki-core/src/cookie_policy.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/cookie_runtime.rs",
+        "sources/ryuki-core/src/cookie_policy.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The production __Host-ryuki_session policy enforces Secure, HttpOnly, Path=/, no Domain, and explicit SameSite with retained-policy integrity, but the AC-006 browser-boundary proof also requires the incomplete Origin/Referer and session-bound CSRF workflow."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named browser security_conformance::ac_006 fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-04-AC-006",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "portal/portal-ui/src/upstream.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Cookie-sourced authority is restricted for unsafe API requests, but every unsafe browser request does not verify both allowed Origin/Referer and a session-bound CSRF token; logout remains authentication-exempt and portal header conversion is not a complete exemption-resistant CSRF boundary."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named browser security_conformance::ac_006 cross-site fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-05-AC-005",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/session_credentials.rs"
+      ],
+      "migration_paths": [
+        "migrations/004_sessions.sql",
+        "migrations/045_api_tokens.sql",
+        "migrations/159_session_bearer_verifiers.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/session_credentials.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Session and token administrative projections expose metadata and do not recover stored bearer/hash material, but the trace remains incomplete because AC-005's full session lifecycle and named conformance fixture are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_005 metadata/lifecycle fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-06-AC-003",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/090_oidc_login_states.sql",
+        "migrations/091_oidc_login_state_binding.sql",
+        "migrations/164_oidc_login_state_admission.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Authorization code/token exchange occurs server-side and provider tokens are discarded after the immediate login flow, but retained refresh/access token envelope custody and an explicit API credential-profile refusal of ID tokens are not implemented end to end."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_003 custody/ID-token-refusal fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SES-07-AC-005",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/044_session_provider.sql",
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Local/admin lifecycle changes invalidate sessions and derived tokens, but refresh-token families, retired-member reuse compromise, production normalized provider events, authenticated source watermarks, atomic audit/outbox, and monitored revocation lag are absent."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_005 family/lifecycle fixture and execution receipt are absent."
+        },
+        {
+          "kind": "external_access",
+          "detail": "No operator-owned provider logout or lifecycle-event delivery/readback evidence was available to this repository-only audit."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-TOK-01-AC-031",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [
+        "migrations/045_api_tokens.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "API tokens are random, shown once, hash-stored, role/site/environment scoped, short-lived, last-use tracked, and revocable, but storage is not a versioned keyed digest and records lack complete purpose, audience, actions, resources, deployment, trust-domain, tenant, and registered-limit bindings."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_031 token fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-TOK-02-AC-031",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [
+        "migrations/045_api_tokens.sql"
+      ],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Only create, list, get, revoke, and last-use tracking exist for a single token row. No token-family rotation operation, new credential version, active-profile-bounded overlap deadline, or automatic prior-version retirement exists, and no rotation test exists."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_031 rotation/overlap fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-TOK-03-AC-031",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/idempotency.rs"
+      ],
+      "migration_paths": [
+        "migrations/093_idempotency_records.sql",
+        "migrations/162_idempotency_principal_budget.sql",
+        "migrations/200_principal_idempotency_cutover_fence.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/idempotency.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Idempotency records bind opaque principal/provider/actor, roles/scopes, method, path, and body digest, but do not bind the exact credential id, typed action and resource, or response authorization scope/version needed to reject replays after authority narrows."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_031 authority-change replay fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-TOK-04-AC-031",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/principal_registry.rs"
+      ],
+      "migration_paths": [
+        "migrations/045_api_tokens.sql",
+        "migrations/182_interactive_human_authority.sql",
+        "migrations/199_principal_registry.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/identity_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Current tokens bind issuing principal authority and support soft revocation, but there is no family/version/status state machine, purpose/audience/action/resource/deployment/trust binding, registered TTL/overlap profile, authority-narrowing rotation, atomic family revocation, or non-reusable family tombstone."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The named security_conformance::ac_031 family/version/lifecycle fixture and execution receipt are absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-01-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/action-resource-registry.implementation.json",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "scripts/validator-rs/src/security_conformance.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Kernel activation denies unactivated typed actions, but the HTTP layer still uses coarse path-prefix permissions and an unclassified unsafe route falls back to the admin capability rather than unconditional deny; the registry remains a transitional snapshot with router_inventory_equal=false, worker_inventory_equal=false, and unknown_entries_rejected=false."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-02-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/repos/requests.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/194_request_resource_version.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/repos/requests.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Canonical resource resolution, version binding, and final authorization are integrated for request reads and lists only; the remaining registered and legacy resources and transitions do not all resolve and authorize through the same current kernel-issued permit path."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-03-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/repos/requests.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/168_snapshot_resource_authority.sql",
+        "migrations/170_shift_queue_authorization_scope.sql",
+        "migrations/175_alert_route_authorization_scope.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/repos/requests.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Closed roles and several domain-specific scope policies exist, but there is no complete kernel matrix for every actor kind, action, resolver, role, site, environment, owner, lifecycle state, assurance level, collection/instance path, and DB/no-DB mode; bespoke handler policies remain."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-04-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "A central typed authorization kernel exists, but only the request read/list slice consumes it; route middleware remains coarse and many handlers perform independent capability and scope checks instead of consuming one canonical kernel decision."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-05-AC-040",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/repos/requests.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The request read and list kernel seals policy version and digest plus a private DenialReason into its decision and permit, but AuthorizationDecision exposes neither policy provenance nor a stable reason code; API denials become generic 403 or 404 responses. All other authorization paths still bypass this kernel, so AC-040 permit and obligation bindings are not universal."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-06-AC-040",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The kernel hard-codes delegation disabled and requires actor and effective-subject equality, but no production path can enable an explicit grant. DelegationBinding::Chain lacks bounded actor hops, per-hop authority intersection, purpose, audience, action and resource binding, durable grant and revocation state, OAuth token-exchange admission, and complete policy and audit propagation."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-07-AC-001",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/action-resource-registry.implementation.json",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/main.rs",
+        "scripts/validator-rs/src/security_conformance.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/main.rs",
+        "scripts/validator-rs/src/security_conformance.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The registry is explicitly an implementation-only transitional snapshot: router_inventory_equal and worker_inventory_equal are false, unknown_entries_rejected is false, worker_mappings is empty, and its six routes do not close over the protected router and worker inventory."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-08-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/site_registry.rs",
+        "sources/ryuki-api/src/repos/site_registry.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [
+        "migrations/086_site_registry.sql",
+        "migrations/157_site_code_system.sql",
+        "migrations/181_noisy_trigger_canonical_site.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/site_registry.rs",
+        "sources/ryuki-api/src/repos/site_registry.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Site-registry deletion has focused global-authority, referential, and no-DB tests, but site-registry actions and resolvers are absent from the closed action/resource registry and the handler does not consume a typed kernel permit."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-09-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/snapshot_governance.rs",
+        "sources/ryuki-engine/src/snapshot_engine.rs",
+        "sources/ryuki-api/src/repos/snapshots.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/059_snapshots_full_model.sql",
+        "migrations/168_snapshot_resource_authority.sql",
+        "migrations/204_snapshot_expiry_typed.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/snapshot_governance.rs",
+        "sources/ryuki-engine/src/snapshot_engine.rs",
+        "sources/ryuki-api/src/repos/snapshots.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Snapshot CMDB authority, lifecycle, expiry, and SQL behavior have focused tests, but snapshot actions and resolvers remain outside the registry and typed-permit matrix, leaving execution and audit authorization on legacy paths."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-09A-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/shift_queue.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/092_shift_queue_assigned_by.sql",
+        "migrations/170_shift_queue_authorization_scope.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/shift_queue.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Shift-queue assignment enforces focused global-human, compare-and-swap, and audit behavior, but its actions are unregistered and unpermitted, and the no-DB fallback bypasses the required typed immutable authority lock and transactional hash-chained audit path."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-09B-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/repos/access_recertification.rs",
+        "sources/ryuki-api/src/repos/aiops.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/035_aiops.sql",
+        "migrations/070_access_recertification.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/repos/access_recertification.rs",
+        "sources/ryuki-api/src/repos/aiops.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Global recertification and AIOps campaign guards plus bounded SQL behavior are implemented, but their actions and resolvers are absent from the registry and collection reads do not consume kernel-issued QueryPermit filters."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-09C-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [
+        "migrations/046_audit_log.sql",
+        "migrations/094_audit_log_hash_chain.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Exact-global capability and dual-axis scope guards exist for both global audit collections, with scoped, blank, and scoped-admin denials plus Global workload admission, but AC-007 does not prove authorization precedence over attacker-controlled cursor parsing: no scoped or malformed-authority test supplies invalid since or until bounds and asserts 403 rather than 400."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AZ-10-AC-007",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/alert_routing_engine.rs",
+        "sources/ryuki-engine/src/event_alerts.rs",
+        "sources/ryuki-engine/src/site_registry.rs",
+        "sources/ryuki-api/src/repos/domain_events.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/008_alert_routing.sql",
+        "migrations/086_site_registry.sql",
+        "migrations/110_domain_events.sql",
+        "migrations/111_domain_events_append_only.sql",
+        "migrations/115_alert_acks.sql",
+        "migrations/175_alert_route_authorization_scope.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/alert_routing_engine.rs",
+        "sources/ryuki-engine/src/event_alerts.rs",
+        "sources/ryuki-engine/src/site_registry.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Monitoring-alert read and acknowledgement use closed legacy capabilities with scoped SQL and focused tests, but those actions and resources are absent from the typed registry and handlers do not consume kernel-issued permits."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-APR-01-AC-032",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [
+        "migrations/174_request_approval_lifecycle_epoch.sql",
+        "migrations/194_request_resource_version.sql",
+        "migrations/196_request_authority_version_bindings.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/database.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Approval persistence binds resource version and lifecycle epoch, but does not bind the complete required policy, provider configuration, secret-reference fingerprint, credential policy/role, adapter/capability, expiry, and maximum-authority tuple."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-APR-02-AC-008",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/approval_quorum.rs",
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/principal_registry.rs"
+      ],
+      "migration_paths": [
+        "migrations/036_emergency_changes.sql",
+        "migrations/118_request_required_approval_roles.sql",
+        "migrations/174_request_approval_lifecycle_epoch.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/205_patch_wave_maker_checker.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/approval_quorum.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/repos/firmware_lifecycle.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Request quorum and several approval families enforce distinct makers and checkers, but the emergency-change schema and handler allow the same verified-human administrator to initiate and approve one emergency change; the SB-3 request, runbook, software, access-review, and emergency decision families are not routed through one shared maker-checker and quorum primitive."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-APR-03-AC-008",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/repos/domain_events.rs"
+      ],
+      "migration_paths": [
+        "migrations/110_domain_events.sql",
+        "migrations/111_domain_events_append_only.sql",
+        "migrations/174_request_approval_lifecycle_epoch.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/audit.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The request-approval primitive atomically binds request CAS, approval decision, authoritative audit, and domain event, but runbook, software, access-review, and emergency decision families use separate transition implementations and do not uniformly persist a decision plus event or outbox plus audit in one shared atomic primitive."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-APR-04-AC-008",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-api/src/scheduler.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/background.rs"
+      ],
+      "migration_paths": [
+        "migrations/199_principal_registry.sql"
+      ],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The principal registry schema permits principal_kind system, but scheduler, compensation, monitoring, and automated-teardown paths still persist unauthenticated string actors such as system and system:auto-teardown; no registry-backed narrow action allowlist or negative admission regression exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-APR-05-AC-032",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-protocol/src/types.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "migration_paths": [
+        "migrations/056_agent_jobs_live_context.sql",
+        "migrations/196_request_authority_version_bindings.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "VerifiedLiveContext binds request version, deployment/trust scope, spec, plan, job, agent authority, and expiry, but omits explicit reviewer-bound secret-reference, credential-policy/role, adapter/capability, and maximum-authority fields; enabled delegation/exchange is absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-APR-06-AC-008",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/access_recertification.rs",
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/repos/access_recertification.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/070_access_recertification.sql",
+        "migrations/199_principal_registry.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-engine/src/auth.rs",
+        "sources/ryuki-engine/src/access_recertification.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MID-01-AC-010",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/config.rs",
+        "sources/ryuki-agent/src/identity.rs",
+        "sources/ryuki-agent/src/main.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [
+        "migrations/158_agent_enrollment_admission.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/config.rs",
+        "sources/ryuki-agent/src/identity.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Invite consumption and proof of possession are enforced and tested, but this trace is bound to AC-010, which remains incomplete: grants have no unique replay id or atomic receipt, and exact result and webhook duplicate ids are returned idempotently instead of being rejected."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No deployment receipt proves authorized out-of-band challenge delivery, protection and removal of bootstrap material, or retirement and re-enrollment of every legacy Approved agent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MID-02-AC-009",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/identity.rs",
+        "sources/ryuki-agent/src/main.rs",
+        "sources/ryuki-agent/src/result.rs",
+        "sources/ryuki-agent/src/token.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [
+        "migrations/053_agents.sql",
+        "migrations/158_agent_enrollment_admission.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/identity.rs",
+        "sources/ryuki-agent/src/result.rs",
+        "sources/ryuki-agent/src/token.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Approved agents still authenticate control-plane requests with an immutable long-lived rya_ bearer. Enrollment and results use Ed25519 proof, but heartbeat, polling, acknowledgement, and other exchanges lack a rotatable proof-of-possession workload credential and no credential-rotation lifecycle is wired."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No deployed workload-identity issuer or migration receipt proves that every legacy rya_ credential has explicit expiry and revocation and that every approved-agent exchange uses proof of possession."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MID-03-AC-009",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/main.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/cp_identity.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/cp_identity.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Keyring primitives and overlap and revocation tests exist, but startup still calls load_or_generate_cp_key and installs one local version-1 keyring. No admitted externally supplied versioned private-key material or runtime activation, overlap, revocation, and rollback lifecycle is wired."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No deployment evidence proves externally governed private-key custody, activation and expiry policy, live rotation, emergency revocation, rollback, or recovery."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MID-04-AC-010",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/result.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/inbound_webhook_receipts.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [
+        "migrations/055_agent_job_results.sql",
+        "migrations/056_agent_jobs_live_context.sql",
+        "migrations/090_oidc_login_states.sql",
+        "migrations/091_oidc_login_state_binding.sql",
+        "migrations/158_agent_enrollment_admission.sql",
+        "migrations/160_inbound_webhook_freshness.sql",
+        "migrations/201_authenticator_runtime_provenance.sql",
+        "migrations/207_inbound_webhook_authority_generation.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/result.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Enrollment and callback state are single-use and result and webhook effects are atomically deduplicated, but grants lack a dedicated unique id, issued-at value, and atomic replay receipt. Exact duplicate results and webhooks return idempotent success rather than rejection, so the literal AC-010 duplicate-id matrix and security_conformance::ac_010 receipt are not complete."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-MID-05-AC-009",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/main.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/cp_identity.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/cp_identity.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Protocol logic validates bounded overlap, revocation, monotonic version updates, rollback, and same-version content reuse, but the agent fetches and pins the keyset only once at startup. No live refresh or monotonic runtime update path calls that validation."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No evidence exists for an operated trust-root update, overlap, emergency revocation, rollback, or recovery exercise."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXEC-01-AC-033",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/live_exec.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-agent/src/live.rs",
+        "sources/ryuki-agent/src/live_exec.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Live mutation grants bind the approved job, agent enrollment and key, provider authority, target, request or step, and expiry before agent-side credential resolution, but no broker issues a provider, operation, target, request or step, and TTL-scoped credential capability; live credential inputs remain ambient."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No per-job capability issuance or agent-binding attestation is stored in the repository."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXEC-02-AC-051",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/live_exec.rs",
+        "sources/ryuki-runner/src/live.rs",
+        "sources/ryuki-api/src/integration.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-agent/src/live_exec.rs",
+        "sources/ryuki-runner/src/live.rs",
+        "sources/ryuki-api/src/integration.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Child-environment clearing, mode-0600 files, and redaction exist, but RYUKI_LIVE_CRED_* and RYUKI_AGENT_BACKEND_HCL remain ambient credential inputs."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production proof demonstrates removal of ambient credentials from runners and agents."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXEC-03-AC-012",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/executor.rs",
+        "sources/ryuki-agent/src/live_exec.rs",
+        "sources/ryuki-agent/src/run.rs",
+        "sources/ryuki-runner/src/exec.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-agent/src/executor.rs",
+        "sources/ryuki-agent/src/live_exec.rs",
+        "sources/ryuki-agent/src/run.rs",
+        "sources/ryuki-runner/src/exec.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Process count, runtime, capture, process-group termination, drain, reap, and lease-loss cancellation propagation are bounded, but complete artifact, disk, and memory limits, policy-revocation and operator-cancellation propagation, and explicit uncertain-provider-call disposition remain absent."
+        },
+        {
+          "kind": "platform_decision",
+          "detail": "A production OS-containment primitive has not been selected or implemented; the sealed containment capability has only a controlled-test constructor and production execution fails closed."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production containment or cancellation-disposition attestation is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXEC-04-AC-013",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-runner/src/scrub.rs",
+        "sources/ryuki-agent/src/result.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "catalog/evidence-redaction-contract.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-runner/src/scrub.rs",
+        "sources/ryuki-agent/src/result.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "scripts/validator-rs/src/evidence_redaction_contract.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "deployment_evidence",
+          "detail": "Implementation is repository-local; no signed production evidence-bundle readback is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-01-AC-052",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "catalog/secret-reference-catalog.yaml"
+      ],
+      "migration_paths": [
+        "migrations/192_integration_connection_typed_secret_ref.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/integration.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Domain state persists a validated provider-qualified SecretRef, but governed administrative SecretReferenceRecord remains only a draft catalog concept."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No administrative secret-reference registry deployment or readback is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-02-AC-011",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.implementation.json",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "scripts/validator-rs/src/security_conformance.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Closed descriptors and fail-closed Vault KV-v2 admission exist, but full backend capability suites and production provider entries are absent."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "The checked-in provider registry is implementation_only and contains only a development fixture."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-03-AC-011",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-agent/src/live_exec.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Vault Kubernetes JWT authentication is implemented, but only that adapter uses workload identity and live provider execution still accepts ambient credentials."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production runtime binding or workload-identity readback is checked in."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-04-AC-033",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "deployment_evidence",
+          "detail": "No live lease-lifecycle or revocation-owner evidence is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-05-AC-033",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "catalog/security-contracts/v1/secret-ref.schema.json",
+        "catalog/security-contracts/v1/secret-lease-metadata.schema.json"
+      ],
+      "migration_paths": [
+        "migrations/192_integration_connection_typed_secret_ref.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "SecretRef and SecretLeaseMetadata are versioned and value-free, and SecretMaterial is non-serializable, non-Debug, and zeroizing, but SecretMaterial::new is public and ResolvedSecret exposes independently owned public material and metadata fields; with_bytes enforces neither lease expiry nor fencing, so scope-bound custody is not yet enforced."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No live material-custody observation is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-06-AC-011",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "catalog/security-contracts/v1/provider-registry.implementation.json"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "SecretResolver and a versioned Vault KV-v2 descriptor exist, but separate dynamic-credential, lease, key-custody, certificate, publisher, and materializer interfaces were not found."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production capability registry or adapter inventory is accepted."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-07-AC-033",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "migration_paths": [
+        "migrations/192_integration_connection_typed_secret_ref.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Lease and provider-read fencing plus pinned/latest semantics exist, but qualified caches and fenced rotation, watch, migration, failover, and reconciliation are absent."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No cache, watch, failover, or provider-migration runtime evidence is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-08-AC-033",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "catalog/secret-reference-catalog.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "No key-portability type, dependency inventory, provider-removal gate, dual-verification flow, or reissue/re-encryption workflow was found."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No provider-removal or key-migration evidence is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-09-AC-047",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "catalog/secret-reference-catalog.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The draft catalog describes publication receipts, but no SecretVersionPublisher, expected-version CAS, idempotency, purpose authorization, or publisher tests exist."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No publication runtime or metadata-only receipt evidence is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SEC-10-AC-047",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/vault-secret-delivery-contract.yaml",
+        "deploy/kubernetes/vault/vso-secrets.yaml",
+        "deploy/kubernetes/operations/migration-vault-dynamic-secret.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/vault_secret_delivery.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Static VSO resources are validated, but no typed MaterializationController, acknowledgement receipt, atomic replacement controller, bounded-staleness enforcement, revocation, or deletion runtime exists."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "Validation explicitly performs no cluster apply or readback."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CERT-01-AC-035",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/certificate_lifecycle.rs",
+        "catalog/certificate-lifecycle-contract.yaml"
+      ],
+      "migration_paths": [
+        "migrations/011_certificates.sql",
+        "migrations/061_certificates_status_check.sql",
+        "migrations/130_certificate_expiry_scan.sql",
+        "migrations/172_certificate_query_bounds.sql",
+        "migrations/209_certificate_expiry_scan_progress.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/certificate_lifecycle.rs",
+        "scripts/validator-rs/src/certificate_lifecycle.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Basic lifecycle state exists, but requests still accept caller CN, subject, and validity; approved profiles, SAN/EKU/key policy, workload key custody, acknowledgement, fencing, CA-compromise, and trust-bundle rotation are missing."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The static validator does not contact an issuer or verify certificate installation and revocation status."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No issuer, installation, CA-rotation, or trust-bundle readback is present."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXT-01-AC-017",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/production_dependencies.rs"
+      ],
+      "migration_paths": [
+        "migrations/192_integration_connection_typed_secret_ref.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/production_dependencies.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Exact provider selection and several fail-closed paths exist, but the closed production dependency plan still identifies thirteen mock/static/local implementations and startup blocks instead of exposing a complete live topology. Replace them and prove no identity, secret, policy, database, audit, key, or workload-trust failure selects a weaker authority. Add executable security_conformance::ac_017 no-fallback coverage."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No exact live production dependency inventory receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXT-02-AC-017",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "catalog/security-contracts/v1/provider-registry.implementation.json",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/build_identity.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-engine/src/adapter_framework.rs"
+      ],
+      "migration_paths": [
+        "migrations/192_integration_connection_typed_secret_ref.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/build_identity.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The checked-in provider registry is development/test-only, all measured shipped adapters are non-production-eligible, and the generic adapter interface is unversioned and synchronous. Implement a production registry/lifecycle owner, mandatory executable per-kind conformance suites, provenance-bound packages/images/SBOMs, narrow capability APIs, and an out-of-process third-party adapter boundary."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No accepted mandatory-baseline deployment evidence or production adapter measurement exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EXT-03-AC-017",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Static startup validation rejects descriptor and lifecycle drift, but no durable event-driven quarantine transition exists. Add accepted-baseline comparison, atomic audit, provider drain/kill, downgrade state, and governed reactivation. A mandatory_baseline_ref is only a reference, not conformance evidence."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No runtime downgrade/quarantine exercise or accepted provider-lifecycle receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EGR-01-AC-018",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/provider-registry.schema.json",
+        "portal/portal-ui/src/security.rs",
+        "portal/portal-ui/src/upstream.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-engine/src/integration_connections.rs",
+        "sources/ryuki-runner/src/live.rs"
+      ],
+      "migration_paths": [
+        "migrations/052_integration_connections.sql"
+      ],
+      "test_paths": [
+        "portal/portal-ui/src/upstream.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-agent/src/client.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Several clients validate endpoints locally, but no common approved TypedDestination reaches every outbound sink. Replace unrestricted endpoint strings and enforce initial-resolution plus connection-time DNS/IP-class validation, rebinding and mixed-answer defense, TLS identity/client-certificate policy, and typed proxy policy, including Terraform backends."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No DNS-rebinding, mixed-address, private/link-local, TLS-identity, or client-certificate adversarial receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EGR-02-AC-018",
+      "implementation_status": "partial",
+      "source_paths": [
+        "deploy/kubernetes/base/networkpolicies.yaml",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "catalog/security-contracts/v1/provider-registry.implementation.json"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/kubernetes_manifest.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Static default-deny and narrow DB/DNS/Vault rules exist, but no enabled-adapter destination inventory compiles into policy. Add Entra/OIDC policies, egress-denial telemetry, actor-driven destination-change audit, and exact registry-to-policy binding."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "The deployment documentation explicitly leaves external-provider egress as future work. No CNI enforcement readback, denial observation, or production policy receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EVO-01-AC-024",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [
+        "migrations/143_agents_protocol_version.sql",
+        "migrations/196_request_authority_version_bindings.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Agent protocol, request-authority, provider, and deployment-profile paths bind selected versions and reject malformed or unknown values, but the required versioned canonical envelope is not implemented uniformly for principals, decisions, grants, agent messages, secret references/leases, callbacks, audit/evidence, provider capability descriptors, and adapters. The agent wire currently admits only v9, so the required current plus N/N-1 compatibility surface and its complete AC-024 test do not exist."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No authenticated operator-environment compatibility receipt exercises the complete current and N/N-1 envelope inventory on the current immutable revision."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EVO-02-AC-024",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "migration_paths": [
+        "migrations/143_agents_protocol_version.sql",
+        "migrations/196_request_authority_version_bindings.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-agent/src/client.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/request_authority.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-protocol/src/types.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Closed protocol allowlists, deny-unknown-field deserialization, exact binding versions, and downgrade rejection exist on selected paths, but there is no authenticated N/N-1 negotiation contract or exhaustive cross-envelope refusal test for assurance, policy, signature, replay, secret-capability, execution, and adapter-capability downgrades. AC-024 therefore remains incomplete."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No authenticated operator-environment receipt proves downgrade refusal and compatible N/N-1 behavior across the complete security-envelope inventory on the current immutable revision."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-EVO-03-AC-025",
+      "implementation_status": "partial",
+      "source_paths": [
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "sources/ryuki-api/src/database.rs"
+      ],
+      "migration_paths": [
+        "migrations/158_agent_enrollment_admission.sql",
+        "migrations/192_integration_connection_typed_secret_ref.sql",
+        "migrations/200_principal_idempotency_cutover_fence.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "sources/ryuki-api/src/database.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Selected migrations have irreversible database fences and the Kubernetes validator enforces a bounded one-shot drain/apply/readback cutover contract, but the repository has no general expand/backfill/verify/cutover/contract state machine or rolling N/N-1 mixed-binary test. Several security migrations explicitly require offline Recreate/non-overlap cutover, and no complete AC-025 rollback suite proves retired credentials, trust roots, authority, plaintext representations, and deprecated fallbacks cannot reappear."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No authenticated operator-environment rolling-upgrade, rollback, and post-contract old-binary-fence receipt exists for the current immutable revision."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-HA-01-AC-026",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/scheduler.rs",
+        "sources/ryuki-api/src/repos/degradation.rs",
+        "sources/ryuki-api/src/production_dependencies.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "catalog/security-contracts/v1/deployment-security-profile.implementation.json"
+      ],
+      "migration_paths": [
+        "migrations/095_scheduler.sql",
+        "migrations/198_live_site_execution_fence.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/scheduler.rs",
+        "sources/ryuki-api/src/repos/degradation.rs",
+        "sources/ryuki-core/src/security_profile.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Transaction advisory locks serialize selected scheduler and site operations, but no executable deployment artifact declares writers, schedulers, regions, privileged mutation mode, or the active-active prohibition."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production topology or failover receipt proves a single current writer."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-HA-02-AC-026",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/repos/degradation.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/165_identity_authority_epochs.sql",
+        "migrations/198_live_site_execution_fence.sql",
+        "migrations/211_runbook_site_authority_epoch.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/repos/degradation.rs",
+        "sources/ryuki-api/src/identity_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Existing identity, live-site, agent-job, and runbook epochs are siloed resource generations rather than one monotonic control-plane epoch fencing grants, leases, approvals, signing, scheduling, replay, and results."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No stale-region or old-primary failover test receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-HA-03-AC-026",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/database.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "migration_paths": [
+        "migrations/197_production_migration_operation_markers.sql",
+        "migrations/198_live_site_execution_fence.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/database.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Migration COMMIT uncertainty and selected agent outcomes reconcile durably, but there is no provider-neutral uncertain-call state machine covering identity, secret, key, callback, and infrastructure calls before retry, compensation, or redispatch."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No leader-loss or region-loss provider-call reconciliation drill exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-HA-04-AC-026",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/security-limit-profile.implementation.json",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-core/src/conformance_trust.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/authenticator_runtime.rs",
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/entra_sso.rs",
+        "sources/ryuki-core/src/conformance_trust.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Authenticator and conformance checks consume bounded skew, but no independent clock-synchronization monitor or readiness gate prevents wall-clock rollback from reviving every expiry, lease, replay, grant, and step-up authority."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No trusted-time monitoring, skew excursion, or recovery receipt exists."
+        },
+        {
+          "kind": "external_access",
+          "detail": "Production clock synchronization and monitoring require operator-controlled infrastructure."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-DATA-01-AC-019",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-engine/src/audit_retention.rs",
+        "sources/ryuki-api/src/repos/notifications.rs",
+        "catalog/security-contracts/v1/deployment-security-profile.implementation.json"
+      ],
+      "migration_paths": [
+        "migrations/026_legal_holds.sql",
+        "migrations/046_audit_log.sql",
+        "migrations/094_audit_log_hash_chain.sql",
+        "migrations/150_evidence_blobs.sql",
+        "migrations/156_portal_notifications_retention.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-engine/src/audit_retention.rs",
+        "sources/ryuki-api/src/repos/notifications.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "No closed public/internal/sensitive/restricted/secret type or classification, owner, exposure, and retention register covers every database column, API/event/evidence/log/metric/cache/export/backup field. The retention-policy reference points only to the narrative specification, and several lifetimes copy numeric constants instead of registered limit IDs."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "The profile is implementation-only/test, backup storage is placeholder-only, GFS lifecycle remains unresolved, and no production classification or retention receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-DATA-02-AC-027",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-engine/src/secret_material.rs"
+      ],
+      "migration_paths": [
+        "migrations/193_first_owner_closure_records.sql",
+        "migrations/201_authenticator_runtime_provenance.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-core/src/security_profile.rs",
+        "sources/ryuki-engine/src/authorization.rs",
+        "sources/ryuki-engine/src/secret_material.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Production multi-tenant admission is conservatively blocked, but there is no AC-027 collision matrix or namespace isolation across identities, aliases, general storage, replay/idempotency, queues, jobs, webhooks, aggregates, quotas, audit, exports, backups, provider credentials, and global administration. No RLS or equivalent service isolation exists."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "The checked-in profile is single-tenant/test-only, with no production namespace or database-isolation readback."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-DATA-03-AC-028",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/legal_hold.rs",
+        "sources/ryuki-api/src/audit.rs"
+      ],
+      "migration_paths": [
+        "migrations/026_legal_holds.sql",
+        "migrations/094_audit_log_hash_chain.sql",
+        "migrations/186_restore_authority_and_provenance.sql",
+        "migrations/187_audit_chain_complete_domain.sql",
+        "migrations/202_restore_active_site_authority.sql",
+        "migrations/206_restore_source_authority.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/legal_hold.rs",
+        "sources/ryuki-api/src/audit.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Legal-hold and immutable-audit foundations exist, but there is no subject privacy model, export/correction/restriction/erasure service or state machine, pseudonymous tombstone or cryptographic-erasure implementation, legal-hold reconciliation, minimal-retention policy, or restore-time erasure reapplication gate."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No privacy lifecycle, restore-reapplication, or backup-readiness receipt exists; the backup target remains a nonfunctional skeleton."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-DATA-04-AC-038",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "sources/ryuki-engine/src/secret_material.rs",
+        "deploy/kubernetes/base/networkpolicies.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Only adjacent SecretRef-purpose and default-deny foundations exist. Implement a classified-dataset registry plus processing/storage region, processor/provider class, transfer-rule, and minimization-evidence types; enforce them before IdP, secret-manager, SIEM, export, backup, migration, or failover delivery and persist immutable transfer receipts."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "Backup region and endpoint are unresolved placeholders, and no residency, provider-migration, restore, or failover readback exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-DATA-05-AC-019",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/scheduler.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/audit_retention.rs",
+        "sources/ryuki-engine/src/legal_hold.rs"
+      ],
+      "migration_paths": [
+        "migrations/026_legal_holds.sql",
+        "migrations/126_legal_hold_expiry_scan.sql",
+        "migrations/131_job_executions_prune.sql",
+        "migrations/132_connection_health_checks_prune.sql",
+        "migrations/133_check_results_prune.sql",
+        "migrations/137_shift_queue_prune.sql",
+        "migrations/156_portal_notifications_retention.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/scheduler.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/audit_retention.rs",
+        "sources/ryuki-engine/src/legal_hold.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Several bounded pruners and legal-hold records exist, but no versioned controller owns all domains. Implement legal-hold-aware bounded deletion, cryptographic erasure/tombstones, retries, quarantine, restore reapplication, and metadata-only deletion receipts. The notification sweep is fail-open and audit retention only recommends future archival. Add executable security_conformance::ac_019 retention and erasure coverage."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No controller run receipt, restore exercise, or deletion receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-GOV-01-AC-022",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/config_store.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-api/src/production_dependencies.rs",
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "migration_paths": [
+        "migrations/001_platform_config.sql",
+        "migrations/046_audit_log.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/authorization.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Platform settings are validated and audited, but database and file persistence are not one atomic activation and there is no immutable activated version, simulation, diff, real step-up, maker-checker, lockout analysis, or safe rollback."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "The production dependency plan explicitly blocks the file/default configuration authority."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No governed production configuration-change or rollback receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-GOV-02-AC-021",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/database.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/postgresql_infrastructure.rs"
+      ],
+      "migration_paths": [
+        "migrations/197_production_migration_operation_markers.sql",
+        "migrations/199_principal_registry.sql",
+        "migrations/200_principal_idempotency_cutover_fence.sql",
+        "migrations/201_authenticator_runtime_provenance.sql",
+        "migrations/212_active_site_degradation_status.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/database.rs",
+        "sources/ryuki-api/src/principal_registry.rs",
+        "sources/ryuki-api/src/authenticator_runtime.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Apply-only migration isolation and selected cutover fences exist, but there is no general expand, resumable backfill, semantic verify, cutover, and contract controller with mixed-version compatibility and rollback proof for every security representation."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No rolling mixed-version migration, rollback, or disaster-recovery drill receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-CRY-01-AC-022",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/cp_identity.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-protocol/src/crypto.rs",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/entra_auth.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-api/src/cp_identity.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/session_credentials.rs",
+        "sources/ryuki-protocol/src/crypto.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Protocols pin individual algorithms and key purposes, but no single versioned cryptographic-policy contract or complete key and credential inventory governs algorithms, purpose separation, custody, rotation, overlap, recovery, or FIPS constraints."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No HSM or KMS custody, rotation, revocation, or disaster-recovery receipt exists."
+        },
+        {
+          "kind": "external_access",
+          "detail": "Production key custody and recovery require authorized operator access to the selected KMS or HSM."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-01-AC-020",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/repos/degradation.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-engine/src/degradation_mode.rs",
+        "sources/ryuki-api/src/production_dependencies.rs"
+      ],
+      "migration_paths": [
+        "migrations/025_degradation_mode.sql",
+        "migrations/198_live_site_execution_fence.sql",
+        "migrations/212_active_site_degradation_status.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/repos/degradation.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The site-execution degradation slice is enforced, but the identity, JWKS, lifecycle, secret, policy, PostgreSQL, audit, time, and workload-signing dependency rows are not one executable matrix with concurrency and recovery tests."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "The production dependency plan still identifies production-reachable mock or static substitutes."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No complete degraded-mode concurrency and recovery receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-02-AC-021",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/identity_authority.rs",
+        "sources/ryuki-api/src/secret_provider_runtime.rs",
+        "sources/ryuki-api/src/repos/degradation.rs"
+      ],
+      "migration_paths": [
+        "migrations/025_degradation_mode.sql",
+        "migrations/045_api_tokens.sql",
+        "migrations/053_agents.sql",
+        "migrations/159_session_bearer_verifiers.sql",
+        "migrations/182_interactive_human_authority.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/identity_authority.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Individual agent, session, token, identity, and site controls exist, but no unified stepped-up and audited incident plane covers pause, provider quarantine, credential-family and lease revocation, session purge, trust rotation, callback blocking, and break-glass aftercare."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No complete incident or compromise-response drill receipt exists."
+        },
+        {
+          "kind": "external_access",
+          "detail": "Production provider, credential, trust, and callback controls require authorized operator access."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-03-AC-039",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/deployed_workload.rs",
+        "sources/ryuki-core/src/postgresql_infrastructure.rs",
+        "sources/ryuki-core/src/public_ingress.rs",
+        "docs/runbooks/db-restore-runbook.md"
+      ],
+      "migration_paths": [
+        "migrations/186_restore_authority_and_provenance.sql",
+        "migrations/202_restore_active_site_authority.sql",
+        "migrations/206_restore_source_authority.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/deployed_workload.rs",
+        "sources/ryuki-core/src/postgresql_infrastructure.rs",
+        "sources/ryuki-core/src/public_ingress.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Startup verifies selected restored-state attestations, but no control-plane restore pipeline reconciles current session, token, agent, replay, approval, lease, provider, and key revocation state before authority is reactivated."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No no-resurrection restore drill receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-04-AC-030",
+      "implementation_status": "partial",
+      "source_paths": [
+        "docs/runbooks/db-restore-runbook.md",
+        "deploy/kubernetes/cloudnativepg/cnpg-cluster.yaml",
+        "deploy/kubernetes/cloudnativepg/scheduled-backup.yaml",
+        "sources/ryuki-engine/src/dr_testing.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/087_dr_plans.sql",
+        "migrations/088_dr_test_runs.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-engine/src/dr_testing.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "DB-specific objectives and recovery order are documented, but there is no executable security-plane dependency graph or readiness-gated recovery controller."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No measured RTO, RPO, maximum revocation-lag, lifecycle-lag, or ordered recovery receipt exists."
+        },
+        {
+          "kind": "external_access",
+          "detail": "The committed backup target is a placeholder, so a real recovery exercise requires operator-provisioned object storage and cluster access."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-05-AC-039",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/deployed_workload.rs",
+        "sources/ryuki-core/src/postgresql_infrastructure.rs",
+        "sources/ryuki-core/src/public_ingress.rs"
+      ],
+      "migration_paths": [
+        "migrations/186_restore_authority_and_provenance.sql",
+        "migrations/202_restore_active_site_authority.sql",
+        "migrations/206_restore_source_authority.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/conformance_trust.rs",
+        "sources/ryuki-core/src/deployed_workload.rs",
+        "sources/ryuki-core/src/postgresql_infrastructure.rs",
+        "sources/ryuki-core/src/public_ingress.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Signed startup attestations require a restored-state flag, but no durable restored-control-plane quarantine reconciles current provider lifecycle, session and token watermarks, lease and key revocation, replay completeness, and authority epoch."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "Attested booleans do not themselves execute or prove the required reconciliation."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No restored-state quarantine and release receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OPS-06-AC-039",
+      "implementation_status": "not_implemented",
+      "source_paths": [
+        "deploy/kubernetes/cloudnativepg/cnpg-cluster.yaml",
+        "deploy/kubernetes/cloudnativepg/scheduled-backup.yaml",
+        "docs/runbooks/db-restore-runbook.md"
+      ],
+      "migration_paths": [],
+      "test_paths": [],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "No signed recovery-set manifest, independently governed signing and verification authority, retained-copy independence proof, or pre-import verifier binds deployment, trust domain, epoch, schema, component digests, key versions, and completeness."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No authenticated recovery-media admission receipt exists."
+        },
+        {
+          "kind": "external_access",
+          "detail": "The committed object-store coordinates are explicitly non-functional placeholders and require operator provisioning."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-OBS-01-AC-020",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-engine/src/health_monitor.rs",
+        "sources/ryuki-api/src/production_dependencies.rs"
+      ],
+      "migration_paths": [
+        "migrations/094_audit_log_hash_chain.sql",
+        "migrations/096_metric_samples.sql",
+        "migrations/173_audit_chain_verification_jobs.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-engine/src/health_monitor.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "HTTP labels and public status are bounded and value-free, but authentication, step-up, authorization and scope deny, replay, lifecycle lag, secret lease and key age, audit or outbox, egress, and saturation telemetry is incomplete."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "Several component and adapter health signals remain explicitly simulated."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production alert-rule, telemetry coverage, or degraded-mode recovery receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-LIM-01-AC-054",
+      "implementation_status": "partial",
+      "source_paths": [
+        "catalog/security-contracts/v1/security-limit-profile.implementation.json",
+        "catalog/security-contracts/v1/security-limit-profile.schema.json",
+        "sources/ryuki-api/src/security_contracts.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "sources/ryuki-api/src/security_contracts.rs",
+        "scripts/validator-rs/src/security_conformance.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The implementation is a transitional snapshot: only 5 of 22 normative categories are covered and many limits are partially enforced."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No repository attestation identifies an active production profile version, governed override, rollback, or drift result."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-ING-01-AC-012",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-engine/src/webhook_receipt.rs"
+      ],
+      "migration_paths": [
+        "migrations/160_inbound_webhook_freshness.sql",
+        "migrations/207_inbound_webhook_authority_generation.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-engine/src/webhook_receipt.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "deployment_evidence",
+          "detail": "No live webhook receiver, replay-store, or queued-work ordering observation is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-ING-02-AC-012",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "migration_paths": [
+        "migrations/158_agent_enrollment_admission.sql",
+        "migrations/160_inbound_webhook_freshness.sql",
+        "migrations/164_oidc_login_state_admission.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Webhook, OIDC-state, enrollment, and local-password admission have bounded body, concurrency, work, and durable-state paths, but WebAuthn challenge admission is absent, no closed inventory proves every public allocation has feature-local per-client and global limits, and the existing numeric bounds are not all governed by the active SecurityLimitProfile."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No production saturation test or active-profile readback is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-ING-03-AC-053",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/scheduler.rs",
+        "sources/ryuki-api/src/repos/managed_secrets.rs"
+      ],
+      "migration_paths": [
+        "migrations/125_secret_rotation_due_scan.sql",
+        "migrations/163_scheduler_population_scan_progress.sql",
+        "migrations/209_certificate_expiry_scan_progress.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/scheduler.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Bounded pages, high-water continuation, transactional cursors, rollback safety, and concurrent-tick exclusion exist, but repository-wide list/lookback closure and profile-governed time, retry, concurrency, backpressure, and fairness are incomplete."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No live queue saturation, provider/trust-domain fairness, or continuation telemetry is stored."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-ING-04-AC-029",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs",
+        "sources/ryuki-api/src/idempotency.rs",
+        "sources/ryuki-api/src/background.rs",
+        "catalog/security-contracts/v1/security-limit-profile.implementation.json"
+      ],
+      "migration_paths": [
+        "migrations/162_idempotency_principal_budget.sql",
+        "migrations/200_principal_idempotency_cutover_fence.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/inbound_webhooks.rs",
+        "sources/ryuki-api/src/repos/oidc_login_states.rs",
+        "sources/ryuki-api/src/idempotency.rs",
+        "sources/ryuki-api/src/background.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Idempotency has a PostgreSQL per-principal budget, but general admission buckets are process-local and do not partition across credential, trust domain, tenant, provider, and replica; background retry backoff is deterministic and lacks jitter."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "Shared JWKS, lifecycle, secret renewal or watch, polling, callback, and recovery paths have no anti-stampede runtime receipt."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No multi-replica distributed-load and bounded-jitter receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-01-AC-036",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-engine/src/auth.rs"
+      ],
+      "migration_paths": [
+        "migrations/046_audit_log.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "AuditRecord, audit_log, and the canonical hash domain record only one actor principal plus display, roles, provider mode, action, request, stage, status, detail, outcome, and chain hashes. They do not require effective subject, bounded actor chain, principal kinds, non-secret credential id, assurance, canonical resource and scope, policy version and decision, principal lifecycle_version and authority_version, control-plane authority_epoch, idempotency id, or correlation id."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "The bound AC-036 repository fixture is absent: no executable security_conformance::ac_036 test performs privileged alter, delete, reorder, or re-hash attacks against a closed segment and verifies rejection by an independent external checkpoint, nor the required concurrent crash, retry, failover, and export guarantees."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-02-AC-036",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/046_audit_log.sql",
+        "migrations/173_audit_chain_verification_jobs.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/main.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Selected request and integration mutations commit their audit append atomically, but this is not a universal security-mutation primitive; for example alert acknowledgement mutates state without audit. Per-request, global-feed, verification-status, retention, and SIEM-export reads are scoped but do not themselves append an authoritative audit record."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "AC-036 delivery semantics are not implemented or tested: migration 187 serializes chain and id allocation, but the exporter has no durable acknowledged consumer checkpoint, idempotent delivery state, crash and failover recovery protocol, maximum-delivery-lag monitor or alert, independent checkpoint verification, or corresponding concurrent fault-injection fixture."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-03-AC-036",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-engine/src/secret_material.rs"
+      ],
+      "migration_paths": [
+        "migrations/046_audit_log.sql",
+        "migrations/187_audit_chain_complete_domain.sql",
+        "migrations/192_integration_connection_typed_secret_ref.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/integration.rs",
+        "sources/ryuki-api/src/oidc_callback.rs",
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-engine/src/secret_material.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Typed SecretRef and SecretLeaseMetadata carry keyed reference fingerprint, fingerprint key id, provider and configuration version, adapter capability version, authority epoch, and fencing token, but integration credential-use audit persists only connection id, vendor type, credential-source class, and endpoint status. Identity provider errors are normalized for the browser but not recorded in the required closed value-free audit schema. No central contract enforces these fields, closed outcome codes, and safe metric-label and error projection for every secret and identity interaction."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "The trace is also bound to AC-036, but no executable security_conformance::ac_036 privileged-database, external-checkpoint, and concurrent-export fault-injection fixture exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-04-AC-036",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "migration_paths": [
+        "migrations/094_audit_log_hash_chain.sql",
+        "migrations/173_audit_chain_verification_jobs.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/database.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The chain remains database-local and globally sequenced; there is no deployment/trust-domain/tenant stream namespace, signed external checkpoint workflow, transactional SIEM outbox, acknowledged consumer checkpoint, gap/replay protocol, or lag alert."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No repository-held deployment evidence demonstrates checkpoint custody outside database-write authority or an acknowledged audit-export consumer."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "No executable security_conformance::ac_036 fixture performs privileged alter, delete, reorder, and re-hash attacks against a closed segment and proves rejection by an independently held checkpoint under concurrent commit, crash, retry, failover, and acknowledged-export recovery."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-05-AC-008",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/background.rs",
+        "sources/ryuki-api/src/repos/domain_events.rs",
+        "sources/ryuki-api/src/repos/notifications.rs"
+      ],
+      "migration_paths": [
+        "migrations/083_portal_notifications.sql",
+        "migrations/110_domain_events.sql",
+        "migrations/111_domain_events_append_only.sql",
+        "migrations/114_agent_offline_flag.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-api/src/agents.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Current-state re-read, conditional transition, event, and notification atomicity is implemented for selected scanners, especially agent liveness, but no platform-wide primitive or conformance suite covers every derived alert and recovery path."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "No repository-wide conformance matrix proves every derived alert and recovery family re-reads authoritative current state and conditionally commits transition, event, and delivery record under stale candidates, concurrent scanners, delayed workers, and database-statement time."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-AUD-06-AC-036",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-runner/src/scrub.rs",
+        "sources/ryuki-runner/src/live.rs",
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs",
+        "sources/ryuki-api/src/repos/domain_events.rs",
+        "sources/ryuki-api/src/repos/notifications.rs"
+      ],
+      "migration_paths": [
+        "migrations/046_audit_log.sql",
+        "migrations/187_audit_chain_complete_domain.sql"
+      ],
+      "test_paths": [
+        "sources/ryuki-runner/src/scrub.rs",
+        "sources/ryuki-runner/src/live.rs",
+        "sources/ryuki-engine/src/evidence_pipeline.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/contracts.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Runner output, request evidence, and audit detail have typed bounded redaction, but generic operational-event and notification persistence sinks still accept arbitrary JSON or text without applying the shared fail-closed redactor or proving a closed sink inventory. Redaction before every outbox or persistence projection is therefore not mechanically enforced."
+        },
+        {
+          "kind": "repository_implementation",
+          "detail": "The bound AC-036 privileged-database, independent-checkpoint, and concurrent acknowledged-export fault-injection fixture is absent."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-01-AC-014",
+      "implementation_status": "partial",
+      "source_paths": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/static.yml",
+        ".github/dependabot.yml",
+        "sources/ryuki-api/Dockerfile",
+        "portal/portal-ui/Dockerfile",
+        "deploy/ci/Dockerfile.validator",
+        "deploy/kubernetes/monitoring/fluent-bit-daemonset.yaml",
+        "deploy/kubernetes/vault/release-approved-chart.sh",
+        "deploy/proving-ground/compose.yaml",
+        "rust-toolchain.toml",
+        "scripts/validator-rs/src/release_engineering.rs",
+        "scripts/validator-rs/src/docker_image.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/release_engineering.rs",
+        "scripts/validator-rs/src/docker_image.rs",
+        "deploy/kubernetes/vault/test-release-approved-chart.sh"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Immutable-input coverage is incomplete: rust-toolchain.toml selects mutable stable, deploy/ci/Dockerfile.validator has tag-only bases, Fluent Bit is tag-only, apt packages are unversioned, cargo-audit is installed outside the protected tool lifecycle, and update automation does not cover every deployment input."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No immutable production receipt proves the resolved actions, images, chart, toolchain, tools, and deployment dependencies used by a real release."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-02-AC-015",
+      "implementation_status": "partial",
+      "source_paths": [
+        "scripts/no-secret-scan.sh",
+        "scripts/dependency-audit.sh",
+        "scripts/verify-workspace-clean.sh",
+        "scripts/validator-rs/src/sensitive_output_guardrails.rs",
+        "scripts/validator-rs/src/security_baseline.rs",
+        "scripts/validator-rs/src/release_image_builds.rs",
+        "scripts/validator-rs/src/release_engineering.rs",
+        ".dockerignore",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/sensitive_output_guardrails.rs",
+        "scripts/validator-rs/src/security_baseline.rs",
+        "scripts/validator-rs/src/release_image_builds.rs",
+        "tests/ci_integration_test.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The secret scan covers Git commit candidates, but no complete supply-chain policy scan inventories every deploy image and generated release input; current validation permits the mutable deploy/ci and Fluent Bit references, and generated release outputs are created after the source scan."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "There is no accepted revision-bound AC-015 gate receipt for the current final revision; security_conformance::ac_015 is only a ControlTrace label."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-03-AC-037",
+      "implementation_status": "partial",
+      "source_paths": [
+        ".github/workflows/release.yml",
+        "scripts/release/validate-source-v1.sh",
+        "scripts/release/render-kubernetes-images-v1.sh",
+        "scripts/validator-rs/src/docker_image.rs",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "catalog/kubernetes-manifest-contract.yaml",
+        "deploy/kubernetes/README.md",
+        "deploy/kubernetes/base/README.md",
+        "deploy/kubernetes/operations/migration-job.yaml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/docker_image.rs",
+        "scripts/validator-rs/src/kubernetes_manifest.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The release emits Buildx SBOM and provenance only for the two OCI images but has no trusted signer or identity binding or verification path for those attestations; the chart, binaries, migration bundle, and rollback artifacts lack equivalent digest-bound SBOM and provenance, and no negative suite substitutes every artifact digest, SBOM, provenance subject, source revision, builder, and signer field."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No signer-verifying registry or cluster admission controller, rollback-artifact admission, adopted-render readback, or running-image identity receipt exists."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-04-AC-037",
+      "implementation_status": "partial",
+      "source_paths": [
+        "scripts/dependency-audit.sh",
+        "scripts/validate-vulnerability-policy.py",
+        "scripts/test-vulnerability-policy.py",
+        ".cargo/vulnerability-exceptions.json",
+        ".cargo/audit.toml",
+        ".github/dependabot.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/test-vulnerability-policy.py"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "Rust dependencies and one owned expiring exception are covered, but container packages, base images, deployed images, charts, and installed build tools are not advisory-scanned; no seeded base-image advisory blocks release, and the Python negative suite is not wired into make verify-clean or GitHub CI."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "The advisory database receipt is printed but not retained as immutable revision-bound conformance evidence."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-05-AC-014",
+      "implementation_status": "implemented",
+      "source_paths": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/static.yml",
+        "scripts/release/validate-source-v1.sh",
+        "scripts/validator-rs/src/release_engineering.rs",
+        "tests/ci_integration_test.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/release/test-validate-source-v1.sh",
+        "scripts/validator-rs/src/release_engineering.rs",
+        "tests/ci_integration_test.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "runtime_evidence",
+          "detail": "Repository mutation tests prove the declared permission and event graph, but there is no real fork-PR/cache/artifact adversarial receipt proving untrusted inputs cannot cross into a privileged job."
+        },
+        {
+          "kind": "external_access",
+          "detail": "GitHub readback is still required for release-environment reviewers, branch and tag rules, fork approval policy, runner isolation, secret availability, and OIDC restrictions."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-06-AC-037",
+      "implementation_status": "partial",
+      "source_paths": [
+        ".github/workflows/release.yml",
+        ".github/workflows/static.yml",
+        "scripts/release/validate-source-v1.sh",
+        "scripts/release/render-kubernetes-images-v1.sh",
+        "scripts/validator-rs/src/release_engineering.rs",
+        "scripts/validator-rs/src/docker_image.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/release/test-validate-source-v1.sh",
+        "scripts/validator-rs/src/release_engineering.rs",
+        "scripts/validator-rs/src/docker_image.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The current image and Pages paths rebuild from a validated revision, but there is no generic promotion verifier for every image, chart, binary, migration bundle, or rollback artifact."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No deployed admission/readback proves that untrusted OCI referrers, caches, workflow artifacts, or rollback inputs cannot be promoted."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-07-AC-037",
+      "implementation_status": "implemented",
+      "source_paths": [
+        "scripts/release/validate-source-v1.sh",
+        "scripts/release/test-validate-source-v1.sh",
+        ".github/workflows/release.yml",
+        "scripts/validator-rs/src/release_engineering.rs"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/release/test-validate-source-v1.sh",
+        "scripts/validator-rs/src/release_engineering.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "runtime_evidence",
+          "detail": "The exact-ref implementation and offline negative suite are strong, but no completed SemVer release receipt proves remote tag-object revalidation and use of the same object through publication."
+        },
+        {
+          "kind": "external_access",
+          "detail": "GitHub readback is required for the configured release public key and fingerprint, tag protection, protected Environment, and signer lifecycle."
+        }
+      ],
+      "dependency_control_ids": []
+    },
+    {
+      "trace_id": "TRACE-SB-SC-08-AC-014",
+      "implementation_status": "partial",
+      "source_paths": [
+        "sources/ryuki-api/Dockerfile",
+        "portal/portal-ui/Dockerfile",
+        "scripts/validator-rs/src/docker_image.rs",
+        "scripts/validator-rs/src/app_skeleton.rs",
+        "scripts/validator-rs/src/local_container_readiness.rs",
+        ".github/workflows/release.yml",
+        ".github/workflows/ci.yml",
+        "deploy/ci/Dockerfile.validator"
+      ],
+      "migration_paths": [],
+      "test_paths": [
+        "scripts/validator-rs/src/docker_image.rs",
+        "scripts/validator-rs/src/app_skeleton.rs",
+        "scripts/validator-rs/src/local_container_readiness.rs"
+      ],
+      "blockers": [
+        {
+          "kind": "repository_implementation",
+          "detail": "The closed grammar covers cargo-chef and cargo-leptos only; privileged cargo-audit installation, mutable Rust toolchain acquisition, Helm/tool installation, and deploy/ci/Dockerfile.validator remain outside it, and no complete privileged-build-tool inventory exists."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No immutable release receipt proves install-to-use closure for every privileged build tool in the actual builder."
+        }
+      ],
+      "dependency_control_ids": []
+    }
+  ]
+}
