@@ -8,10 +8,10 @@
   "status_assurance": "source-audited-declaration-without-conformance-receipt",
   "control_trace_ref": {
     "document_id": "control-trace:ryuki-security-boundary-v1",
-    "document_version": 2,
+    "document_version": 3,
     "ledger_id": "ryuki-security-boundary",
-    "ledger_version": "1.1.0",
-    "raw_sha256": "sha256:b905dc693d18df58ef053abf99f25a6ba756d20795ff7b6587c05e756c7fbe32"
+    "ledger_version": "1.2.0",
+    "raw_sha256": "sha256:113b726cefe61f3fe4fcca9a338686e85526bce4f402e2f279d12a87031abf7a"
   },
   "rows": [
     {

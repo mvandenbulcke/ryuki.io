@@ -29,7 +29,7 @@
       {
         "document_id": "source:ryuki-api-build-identity",
         "document_version": 1,
-        "content_digest": "sha256:92842b760ea31e5f0a35df5fb7b24fd9b6571b268033a9318300fda021b4fa87",
+        "content_digest": "sha256:344cb97cffa25bc01aa8dd3049d7234648225a46a82c75e20591676ebfa42bee",
         "artifact_locator": "sources/ryuki-api/src/build_identity.rs"
       },
       {
@@ -119,7 +119,7 @@
       {
         "document_id": "source:ryuki-api-security-contract-loader",
         "document_version": 1,
-        "content_digest": "sha256:aa94dcc042a488c874ee09263184e00754dcd574bc75ab7a91eec8daab7a25c7",
+        "content_digest": "sha256:84130e5859b6f39bc79f9287d5347e23b012df9efced884740f45f019423f71b",
         "artifact_locator": "sources/ryuki-api/src/security_contracts.rs"
       },
       {

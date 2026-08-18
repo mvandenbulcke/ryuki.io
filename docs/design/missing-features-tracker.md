@@ -66,12 +66,14 @@ without revision- and digest-bound accepted receipts, and
 `production_acceptance_asserted` remains `false`. The projection also exposes
 `working_tree_concurrency_assurance: trusted-stable-checkout-required`; final
 receipts require an exclusively owned immutable checkout or stronger platform
-snapshot. It also exposes
-an authoritative ledger defect rather than hiding it: all 141 deployment
-expressions are `always`, while 139 have a null minimum deployment tier and
-therefore no deployable scope under SB-CONF-04. Only
-`TRACE-SB-OPS-07-AC-016` and `TRACE-SB-CONF-05-AC-055` currently have non-null
-deployment tiers.
+snapshot. ControlTrace v3 closes the earlier deployment-contract defect: all
+141 `always` deployment expressions now have a non-null evidence tier and
+exact deployment identity dimensions. The 139 ordinary traces require at
+least `operator_environment` evidence; `TRACE-SB-OPS-07-AC-016` and
+`TRACE-SB-CONF-05-AC-055` retain stricter `externally_attested` requirements.
+The projection therefore reports zero always-applicable rows without a tier,
+but all 141 deployment assessments remain `required_unproven` because no
+accepted deployment receipts are joined.
 
 SB-0 now has a repository-local, lower-level first-owner closure installation
 slice, without closing the SB-0 package. Exact production apply-only inputs bind

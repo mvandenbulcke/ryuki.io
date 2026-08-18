@@ -5830,7 +5830,7 @@ pub mod tests {
             &claims,
         )
         .map_err(|error| error.to_string())?;
-        assert_eq!(applicability.instances.len(), 149);
+        assert_eq!(applicability.instances.len(), 288);
         let implementation_count = applicability
             .instances
             .iter()
@@ -6107,7 +6107,7 @@ pub mod tests {
                 ConformanceDocumentKind::PackageExitReceipt,
                 package_id,
                 receipt_locator(package_id),
-                200 + u64::try_from(package_index).unwrap(),
+                u64::try_from(bundles.len() + package_index + 1).unwrap(),
                 &signing_key,
                 &registry_digest,
             );
@@ -6298,7 +6298,7 @@ pub mod tests {
         .map_err(|error| error.to_string())
     }
 
-    /// Builds the same genuinely signed 149-instance closure used by the core
+    /// Builds the same genuinely signed 288-instance closure used by the core
     /// acceptance test and returns its exact bound profile representation.
     ///
     /// This is feature-gated test support so downstream startup-composition
@@ -6313,12 +6313,12 @@ pub mod tests {
     }
 
     #[test]
-    fn public_entrypoint_accepts_one_genuine_opaque_149_instance_closure() {
+    fn public_entrypoint_accepts_one_genuine_opaque_288_instance_closure() {
         let closure = verify_public_fixture(PublicFixtureMutation::None)
             .expect("the public closure boundary must accept one exact authenticated fixture");
         assert_eq!(closure.package_count(), 10);
-        assert_eq!(closure.evidence_count(), 149);
-        assert_eq!(closure.applicability_instances().len(), 149);
+        assert_eq!(closure.evidence_count(), 288);
+        assert_eq!(closure.applicability_instances().len(), 288);
         assert_eq!(closure.runtime_guard_requirements().len(), 8);
         for requirement in closure.runtime_guard_requirements() {
             assert_eq!(

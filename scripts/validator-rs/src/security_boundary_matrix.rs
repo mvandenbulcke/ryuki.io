@@ -246,9 +246,9 @@ fn build_matrix(
     let mut rows = Vec::with_capacity(active_traces.len());
     let mut work_package_counts = BTreeMap::new();
     let mut repository_status_counts = BTreeMap::new();
-    let mut implementation_evidence_state_counts = BTreeMap::new();
-    let mut runtime_tracking_state_counts = BTreeMap::new();
-    let mut deployment_evidence_state_counts = BTreeMap::new();
+    let mut implementation_evidence_state_counts = empty_evidence_state_counts();
+    let mut runtime_tracking_state_counts = empty_evidence_state_counts();
+    let mut deployment_evidence_state_counts = empty_evidence_state_counts();
     let mut deployment_always_without_evidence_tier_count = 0;
 
     for ((trace_id, trace), overlay_row) in active_traces.iter().zip(overlay_rows) {
@@ -376,6 +376,17 @@ fn build_matrix(
         },
         rows,
     })
+}
+
+fn empty_evidence_state_counts() -> BTreeMap<String, usize> {
+    [
+        EvidenceState::NotEvaluated,
+        EvidenceState::NotInScope,
+        EvidenceState::RequiredUnproven,
+    ]
+    .into_iter()
+    .map(|state| (state.as_str().to_string(), 0))
+    .collect()
 }
 
 fn verify_binding(
@@ -880,6 +891,38 @@ mod tests {
         );
         assert_eq!(value["summary"]["active_trace_count"], 141);
         assert_eq!(value["rows"].as_array().map(Vec::len), Some(141));
+        let rows = value["rows"]
+            .as_array()
+            .expect("matrix rows should be an array");
+        let operator_environment_count = rows
+            .iter()
+            .filter(|row| {
+                row["trace_contract"]["minimum_evidence_tier"]["deployment"]["name"].as_str()
+                    == Some("operator_environment")
+            })
+            .count();
+        let externally_attested_trace_ids: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["trace_contract"]["minimum_evidence_tier"]["deployment"]["name"].as_str()
+                    == Some("externally_attested")
+            })
+            .map(|row| {
+                row["trace_id"]
+                    .as_str()
+                    .expect("trace id should be a string")
+            })
+            .collect();
+        assert_eq!(operator_environment_count, 139);
+        assert_eq!(
+            externally_attested_trace_ids,
+            ["TRACE-SB-OPS-07-AC-016", "TRACE-SB-CONF-05-AC-055"]
+        );
+        assert!(rows.iter().all(|row| {
+            row["trace_contract"]["evidence_instance_dimensions"]["deployment"]
+                .as_array()
+                .is_some_and(|dimensions| !dimensions.is_empty())
+        }));
         assert_eq!(
             value["summary"]["repository_status_counts"]["implemented"],
             14
@@ -903,15 +946,15 @@ mod tests {
         );
         assert_eq!(
             value["summary"]["deployment_evidence_state_counts"]["not_in_scope"],
-            139
+            0
         );
         assert_eq!(
             value["summary"]["deployment_evidence_state_counts"]["required_unproven"],
-            2
+            141
         );
         assert_eq!(
             value["summary"]["deployment_always_without_evidence_tier_count"],
-            139
+            0
         );
         for source in ["control_trace", "status_overlay"] {
             let digest = value["generated_from"][source]["raw_sha256"]

@@ -16027,13 +16027,8 @@ mod tests {
                 "content_digest": trust_root_registry_digest,
                 "artifact_locator": TRUST_ROOT_REGISTRY_PATH
             });
-            profile["control_trace_ref"] = json!({
-                "artifact_kind": "control-trace",
-                "document_id": "control-trace:ryuki-security-boundary-v1",
-                "document_version": 2,
-                "content_digest": control_trace_digest,
-                "artifact_locator": CONTROL_TRACE_PATH
-            });
+            profile["control_trace_ref"]["content_digest"] = json!(control_trace_digest);
+            profile["control_trace_ref"]["artifact_locator"] = json!(CONTROL_TRACE_PATH);
             set_root_reference(
                 &mut profile,
                 "provider_registry_ref",

@@ -1136,14 +1136,19 @@ boundary. A
 revision-bound receipt must run from an exclusively owned immutable checkout or
 stronger platform snapshot.
 
-The authoritative `ControlTrace` also has a deployment-contract gap: all 141
-active traces declare deployment applicability `always`, but 139 have a null
-minimum deployment evidence tier. SB-CONF-04 defines null as absent scope, so
-the projection records `deployment_always_without_evidence_tier_count: 139`
-instead of inventing deployment obligations. Only `TRACE-SB-OPS-07-AC-016` and
-`TRACE-SB-CONF-05-AC-055` have non-null deployment tiers. Production closure
-requires a corrected authoritative trace plus accepted deployment evidence;
-the repository overlay cannot repair either. The schema, instance, and
+The authoritative `ControlTrace` v3 closes the earlier deployment-contract
+gap. Every one of the 141 active traces now has a non-null deployment evidence
+tier and an exact deployment identity tuple. The 139 ordinary traces require
+at least `operator_environment` evidence over the deployment id, deployment
+profile id and version, provider-registry version, policy version,
+configuration version, security-limit-profile version, and deployed artifact
+digest. `TRACE-SB-OPS-07-AC-016` and `TRACE-SB-CONF-05-AC-055` retain their
+stricter `externally_attested` requirements and specialized dimensions. The
+projection therefore records
+`deployment_always_without_evidence_tier_count: 0`; because no accepted
+deployment receipts are joined, all 141 deployment assessments remain
+`required_unproven` and production closure remains false. The repository
+overlay cannot invent or satisfy this evidence. The schema, instance, and
 deterministic joined projection are validated with:
 
 ```bash
