@@ -22,6 +22,7 @@ mod inbound_webhooks;
 mod integration;
 mod oidc_callback;
 mod openapi;
+mod pinned_file;
 mod postgresql_tls_channel;
 mod principal_registry;
 mod repos;
@@ -3634,6 +3635,20 @@ async fn main() {
             eprintln!("security contract preflight failed: {error}");
             std::process::exit(1);
         });
+    // Reject first-owner installation inputs for every non-apply-only mode
+    // before any path or digest is used to load a security artifact. This
+    // keeps serving and verify-only processes from retaining or touching the
+    // detached certificate even transiently.
+    let migration_mode = database::migration_startup_mode_from_env().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    security_pins
+        .validate_first_owner_certificate_mode(migration_mode)
+        .unwrap_or_else(|error| {
+            eprintln!("first-owner installation input rejected: {error}");
+            std::process::exit(1);
+        });
     let mut security_contract =
         security_contracts::load_startup_security_contract_for_serving(&security_pins)
             .await
@@ -3642,10 +3657,6 @@ async fn main() {
                 std::process::exit(1);
             });
 
-    let migration_mode = database::migration_startup_mode_from_env().unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
     if security_contract.is_production()
         && migration_mode == database::MigrationStartupMode::LocalAuto
     {
@@ -4929,6 +4940,7 @@ fn readiness_status_for_pool_state(
         MigrationStatus::Applied => ReadinessStatus::Ready,
         MigrationStatus::NotApplied => ReadinessStatus::MigrationsNotApplied,
         MigrationStatus::Failed => ReadinessStatus::MigrationsFailed,
+        MigrationStatus::OutcomeUnknown => ReadinessStatus::MigrationsFailed,
     }
 }
 
@@ -5093,6 +5105,10 @@ async fn platform_self_health() -> (StatusCode, Json<serde_json::Value>) {
         MigrationStatus::Applied => DependencyProbe::healthy("migrations"),
         MigrationStatus::NotApplied => DependencyProbe::down("migrations", "not applied"),
         MigrationStatus::Failed => DependencyProbe::down("migrations", "failed"),
+        MigrationStatus::OutcomeUnknown => DependencyProbe::down(
+            "migrations",
+            "commit outcome unknown; reconciliation required",
+        ),
     });
 
     // 3. Scheduler liveness — an enabled schedule whose next_run_at is >2x its
@@ -7313,6 +7329,10 @@ mod tests {
         );
         assert_eq!(
             readiness_status_for_pool_state(true, MigrationStatus::Failed),
+            ReadinessStatus::MigrationsFailed
+        );
+        assert_eq!(
+            readiness_status_for_pool_state(true, MigrationStatus::OutcomeUnknown),
             ReadinessStatus::MigrationsFailed
         );
         assert_eq!(

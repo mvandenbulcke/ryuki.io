@@ -56,7 +56,7 @@ use ryuki_engine::auth::AuthSession;
 // ---------------------------------------------------------------------------
 
 /// Predecessor hash of the first row in the chain.
-const AUDIT_CHAIN_GENESIS: &str = "GENESIS";
+pub(crate) const AUDIT_CHAIN_GENESIS: &str = "GENESIS";
 
 /// Deterministic, canonical JSON: object keys are sorted, arrays keep order,
 /// scalars use serde's stable encoding. The SAME logical value hashes
@@ -89,7 +89,7 @@ fn canonical_json(value: &Value) -> String {
 /// stored row), so the two must agree field-for-field. `request_id` is the
 /// STORED uuid string (not the raw input), matching what verify reads back.
 #[allow(clippy::too_many_arguments)]
-fn audit_canonical_payload(
+pub(crate) fn audit_canonical_payload(
     request_id: Option<&str>,
     actor_principal: &str,
     actor_display: &str,
@@ -122,7 +122,7 @@ fn audit_canonical_payload(
 /// `sha256(hex16(byte_len(prev_hash))‖prev_hash‖hex16(byte_len(payload))‖payload)`,
 /// lowercase hex. Migration 187 uses this same SQL-reproducible v2 framing to
 /// backfill and append the complete domain. Pure + deterministic.
-fn chain_hash(prev_hash: &str, payload: &str) -> String {
+pub(crate) fn chain_hash(prev_hash: &str, payload: &str) -> String {
     let mut h = Sha256::new();
     h.update(format!("{:016x}", prev_hash.len()).as_bytes());
     h.update(prev_hash.as_bytes());

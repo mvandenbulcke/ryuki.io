@@ -55,6 +55,7 @@ const IDEMPOTENCY_CUTOVER_INSTALL_MODE_GUC: &str =
     "ryuki.idempotency_principal_cutover_install_mode";
 const IDEMPOTENCY_CUTOVER_FRESH_INSTALL_MODE: &str = "fresh-install-v1";
 const IDEMPOTENCY_CUTOVER_UPGRADE_MODE: &str = "upgrade-v1";
+const FIRST_OWNER_CLOSURE_WRITER_CONTRACT_GUC: &str = "ryuki.first_owner_closure_writer_contract";
 
 /// Selects who owns schema mutation during process startup.
 ///
@@ -1683,8 +1684,13 @@ pub enum MigrationRunError {
     Admission(String),
     #[error("production migration target was rejected before connection: {0}")]
     Target(String),
-    #[error("production migration pre-DDL verification failed: {0}")]
+    #[error("production migration verification failed before COMMIT: {0}")]
     Preflight(String),
+    #[error("first-owner {phase} failed ({category}) before COMMIT")]
+    FirstOwnerBoundary {
+        phase: &'static str,
+        category: &'static str,
+    },
     #[error("dedicated migration database connection failed: {0}")]
     Connect(#[source] sqlx::Error),
     #[error("embedded migration execution failed: {0}")]
@@ -1718,8 +1724,8 @@ impl MigrationRunError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProductionMigrationFailureBoundary {
-    BeforeCommitDispatch,
-    CommitDispatched,
+    BeforeCommitAttempt,
+    CommitAttempted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1732,10 +1738,10 @@ const fn classify_production_migration_failure(
     boundary: ProductionMigrationFailureBoundary,
 ) -> ProductionMigrationFailureDisposition {
     match boundary {
-        ProductionMigrationFailureBoundary::BeforeCommitDispatch => {
+        ProductionMigrationFailureBoundary::BeforeCommitAttempt => {
             ProductionMigrationFailureDisposition::RollbackExpected
         }
-        ProductionMigrationFailureBoundary::CommitDispatched => {
+        ProductionMigrationFailureBoundary::CommitAttempted => {
             ProductionMigrationFailureDisposition::OutcomeUnknown
         }
     }
@@ -1759,6 +1765,7 @@ pub enum MigrationStatus {
     NotApplied = 0,
     Applied = 1,
     Failed = 2,
+    OutcomeUnknown = 3,
 }
 
 impl MigrationStatus {
@@ -1766,6 +1773,7 @@ impl MigrationStatus {
         match value {
             1 => Self::Applied,
             2 => Self::Failed,
+            3 => Self::OutcomeUnknown,
             _ => Self::NotApplied,
         }
     }
@@ -7677,11 +7685,65 @@ const PRODUCTION_MIGRATION_PREFLIGHT_TIMEOUT_MILLIS: u64 = 30_000;
 const PRODUCTION_MIGRATION_COMMIT_ACK_TIMEOUT_SECS: u64 = 30;
 const PRODUCTION_MIGRATION_SESSION_LOCK_ID: i64 = 0x7279_756b_695f_6d67;
 const PRODUCTION_MIGRATION_RELEASE_BINDING_DIGEST_CONTRACT: &str =
-    "ryuki-production-migration-release-binding-v1";
+    "ryuki-production-migration-release-binding-v2";
 const PRODUCTION_MIGRATION_TARGET_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-production-migration-target-binding-v1";
 const PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT: &str =
-    "ryuki-production-migration-operation-id-v1";
+    "ryuki-production-migration-operation-id-v2";
+const FIRST_OWNER_INSTALLATION_MIGRATION_VERSION: i64 = 213;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicProductionMigrationHook {
+    InstallFirstOwnerClosure,
+}
+
+const fn atomic_production_migration_hook(version: i64) -> Option<AtomicProductionMigrationHook> {
+    if version == FIRST_OWNER_INSTALLATION_MIGRATION_VERSION {
+        Some(AtomicProductionMigrationHook::InstallFirstOwnerClosure)
+    } else {
+        None
+    }
+}
+
+fn first_owner_installation_hook_index(entries: &[(i64, bool, bool)]) -> Result<usize, String> {
+    let mut selected = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (version, _, _))| atomic_production_migration_hook(*version).is_some());
+    let Some((index, (_, is_down, no_tx))) = selected.next() else {
+        return Err(
+            "atomic production migration inventory omits the first-owner installation hook".into(),
+        );
+    };
+    if selected.next().is_some() || *is_down || *no_tx {
+        return Err(
+            "first-owner installation hook must select exactly one forward transactional migration"
+                .into(),
+        );
+    }
+    Ok(index)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstOwnerMigrationState {
+    InstallAtHook,
+    VerifyExisting,
+}
+
+fn first_owner_migration_state(
+    entries: &[(i64, bool, bool)],
+    applied_prefix_len: usize,
+) -> Result<FirstOwnerMigrationState, String> {
+    let hook_index = first_owner_installation_hook_index(entries)?;
+    if applied_prefix_len > entries.len() {
+        return Err("applied migration prefix exceeds the embedded inventory".into());
+    }
+    Ok(if applied_prefix_len <= hook_index {
+        FirstOwnerMigrationState::InstallAtHook
+    } else {
+        FirstOwnerMigrationState::VerifyExisting
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProductionMigrationWaveLimits {
@@ -7784,32 +7846,88 @@ fn advance_production_migration_snapshot_state(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionMigrationReleaseBindingProjection<'a> {
+    deployment_id: &'a str,
+    trust_domain_id: &'a str,
+    workload_id: &'a str,
+    source_revision: &'a str,
+    artifact_digest: &'a str,
+    attestation_profile_id: &'a str,
+    attestation_profile_version: &'a str,
+    attestation_profile_digest: &'a str,
+    first_owner_reconciliation_binding_digest: &'a str,
+}
+
+fn production_migration_release_binding_digest(
+    projection: &ProductionMigrationReleaseBindingProjection<'_>,
+) -> String {
+    framed_migration_digest(
+        PRODUCTION_MIGRATION_RELEASE_BINDING_DIGEST_CONTRACT,
+        &[
+            ("deployment_id", projection.deployment_id),
+            ("trust_domain_id", projection.trust_domain_id),
+            ("workload_id", projection.workload_id),
+            ("source_revision", projection.source_revision),
+            ("artifact_digest", projection.artifact_digest),
+            ("attestation_profile_id", projection.attestation_profile_id),
+            (
+                "attestation_profile_version",
+                projection.attestation_profile_version,
+            ),
+            (
+                "attestation_profile_digest",
+                projection.attestation_profile_digest,
+            ),
+            (
+                "first_owner_reconciliation_binding_digest",
+                projection.first_owner_reconciliation_binding_digest,
+            ),
+        ],
+    )
+}
+
+fn production_migration_operation_id(
+    release_binding_digest: &str,
+    target_binding_digest: &str,
+    migration_inventory_digest: &str,
+) -> String {
+    framed_migration_digest(
+        PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
+        &[
+            ("release_binding_digest", release_binding_digest),
+            ("target_binding_digest", target_binding_digest),
+            ("migration_inventory_digest", migration_inventory_digest),
+        ],
+    )
+}
+
 fn production_migration_operation_marker(
     execution: &crate::security_contracts::VerifiedProductionMigrationExecution,
 ) -> ProductionMigrationOperationMarker {
     let proof = execution.verified_infrastructure();
     let profile_version = proof.attestation_profile_version().to_string();
-    // Workload-instance and authority-key identity are intentionally excluded:
-    // a new one-shot pod and a rotated authority must be able to reconcile the
-    // same release operation after a lost COMMIT acknowledgement. Source,
-    // artifact, profile, namespace, exact database/storage identity, roles, and
-    // final inventory remain fixed and independently re-attested.
-    let release_binding_digest = framed_migration_digest(
-        PRODUCTION_MIGRATION_RELEASE_BINDING_DIGEST_CONTRACT,
-        &[
-            ("deployment_id", proof.deployment_id()),
-            ("trust_domain_id", proof.trust_domain_id()),
-            ("workload_id", proof.workload_id()),
-            ("source_revision", proof.source_revision()),
-            ("artifact_digest", proof.artifact_digest()),
-            ("attestation_profile_id", proof.attestation_profile_id()),
-            ("attestation_profile_version", &profile_version),
-            (
-                "attestation_profile_digest",
-                proof.attestation_profile_digest(),
-            ),
-        ],
-    );
+    // Transient PostgreSQL workload-instance, response, and session identity
+    // are intentionally excluded: a new one-shot pod must be able to reconcile
+    // the same release operation after a lost COMMIT acknowledgement. The
+    // stable first-owner reconciliation digest still binds the exact signed
+    // certificate and its authority/closure projection; source, artifact,
+    // profile, exact database/storage identity, roles, and final inventory are
+    // independently re-attested.
+    let release_binding_digest =
+        production_migration_release_binding_digest(&ProductionMigrationReleaseBindingProjection {
+            deployment_id: proof.deployment_id(),
+            trust_domain_id: proof.trust_domain_id(),
+            workload_id: proof.workload_id(),
+            source_revision: proof.source_revision(),
+            artifact_digest: proof.artifact_digest(),
+            attestation_profile_id: proof.attestation_profile_id(),
+            attestation_profile_version: &profile_version,
+            attestation_profile_digest: proof.attestation_profile_digest(),
+            first_owner_reconciliation_binding_digest: execution
+                .first_owner_installation_binding()
+                .reconciliation_digest(),
+        });
     let target_binding_digest = production_migration_target_binding_digest(
         proof.database_provider(),
         proof.provider_route_binding_digest(),
@@ -7820,13 +7938,10 @@ fn production_migration_operation_marker(
         proof.migration_role(),
     );
     let migration_inventory_digest = execution.expected_migration_inventory_digest().to_owned();
-    let operation_id = framed_migration_digest(
-        PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
-        &[
-            ("release_binding_digest", &release_binding_digest),
-            ("target_binding_digest", &target_binding_digest),
-            ("migration_inventory_digest", &migration_inventory_digest),
-        ],
+    let operation_id = production_migration_operation_id(
+        &release_binding_digest,
+        &target_binding_digest,
+        &migration_inventory_digest,
     );
     ProductionMigrationOperationMarker {
         operation_id,
@@ -8561,6 +8676,7 @@ fn validate_atomic_embedded_migration_plan() -> Result<(), String> {
         })
         .collect::<Vec<_>>();
     validate_atomic_migration_shape(&entries)?;
+    first_owner_installation_hook_index(&entries)?;
     if EMBEDDED_MIGRATOR
         .iter()
         .any(|migration| migration.sql.trim().is_empty() || migration.checksum.is_empty())
@@ -8657,11 +8773,151 @@ async fn set_idempotency_cutover_install_mode(
     Ok(())
 }
 
+async fn clear_first_owner_closure_writer_contract(
+    connection: &mut PgConnection,
+) -> Result<(), MigrationRunError> {
+    let retained: String = sqlx::query_scalar("SELECT pg_catalog.set_config($1, '', TRUE)")
+        .bind(FIRST_OWNER_CLOSURE_WRITER_CONTRACT_GUC)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| {
+            MigrationRunError::Preflight(
+                "first-owner closure writer contract could not be cleared".into(),
+            )
+        })?;
+    let observed: Option<String> =
+        sqlx::query_scalar("SELECT pg_catalog.current_setting($1, TRUE)")
+            .bind(FIRST_OWNER_CLOSURE_WRITER_CONTRACT_GUC)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| {
+                MigrationRunError::Preflight(
+                    "first-owner closure writer contract clear could not be verified".into(),
+                )
+            })?;
+    if !retained.is_empty() || observed.as_deref() != Some("") {
+        return Err(MigrationRunError::Preflight(
+            "first-owner closure writer contract remained active after installation".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn install_first_owner_closure_after_migration(
+    connection: &mut PgConnection,
+    transaction_guard: AtomicMigrationTransactionGuard,
+    execution: &mut crate::security_contracts::VerifiedProductionMigrationExecution,
+) -> Result<crate::first_owner_runtime::FirstOwnerInstallationReadbackExpectation, MigrationRunError>
+{
+    let installation_check_at = Utc::now();
+    execution.ensure_fresh(installation_check_at).map_err(|_| {
+        MigrationRunError::Admission(
+            "production migration execution was not fresh at the first-owner writer boundary"
+                .into(),
+        )
+    })?;
+    execution
+        .ensure_first_owner_installation_fresh(installation_check_at)
+        .map_err(|_| {
+            MigrationRunError::Admission(
+                "first-owner installation freshness or binding integrity failed at the writer boundary"
+                    .into(),
+            )
+        })?;
+    let authority = execution
+        .take_first_owner_installation_authority(
+            ryuki_core::conformance_trust::ConformanceTrustedTimeWindow {
+                not_before: installation_check_at,
+                not_after: installation_check_at,
+            },
+        )
+        .map_err(|_| {
+            MigrationRunError::Admission(
+                "first-owner installation authority could not be consumed at the reviewed migration boundary"
+                    .into(),
+            )
+        })?;
+    let (certificate_bytes, readback_expectation) = authority.into_database_storage_parts();
+    let stored: bool =
+        sqlx::query_scalar("SELECT public.store_authority_verified_first_owner_closure($1)")
+            .bind(certificate_bytes.as_ref())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| MigrationRunError::FirstOwnerBoundary {
+                phase: "installation storage",
+                category: "database-write-failed",
+            })?;
+    if !stored {
+        clear_first_owner_closure_writer_contract(connection).await?;
+        verify_atomic_migration_transaction_guard(connection, transaction_guard)
+            .await
+            .map_err(|_| {
+                MigrationRunError::Preflight(
+                    "first-owner writer retry changed the atomic migration transaction guard"
+                        .into(),
+                )
+            })?;
+        return Err(MigrationRunError::Preflight(
+            "first-owner closure already existed on the markerless fresh installation path".into(),
+        ));
+    }
+    clear_first_owner_closure_writer_contract(connection).await?;
+    sqlx::query("SET CONSTRAINTS public.first_owner_domain_set_complete IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| {
+            MigrationRunError::Preflight(
+                "first-owner privileged-domain completeness check failed".into(),
+            )
+        })?;
+    crate::first_owner_runtime::validate_first_owner_installation_readback(
+        connection,
+        &readback_expectation,
+    )
+    .await
+    .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+        phase: "same-transaction installation readback",
+        category: error.redacted_category(),
+    })?;
+    verify_atomic_migration_transaction_guard(connection, transaction_guard)
+        .await
+        .map_err(|_| {
+            MigrationRunError::Preflight(
+                "first-owner installation changed the atomic migration transaction guard".into(),
+            )
+        })?;
+    Ok(readback_expectation)
+}
+
 async fn apply_atomic_embedded_migrations(
     connection: &mut PgConnection,
     contract: &MigrationRoleContract,
     preflight_ledger: &[(i64, Vec<u8>, bool)],
-) -> Result<(), MigrationRunError> {
+    execution: &mut crate::security_contracts::VerifiedProductionMigrationExecution,
+    first_owner_state: FirstOwnerMigrationState,
+) -> Result<crate::first_owner_runtime::FirstOwnerInstallationReadbackExpectation, MigrationRunError>
+{
+    let mut first_owner_readback_expectation = match first_owner_state {
+        FirstOwnerMigrationState::InstallAtHook => None,
+        FirstOwnerMigrationState::VerifyExisting => {
+            let expectation = execution
+                .first_owner_readback_expectation()
+                .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+                    phase: "follow-on expectation construction",
+                    category: error.redacted_category(),
+                })?;
+            crate::first_owner_runtime::validate_first_owner_installation_readback(
+                connection,
+                &expectation,
+            )
+            .await
+            .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+                phase: "pre-wave existing-closure readback",
+                category: error.redacted_category(),
+            })?;
+            Some(expectation)
+        }
+    };
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS public._sqlx_migrations (
@@ -8713,6 +8969,26 @@ async fn apply_atomic_embedded_migrations(
                 version: migration.version,
                 source,
             })?;
+        if matches!(
+            atomic_production_migration_hook(migration.version),
+            Some(AtomicProductionMigrationHook::InstallFirstOwnerClosure)
+        ) {
+            if first_owner_state != FirstOwnerMigrationState::InstallAtHook
+                || first_owner_readback_expectation.is_some()
+            {
+                return Err(MigrationRunError::Preflight(
+                    "first-owner installation hook was selected more than once".into(),
+                ));
+            }
+            first_owner_readback_expectation = Some(
+                install_first_owner_closure_after_migration(
+                    connection,
+                    transaction_guard,
+                    execution,
+                )
+                .await?,
+            );
+        }
         let elapsed_nanos = i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX);
         sqlx::query(
             "INSERT INTO public._sqlx_migrations \
@@ -8730,17 +9006,25 @@ async fn apply_atomic_embedded_migrations(
             source,
         })?;
     }
-    Ok(())
+    first_owner_readback_expectation.ok_or_else(|| {
+        MigrationRunError::Preflight(
+            "pending migration wave did not execute the first-owner installation hook".into(),
+        )
+    })
 }
 
 async fn attest_production_migration_operations_table(
     connection: &mut PgConnection,
     migration_role: &str,
+    application_role: &str,
 ) -> Result<(), sqlx::Error> {
     let exact: bool = sqlx::query_scalar(
         r#"
         WITH migration AS (
             SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1::name
+        ),
+        application AS (
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $2::name
         ),
         marker AS (
             SELECT class.*
@@ -8784,6 +9068,38 @@ async fn attest_production_migration_operations_table(
               ON constraint_catalog.conrelid = marker.oid
              AND constraint_catalog.contype = 'p'
         ),
+        actual_indexes AS (
+            SELECT index_catalog.indexrelid,
+                   index_catalog.indrelid,
+                   index_catalog.indnatts,
+                   index_catalog.indnkeyatts,
+                   index_catalog.indisunique,
+                   index_catalog.indnullsnotdistinct,
+                   index_catalog.indisprimary,
+                   index_catalog.indisexclusion,
+                   index_catalog.indimmediate,
+                   index_catalog.indisclustered,
+                   index_catalog.indisvalid,
+                   index_catalog.indcheckxmin,
+                   index_catalog.indisready,
+                   index_catalog.indislive,
+                   index_catalog.indisreplident,
+                   index_catalog.indkey,
+                   index_catalog.indexprs,
+                   index_catalog.indpred,
+                   index_class.relkind AS index_relkind,
+                   index_class.relpersistence AS index_relpersistence,
+                   index_class.relispartition AS index_is_partition,
+                   index_class.relowner AS index_owner,
+                   access_method.amname AS access_method
+            FROM marker
+            JOIN pg_catalog.pg_index AS index_catalog
+              ON index_catalog.indrelid = marker.oid
+            JOIN pg_catalog.pg_class AS index_class
+              ON index_class.oid = index_catalog.indexrelid
+            JOIN pg_catalog.pg_am AS access_method
+              ON access_method.oid = index_class.relam
+        ),
         expected_triggers(name, trigger_type) AS (
             VALUES
                 ('production_migration_operations_no_mutation'::text, 27::smallint),
@@ -8796,6 +9112,12 @@ async fn attest_production_migration_operations_table(
                    trigger.tgdeferrable,
                    trigger.tginitdeferred,
                    trigger.tgconstraint,
+                   trigger.tgattr,
+                   trigger.tgargs,
+                   trigger.tgqual,
+                   trigger.tgparentid,
+                   trigger.tgoldtable,
+                   trigger.tgnewtable,
                    procedure.proowner,
                    procedure.prorettype,
                    procedure.prosecdef,
@@ -8824,6 +9146,81 @@ async fn attest_production_migration_operations_table(
                AND NOT marker.relforcerowsecurity
                AND marker.relreplident = 'd'
                AND marker.relowner = migration.oid
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.aclexplode(COALESCE(
+                        marker.relacl,
+                        pg_catalog.acldefault('r', marker.relowner)
+                    )) AS privilege
+                    CROSS JOIN application
+                    WHERE privilege.grantor <> marker.relowner
+                       OR privilege.is_grantable
+                       OR (
+                            privilege.grantee = marker.relowner
+                            AND privilege.privilege_type NOT IN (
+                                'DELETE', 'INSERT', 'MAINTAIN', 'REFERENCES',
+                                'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE'
+                            )
+                       )
+                       OR (
+                            privilege.grantee = application.oid
+                            AND privilege.privilege_type <> 'SELECT'
+                       )
+                       OR privilege.grantee NOT IN (
+                            marker.relowner,
+                            application.oid
+                       )
+               )
+               AND (
+                    SELECT pg_catalog.array_agg(
+                        privilege.privilege_type
+                        ORDER BY privilege.privilege_type COLLATE "C"
+                    )
+                    FROM pg_catalog.aclexplode(COALESCE(
+                        marker.relacl,
+                        pg_catalog.acldefault('r', marker.relowner)
+                    )) AS privilege
+                    WHERE privilege.grantee = marker.relowner
+               ) = ARRAY[
+                    'DELETE', 'INSERT', 'MAINTAIN', 'REFERENCES', 'SELECT',
+                    'TRIGGER', 'TRUNCATE', 'UPDATE'
+               ]::text[]
+               AND (
+                    SELECT pg_catalog.array_agg(
+                        privilege.privilege_type
+                        ORDER BY privilege.privilege_type COLLATE "C"
+                    )
+                    FROM pg_catalog.aclexplode(COALESCE(
+                        marker.relacl,
+                        pg_catalog.acldefault('r', marker.relowner)
+                    )) AS privilege
+                    CROSS JOIN application
+                    WHERE privilege.grantee = application.oid
+               ) = ARRAY['SELECT']::text[]
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_attribute AS attribute
+                    WHERE attribute.attrelid = marker.oid
+                      AND attribute.attnum > 0
+                      AND NOT attribute.attisdropped
+                      AND attribute.attacl IS NOT NULL
+               )
+               AND (
+                    SELECT count(*)
+                    FROM pg_catalog.pg_auth_members AS membership
+                    WHERE membership.roleid = migration.oid
+               ) = 1
+               AND EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_auth_members AS membership
+                    JOIN pg_catalog.pg_roles AS login
+                      ON login.oid = membership.member
+                    WHERE membership.roleid = migration.oid
+                      AND login.rolname = session_user
+                      AND membership.set_option
+                      AND NOT membership.inherit_option
+                      AND NOT membership.admin_option
+               )
                AND marker.relam = (
                     SELECT access_method.oid
                     FROM pg_catalog.pg_am AS access_method
@@ -8850,6 +9247,7 @@ async fn attest_production_migration_operations_table(
                       AND attribute.attisdropped
                )
                AND (SELECT count(*) FROM primary_key) = 1
+               AND (SELECT count(*) FROM actual_indexes) = 1
                AND (SELECT conkey FROM primary_key) = ARRAY[
                     (
                         SELECT attribute.attnum
@@ -8861,6 +9259,41 @@ async fn attest_production_migration_operations_table(
                AND NOT (SELECT condeferrable FROM primary_key)
                AND NOT (SELECT condeferred FROM primary_key)
                AND (SELECT convalidated FROM primary_key)
+               AND (SELECT conenforced FROM primary_key)
+               AND (SELECT conislocal FROM primary_key)
+               AND (SELECT coninhcount FROM primary_key) = 0
+               AND NOT (SELECT connoinherit FROM primary_key)
+               AND NOT (SELECT conperiod FROM primary_key)
+               AND (SELECT indexrelid FROM actual_indexes) =
+                   (SELECT conindid FROM primary_key)
+               AND (SELECT index_relkind FROM actual_indexes) = 'i'
+               AND (SELECT index_relpersistence FROM actual_indexes) = 'p'
+               AND NOT (SELECT index_is_partition FROM actual_indexes)
+               AND (SELECT index_owner FROM actual_indexes) = migration.oid
+               AND (SELECT access_method FROM actual_indexes) = 'btree'
+               AND (SELECT indnatts FROM actual_indexes) = 1
+               AND (SELECT indnkeyatts FROM actual_indexes) = 1
+               AND (SELECT indisunique FROM actual_indexes)
+               AND NOT (SELECT indnullsnotdistinct FROM actual_indexes)
+               AND (SELECT indisprimary FROM actual_indexes)
+               AND NOT (SELECT indisexclusion FROM actual_indexes)
+               AND (SELECT indimmediate FROM actual_indexes)
+               AND NOT (SELECT indisclustered FROM actual_indexes)
+               AND (SELECT indisvalid FROM actual_indexes)
+               AND NOT (SELECT indcheckxmin FROM actual_indexes)
+               AND (SELECT indisready FROM actual_indexes)
+               AND (SELECT indislive FROM actual_indexes)
+               AND NOT (SELECT indisreplident FROM actual_indexes)
+               AND (SELECT indkey::smallint[] FROM actual_indexes) = ARRAY[
+                    (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute AS attribute
+                        WHERE attribute.attrelid = marker.oid
+                          AND attribute.attname = 'operation_id'
+                    )
+               ]::smallint[]
+               AND (SELECT indexprs FROM actual_indexes) IS NULL
+               AND (SELECT indpred FROM actual_indexes) IS NULL
                AND NOT EXISTS (
                     SELECT 1
                     FROM pg_catalog.pg_constraint AS constraint_catalog
@@ -8878,6 +9311,12 @@ async fn attest_production_migration_operations_table(
                        OR actual_triggers.tgdeferrable
                        OR actual_triggers.tginitdeferred
                        OR actual_triggers.tgconstraint <> 0
+                       OR actual_triggers.tgattr::text <> ''
+                       OR pg_catalog.octet_length(actual_triggers.tgargs) <> 0
+                       OR actual_triggers.tgqual IS NOT NULL
+                       OR actual_triggers.tgparentid <> 0
+                       OR actual_triggers.tgoldtable IS NOT NULL
+                       OR actual_triggers.tgnewtable IS NOT NULL
                        OR actual_triggers.proowner <> migration.oid
                        OR actual_triggers.prorettype <>
                           'pg_catalog.trigger'::regtype
@@ -8906,6 +9345,7 @@ async fn attest_production_migration_operations_table(
         "#,
     )
     .bind(migration_role)
+    .bind(application_role)
     .fetch_one(&mut *connection)
     .await?;
     if !exact {
@@ -8932,16 +9372,10 @@ fn validate_production_migration_operation_marker(
     {
         return Err("production migration operation marker contains a noncanonical digest".into());
     }
-    let expected_operation_id = framed_migration_digest(
-        PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
-        &[
-            ("release_binding_digest", &marker.release_binding_digest),
-            ("target_binding_digest", &marker.target_binding_digest),
-            (
-                "migration_inventory_digest",
-                &marker.migration_inventory_digest,
-            ),
-        ],
+    let expected_operation_id = production_migration_operation_id(
+        &marker.release_binding_digest,
+        &marker.target_binding_digest,
+        &marker.migration_inventory_digest,
     );
     if marker.operation_id != expected_operation_id {
         return Err(
@@ -8968,15 +9402,20 @@ async fn read_production_migration_operation_marker(
     connection: &mut PgConnection,
     operation_id: &str,
 ) -> Result<Option<ProductionMigrationOperationMarker>, sqlx::Error> {
-    let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
+    let mut rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT operation_id, release_binding_digest, target_binding_digest, \
                 migration_inventory_digest, attestation_response_digest, session_binding_digest \
-         FROM public.production_migration_operations WHERE operation_id = $1",
+         FROM public.production_migration_operations WHERE operation_id = $1 LIMIT 2",
     )
     .bind(operation_id)
-    .fetch_optional(&mut *connection)
+    .fetch_all(&mut *connection)
     .await?;
-    Ok(row.map(
+    if rows.len() > 1 {
+        return Err(role_protocol_error(
+            "production migration operation marker read returned duplicate operation identities",
+        ));
+    }
+    Ok(rows.pop().map(
         |(
             operation_id,
             release_binding_digest,
@@ -9142,7 +9581,7 @@ async fn run_atomic_production_migration(
         read_preflight_migration_ledger(&mut transaction, &role_contract.expected).await?;
     verify_preflight_migration_inventory(&preflight_ledger)?;
 
-    let execution = pending
+    let mut execution = pending
         .attest_exact_session(initial.clone(), Utc::now())
         .await
         .map_err(MigrationRunError::Admission)?;
@@ -9170,8 +9609,6 @@ async fn run_atomic_production_migration(
         .ensure_fresh(Utc::now())
         .map_err(MigrationRunError::Admission)?;
     let proof_valid_until = execution.valid_until();
-    let limits = production_migration_wave_limits(Utc::now(), proof_valid_until, timeouts)
-        .map_err(MigrationRunError::Admission)?;
     let operation_marker = production_migration_operation_marker(&execution);
     validate_production_migration_operation_marker(&operation_marker)
         .map_err(MigrationRunError::Preflight)?;
@@ -9181,73 +9618,128 @@ async fn run_atomic_production_migration(
     // its atomic completion witness. This is the only automatic path after a
     // lost COMMIT acknowledgement: it performs no migration or marker write.
     if preflight_ledger.len() == expected_embedded_migrations().len() {
-        attest_production_migration_operations_table(&mut transaction, &role_contract.expected)
-            .await
-            .map_err(MigrationRunError::Connect)?;
-        if let Some(committed_marker) = read_production_migration_operation_marker(
+        let readback_expectation =
+            execution
+                .first_owner_readback_expectation()
+                .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+                    phase: "lost-COMMIT expectation construction",
+                    category: error.redacted_category(),
+                })?;
+        attest_production_migration_operations_table(
+            &mut transaction,
+            &role_contract.expected,
+            &role_contract.application,
+        )
+        .await
+        .map_err(MigrationRunError::Connect)?;
+        let committed_marker = read_production_migration_operation_marker(
             &mut transaction,
             &operation_marker.operation_id,
         )
         .await
         .map_err(MigrationRunError::Connect)?
-        {
-            if !marker_reconciles_exact_operation(&committed_marker, &operation_marker)
-                .map_err(MigrationRunError::Preflight)?
-            {
-                return Err(MigrationRunError::Preflight(
-                    "durable production migration marker does not match the freshly attested release, target, and inventory"
-                        .into(),
-                ));
-            }
-            attest_idempotency_writer_contract(
-                &mut transaction,
-                &role_contract.application,
-                &role_contract.expected,
+        .ok_or_else(|| {
+            MigrationRunError::Preflight(
+                "complete migration ledger has no exact durable production operation marker".into(),
             )
+        })?;
+        if !marker_reconciles_exact_operation(&committed_marker, &operation_marker)
+            .map_err(MigrationRunError::Preflight)?
+        {
+            return Err(MigrationRunError::Preflight(
+                "durable production migration marker does not match the freshly attested release, target, and inventory"
+                    .into(),
+            ));
+        }
+        crate::first_owner_runtime::validate_first_owner_installation_readback(
+            &mut transaction,
+            &readback_expectation,
+        )
+        .await
+        .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+            phase: "lost-COMMIT reconciliation readback",
+            category: error.redacted_category(),
+        })?;
+        attest_idempotency_writer_contract(
+            &mut transaction,
+            &role_contract.application,
+            &role_contract.expected,
+        )
+        .await
+        .map_err(MigrationRunError::Privileges)?;
+        attest_application_acl(&mut transaction, &role_contract.application)
             .await
             .map_err(MigrationRunError::Privileges)?;
-            attest_application_acl(&mut transaction, &role_contract.application)
-                .await
-                .map_err(MigrationRunError::Privileges)?;
-            let mut inventory = verify_embedded_migrations_on_connection(&mut transaction).await?;
-            if inventory.content_digest != execution.expected_migration_inventory_digest() {
-                return Err(MigrationRunError::Admission(
-                    "durable operation marker exists but the exact final migration inventory differs"
-                        .into(),
-                ));
-            }
-            let final_binding = read_postgresql_migration_session_binding(
-                &mut transaction,
-                &application_name,
-                execution.role_contract(),
-                tls_channel_binding,
-            )
-            .await
-            .map_err(MigrationRunError::Preflight)?;
-            if final_binding != initial {
-                return Err(MigrationRunError::Preflight(
-                    "exact PostgreSQL backend row changed during commit reconciliation".into(),
-                ));
-            }
-            verify_attested_migration_session_projection(&execution, &final_binding)
-                .map_err(MigrationRunError::Preflight)?;
-            execution
-                .ensure_fresh(Utc::now())
-                .map_err(MigrationRunError::Admission)?;
-            let completion = execution.completion_evidence();
-            // The pre-BEGIN session lock was explicitly replaced by an
-            // advisory xact lock before this reconciliation path ran. A lost
-            // ROLLBACK response cannot invalidate the already-read durable
-            // commit witness.
-            let _ = transaction.rollback().await;
-            inventory.production_attestation = Some(completion);
-            inventory.production_operation = Some(ProductionMigrationOperationReceipt {
-                operation_id: operation_marker.operation_id,
-                reconciled_after_prior_attempt: true,
-            });
-            return Ok(inventory);
+        let mut inventory = verify_embedded_migrations_on_connection(&mut transaction).await?;
+        if inventory.content_digest != execution.expected_migration_inventory_digest() {
+            return Err(MigrationRunError::Admission(
+                "durable operation marker exists but the exact final migration inventory differs"
+                    .into(),
+            ));
         }
+        let final_binding = read_postgresql_migration_session_binding(
+            &mut transaction,
+            &application_name,
+            execution.role_contract(),
+            tls_channel_binding,
+        )
+        .await
+        .map_err(MigrationRunError::Preflight)?;
+        if final_binding != initial {
+            return Err(MigrationRunError::Preflight(
+                "exact PostgreSQL backend row changed during commit reconciliation".into(),
+            ));
+        }
+        verify_attested_migration_session_projection(&execution, &final_binding)
+            .map_err(MigrationRunError::Preflight)?;
+        execution
+            .ensure_fresh(Utc::now())
+            .map_err(MigrationRunError::Admission)?;
+        let completion = execution.completion_evidence();
+        // The pre-BEGIN session lock was explicitly replaced by an advisory
+        // xact lock before this reconciliation path ran. A lost ROLLBACK
+        // response cannot invalidate the already-read durable commit witness.
+        let _ = transaction.rollback().await;
+        inventory.production_attestation = Some(completion);
+        inventory.production_operation = Some(ProductionMigrationOperationReceipt {
+            operation_id: operation_marker.operation_id,
+            reconciled_after_prior_attempt: true,
+        });
+        return Ok(inventory);
     }
+
+    let entries = EMBEDDED_MIGRATOR
+        .iter()
+        .map(|migration| {
+            (
+                migration.version,
+                migration.migration_type.is_down_migration(),
+                migration.no_tx,
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_owner_state = first_owner_migration_state(&entries, preflight_ledger.len())
+        .map_err(MigrationRunError::Preflight)?;
+    let first_owner_installation_pending =
+        first_owner_state == FirstOwnerMigrationState::InstallAtHook;
+    let fresh_path_check_at = Utc::now();
+    if first_owner_installation_pending {
+        execution
+            .ensure_first_owner_installation_fresh(fresh_path_check_at)
+            .map_err(|_| {
+                MigrationRunError::Admission(
+                    "first-owner installation capability is inactive before the atomic wave".into(),
+                )
+            })?;
+    }
+    let fresh_path_valid_until = if first_owner_installation_pending {
+        proof_valid_until.min(execution.first_owner_installation_valid_until())
+    } else {
+        proof_valid_until
+    };
+    let limits =
+        production_migration_wave_limits(fresh_path_check_at, fresh_path_valid_until, timeouts)
+            .map_err(MigrationRunError::Admission)?;
 
     let remaining_ddl_timeout = limits
         .deadline_at
@@ -9267,18 +9759,17 @@ async fn run_atomic_production_migration(
         )
         .await
         .map_err(MigrationRunError::Connect)?;
-        apply_atomic_embedded_migrations(
+        let first_owner_readback_expectation = apply_atomic_embedded_migrations(
             &mut transaction,
-            execution.role_contract(),
+            &role_contract,
             &preflight_ledger,
+            &mut execution,
+            first_owner_state,
         )
         .await?;
-        reconcile_application_privileges_in_transaction(
-            &mut transaction,
-            execution.role_contract(),
-        )
-        .await
-        .map_err(MigrationRunError::Privileges)?;
+        reconcile_application_privileges_in_transaction(&mut transaction, &role_contract)
+            .await
+            .map_err(MigrationRunError::Privileges)?;
         attest_sqlx_migrations_table(&mut transaction, &role_contract.expected).await?;
         let inventory = verify_embedded_migrations_on_connection(&mut transaction).await?;
         if inventory.content_digest != execution.expected_migration_inventory_digest() {
@@ -9286,9 +9777,13 @@ async fn run_atomic_production_migration(
                 "verified post-migration ledger differs from the admitted inventory".into(),
             ));
         }
-        attest_production_migration_operations_table(&mut transaction, &role_contract.expected)
-            .await
-            .map_err(MigrationRunError::Connect)?;
+        attest_production_migration_operations_table(
+            &mut transaction,
+            &role_contract.expected,
+            &role_contract.application,
+        )
+        .await
+        .map_err(MigrationRunError::Connect)?;
         let final_binding = read_postgresql_migration_session_binding(
             &mut transaction,
             &application_name,
@@ -9304,10 +9799,30 @@ async fn run_atomic_production_migration(
         }
         verify_attested_migration_session_projection(&execution, &final_binding)
             .map_err(MigrationRunError::Preflight)?;
+        crate::first_owner_runtime::validate_first_owner_installation_readback(
+            &mut transaction,
+            &first_owner_readback_expectation,
+        )
+        .await
+        .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+            phase: "pre-marker readback",
+            category: error.redacted_category(),
+        })?;
+        let marker_check_at = Utc::now();
         execution
-            .ensure_fresh(Utc::now())
+            .ensure_fresh(marker_check_at)
             .map_err(MigrationRunError::Admission)?;
-        if Utc::now() >= limits.deadline_at {
+        if first_owner_installation_pending {
+            execution
+                .ensure_first_owner_installation_fresh(marker_check_at)
+                .map_err(|_| {
+                    MigrationRunError::Admission(
+                        "first-owner installation freshness or binding integrity failed before operation-marker retention"
+                            .into(),
+                    )
+                })?;
+        }
+        if marker_check_at >= limits.deadline_at {
             return Err(MigrationRunError::Admission(
                 "atomic migration reached the proof safety margin before commit".into(),
             ));
@@ -9332,10 +9847,30 @@ async fn run_atomic_production_migration(
                 "production migration operation marker changed before commit".into(),
             ));
         }
+        crate::first_owner_runtime::validate_first_owner_installation_readback(
+            &mut transaction,
+            &first_owner_readback_expectation,
+        )
+        .await
+        .map_err(|error| MigrationRunError::FirstOwnerBoundary {
+            phase: "pre-COMMIT readback",
+            category: error.redacted_category(),
+        })?;
+        let retained_marker_check_at = Utc::now();
         execution
-            .ensure_fresh(Utc::now())
+            .ensure_fresh(retained_marker_check_at)
             .map_err(MigrationRunError::Admission)?;
-        if Utc::now() >= limits.deadline_at {
+        if first_owner_installation_pending {
+            execution
+                .ensure_first_owner_installation_fresh(retained_marker_check_at)
+                .map_err(|_| {
+                    MigrationRunError::Admission(
+                        "first-owner installation freshness or binding integrity failed before commit dispatch"
+                            .into(),
+                    )
+                })?;
+        }
+        if retained_marker_check_at >= limits.deadline_at {
             return Err(MigrationRunError::Admission(
                 "atomic migration reached the proof safety margin before commit dispatch".into(),
             ));
@@ -9361,18 +9896,28 @@ async fn run_atomic_production_migration(
     execution
         .ensure_fresh(commit_dispatch_check_at)
         .map_err(MigrationRunError::Admission)?;
+    if first_owner_installation_pending {
+        execution
+            .ensure_first_owner_installation_fresh(commit_dispatch_check_at)
+            .map_err(|_| {
+                MigrationRunError::Admission(
+                    "first-owner installation freshness or binding integrity failed before COMMIT dispatch"
+                        .into(),
+                )
+            })?;
+    }
     if commit_dispatch_check_at >= limits.deadline_at {
         return Err(MigrationRunError::Admission(
             "atomic migration reached the proof safety margin before COMMIT dispatch".into(),
         ));
     }
     let completion = execution.completion_evidence();
-    let remaining_commit_millis = proof_valid_until
+    let remaining_commit_millis = fresh_path_valid_until
         .signed_duration_since(Utc::now())
         .num_milliseconds();
     if remaining_commit_millis < 2 {
         return Err(MigrationRunError::Admission(
-            "PostgreSQL proof expired before COMMIT could be dispatched".into(),
+            "production migration authority expired before COMMIT could be dispatched".into(),
         ));
     }
     let commit_ack_timeout = Duration::from_millis(
@@ -9391,12 +9936,12 @@ async fn run_atomic_production_migration(
         }
         Ok(Err(source)) => Err(MigrationRunError::CommitOutcomeUnknown {
             operation_id: operation_marker.operation_id,
-            reason: "PostgreSQL returned an error after COMMIT was dispatched",
+            reason: "the PostgreSQL COMMIT attempt returned an error before a durable outcome could be established",
             source: Some(source),
         }),
         Err(_) => Err(MigrationRunError::CommitOutcomeUnknown {
             operation_id: operation_marker.operation_id,
-            reason: "the bounded COMMIT acknowledgement deadline elapsed",
+            reason: "the bounded COMMIT-attempt acknowledgement deadline elapsed",
             source: None,
         }),
     }
@@ -9453,21 +9998,22 @@ async fn apply_embedded_production_migrations(
         }
         Err(error) => {
             let failure_boundary = if error.commit_outcome_unknown() {
-                ProductionMigrationFailureBoundary::CommitDispatched
+                ProductionMigrationFailureBoundary::CommitAttempted
             } else {
-                ProductionMigrationFailureBoundary::BeforeCommitDispatch
+                ProductionMigrationFailureBoundary::BeforeCommitAttempt
             };
             match classify_production_migration_failure(failure_boundary) {
                 ProductionMigrationFailureDisposition::RollbackExpected => {
-                    // Before COMMIT dispatch, dropping the outer transaction
+                    // Before a COMMIT attempt, dropping the outer transaction
                     // and terminating the backend is the cancellation fence.
                     channel.close_hard().await;
                 }
                 ProductionMigrationFailureDisposition::OutcomeUnknown => {
-                    // COMMIT was already sent. Hard-closing bounds the broken
-                    // transport but is not, and must never be reported as, a
-                    // rollback. A fresh run can only reconcile the durable
-                    // marker and exact final inventory for this operation id.
+                    // A COMMIT attempt has an indeterminate delivery/outcome.
+                    // Hard-closing bounds the broken transport but is not, and
+                    // must never be reported as, a rollback. A fresh run can
+                    // only reconcile the durable marker and exact final
+                    // inventory for this operation id.
                     channel.close_hard().await;
                 }
             }
@@ -9579,10 +10125,10 @@ pub(crate) async fn apply_embedded_migrations_with_admission(
         }
     }
     .await;
-    set_migration_status(if result.is_ok() {
-        MigrationStatus::Applied
-    } else {
-        MigrationStatus::Failed
+    set_migration_status(match &result {
+        Ok(_) => MigrationStatus::Applied,
+        Err(error) if error.commit_outcome_unknown() => MigrationStatus::OutcomeUnknown,
+        Err(_) => MigrationStatus::Failed,
     });
     result
 }
@@ -10085,6 +10631,7 @@ mod tests {
                 MigrationStatus::NotApplied,
                 MigrationStatus::Applied,
                 MigrationStatus::Failed,
+                MigrationStatus::OutcomeUnknown,
             ] {
                 for pool_present in [false, true] {
                     let expected = matches!(
@@ -10403,16 +10950,16 @@ mod tests {
     }
 
     #[test]
-    fn commit_dispatch_failures_are_never_classified_as_rollback() {
+    fn commit_attempt_failures_are_never_classified_as_rollback() {
         assert_eq!(
             super::classify_production_migration_failure(
-                super::ProductionMigrationFailureBoundary::BeforeCommitDispatch,
+                super::ProductionMigrationFailureBoundary::BeforeCommitAttempt,
             ),
             super::ProductionMigrationFailureDisposition::RollbackExpected,
         );
         assert_eq!(
             super::classify_production_migration_failure(
-                super::ProductionMigrationFailureBoundary::CommitDispatched,
+                super::ProductionMigrationFailureBoundary::CommitAttempted,
             ),
             super::ProductionMigrationFailureDisposition::OutcomeUnknown,
         );
@@ -10444,22 +10991,179 @@ mod tests {
     }
 
     #[test]
+    fn production_operation_identity_binds_first_owner_reconciliation_v2() {
+        fn digest(character: char) -> String {
+            format!("sha256:{}", character.to_string().repeat(64))
+        }
+
+        assert_eq!(
+            super::PRODUCTION_MIGRATION_RELEASE_BINDING_DIGEST_CONTRACT,
+            "ryuki-production-migration-release-binding-v2"
+        );
+        assert_eq!(
+            super::PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
+            "ryuki-production-migration-operation-id-v2"
+        );
+        let profile_digest = digest('1');
+        let artifact_digest = digest('2');
+        let first_owner_reconciliation_binding = digest('3');
+        let substituted_first_owner_reconciliation_binding = digest('4');
+        let projection = super::ProductionMigrationReleaseBindingProjection {
+            deployment_id: "deployment-a",
+            trust_domain_id: "trust-domain-a",
+            workload_id: "workload-a",
+            source_revision: "revision-a",
+            artifact_digest: &artifact_digest,
+            attestation_profile_id: "profile-a",
+            attestation_profile_version: "7",
+            attestation_profile_digest: &profile_digest,
+            first_owner_reconciliation_binding_digest: &first_owner_reconciliation_binding,
+        };
+        let release = super::production_migration_release_binding_digest(&projection);
+        assert_eq!(
+            release,
+            super::production_migration_release_binding_digest(&projection)
+        );
+        let substituted_release = super::production_migration_release_binding_digest(
+            &super::ProductionMigrationReleaseBindingProjection {
+                first_owner_reconciliation_binding_digest:
+                    &substituted_first_owner_reconciliation_binding,
+                ..projection
+            },
+        );
+        assert_ne!(release, substituted_release);
+
+        let target = digest('5');
+        let inventory = digest('6');
+        let operation = super::production_migration_operation_id(&release, &target, &inventory);
+        let substituted_operation =
+            super::production_migration_operation_id(&substituted_release, &target, &inventory);
+        assert_ne!(operation, substituted_operation);
+
+        let legacy_release = super::framed_migration_digest(
+            "ryuki-production-migration-release-binding-v1",
+            &[
+                ("deployment_id", projection.deployment_id),
+                ("trust_domain_id", projection.trust_domain_id),
+                ("workload_id", projection.workload_id),
+                ("source_revision", projection.source_revision),
+                ("artifact_digest", projection.artifact_digest),
+                ("attestation_profile_id", projection.attestation_profile_id),
+                (
+                    "attestation_profile_version",
+                    projection.attestation_profile_version,
+                ),
+                (
+                    "attestation_profile_digest",
+                    projection.attestation_profile_digest,
+                ),
+            ],
+        );
+        let legacy_operation = super::framed_migration_digest(
+            "ryuki-production-migration-operation-id-v1",
+            &[
+                ("release_binding_digest", &legacy_release),
+                ("target_binding_digest", &target),
+                ("migration_inventory_digest", &inventory),
+            ],
+        );
+        assert_ne!(release, legacy_release);
+        assert_ne!(operation, legacy_operation);
+    }
+
+    #[test]
+    fn first_owner_installation_hook_selects_only_pending_migration_213() {
+        assert_eq!(super::atomic_production_migration_hook(193), None);
+        assert_eq!(super::atomic_production_migration_hook(212), None);
+        assert_eq!(
+            super::atomic_production_migration_hook(213),
+            Some(super::AtomicProductionMigrationHook::InstallFirstOwnerClosure)
+        );
+        assert_eq!(super::atomic_production_migration_hook(214), None);
+
+        let mut entries = super::EMBEDDED_MIGRATOR
+            .iter()
+            .map(|migration| {
+                (
+                    migration.version,
+                    migration.migration_type.is_down_migration(),
+                    migration.no_tx,
+                )
+            })
+            .collect::<Vec<_>>();
+        let hook_index = super::first_owner_installation_hook_index(&entries)
+            .expect("embedded hook is exact and transactional");
+        assert_eq!(
+            entries[hook_index],
+            (
+                super::FIRST_OWNER_INSTALLATION_MIGRATION_VERSION,
+                false,
+                false
+            )
+        );
+        let predecessor_index = entries
+            .iter()
+            .position(|(version, _, _)| *version == 193)
+            .expect("writer-definition migration remains embedded");
+        assert!(predecessor_index < hook_index);
+        assert_eq!(
+            super::first_owner_migration_state(&entries, hook_index),
+            Ok(super::FirstOwnerMigrationState::InstallAtHook)
+        );
+        assert_eq!(
+            super::first_owner_migration_state(&entries, hook_index + 1),
+            Ok(super::FirstOwnerMigrationState::VerifyExisting)
+        );
+        entries.push((214, false, false));
+        assert_eq!(
+            super::first_owner_migration_state(&entries, hook_index + 1),
+            Ok(super::FirstOwnerMigrationState::VerifyExisting)
+        );
+        assert!(super::first_owner_migration_state(&entries, entries.len() + 1).is_err());
+
+        assert!(super::first_owner_installation_hook_index(&[(212, false, false)]).is_err());
+        assert!(super::first_owner_installation_hook_index(&[
+            (213, false, false),
+            (213, false, false),
+        ])
+        .is_err());
+        assert!(super::first_owner_installation_hook_index(&[(213, true, false)]).is_err());
+        assert!(super::first_owner_installation_hook_index(&[(213, false, true)]).is_err());
+    }
+
+    #[test]
     fn production_operation_marker_is_stable_across_fresh_attestation_readback() {
         fn digest(character: char) -> String {
             format!("sha256:{}", character.to_string().repeat(64))
         }
 
-        fn marker(response: char, session: char) -> super::ProductionMigrationOperationMarker {
-            let release_binding_digest = digest('1');
+        fn marker(
+            response: char,
+            session: char,
+            first_owner_binding: char,
+        ) -> super::ProductionMigrationOperationMarker {
+            let profile_digest = digest('1');
+            let artifact_digest = digest('2');
+            let first_owner_binding = digest(first_owner_binding);
+            let release_binding_digest = super::production_migration_release_binding_digest(
+                &super::ProductionMigrationReleaseBindingProjection {
+                    deployment_id: "deployment-a",
+                    trust_domain_id: "trust-domain-a",
+                    workload_id: "workload-a",
+                    source_revision: "revision-a",
+                    artifact_digest: &artifact_digest,
+                    attestation_profile_id: "profile-a",
+                    attestation_profile_version: "7",
+                    attestation_profile_digest: &profile_digest,
+                    first_owner_reconciliation_binding_digest: &first_owner_binding,
+                },
+            );
             let target_binding_digest = digest('2');
             let migration_inventory_digest = digest('3');
-            let operation_id = super::framed_migration_digest(
-                super::PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
-                &[
-                    ("release_binding_digest", &release_binding_digest),
-                    ("target_binding_digest", &target_binding_digest),
-                    ("migration_inventory_digest", &migration_inventory_digest),
-                ],
+            let operation_id = super::production_migration_operation_id(
+                &release_binding_digest,
+                &target_binding_digest,
+                &migration_inventory_digest,
             );
             super::ProductionMigrationOperationMarker {
                 operation_id,
@@ -10471,32 +11175,26 @@ mod tests {
             }
         }
 
-        let committed = marker('4', '5');
-        let freshly_attested = marker('6', '7');
+        let committed = marker('4', '5', '8');
+        let freshly_attested = marker('6', '7', '8');
         assert!(super::validate_production_migration_operation_marker(&committed).is_ok());
         assert!(
             super::marker_reconciles_exact_operation(&committed, &freshly_attested)
                 .expect("canonical marker projection")
         );
 
+        let substituted_first_owner = marker('6', '7', '9');
+        assert!(
+            !super::marker_reconciles_exact_operation(&committed, &substituted_first_owner)
+                .expect("canonical substituted first-owner projection")
+        );
+
         let mut different_target = freshly_attested.clone();
         different_target.target_binding_digest = digest('8');
-        different_target.operation_id = super::framed_migration_digest(
-            super::PRODUCTION_MIGRATION_OPERATION_ID_CONTRACT,
-            &[
-                (
-                    "release_binding_digest",
-                    &different_target.release_binding_digest,
-                ),
-                (
-                    "target_binding_digest",
-                    &different_target.target_binding_digest,
-                ),
-                (
-                    "migration_inventory_digest",
-                    &different_target.migration_inventory_digest,
-                ),
-            ],
+        different_target.operation_id = super::production_migration_operation_id(
+            &different_target.release_binding_digest,
+            &different_target.target_binding_digest,
+            &different_target.migration_inventory_digest,
         );
         assert!(
             !super::marker_reconciles_exact_operation(&committed, &different_target)

@@ -501,6 +501,8 @@ const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS: &[&str] = &[
 ];
 const FIRST_OWNER_AUTHORITY_CONFIG_MAP: &str = "platform-first-owner-authority-pins";
 const FIRST_OWNER_AUTHORITY_KEYS: &[&str] = &[
+    "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH",
+    "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST",
     "RYUKI_FIRST_OWNER_AUTHORITY_ID",
     "RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID",
     "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64",
@@ -584,7 +586,14 @@ const MIGRATION_JOB_RYUKI_ANNOTATIONS: [&str; 15] = [
     "ryuki.io/socket-projection-receipt-digest",
     "ryuki.io/socket-contract-digest",
 ];
-const MIGRATION_JOB_ENV_COUNT: usize = 49;
+const MIGRATION_JOB_ENV_COUNT: usize = 1
+    + SECURITY_ADMISSION_KEYS.len()
+    + PRODUCTION_BUILD_MANIFEST_KEYS.len()
+    + CONFORMANCE_TRUST_CHECKPOINT_KEYS.len()
+    + DEPLOYED_WORKLOAD_ATTESTATION_KEYS.len()
+    + PUBLIC_INGRESS_ATTESTATION_KEYS.len()
+    + POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS.len()
+    + FIRST_OWNER_AUTHORITY_KEYS.len();
 const FINAL_RENDER_CONTRACT: &str = "migration-final-render-v1";
 const SOURCE_TEMPLATE_MODE: &str = "source-template";
 const FINAL_RENDER_MODE: &str = "final-render";
@@ -2670,6 +2679,10 @@ fn migration_cutover_contract_derives_identities_and_pins_writer_evidence() {
         "independentlyGovernedAuthorityRequired",
         "ed25519Required",
         "privateKeyInWorkloadForbidden",
+        "detachedCertificateRequired",
+        "descriptorPinnedRegularFileRequired",
+        "symlinkProjectionForbidden",
+        "materializationReceiptRequired",
     ] {
         assert_eq!(
             projections["firstOwnerAuthority"][flag], true,

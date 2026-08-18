@@ -13,31 +13,34 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use ryuki_core::conformance_trust::canonical_json_bytes;
+use ryuki_core::conformance_trust::ConformanceTrustedTimeWindow;
 use ryuki_core::postgresql_infrastructure::PostgresqlSessionBinding;
 use ryuki_core::security_profile::{
-    first_owner_authority_namespace_digest, first_owner_closure_record_digest,
-    DeploymentSecurityProfile, FirstOwnerAuthorityNamespace, FirstOwnerClosureRecord,
-    FirstOwnerClosureStatus, RuntimeGuardExpectedValue, TenancyMode,
+    first_owner_closure_certificate_canonical_bytes,
+    first_owner_closure_certificate_is_installable_at,
+    first_owner_closure_certificate_signature_digest, first_owner_closure_record_digest,
+    first_owner_closure_record_from_certificate, parse_first_owner_closure_certificate,
+    verify_first_owner_closure_certificate, DeploymentSecurityProfile,
+    FirstOwnerCertificateAuthorityAnchor, FirstOwnerClosureCertificate,
+    FirstOwnerClosureCertificateError, RuntimeGuardExpectedValue, TenancyMode,
+    VerifiedFirstOwnerClosureCertificate, FIRST_OWNER_MAX_EXACT_JSON_INTEGER,
+    FIRST_OWNER_PRIVILEGED_DOMAINS,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use thiserror::Error;
 
 use crate::database::{PostgresqlRuntimeObservation, RetainedPostgresqlRuntime};
 
 const LIVE_MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(15);
-const FIRST_OWNER_CERTIFICATE_SIGNATURE_DOMAIN: &[u8] = b"ryuki-v1/first-owner-closure-certificate";
-const PRIVILEGED_DOMAINS: [&str; 5] = [
-    "audit-administration",
-    "identity-administration",
-    "live-execution-administration",
-    "policy-administration",
-    "secret-key-custody",
-];
+const FIRST_OWNER_INSTALLATION_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-first-owner-installation-binding-v1";
+const FIRST_OWNER_RECONCILIATION_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-first-owner-reconciliation-binding-v1";
 
 /// Redacted failure categories for the live first-owner closure boundary.
 ///
@@ -62,6 +65,8 @@ pub(crate) enum FirstOwnerRuntimeError {
     CertificateSchemaInvalid,
     #[error("the first-owner closure certificate digest is invalid")]
     CertificateDigestInvalid,
+    #[error("the detached first-owner closure certificate digest differs from its deployment pin")]
+    CertificateFileDigestMismatch,
     #[error("the first-owner closure certificate signature representation is invalid")]
     SignatureRepresentationInvalid,
     #[error("the independently pinned first-owner authority binding is invalid")]
@@ -84,6 +89,47 @@ pub(crate) enum FirstOwnerRuntimeError {
     RuntimeChannelInvalid,
     #[error("the live first-owner closure changed after it was sealed")]
     LiveMeasurementChanged,
+    #[error("the first-owner installation receipt binding is invalid")]
+    ReceiptBindingInvalid,
+    #[error("the trusted first-owner installation interval is invalid")]
+    InvalidTrustedTimeWindow,
+    #[error(
+        "the first-owner installation capability is not active for the complete trusted interval"
+    )]
+    InstallationCapabilityInactive,
+}
+
+impl From<FirstOwnerClosureCertificateError> for FirstOwnerRuntimeError {
+    fn from(error: FirstOwnerClosureCertificateError) -> Self {
+        match error {
+            FirstOwnerClosureCertificateError::InvalidCertificate => Self::CertificateSchemaInvalid,
+            FirstOwnerClosureCertificateError::NonCanonicalCertificate => {
+                Self::CertificateNotCanonical
+            }
+            FirstOwnerClosureCertificateError::InvalidSignatureRepresentation => {
+                Self::SignatureRepresentationInvalid
+            }
+            FirstOwnerClosureCertificateError::InvalidAuthorityBinding => {
+                Self::AuthorityBindingInvalid
+            }
+            FirstOwnerClosureCertificateError::SignatureVerificationFailed => {
+                Self::SignatureVerificationFailed
+            }
+        }
+    }
+}
+
+impl FirstOwnerRuntimeError {
+    /// Payload-free category suitable for operator-facing migration errors.
+    pub(crate) const fn redacted_category(&self) -> &'static str {
+        match self {
+            Self::DatabaseReadFailed => "database-read-failed",
+            Self::MeasurementTimedOut => "measurement-timed-out",
+            Self::ClosureRecordMissing => "closure-record-missing",
+            Self::RuntimeChannelInvalid => "runtime-channel-invalid",
+            _ => "evidence-integrity-or-admission-failed",
+        }
+    }
 }
 
 /// Independently provisioned first-owner authority trust anchor.
@@ -96,7 +142,7 @@ pub(crate) struct FirstOwnerAuthorityAnchor {
     key_id: String,
     public_key_fingerprint: String,
     minimum_authority_epoch: u64,
-    verifying_key: VerifyingKey,
+    public_key_bytes: [u8; 32],
 }
 
 impl fmt::Debug for FirstOwnerAuthorityAnchor {
@@ -107,7 +153,7 @@ impl fmt::Debug for FirstOwnerAuthorityAnchor {
             .field("key_id", &"[PINNED]")
             .field("public_key_fingerprint", &"[PINNED]")
             .field("minimum_authority_epoch", &self.minimum_authority_epoch)
-            .field("verifying_key", &"[PINNED-ED25519-PUBLIC-KEY]")
+            .field("public_key", &"[PINNED-ED25519-PUBLIC-KEY]")
             .finish()
     }
 }
@@ -123,6 +169,7 @@ impl FirstOwnerAuthorityAnchor {
         let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
             .map_err(|_| FirstOwnerRuntimeError::AuthorityBindingInvalid)?;
         if minimum_authority_epoch == 0
+            || minimum_authority_epoch > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
             || verifying_key.is_weak()
             || sha256_digest(&public_key_bytes) != public_key_fingerprint
         {
@@ -133,8 +180,18 @@ impl FirstOwnerAuthorityAnchor {
             key_id,
             public_key_fingerprint,
             minimum_authority_epoch,
-            verifying_key,
+            public_key_bytes,
         })
+    }
+
+    fn as_core_anchor(&self) -> FirstOwnerCertificateAuthorityAnchor<'_> {
+        FirstOwnerCertificateAuthorityAnchor {
+            authority_id: &self.authority_id,
+            authority_key_id: &self.key_id,
+            public_key: &self.public_key_bytes,
+            public_key_fingerprint: &self.public_key_fingerprint,
+            minimum_authority_epoch: self.minimum_authority_epoch,
+        }
     }
 }
 
@@ -232,6 +289,10 @@ struct FirstOwnerAuditRow {
     to_status: String,
     detail: Value,
     outcome: String,
+    prev_hash: String,
+    entry_hash: String,
+    has_predecessor: bool,
+    predecessor_entry_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -255,42 +316,505 @@ struct FirstOwnerClosureSnapshot {
     domain_event: FirstOwnerDomainEventRow,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct SignedFirstOwnerClosure {
-    state_contract_version: u64,
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FirstOwnerInstallationBinding {
     deployment_id: String,
+    certificate_digest: String,
     authority_namespace_digest: String,
-    status: FirstOwnerClosureStatus,
-    closure_event_id: String,
-    authority_sequence: u64,
-    first_owner_principal_id: String,
-    claim_request_digest: String,
-    capability_id: String,
-    capability_expires_at: String,
-    closed_at_not_before: String,
-    closed_at_not_after: String,
+    closure_record_digest: String,
+    requirement_digest: String,
+    challenge_binding_digest: String,
+    installation_valid_until: DateTime<Utc>,
+    reconciliation_binding_digest: String,
+    installation_binding_digest: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct SignedPrivilegedDomainAssignment {
-    assignment_event_id: String,
-    domain_id: String,
-    principal_id: String,
+impl fmt::Debug for FirstOwnerInstallationBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstOwnerInstallationBinding")
+            .field(
+                "contract",
+                &FIRST_OWNER_INSTALLATION_BINDING_DIGEST_CONTRACT,
+            )
+            .field("deployment", &"[RECEIPT-BOUND]")
+            .field("certificate_digest", &self.certificate_digest)
+            .field(
+                "reconciliation_binding_digest",
+                &self.reconciliation_binding_digest,
+            )
+            .field(
+                "installation_binding_digest",
+                &self.installation_binding_digest,
+            )
+            .finish()
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct FirstOwnerClosureCertificate {
-    schema_version: String,
-    contract_kind: String,
-    canonicalization: String,
-    signature_algorithm: String,
-    authority_namespace: FirstOwnerAuthorityNamespace,
-    closure: SignedFirstOwnerClosure,
-    privileged_domain_assignments: Vec<SignedPrivilegedDomainAssignment>,
-    signature_base64: String,
+impl FirstOwnerInstallationBinding {
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn certificate_digest(&self) -> &str {
+        &self.certificate_digest
+    }
+
+    pub(crate) fn authority_namespace_digest(&self) -> &str {
+        &self.authority_namespace_digest
+    }
+
+    pub(crate) fn closure_record_digest(&self) -> &str {
+        &self.closure_record_digest
+    }
+
+    pub(crate) fn requirement_digest(&self) -> &str {
+        &self.requirement_digest
+    }
+
+    pub(crate) fn challenge_binding_digest(&self) -> &str {
+        &self.challenge_binding_digest
+    }
+
+    /// Exclusive end of fresh installation authority. Readback validation is
+    /// intentionally timeless and never rejects merely because this passed.
+    pub(crate) fn installation_valid_until(&self) -> DateTime<Utc> {
+        self.installation_valid_until.to_owned()
+    }
+
+    pub(crate) fn digest(&self) -> &str {
+        &self.installation_binding_digest
+    }
+
+    /// Stable identity for a committed first-owner installation. Unlike the
+    /// fresh authority digest, this excludes transient receipt/challenge and
+    /// workload-instance facts so a newly attested one-shot pod can reconcile
+    /// an unknown COMMIT outcome without gaining a second write capability.
+    pub(crate) fn reconciliation_digest(&self) -> &str {
+        &self.reconciliation_binding_digest
+    }
+}
+
+#[derive(Serialize)]
+struct FirstOwnerInstallationBindingProjection<'a> {
+    digest_contract: &'static str,
+    deployment_id: &'a str,
+    state_contract_version: u64,
+    certificate_digest: &'a str,
+    authority_namespace_digest: &'a str,
+    closure_record_digest: &'a str,
+    authority_id: &'a str,
+    authority_key_id: &'a str,
+    authority_epoch: u64,
+    capability_expires_at: &'a str,
+    requirement_digest: &'a str,
+    challenge_binding_digest: &'a str,
+}
+
+#[derive(Serialize)]
+struct FirstOwnerReconciliationBindingProjection<'a> {
+    digest_contract: &'static str,
+    deployment_id: &'a str,
+    state_contract_version: u64,
+    certificate_digest: &'a str,
+    authority_namespace_digest: &'a str,
+    closure_record_digest: &'a str,
+    authority_id: &'a str,
+    authority_key_id: &'a str,
+    authority_epoch: u64,
+    capability_id: &'a str,
+    capability_expires_at: &'a str,
+}
+
+/// Timeless, non-cloneable proof for one detached first-owner certificate.
+///
+/// It is not installation authority. The exact bytes, parsed closed type,
+/// signature proof, independent authority identity, receipt-bound state, and
+/// operation binding remain inseparable until a trusted interval is supplied.
+pub(crate) struct VerifiedFirstOwnerInstallCertificate {
+    certificate_bytes: Box<[u8]>,
+    certificate: FirstOwnerClosureCertificate,
+    proof: VerifiedFirstOwnerClosureCertificate,
+    authority: FirstOwnerAuthorityAnchor,
+    authority_id: String,
+    authority_key_id: String,
+    authority_epoch: u64,
+    scope: DeploymentScope,
+    expected: RuntimeGuardExpectedValue,
+    binding: FirstOwnerInstallationBinding,
+}
+
+impl fmt::Debug for VerifiedFirstOwnerInstallCertificate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedFirstOwnerInstallCertificate")
+            .field("contract", &"first-owner-install-certificate-v1")
+            .field("certificate", &"[TIMELESS-SIGNATURE-VERIFIED]")
+            .field("authority", &"[INDEPENDENTLY-PINNED]")
+            .field("binding", &self.binding)
+            .finish()
+    }
+}
+
+impl VerifiedFirstOwnerInstallCertificate {
+    #[cfg(test)]
+    pub(crate) fn expected_value(&self) -> &RuntimeGuardExpectedValue {
+        &self.expected
+    }
+
+    pub(crate) fn installation_binding(&self) -> &FirstOwnerInstallationBinding {
+        &self.binding
+    }
+
+    /// Build another non-cloneable readback expectation without minting write
+    /// authority. Lost-COMMIT reconciliation can therefore repeat exact reads
+    /// while the one-shot installation path remains unavailable.
+    pub(crate) fn readback_expectation(
+        &self,
+    ) -> Result<FirstOwnerInstallationReadbackExpectation, FirstOwnerRuntimeError> {
+        validate_retained_install_certificate(self)?;
+        Ok(FirstOwnerInstallationReadbackExpectation {
+            scope: self.scope.clone(),
+            expected: self.expected.clone(),
+            authority: self.authority.clone(),
+            binding: self.binding.clone(),
+        })
+    }
+
+    /// Consume the timeless proof and mint one installation authority only
+    /// when the entire conservative trusted interval is inside the capability
+    /// window. Expiry is exclusive; permanent serving validation is timeless.
+    pub(crate) fn authorize_installation(
+        self,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<VerifiedFirstOwnerInstallationAuthority, FirstOwnerRuntimeError> {
+        validate_retained_install_certificate(&self)?;
+        if trusted_now.not_before > trusted_now.not_after {
+            return Err(FirstOwnerRuntimeError::InvalidTrustedTimeWindow);
+        }
+        let active_at_start = first_owner_closure_certificate_is_installable_at(
+            &self.certificate,
+            trusted_now.not_before,
+        )?;
+        let active_at_end = first_owner_closure_certificate_is_installable_at(
+            &self.certificate,
+            trusted_now.not_after,
+        )?;
+        if !active_at_start || !active_at_end {
+            return Err(FirstOwnerRuntimeError::InstallationCapabilityInactive);
+        }
+        Ok(VerifiedFirstOwnerInstallationAuthority { certificate: self })
+    }
+}
+
+/// Non-cloneable, one-shot database write authority.
+pub(crate) struct VerifiedFirstOwnerInstallationAuthority {
+    certificate: VerifiedFirstOwnerInstallCertificate,
+}
+
+impl fmt::Debug for VerifiedFirstOwnerInstallationAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedFirstOwnerInstallationAuthority")
+            .field("contract", &"first-owner-installation-authority-v1")
+            .field("binding", &self.certificate.binding)
+            .finish()
+    }
+}
+
+impl VerifiedFirstOwnerInstallationAuthority {
+    #[cfg(test)]
+    pub(crate) fn installation_binding(&self) -> &FirstOwnerInstallationBinding {
+        &self.certificate.binding
+    }
+
+    /// The exact certificate bytes are exposed only by consuming the one-shot
+    /// authority. The paired expectation survives the SQL call for same-
+    /// transaction readback and lost-COMMIT reconciliation.
+    pub(crate) fn into_database_storage_parts(
+        self,
+    ) -> (Box<[u8]>, FirstOwnerInstallationReadbackExpectation) {
+        let VerifiedFirstOwnerInstallCertificate {
+            certificate_bytes,
+            authority,
+            scope,
+            expected,
+            binding,
+            ..
+        } = self.certificate;
+        (
+            certificate_bytes,
+            FirstOwnerInstallationReadbackExpectation {
+                scope,
+                expected,
+                authority,
+                binding,
+            },
+        )
+    }
+}
+
+/// Exact state retained across a storage call and usable on an existing SQLx
+/// transaction connection. It deliberately has no `Clone` implementation.
+pub(crate) struct FirstOwnerInstallationReadbackExpectation {
+    scope: DeploymentScope,
+    expected: RuntimeGuardExpectedValue,
+    authority: FirstOwnerAuthorityAnchor,
+    binding: FirstOwnerInstallationBinding,
+}
+
+impl fmt::Debug for FirstOwnerInstallationReadbackExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstOwnerInstallationReadbackExpectation")
+            .field("contract", &"first-owner-installation-readback-v1")
+            .field("binding", &self.binding)
+            .finish()
+    }
+}
+
+impl FirstOwnerInstallationReadbackExpectation {
+    #[cfg(test)]
+    pub(crate) fn expected_value(&self) -> &RuntimeGuardExpectedValue {
+        &self.expected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installation_binding(&self) -> &FirstOwnerInstallationBinding {
+        &self.binding
+    }
+}
+
+/// Verify a detached, digest-pinned certificate against the deployment
+/// profile and the exact `FirstOwnerPathClosed` receipt challenge.
+pub(crate) fn verify_first_owner_install_certificate(
+    certificate_bytes: Vec<u8>,
+    expected_file_digest: &str,
+    profile: &DeploymentSecurityProfile,
+    expected: &RuntimeGuardExpectedValue,
+    requirement_digest: &str,
+    challenge_binding_digest: &str,
+    authority: FirstOwnerAuthorityAnchor,
+) -> Result<VerifiedFirstOwnerInstallCertificate, FirstOwnerRuntimeError> {
+    let scope = DeploymentScope::from_profile(profile, expected)?;
+    verify_first_owner_install_certificate_for_scope(
+        certificate_bytes,
+        expected_file_digest,
+        scope,
+        expected,
+        requirement_digest,
+        challenge_binding_digest,
+        authority,
+    )
+}
+
+fn verify_first_owner_install_certificate_for_scope(
+    certificate_bytes: Vec<u8>,
+    expected_file_digest: &str,
+    scope: DeploymentScope,
+    expected: &RuntimeGuardExpectedValue,
+    requirement_digest: &str,
+    challenge_binding_digest: &str,
+    authority: FirstOwnerAuthorityAnchor,
+) -> Result<VerifiedFirstOwnerInstallCertificate, FirstOwnerRuntimeError> {
+    if !valid_sha256_digest(expected_file_digest)
+        || sha256_digest(&certificate_bytes) != expected_file_digest
+    {
+        return Err(FirstOwnerRuntimeError::CertificateFileDigestMismatch);
+    }
+    let certificate = parse_first_owner_closure_certificate(&certificate_bytes)?;
+    if first_owner_closure_certificate_canonical_bytes(&certificate)? != certificate_bytes {
+        return Err(FirstOwnerRuntimeError::CertificateNotCanonical);
+    }
+    let proof = verify_first_owner_closure_certificate(&certificate, authority.as_core_anchor())?;
+    if proof.certificate_digest() != expected_file_digest {
+        return Err(FirstOwnerRuntimeError::CertificateFileDigestMismatch);
+    }
+    validate_certificate_receipt_scope(&certificate, &proof, &scope, expected)?;
+    let binding = first_owner_installation_binding(
+        &certificate,
+        &proof,
+        expected,
+        requirement_digest,
+        challenge_binding_digest,
+    )?;
+    let authority_id = certificate.authority_namespace.authority_id.clone();
+    let authority_key_id = certificate.authority_namespace.authority_key_id.clone();
+    let authority_epoch = certificate.authority_namespace.authority_epoch;
+    Ok(VerifiedFirstOwnerInstallCertificate {
+        certificate_bytes: certificate_bytes.into_boxed_slice(),
+        certificate,
+        proof,
+        authority,
+        authority_id,
+        authority_key_id,
+        authority_epoch,
+        scope,
+        expected: expected.clone(),
+        binding,
+    })
+}
+
+fn validate_certificate_receipt_scope(
+    certificate: &FirstOwnerClosureCertificate,
+    proof: &VerifiedFirstOwnerClosureCertificate,
+    scope: &DeploymentScope,
+    expected: &RuntimeGuardExpectedValue,
+) -> Result<(), FirstOwnerRuntimeError> {
+    let RuntimeGuardExpectedValue::FirstOwnerPathClosed {
+        deployment_id,
+        state_contract_version,
+        authority_namespace_digest,
+        closure_record_digest,
+    } = expected
+    else {
+        return Err(FirstOwnerRuntimeError::WrongExpectedGuard);
+    };
+    if deployment_id != &scope.deployment_id
+        || certificate.authority_namespace.deployment_id != scope.deployment_id
+        || certificate.authority_namespace.trust_domain_ids != scope.trust_domain_ids
+        || certificate.authority_namespace.tenancy_mode != scope.tenancy_mode
+        || certificate.closure.deployment_id != scope.deployment_id
+    {
+        return Err(FirstOwnerRuntimeError::ProfileExpectationMismatch);
+    }
+    if *state_contract_version != certificate.closure.state_contract_version
+        || authority_namespace_digest != proof.authority_namespace_digest()
+        || closure_record_digest != proof.closure_record_digest()
+    {
+        return Err(FirstOwnerRuntimeError::ExpectedValueMismatch);
+    }
+    Ok(())
+}
+
+fn first_owner_installation_binding(
+    certificate: &FirstOwnerClosureCertificate,
+    proof: &VerifiedFirstOwnerClosureCertificate,
+    expected: &RuntimeGuardExpectedValue,
+    requirement_digest: &str,
+    challenge_binding_digest: &str,
+) -> Result<FirstOwnerInstallationBinding, FirstOwnerRuntimeError> {
+    let RuntimeGuardExpectedValue::FirstOwnerPathClosed {
+        deployment_id,
+        state_contract_version,
+        authority_namespace_digest,
+        closure_record_digest,
+    } = expected
+    else {
+        return Err(FirstOwnerRuntimeError::WrongExpectedGuard);
+    };
+    let bound_digests = [
+        proof.certificate_digest(),
+        proof.authority_namespace_digest(),
+        proof.closure_record_digest(),
+        proof.signature_digest(),
+        requirement_digest,
+        challenge_binding_digest,
+    ];
+    if bound_digests
+        .iter()
+        .any(|digest| !valid_sha256_digest(digest))
+        || bound_digests
+            .iter()
+            .enumerate()
+            .any(|(index, digest)| bound_digests[index + 1..].contains(digest))
+        || authority_namespace_digest != proof.authority_namespace_digest()
+        || closure_record_digest != proof.closure_record_digest()
+    {
+        return Err(FirstOwnerRuntimeError::ReceiptBindingInvalid);
+    }
+    let projection = FirstOwnerInstallationBindingProjection {
+        digest_contract: FIRST_OWNER_INSTALLATION_BINDING_DIGEST_CONTRACT,
+        deployment_id,
+        state_contract_version: *state_contract_version,
+        certificate_digest: proof.certificate_digest(),
+        authority_namespace_digest,
+        closure_record_digest,
+        authority_id: &certificate.authority_namespace.authority_id,
+        authority_key_id: &certificate.authority_namespace.authority_key_id,
+        authority_epoch: certificate.authority_namespace.authority_epoch,
+        capability_expires_at: &certificate.closure.capability_expires_at,
+        requirement_digest,
+        challenge_binding_digest,
+    };
+    let reconciliation_projection = FirstOwnerReconciliationBindingProjection {
+        digest_contract: FIRST_OWNER_RECONCILIATION_BINDING_DIGEST_CONTRACT,
+        deployment_id,
+        state_contract_version: *state_contract_version,
+        certificate_digest: proof.certificate_digest(),
+        authority_namespace_digest,
+        closure_record_digest,
+        authority_id: &certificate.authority_namespace.authority_id,
+        authority_key_id: &certificate.authority_namespace.authority_key_id,
+        authority_epoch: certificate.authority_namespace.authority_epoch,
+        capability_id: &certificate.closure.capability_id,
+        capability_expires_at: &certificate.closure.capability_expires_at,
+    };
+    let canonical = canonical_json_bytes(
+        &serde_json::to_value(projection)
+            .map_err(|_| FirstOwnerRuntimeError::ReceiptBindingInvalid)?,
+    )
+    .map_err(|_| FirstOwnerRuntimeError::ReceiptBindingInvalid)?;
+    let reconciliation_canonical = canonical_json_bytes(
+        &serde_json::to_value(reconciliation_projection)
+            .map_err(|_| FirstOwnerRuntimeError::ReceiptBindingInvalid)?,
+    )
+    .map_err(|_| FirstOwnerRuntimeError::ReceiptBindingInvalid)?;
+    Ok(FirstOwnerInstallationBinding {
+        deployment_id: deployment_id.clone(),
+        certificate_digest: proof.certificate_digest().to_owned(),
+        authority_namespace_digest: authority_namespace_digest.clone(),
+        closure_record_digest: closure_record_digest.clone(),
+        requirement_digest: requirement_digest.to_owned(),
+        challenge_binding_digest: challenge_binding_digest.to_owned(),
+        installation_valid_until: parse_exact_timestamp(
+            &certificate.closure.capability_expires_at,
+        )?,
+        reconciliation_binding_digest: sha256_digest(&reconciliation_canonical),
+        installation_binding_digest: sha256_digest(&canonical),
+    })
+}
+
+fn validate_retained_install_certificate(
+    verified: &VerifiedFirstOwnerInstallCertificate,
+) -> Result<(), FirstOwnerRuntimeError> {
+    if sha256_digest(&verified.certificate_bytes) != verified.proof.certificate_digest()
+        || first_owner_closure_certificate_canonical_bytes(&verified.certificate)?
+            != verified.certificate_bytes.as_ref()
+        || parse_first_owner_closure_certificate(&verified.certificate_bytes)?
+            != verified.certificate
+    {
+        return Err(FirstOwnerRuntimeError::CertificateDigestInvalid);
+    }
+    let reverified = verify_first_owner_closure_certificate(
+        &verified.certificate,
+        verified.authority.as_core_anchor(),
+    )?;
+    if reverified != verified.proof
+        || verified.authority_id != verified.certificate.authority_namespace.authority_id
+        || verified.authority_key_id != verified.certificate.authority_namespace.authority_key_id
+        || verified.authority_epoch != verified.certificate.authority_namespace.authority_epoch
+    {
+        return Err(FirstOwnerRuntimeError::AuthorityBindingInvalid);
+    }
+    validate_certificate_receipt_scope(
+        &verified.certificate,
+        &verified.proof,
+        &verified.scope,
+        &verified.expected,
+    )?;
+    let rebound = first_owner_installation_binding(
+        &verified.certificate,
+        &verified.proof,
+        &verified.expected,
+        verified.binding.requirement_digest(),
+        verified.binding.challenge_binding_digest(),
+    )?;
+    if rebound != verified.binding {
+        return Err(FirstOwnerRuntimeError::ReceiptBindingInvalid);
+    }
+    Ok(())
 }
 
 /// The verified local half of `FirstOwnerPathClosed`.
@@ -459,7 +983,19 @@ async fn read_snapshot(
         .await
         .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
     configure_read_only_snapshot(&mut transaction).await?;
-    let closure = sqlx::query_as::<_, FirstOwnerClosureRow>(
+    let snapshot = read_snapshot_from_connection(&mut transaction, deployment_id).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
+    Ok(snapshot)
+}
+
+async fn read_snapshot_from_connection(
+    connection: &mut PgConnection,
+    deployment_id: &str,
+) -> Result<FirstOwnerClosureSnapshot, FirstOwnerRuntimeError> {
+    let mut closures = sqlx::query_as::<_, FirstOwnerClosureRow>(
         r#"
         SELECT
             deployment_id,
@@ -500,13 +1036,22 @@ async fn read_snapshot(
             recorded_at
         FROM public.first_owner_closure_records
         WHERE deployment_id = $1
+        LIMIT 2
         "#,
     )
     .bind(deployment_id)
-    .fetch_optional(&mut *transaction)
+    .fetch_all(&mut *connection)
     .await
-    .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?
-    .ok_or(FirstOwnerRuntimeError::ClosureRecordMissing)?;
+    .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
+    if closures.is_empty() {
+        return Err(FirstOwnerRuntimeError::ClosureRecordMissing);
+    }
+    if closures.len() != 1 {
+        return Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid);
+    }
+    let closure = closures
+        .pop()
+        .ok_or(FirstOwnerRuntimeError::ClosureRecordMissing)?;
     let assignments = sqlx::query_as::<_, FirstOwnerAssignmentRow>(
         r#"
         SELECT
@@ -521,39 +1066,60 @@ async fn read_snapshot(
         FROM public.first_owner_privileged_domain_assignments
         WHERE deployment_id = $1
         ORDER BY domain_id COLLATE "C"
+        LIMIT 6
         "#,
     )
     .bind(deployment_id)
-    .fetch_all(&mut *transaction)
+    .fetch_all(&mut *connection)
     .await
     .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
-    let audit = sqlx::query_as::<_, FirstOwnerAuditRow>(
+    let mut audits = sqlx::query_as::<_, FirstOwnerAuditRow>(
         r#"
         SELECT
-            id,
-            occurred_at,
-            request_id::TEXT AS request_id,
-            actor_principal,
-            actor_display,
-            actor_roles,
-            provider_mode,
-            action,
-            from_stage,
-            to_stage,
-            from_status,
-            to_status,
-            detail,
-            outcome
-        FROM public.audit_log
-        WHERE id = $1
+            audit.id,
+            audit.occurred_at,
+            audit.request_id::TEXT AS request_id,
+            audit.actor_principal,
+            audit.actor_display,
+            audit.actor_roles,
+            audit.provider_mode,
+            audit.action,
+            audit.from_stage,
+            audit.to_stage,
+            audit.from_status,
+            audit.to_status,
+            audit.detail,
+            audit.outcome,
+            audit.prev_hash,
+            audit.entry_hash,
+            EXISTS (
+                SELECT 1
+                FROM public.audit_log AS predecessor
+                WHERE predecessor.id < audit.id
+            ) AS has_predecessor,
+            (
+                SELECT predecessor.entry_hash
+                FROM public.audit_log AS predecessor
+                WHERE predecessor.id < audit.id
+                ORDER BY predecessor.id DESC
+                LIMIT 1
+            ) AS predecessor_entry_hash
+        FROM public.audit_log AS audit
+        WHERE audit.id = $1
+        LIMIT 2
         "#,
     )
     .bind(closure.audit_log_id)
-    .fetch_optional(&mut *transaction)
+    .fetch_all(&mut *connection)
     .await
-    .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?
-    .ok_or(FirstOwnerRuntimeError::AtomicEvidenceInvalid)?;
-    let domain_event = sqlx::query_as::<_, FirstOwnerDomainEventRow>(
+    .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
+    if audits.len() != 1 {
+        return Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid);
+    }
+    let audit = audits
+        .pop()
+        .ok_or(FirstOwnerRuntimeError::AtomicEvidenceInvalid)?;
+    let mut domain_events = sqlx::query_as::<_, FirstOwnerDomainEventRow>(
         r#"
         SELECT
             id,
@@ -567,23 +1133,48 @@ async fn read_snapshot(
             occurred_at
         FROM public.domain_events
         WHERE id = $1
+        LIMIT 2
         "#,
     )
     .bind(closure.domain_event_id)
-    .fetch_optional(&mut *transaction)
+    .fetch_all(&mut *connection)
     .await
-    .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?
-    .ok_or(FirstOwnerRuntimeError::AtomicEvidenceInvalid)?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
+    .map_err(|_| FirstOwnerRuntimeError::DatabaseReadFailed)?;
+    if domain_events.len() != 1 {
+        return Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid);
+    }
+    let domain_event = domain_events
+        .pop()
+        .ok_or(FirstOwnerRuntimeError::AtomicEvidenceInvalid)?;
     Ok(FirstOwnerClosureSnapshot {
         closure,
         assignments,
         audit,
         domain_event,
     })
+}
+
+/// Validate an installation readback on the caller's existing PostgreSQL
+/// connection. Passing `&mut *transaction` keeps the write and all exact-row,
+/// assignment, audit, and domain-event checks in one outer transaction.
+pub(crate) async fn validate_first_owner_installation_readback(
+    connection: &mut PgConnection,
+    expectation: &FirstOwnerInstallationReadbackExpectation,
+) -> Result<(), FirstOwnerRuntimeError> {
+    let snapshot =
+        read_snapshot_from_connection(connection, &expectation.scope.deployment_id).await?;
+    let observed = validate_snapshot(
+        &snapshot,
+        &expectation.scope,
+        &expectation.expected,
+        &expectation.authority,
+    )?;
+    if observed != expectation.expected
+        || snapshot.closure.closure_certificate_digest != expectation.binding.certificate_digest
+    {
+        return Err(FirstOwnerRuntimeError::LiveMeasurementChanged);
+    }
+    Ok(())
 }
 
 fn validate_snapshot(
@@ -611,32 +1202,34 @@ fn validate_snapshot(
         return Err(FirstOwnerRuntimeError::ProfileExpectationMismatch);
     }
 
-    let value_from_bytes: Value = serde_json::from_slice(&row.certificate_bytes)
-        .map_err(|_| FirstOwnerRuntimeError::CertificateNotCanonical)?;
-    let canonical = canonical_json_bytes(&value_from_bytes)
-        .map_err(|_| FirstOwnerRuntimeError::CertificateNotCanonical)?;
-    if canonical != row.certificate_bytes || value_from_bytes != row.certificate_document {
+    let certificate = parse_first_owner_closure_certificate(&row.certificate_bytes)?;
+    let certificate_document = serde_json::to_value(&certificate)
+        .map_err(|_| FirstOwnerRuntimeError::CertificateSchemaInvalid)?;
+    if first_owner_closure_certificate_canonical_bytes(&certificate)? != row.certificate_bytes
+        || certificate_document != row.certificate_document
+    {
         return Err(FirstOwnerRuntimeError::CertificateNotCanonical);
     }
-    validate_certificate_shape(&value_from_bytes)?;
-    let certificate: FirstOwnerClosureCertificate = serde_json::from_value(value_from_bytes)
-        .map_err(|_| FirstOwnerRuntimeError::CertificateSchemaInvalid)?;
-    if certificate.schema_version != "1.0.0"
-        || certificate.contract_kind != "first-owner-closure-certificate"
-        || certificate.canonicalization != "ryuki-canonical-json-v1"
-        || certificate.signature_algorithm != "ed25519"
-    {
-        return Err(FirstOwnerRuntimeError::CertificateSchemaInvalid);
-    }
-
-    let certificate_digest = sha256_digest(&row.certificate_bytes);
+    let proof = verify_first_owner_closure_certificate(&certificate, authority.as_core_anchor())?;
+    let certificate_digest = proof.certificate_digest();
     if certificate_digest != row.closure_certificate_digest {
         return Err(FirstOwnerRuntimeError::CertificateDigestInvalid);
     }
-    validate_signature(&certificate, row, authority)?;
+    let signature_digest = first_owner_closure_certificate_signature_digest(&certificate)?;
+    let certificate_signature = BASE64_STANDARD
+        .decode(certificate.signature_base64.as_bytes())
+        .map_err(|_| FirstOwnerRuntimeError::SignatureRepresentationInvalid)?;
+    if certificate_signature.len() != 64
+        || BASE64_STANDARD.encode(&certificate_signature) != certificate.signature_base64
+        || certificate_signature != row.authority_signature
+        || signature_digest != proof.signature_digest()
+        || signature_digest != row.authority_signature_digest
+        || sha256_digest(&row.authority_signature) != signature_digest
+    {
+        return Err(FirstOwnerRuntimeError::SignatureRepresentationInvalid);
+    }
 
-    let namespace_digest = first_owner_authority_namespace_digest(&certificate.authority_namespace)
-        .map_err(|_| FirstOwnerRuntimeError::ProjectionInvalid)?;
+    let namespace_digest = proof.authority_namespace_digest();
     let state_contract_version =
         i64::try_from(certificate.authority_namespace.state_contract_version)
             .map_err(|_| FirstOwnerRuntimeError::StoredFactsMismatch)?;
@@ -644,9 +1237,6 @@ fn validate_snapshot(
         .map_err(|_| FirstOwnerRuntimeError::StoredFactsMismatch)?;
     let authority_sequence = i64::try_from(certificate.closure.authority_sequence)
         .map_err(|_| FirstOwnerRuntimeError::StoredFactsMismatch)?;
-    let closure_status = match certificate.closure.status {
-        FirstOwnerClosureStatus::Closed => "closed",
-    };
     if row.schema_version != certificate.schema_version
         || row.contract_kind != certificate.contract_kind
         || row.canonicalization != certificate.canonicalization
@@ -670,7 +1260,7 @@ fn validate_snapshot(
                 .map_err(|_| FirstOwnerRuntimeError::StoredFactsMismatch)?
         || row.deployment_id != certificate.closure.deployment_id
         || row.authority_namespace_digest != certificate.closure.authority_namespace_digest
-        || row.closure_status != closure_status
+        || row.closure_status != "closed"
         || row.closure_event_id != certificate.closure.closure_event_id
         || row.authority_sequence != authority_sequence
         || row.first_owner_principal_id != certificate.closure.first_owner_principal_id
@@ -697,27 +1287,15 @@ fn validate_snapshot(
         return Err(FirstOwnerRuntimeError::StoredFactsMismatch);
     }
 
-    validate_assignments(snapshot, &certificate, &certificate_digest)?;
-    validate_atomic_evidence(snapshot, &certificate, &certificate_digest)?;
+    validate_assignments(snapshot, &certificate, certificate_digest)?;
+    validate_atomic_evidence(snapshot, &certificate, certificate_digest)?;
 
-    let closure_record = FirstOwnerClosureRecord {
-        state_contract_version: certificate.closure.state_contract_version,
-        deployment_id: certificate.closure.deployment_id,
-        authority_namespace_digest: certificate.closure.authority_namespace_digest,
-        status: certificate.closure.status,
-        closure_event_id: certificate.closure.closure_event_id,
-        authority_sequence: certificate.closure.authority_sequence,
-        first_owner_principal_id: certificate.closure.first_owner_principal_id,
-        claim_request_digest: certificate.closure.claim_request_digest,
-        capability_id: certificate.closure.capability_id,
-        capability_expires_at: certificate.closure.capability_expires_at,
-        closed_at_not_before: certificate.closure.closed_at_not_before,
-        closed_at_not_after: certificate.closure.closed_at_not_after,
-        closure_certificate_digest: certificate_digest,
-    };
+    let closure_record = first_owner_closure_record_from_certificate(&certificate)?;
     let closure_record_digest = first_owner_closure_record_digest(&closure_record)
         .map_err(|_| FirstOwnerRuntimeError::ProjectionInvalid)?;
-    if row.closure_record_digest != closure_record_digest {
+    if row.closure_record_digest != closure_record_digest
+        || closure_record_digest != proof.closure_record_digest()
+    {
         return Err(FirstOwnerRuntimeError::StoredFactsMismatch);
     }
 
@@ -725,7 +1303,7 @@ fn validate_snapshot(
         deployment_id: row.deployment_id.clone(),
         state_contract_version: u64::try_from(row.state_contract_version)
             .map_err(|_| FirstOwnerRuntimeError::ProjectionInvalid)?,
-        authority_namespace_digest: namespace_digest,
+        authority_namespace_digest: namespace_digest.to_owned(),
         closure_record_digest,
     };
     if &observed != expected {
@@ -734,150 +1312,18 @@ fn validate_snapshot(
     Ok(observed)
 }
 
-fn validate_certificate_shape(document: &Value) -> Result<(), FirstOwnerRuntimeError> {
-    const TOP_LEVEL_KEYS: [&str; 8] = [
-        "authority_namespace",
-        "canonicalization",
-        "closure",
-        "contract_kind",
-        "privileged_domain_assignments",
-        "schema_version",
-        "signature_algorithm",
-        "signature_base64",
-    ];
-    const NAMESPACE_KEYS: [&str; 10] = [
-        "authority_epoch",
-        "authority_id",
-        "authority_key_id",
-        "authority_public_key_fingerprint",
-        "deployment_id",
-        "namespace_id",
-        "state_contract_version",
-        "tenancy_mode",
-        "tenant_id",
-        "trust_domain_ids",
-    ];
-    const CLOSURE_KEYS: [&str; 12] = [
-        "authority_namespace_digest",
-        "authority_sequence",
-        "capability_expires_at",
-        "capability_id",
-        "claim_request_digest",
-        "closed_at_not_after",
-        "closed_at_not_before",
-        "closure_event_id",
-        "deployment_id",
-        "first_owner_principal_id",
-        "state_contract_version",
-        "status",
-    ];
-    const ASSIGNMENT_KEYS: [&str; 3] = ["assignment_event_id", "domain_id", "principal_id"];
-
-    let namespace = document.get("authority_namespace");
-    let closure = document.get("closure");
-    let assignments = document
-        .get("privileged_domain_assignments")
-        .and_then(Value::as_array);
-    if !has_exact_object_keys(document, &TOP_LEVEL_KEYS)
-        || !namespace.is_some_and(|value| has_exact_object_keys(value, &NAMESPACE_KEYS))
-        || !closure.is_some_and(|value| has_exact_object_keys(value, &CLOSURE_KEYS))
-        || !assignments.is_some_and(|values| {
-            values.len() == PRIVILEGED_DOMAINS.len()
-                && values
-                    .iter()
-                    .all(|value| has_exact_object_keys(value, &ASSIGNMENT_KEYS))
-        })
-    {
-        return Err(FirstOwnerRuntimeError::CertificateSchemaInvalid);
-    }
-    Ok(())
-}
-
-fn has_exact_object_keys(value: &Value, expected: &[&str]) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
-    })
-}
-
-fn certificate_signing_bytes(document: &Value) -> Result<Vec<u8>, FirstOwnerRuntimeError> {
-    let mut unsigned = document.clone();
-    let object = unsigned
-        .as_object_mut()
-        .ok_or(FirstOwnerRuntimeError::CertificateSchemaInvalid)?;
-    if object.remove("signature_base64").is_none() {
-        return Err(FirstOwnerRuntimeError::CertificateSchemaInvalid);
-    }
-    let canonical = canonical_json_bytes(&unsigned)
-        .map_err(|_| FirstOwnerRuntimeError::CertificateNotCanonical)?;
-    let domain_length = u64::try_from(FIRST_OWNER_CERTIFICATE_SIGNATURE_DOMAIN.len())
-        .map_err(|_| FirstOwnerRuntimeError::CertificateSchemaInvalid)?;
-    let canonical_length = u64::try_from(canonical.len())
-        .map_err(|_| FirstOwnerRuntimeError::CertificateSchemaInvalid)?;
-    let mut signing_bytes =
-        Vec::with_capacity(16 + FIRST_OWNER_CERTIFICATE_SIGNATURE_DOMAIN.len() + canonical.len());
-    signing_bytes.extend_from_slice(&domain_length.to_le_bytes());
-    signing_bytes.extend_from_slice(FIRST_OWNER_CERTIFICATE_SIGNATURE_DOMAIN);
-    signing_bytes.extend_from_slice(&canonical_length.to_le_bytes());
-    signing_bytes.extend_from_slice(&canonical);
-    Ok(signing_bytes)
-}
-
-fn validate_signature(
-    certificate: &FirstOwnerClosureCertificate,
-    row: &FirstOwnerClosureRow,
-    authority: &FirstOwnerAuthorityAnchor,
-) -> Result<(), FirstOwnerRuntimeError> {
-    let signature_bytes = BASE64_STANDARD
-        .decode(certificate.signature_base64.as_bytes())
-        .map_err(|_| FirstOwnerRuntimeError::SignatureRepresentationInvalid)?;
-    if signature_bytes.len() != 64
-        || BASE64_STANDARD.encode(&signature_bytes) != certificate.signature_base64
-        || signature_bytes != row.authority_signature
-        || sha256_digest(&signature_bytes) != row.authority_signature_digest
-    {
-        return Err(FirstOwnerRuntimeError::SignatureRepresentationInvalid);
-    }
-    if certificate.authority_namespace.authority_id != authority.authority_id
-        || certificate.authority_namespace.authority_key_id != authority.key_id
-        || certificate
-            .authority_namespace
-            .authority_public_key_fingerprint
-            != authority.public_key_fingerprint
-        || certificate.authority_namespace.authority_epoch < authority.minimum_authority_epoch
-    {
-        return Err(FirstOwnerRuntimeError::AuthorityBindingInvalid);
-    }
-    let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|_| FirstOwnerRuntimeError::SignatureRepresentationInvalid)?;
-    let signing_bytes = certificate_signing_bytes(&row.certificate_document)?;
-    authority
-        .verifying_key
-        .verify_strict(&signing_bytes, &signature)
-        .map_err(|_| FirstOwnerRuntimeError::SignatureVerificationFailed)?;
-    Ok(())
-}
-
 fn validate_assignments(
     snapshot: &FirstOwnerClosureSnapshot,
     certificate: &FirstOwnerClosureCertificate,
     certificate_digest: &str,
 ) -> Result<(), FirstOwnerRuntimeError> {
     let signed = &certificate.privileged_domain_assignments;
-    if signed.len() != PRIVILEGED_DOMAINS.len()
-        || snapshot.assignments.len() != PRIVILEGED_DOMAINS.len()
+    if signed.len() != FIRST_OWNER_PRIVILEGED_DOMAINS.len()
+        || snapshot.assignments.len() != FIRST_OWNER_PRIVILEGED_DOMAINS.len()
         || !signed
             .iter()
             .map(|assignment| assignment.domain_id.as_str())
-            .eq(PRIVILEGED_DOMAINS)
-        || signed.iter().any(|assignment| {
-            !valid_runtime_identifier(&assignment.assignment_event_id)
-                || !valid_runtime_identifier(&assignment.principal_id)
-        })
-        || signed.iter().enumerate().any(|(index, assignment)| {
-            signed[index + 1..]
-                .iter()
-                .any(|candidate| candidate.assignment_event_id == assignment.assignment_event_id)
-        })
+            .eq(FIRST_OWNER_PRIVILEGED_DOMAINS)
     {
         return Err(FirstOwnerRuntimeError::AssignmentSetInvalid);
     }
@@ -910,6 +1356,29 @@ fn validate_atomic_evidence(
         "closure_event_id": row.closure_event_id,
         "deployment_id": row.deployment_id,
     });
+    let expected_prev_hash = match (
+        audit.has_predecessor,
+        audit.predecessor_entry_hash.as_deref(),
+    ) {
+        (false, None) => crate::audit::AUDIT_CHAIN_GENESIS,
+        (true, Some(predecessor_entry_hash)) => predecessor_entry_hash,
+        _ => return Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid),
+    };
+    let audit_payload = crate::audit::audit_canonical_payload(
+        audit.request_id.as_deref(),
+        &audit.actor_principal,
+        audit.actor_display.as_deref().unwrap_or(""),
+        &audit.actor_roles,
+        &audit.provider_mode,
+        &audit.action,
+        audit.from_stage.as_deref(),
+        &audit.to_stage,
+        audit.from_status.as_deref(),
+        &audit.to_status,
+        &audit.detail,
+        &audit.outcome,
+    );
+    let expected_entry_hash = crate::audit::chain_hash(expected_prev_hash, &audit_payload);
     if audit.id != row.audit_log_id
         || audit.request_id.is_some()
         || audit.actor_principal != certificate.closure.first_owner_principal_id
@@ -924,6 +1393,8 @@ fn validate_atomic_evidence(
         || audit.detail != expected_audit_detail
         || audit.outcome != "applied"
         || audit.occurred_at > row.recorded_at
+        || audit.prev_hash != expected_prev_hash
+        || audit.entry_hash != expected_entry_hash
     {
         return Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid);
     }
@@ -966,21 +1437,26 @@ fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn valid_runtime_identifier(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (3..=255).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(*byte, b'.' | b'_' | b':' | b'/' | b'-')
-        })
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && hex.bytes().any(|byte| byte != b'0')
+    })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
+    use rand::rngs::OsRng;
+    use ryuki_core::security_profile::{
+        first_owner_authority_namespace_digest, first_owner_closure_certificate_signing_bytes,
+        FirstOwnerAuthorityNamespace, FirstOwnerClosureStatus, SignedFirstOwnerClosure,
+        SignedPrivilegedDomainAssignment,
+    };
     use serde_json::json;
 
     fn digest(byte: char) -> String {
@@ -999,7 +1475,7 @@ mod tests {
         RuntimeGuardExpectedValue,
         FirstOwnerAuthorityAnchor,
     ) {
-        let signing_key = SigningKey::from_bytes(&[0x17; 32]);
+        let signing_key = SigningKey::generate(&mut OsRng);
         let public_key_bytes = signing_key.verifying_key().to_bytes();
         let public_key_fingerprint = sha256_digest(&public_key_bytes);
         let authority = FirstOwnerAuthorityAnchor::new(
@@ -1028,7 +1504,7 @@ mod tests {
             deployment_id: "deployment:fixture".into(),
             authority_namespace_digest: namespace_digest.clone(),
             status: FirstOwnerClosureStatus::Closed,
-            closure_event_id: "first-owner-event:fixture".into(),
+            closure_event_id: "first-owner-closure-event:fixture".into(),
             authority_sequence: 1,
             first_owner_principal_id: "principal:fixture-owner".into(),
             claim_request_digest: digest('2'),
@@ -1037,11 +1513,11 @@ mod tests {
             closed_at_not_before: "2026-01-01T00:00:00Z".into(),
             closed_at_not_after: "2026-01-01T00:00:01Z".into(),
         };
-        let signed_assignments = PRIVILEGED_DOMAINS
+        let signed_assignments = FIRST_OWNER_PRIVILEGED_DOMAINS
             .iter()
             .enumerate()
             .map(|(index, domain)| SignedPrivilegedDomainAssignment {
-                assignment_event_id: format!("first-owner-assignment:event-{index}"),
+                assignment_event_id: format!("first-owner-assignment-event:fixture-{index}"),
                 domain_id: (*domain).into(),
                 principal_id: "principal:fixture-owner".into(),
             })
@@ -1054,32 +1530,21 @@ mod tests {
             authority_namespace: namespace,
             closure,
             privileged_domain_assignments: signed_assignments,
-            signature_base64: String::new(),
+            signature_base64: BASE64_STANDARD.encode(
+                signing_key
+                    .sign(b"first-owner certificate fixture placeholder")
+                    .to_bytes(),
+            ),
         };
-        let unsigned_document = serde_json::to_value(&certificate).unwrap();
         let signature = signing_key
-            .sign(&certificate_signing_bytes(&unsigned_document).unwrap())
+            .sign(&first_owner_closure_certificate_signing_bytes(&certificate).unwrap())
             .to_bytes()
             .to_vec();
         certificate.signature_base64 = BASE64_STANDARD.encode(&signature);
         let certificate_document = serde_json::to_value(&certificate).unwrap();
         let certificate_bytes = canonical_json_bytes(&certificate_document).unwrap();
         let certificate_digest = sha256_digest(&certificate_bytes);
-        let closure_record = FirstOwnerClosureRecord {
-            state_contract_version: 1,
-            deployment_id: certificate.closure.deployment_id.clone(),
-            authority_namespace_digest: namespace_digest.clone(),
-            status: FirstOwnerClosureStatus::Closed,
-            closure_event_id: certificate.closure.closure_event_id.clone(),
-            authority_sequence: 1,
-            first_owner_principal_id: certificate.closure.first_owner_principal_id.clone(),
-            claim_request_digest: certificate.closure.claim_request_digest.clone(),
-            capability_id: certificate.closure.capability_id.clone(),
-            capability_expires_at: certificate.closure.capability_expires_at.clone(),
-            closed_at_not_before: certificate.closure.closed_at_not_before.clone(),
-            closed_at_not_after: certificate.closure.closed_at_not_after.clone(),
-            closure_certificate_digest: certificate_digest.clone(),
-        };
+        let closure_record = first_owner_closure_record_from_certificate(&certificate).unwrap();
         let closure_record_digest = first_owner_closure_record_digest(&closure_record).unwrap();
         let closed_at_not_after = timestamp("2026-01-01T00:00:01Z");
         let assignments = certificate
@@ -1091,11 +1556,33 @@ mod tests {
                 assignment_event_id: assignment.assignment_event_id.clone(),
                 principal_id: assignment.principal_id.clone(),
                 first_owner_principal_id: "principal:fixture-owner".into(),
-                closure_event_id: "first-owner-event:fixture".into(),
+                closure_event_id: "first-owner-closure-event:fixture".into(),
                 closure_certificate_digest: certificate_digest.clone(),
                 assigned_at: closed_at_not_after,
             })
             .collect();
+        let audit_detail = json!({
+            "authority_namespace_digest": namespace_digest.clone(),
+            "closure_certificate_digest": certificate_digest.clone(),
+            "closure_event_id": "first-owner-closure-event:fixture",
+            "deployment_id": "deployment:fixture",
+        });
+        let audit_payload = crate::audit::audit_canonical_payload(
+            None,
+            "principal:fixture-owner",
+            "",
+            &[],
+            "first-owner-authority",
+            "platform.first-owner.close",
+            None,
+            "bootstrap-closed",
+            None,
+            "closed",
+            &audit_detail,
+            "applied",
+        );
+        let audit_entry_hash =
+            crate::audit::chain_hash(crate::audit::AUDIT_CHAIN_GENESIS, &audit_payload);
         let snapshot = FirstOwnerClosureSnapshot {
             closure: FirstOwnerClosureRow {
                 deployment_id: "deployment:fixture".into(),
@@ -1114,7 +1601,7 @@ mod tests {
                 namespace_id: "first-owner-namespace:fixture".into(),
                 authority_namespace_digest: namespace_digest.clone(),
                 closure_status: "closed".into(),
-                closure_event_id: "first-owner-event:fixture".into(),
+                closure_event_id: "first-owner-closure-event:fixture".into(),
                 authority_sequence: 1,
                 first_owner_principal_id: "principal:fixture-owner".into(),
                 claim_request_digest: digest('2'),
@@ -1149,13 +1636,12 @@ mod tests {
                 to_stage: "bootstrap-closed".into(),
                 from_status: None,
                 to_status: "closed".into(),
-                detail: json!({
-                    "authority_namespace_digest": namespace_digest.clone(),
-                    "closure_certificate_digest": certificate_digest.clone(),
-                    "closure_event_id": "first-owner-event:fixture",
-                    "deployment_id": "deployment:fixture",
-                }),
+                detail: audit_detail,
                 outcome: "applied".into(),
+                prev_hash: crate::audit::AUDIT_CHAIN_GENESIS.into(),
+                entry_hash: audit_entry_hash,
+                has_predecessor: false,
+                predecessor_entry_hash: None,
             },
             domain_event: FirstOwnerDomainEventRow {
                 id: 1,
@@ -1168,7 +1654,7 @@ mod tests {
                 payload: json!({
                     "authority_namespace_digest": namespace_digest.clone(),
                     "closure_certificate_digest": certificate_digest.clone(),
-                    "closure_event_id": "first-owner-event:fixture",
+                    "closure_event_id": "first-owner-closure-event:fixture",
                 }),
                 occurred_at: closed_at_not_after,
             },
@@ -1185,6 +1671,289 @@ mod tests {
             closure_record_digest,
         };
         (snapshot, scope, expected, authority)
+    }
+
+    fn install_fixture() -> (
+        Vec<u8>,
+        String,
+        DeploymentScope,
+        RuntimeGuardExpectedValue,
+        FirstOwnerAuthorityAnchor,
+    ) {
+        let (snapshot, scope, expected, authority) = fixture();
+        (
+            snapshot.closure.certificate_bytes,
+            snapshot.closure.closure_certificate_digest,
+            scope,
+            expected,
+            authority,
+        )
+    }
+
+    fn verify_install_fixture(
+        bytes: Vec<u8>,
+        file_digest: &str,
+        scope: DeploymentScope,
+        expected: &RuntimeGuardExpectedValue,
+        requirement_digest: &str,
+        challenge_binding_digest: &str,
+        authority: FirstOwnerAuthorityAnchor,
+    ) -> Result<VerifiedFirstOwnerInstallCertificate, FirstOwnerRuntimeError> {
+        verify_first_owner_install_certificate_for_scope(
+            bytes,
+            file_digest,
+            scope,
+            expected,
+            requirement_digest,
+            challenge_binding_digest,
+            authority,
+        )
+    }
+
+    #[test]
+    fn detached_certificate_retains_exact_receipt_and_repeatable_readback_binding() {
+        let (bytes, file_digest, scope, expected, authority) = install_fixture();
+        let verified = verify_install_fixture(
+            bytes.clone(),
+            &file_digest,
+            scope,
+            &expected,
+            &digest('8'),
+            &digest('9'),
+            authority,
+        )
+        .unwrap();
+        assert_eq!(verified.expected_value(), &expected);
+        assert_eq!(
+            verified.installation_binding().certificate_digest(),
+            file_digest
+        );
+        let installation_valid_until = timestamp("2026-01-01T00:05:00Z");
+        assert_eq!(
+            verified.installation_binding().installation_valid_until(),
+            installation_valid_until
+        );
+        let first = verified.readback_expectation().unwrap();
+        let second = verified.readback_expectation().unwrap();
+        assert_eq!(first.expected_value(), &expected);
+        assert_eq!(first.installation_binding(), second.installation_binding());
+
+        let authority = verified
+            .authorize_installation(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-01-01T00:00:01Z"),
+                not_after: timestamp("2026-01-01T00:04:59Z"),
+            })
+            .unwrap();
+        let marker_digest = authority.installation_binding().digest().to_owned();
+        assert_eq!(
+            authority.installation_binding().installation_valid_until(),
+            installation_valid_until
+        );
+        let (storage_bytes, readback) = authority.into_database_storage_parts();
+        assert_eq!(storage_bytes.as_ref(), bytes);
+        assert_eq!(readback.installation_binding().digest(), marker_digest);
+        assert_eq!(
+            readback.installation_binding().installation_valid_until(),
+            installation_valid_until
+        );
+    }
+
+    #[test]
+    fn deployment_scope_substitutions_are_rejected() {
+        for mutate in [0_u8, 1, 2] {
+            let (bytes, file_digest, mut scope, expected, authority) = install_fixture();
+            match mutate {
+                0 => scope.deployment_id = "deployment:substituted".into(),
+                1 => scope.trust_domain_ids = vec!["trust-domain:substituted".into()],
+                2 => scope.tenancy_mode = TenancyMode::MultiTenant,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                verify_install_fixture(
+                    bytes,
+                    &file_digest,
+                    scope,
+                    &expected,
+                    &digest('8'),
+                    &digest('9'),
+                    authority,
+                ),
+                Err(FirstOwnerRuntimeError::ProfileExpectationMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn expected_state_and_projection_digest_substitutions_are_rejected() {
+        for mutate in [0_u8, 1, 2] {
+            let (bytes, file_digest, scope, mut expected, authority) = install_fixture();
+            let RuntimeGuardExpectedValue::FirstOwnerPathClosed {
+                state_contract_version,
+                authority_namespace_digest,
+                closure_record_digest,
+                ..
+            } = &mut expected
+            else {
+                unreachable!();
+            };
+            match mutate {
+                0 => *state_contract_version = 2,
+                1 => *authority_namespace_digest = digest('a'),
+                2 => *closure_record_digest = digest('b'),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                verify_install_fixture(
+                    bytes,
+                    &file_digest,
+                    scope,
+                    &expected,
+                    &digest('8'),
+                    &digest('9'),
+                    authority,
+                ),
+                Err(FirstOwnerRuntimeError::ExpectedValueMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn detached_file_and_authority_substitutions_are_rejected() {
+        let (bytes, _, scope, expected, authority) = install_fixture();
+        assert!(matches!(
+            verify_install_fixture(
+                bytes,
+                &digest('c'),
+                scope,
+                &expected,
+                &digest('8'),
+                &digest('9'),
+                authority,
+            ),
+            Err(FirstOwnerRuntimeError::CertificateFileDigestMismatch)
+        ));
+
+        let (bytes, file_digest, scope, expected, mut authority) = install_fixture();
+        authority.minimum_authority_epoch = 2;
+        assert!(matches!(
+            verify_install_fixture(
+                bytes,
+                &file_digest,
+                scope,
+                &expected,
+                &digest('8'),
+                &digest('9'),
+                authority,
+            ),
+            Err(FirstOwnerRuntimeError::AuthorityBindingInvalid)
+        ));
+    }
+
+    #[test]
+    fn receipt_digest_substitution_changes_only_fresh_installation_identity() {
+        let (bytes, file_digest, scope, expected, authority) = install_fixture();
+        let exact = verify_install_fixture(
+            bytes.clone(),
+            &file_digest,
+            scope.clone(),
+            &expected,
+            &digest('8'),
+            &digest('9'),
+            authority.clone(),
+        )
+        .unwrap();
+        let exact_digest = exact.installation_binding().digest().to_owned();
+        let exact_reconciliation_digest = exact
+            .installation_binding()
+            .reconciliation_digest()
+            .to_owned();
+
+        let substituted = verify_install_fixture(
+            bytes,
+            &file_digest,
+            scope,
+            &expected,
+            &digest('a'),
+            &digest('b'),
+            authority,
+        )
+        .unwrap();
+        assert_ne!(exact_digest, substituted.installation_binding().digest());
+        assert_eq!(
+            exact_reconciliation_digest,
+            substituted.installation_binding().reconciliation_digest()
+        );
+        assert_eq!(
+            substituted.installation_binding().requirement_digest(),
+            digest('a')
+        );
+        assert_eq!(
+            substituted
+                .installation_binding()
+                .challenge_binding_digest(),
+            digest('b')
+        );
+
+        let (other_bytes, other_file_digest, other_scope, other_expected, other_authority) =
+            install_fixture();
+        let other = verify_install_fixture(
+            other_bytes,
+            &other_file_digest,
+            other_scope,
+            &other_expected,
+            &digest('8'),
+            &digest('9'),
+            other_authority,
+        )
+        .unwrap();
+        assert_ne!(
+            exact_reconciliation_digest,
+            other.installation_binding().reconciliation_digest()
+        );
+    }
+
+    #[test]
+    fn installation_trusted_interval_uses_inclusive_close_and_exclusive_expiry() {
+        let verify = || {
+            let (bytes, file_digest, scope, expected, authority) = install_fixture();
+            verify_install_fixture(
+                bytes,
+                &file_digest,
+                scope,
+                &expected,
+                &digest('8'),
+                &digest('9'),
+                authority,
+            )
+            .unwrap()
+        };
+        assert!(verify()
+            .authorize_installation(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-01-01T00:00:01Z"),
+                not_after: timestamp("2026-01-01T00:00:01Z"),
+            })
+            .is_ok());
+        assert!(matches!(
+            verify().authorize_installation(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-01-01T00:00:00Z"),
+                not_after: timestamp("2026-01-01T00:00:01Z"),
+            }),
+            Err(FirstOwnerRuntimeError::InstallationCapabilityInactive)
+        ));
+        assert!(matches!(
+            verify().authorize_installation(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-01-01T00:04:59Z"),
+                not_after: timestamp("2026-01-01T00:05:00Z"),
+            }),
+            Err(FirstOwnerRuntimeError::InstallationCapabilityInactive)
+        ));
+        assert!(matches!(
+            verify().authorize_installation(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-01-01T00:00:02Z"),
+                not_after: timestamp("2026-01-01T00:00:01Z"),
+            }),
+            Err(FirstOwnerRuntimeError::InvalidTrustedTimeWindow)
+        ));
     }
 
     #[test]
@@ -1230,14 +1999,17 @@ mod tests {
             canonical_json_bytes(&snapshot.closure.certificate_document).unwrap();
         assert_eq!(
             validate_snapshot(&snapshot, &scope, &expected, &authority),
-            Err(FirstOwnerRuntimeError::CertificateSchemaInvalid)
+            Err(FirstOwnerRuntimeError::CertificateNotCanonical)
         );
     }
 
     #[test]
     fn arbitrary_well_formed_signature_is_rejected() {
         let (mut snapshot, scope, expected, authority) = fixture();
-        let substituted_signature = vec![0x42; 64];
+        let substituted_signature = SigningKey::generate(&mut OsRng)
+            .sign(b"substituted first-owner certificate signature")
+            .to_bytes()
+            .to_vec();
         snapshot
             .closure
             .certificate_document
@@ -1260,6 +2032,18 @@ mod tests {
     }
 
     #[test]
+    fn stored_signature_byte_substitution_is_rejected_even_with_matching_row_digest() {
+        let (mut snapshot, scope, expected, authority) = fixture();
+        snapshot.closure.authority_signature[0] ^= 0x01;
+        snapshot.closure.authority_signature_digest =
+            sha256_digest(&snapshot.closure.authority_signature);
+        assert_eq!(
+            validate_snapshot(&snapshot, &scope, &expected, &authority),
+            Err(FirstOwnerRuntimeError::SignatureRepresentationInvalid)
+        );
+    }
+
+    #[test]
     fn privileged_domain_assignment_tamper_is_rejected() {
         let (mut snapshot, scope, expected, authority) = fixture();
         snapshot.assignments[0].principal_id = "principal:substituted-owner".into();
@@ -1277,6 +2061,23 @@ mod tests {
             validate_snapshot(&snapshot, &scope, &expected, &authority),
             Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid)
         );
+    }
+
+    #[test]
+    fn linked_audit_chain_witness_tamper_is_rejected() {
+        for mutation in 0_u8..3 {
+            let (mut snapshot, scope, expected, authority) = fixture();
+            match mutation {
+                0 => snapshot.audit.prev_hash = digest('a'),
+                1 => snapshot.audit.entry_hash = digest('b'),
+                2 => snapshot.audit.has_predecessor = true,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_snapshot(&snapshot, &scope, &expected, &authority),
+                Err(FirstOwnerRuntimeError::AtomicEvidenceInvalid)
+            );
+        }
     }
 
     #[test]

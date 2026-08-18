@@ -1428,6 +1428,36 @@ canonical certificate bytes. A changed certificate, assignment,
 linked evidence row, receipt value, channel, pool, session, or observation
 fails closed. This closed-state witness is not evidence that the bootstrap
 writer or operator ceremonies required by SB-BOOT and AC-023 are complete.
+
+The repository-local apply-only installation slice accepts only a complete
+detached certificate path/digest pair. It opens the normalized absolute JSON
+path through descriptor-pinned, no-symlink traversal, requires a stable regular
+file with a bounded size and non-writable group/other mode, and verifies its
+exact digest, canonical bytes, signature, authority pins, deployment scope,
+receipt binding, and trusted installation interval. Migration 213 performs a
+forward-only tenant-null correction with predecessor catalog attestation. The
+same outer migration transaction then consumes one in-process installation
+authority, invokes the migration-193 writer, clears the writer GUC, forces the
+five-domain completeness constraint, and reads back the closure, assignments,
+linked audit entry and predecessor, and domain event before retaining the
+stable migration-operation marker. Unknown-COMMIT handling performs marker and
+closure readback instead of blindly issuing the write again; later migration
+waves verify the existing closure before applying more DDL.
+
+This slice is not yet a production bootstrap ceremony. Production migration
+runtime render admission remains hard-fenced by
+`production_migration_runtime_render_admission_is_implemented() == false`.
+The moved Rust authority is not an externally monotonic one-use attempt; the
+checked-in Job imports path and digest strings but has no certificate
+materializer or independently validated materialization receipt; and no live
+PostgreSQL 18 concurrency, rollback, lost-COMMIT, restore, or future-upgrade
+receipt exists. Current audit readback proves the linked entry and immediate
+predecessor, not the complete historical chain, and deployment provisioning
+still owns parent-directory and hostile-device controls. Ownership transfer,
+step-up, maker-checker removal, last-owner protection, recovery, WebAuthn, and
+break-glass governance are also absent. Therefore SB-BOOT-01, SB-BOOT-02,
+SB-BOOT-03, and AC-023 remain partial.
+
 Digest-valued expectations use the named canonical contracts
 `ryuki-postgresql-database-identity-v1`,
 `ryuki-postgresql-storage-binding-v1`,

@@ -191,6 +191,10 @@ pub(crate) const FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT_ENV: &str =
     "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_FINGERPRINT";
 pub(crate) const FIRST_OWNER_AUTHORITY_MIN_EPOCH_ENV: &str =
     "RYUKI_FIRST_OWNER_AUTHORITY_MIN_EPOCH";
+pub(crate) const FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV: &str =
+    "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH";
+pub(crate) const FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV: &str =
+    "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_PATH_ENV: &str = "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_DIGEST_ENV: &str =
     "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST";
@@ -251,6 +255,9 @@ const PACKAGE_EXIT_RECEIPT_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/package-exit-receipt.schema.json");
 const PRODUCTION_BUILD_MANIFEST_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/production-build-manifest.schema.json");
+const FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA: &str = include_str!(
+    "../../../catalog/security-contracts/v1/first-owner-closure-certificate.schema.json"
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartupTrustCheckpointAuthorityPins {
@@ -314,6 +321,17 @@ pub(crate) struct StartupFirstOwnerAuthorityPins {
     pub(crate) minimum_authority_epoch: u64,
 }
 
+/// Detached one-shot installation input for production apply-only mode.
+///
+/// The pair is parsed without touching the path. Only the later migration
+/// admission boundary may open and consume it, after all independent runtime
+/// prerequisites have passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupFirstOwnerClosureCertificatePins {
+    pub(crate) path: PathBuf,
+    pub(crate) digest: String,
+}
+
 /// Detached build identity selected by independently governed deployment
 /// configuration. The manifest deliberately lives outside the rollbackable
 /// security-contract root and is bound by the digest supplied here.
@@ -336,6 +354,7 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) postgresql_infrastructure_attestation:
         Option<StartupPostgresqlInfrastructureAttestationPins>,
     pub(crate) first_owner_authority: Option<StartupFirstOwnerAuthorityPins>,
+    pub(crate) first_owner_closure_certificate: Option<StartupFirstOwnerClosureCertificatePins>,
     pub(crate) production_build_manifest: Option<StartupProductionBuildManifestPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
@@ -386,6 +405,7 @@ impl StartupSecurityPins {
         let postgresql_infrastructure_attestation =
             optional_postgresql_infrastructure_attestation(&mut get)?;
         let first_owner_authority = optional_first_owner_authority(&mut get)?;
+        let first_owner_closure_certificate = optional_first_owner_closure_certificate(&mut get)?;
         let production_build_manifest = optional_production_build_manifest(&mut get)?;
 
         if let Some(postgresql) = postgresql_infrastructure_attestation.as_ref() {
@@ -533,6 +553,11 @@ impl StartupSecurityPins {
                 "the first-owner authority binding beginning with {FIRST_OWNER_AUTHORITY_ID_ENV} is production-only and must be unset for {profile_raw}"
             ));
         }
+        if !security_profile.is_production() && first_owner_closure_certificate.is_some() {
+            return Err(format!(
+                "{FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV} and {FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV} are production apply-only inputs and must be unset for {profile_raw}"
+            ));
+        }
 
         Ok(Self {
             contract_root,
@@ -545,10 +570,28 @@ impl StartupSecurityPins {
             public_ingress_attestation,
             postgresql_infrastructure_attestation,
             first_owner_authority,
+            first_owner_closure_certificate,
             production_build_manifest,
             deployment_id,
             security_profile,
         })
+    }
+
+    /// The detached certificate is one-shot apply-only input. Serving and
+    /// verify-only processes must not retain even its path/digest pins.
+    pub(crate) fn validate_first_owner_certificate_mode(
+        &self,
+        mode: crate::database::MigrationStartupMode,
+    ) -> Result<(), String> {
+        if self.first_owner_closure_certificate.is_some()
+            && mode != crate::database::MigrationStartupMode::ApplyOnly
+        {
+            Err(format!(
+                "{FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV} and {FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV} may be configured only for exact apply-only mode"
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -4125,7 +4168,7 @@ mod runtime_admission {
         }
     }
 
-    fn first_owner_authority_from_pins(
+    pub(super) fn first_owner_authority_from_pins(
         pins: &StartupFirstOwnerAuthorityPins,
     ) -> Result<
         crate::first_owner_runtime::FirstOwnerAuthorityAnchor,
@@ -5771,6 +5814,12 @@ pub(crate) struct PendingProductionMigrationTarget {
     boundary: Box<VerifiedProductionBoundary>,
     role_contract: crate::database::MigrationRoleContract,
     receipt_bound_database_target: RuntimeGuardExpectedValue,
+    // `None` exists only while the private structural verifier assembles the
+    // database half of admission. The production constructor attaches the
+    // verified proof before this value can leave the module; successful
+    // session attestation fails closed if that invariant is ever violated.
+    first_owner_install_certificate:
+        Option<crate::first_owner_runtime::VerifiedFirstOwnerInstallCertificate>,
     expected_migration_inventory_digest: String,
     requirement_digest: String,
     challenge_binding_digest: String,
@@ -5792,6 +5841,14 @@ impl fmt::Debug for PendingProductionMigrationTarget {
                 "receipt_bound_database_target_guard",
                 &self.receipt_bound_database_target.guard_id(),
             )
+            .field(
+                "first_owner_installation_binding",
+                &self
+                    .first_owner_install_certificate
+                    .as_ref()
+                    .map(|certificate| certificate.installation_binding().digest())
+                    .unwrap_or("[ASSEMBLY-INCOMPLETE]"),
+            )
             .field("request_tag", &"[DERIVED-FROM-TLS-CHANNEL]")
             .field("attestation_authority", &self.pins.authority_id)
             .field("role_contract", &"[RECEIPT-BOUND]")
@@ -5808,6 +5865,9 @@ pub(crate) struct VerifiedProductionMigrationExecution {
     role_contract: crate::database::MigrationRoleContract,
     expected_migration_inventory_digest: String,
     verified_infrastructure: VerifiedPostgresqlInfrastructureAttestation,
+    first_owner_installation_binding: crate::first_owner_runtime::FirstOwnerInstallationBinding,
+    first_owner_install_certificate:
+        Option<crate::first_owner_runtime::VerifiedFirstOwnerInstallCertificate>,
 }
 
 /// Non-sensitive projection retained after a production migration commits.
@@ -5889,6 +5949,10 @@ impl fmt::Debug for VerifiedProductionMigrationExecution {
             )
             .field("role_contract", &"[RECEIPT-BOUND]")
             .field("verified_infrastructure", &self.verified_infrastructure)
+            .field(
+                "first_owner_installation_binding",
+                &self.first_owner_installation_binding.digest(),
+            )
             .finish()
     }
 }
@@ -5980,7 +6044,19 @@ impl VerifiedProductionMigrationExecution {
             .ensure_fresh(trusted_now)
             .map_err(|error| {
                 format!("verified PostgreSQL-infrastructure proof is stale before DDL: {error}")
-            })
+            })?;
+        validate_first_owner_migration_binding(
+            self.boundary.as_ref(),
+            &self.first_owner_installation_binding,
+        )?;
+        if let Some(certificate) = self.first_owner_install_certificate.as_ref() {
+            certificate.readback_expectation().map_err(|error| {
+                format!(
+                    "verified first-owner installation certificate lost integrity before DDL: {error}"
+                )
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn role_contract(&self) -> &crate::database::MigrationRoleContract {
@@ -6035,9 +6111,108 @@ impl VerifiedProductionMigrationExecution {
         &self.verified_infrastructure
     }
 
+    pub(crate) fn first_owner_installation_binding(
+        &self,
+    ) -> &crate::first_owner_runtime::FirstOwnerInstallationBinding {
+        &self.first_owner_installation_binding
+    }
+
+    /// Exclusive certificate-expiry fence for a fresh installation
+    /// transaction. Lost-COMMIT reconciliation deliberately remains timeless.
+    pub(crate) fn first_owner_installation_valid_until(&self) -> DateTime<Utc> {
+        self.first_owner_installation_binding
+            .installation_valid_until()
+    }
+
+    pub(crate) fn ensure_first_owner_installation_fresh(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        if now >= self.first_owner_installation_valid_until() {
+            Err(
+                "first-owner installation capability expired before the atomic transaction committed"
+                    .into(),
+            )
+        } else {
+            validate_first_owner_migration_binding(
+                self.boundary.as_ref(),
+                &self.first_owner_installation_binding,
+            )
+        }
+    }
+
+    /// Build the read-only reconciliation witness without consuming the
+    /// one-shot write authority. This is the only first-owner operation used
+    /// on the lost-COMMIT branch.
+    pub(crate) fn first_owner_readback_expectation(
+        &self,
+    ) -> Result<
+        crate::first_owner_runtime::FirstOwnerInstallationReadbackExpectation,
+        crate::first_owner_runtime::FirstOwnerRuntimeError,
+    > {
+        self.first_owner_install_certificate
+            .as_ref()
+            .ok_or(crate::first_owner_runtime::FirstOwnerRuntimeError::ReceiptBindingInvalid)?
+            .readback_expectation()
+    }
+
+    /// Consume the certificate exactly once and mint the narrow SQL-writer
+    /// authority at the selected migration boundary.
+    pub(crate) fn take_first_owner_installation_authority(
+        &mut self,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<crate::first_owner_runtime::VerifiedFirstOwnerInstallationAuthority, String> {
+        validate_first_owner_migration_binding(
+            self.boundary.as_ref(),
+            &self.first_owner_installation_binding,
+        )?;
+        self.first_owner_install_certificate
+            .take()
+            .ok_or_else(|| {
+                "first-owner installation authority was requested more than once".to_string()
+            })?
+            .authorize_installation(trusted_now)
+            .map_err(|error| format!("first-owner installation capability is not active: {error}"))
+    }
+
     pub(crate) fn session_binding(&self) -> &PostgresqlSessionBinding {
         self.verified_infrastructure.session_binding()
     }
+}
+
+fn validate_first_owner_migration_binding(
+    boundary: &VerifiedProductionBoundary,
+    binding: &crate::first_owner_runtime::FirstOwnerInstallationBinding,
+) -> Result<(), String> {
+    let challenge = runtime_admission::exact_challenge(boundary, GuardId::FirstOwnerPathClosed)
+        .map_err(|error| {
+            format!("production migration lost its exact first-owner challenge: {error}")
+        })?;
+    let RuntimeGuardExpectedValue::FirstOwnerPathClosed {
+        deployment_id,
+        state_contract_version,
+        authority_namespace_digest,
+        closure_record_digest,
+    } = challenge.expected_value()
+    else {
+        return Err(
+            "production migration first-owner challenge changed to an unexpected guard kind".into(),
+        );
+    };
+    if binding.deployment_id() != deployment_id
+        || *state_contract_version
+            != ryuki_core::security_profile::FIRST_OWNER_STATE_CONTRACT_VERSION
+        || binding.authority_namespace_digest() != authority_namespace_digest
+        || binding.closure_record_digest() != closure_record_digest
+        || binding.requirement_digest() != challenge.requirement_digest()
+        || binding.challenge_binding_digest() != challenge.challenge_binding_digest()
+    {
+        return Err(
+            "verified first-owner installation binding differs from the retained production boundary"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn ensure_production_migration_execution_before_expiry(
@@ -6226,6 +6401,24 @@ impl PendingProductionMigrationTarget {
                     .into(),
             );
         }
+        let first_owner_install_certificate = self
+            .first_owner_install_certificate
+            .as_ref()
+            .ok_or_else(|| {
+                "production migration target has no verified first-owner installation certificate"
+                    .to_string()
+            })?;
+        validate_first_owner_migration_binding(
+            self.boundary.as_ref(),
+            first_owner_install_certificate.installation_binding(),
+        )?;
+        first_owner_install_certificate
+            .readback_expectation()
+            .map_err(|error| {
+                format!(
+                    "production migration first-owner certificate lost integrity before target attestation: {error}"
+                )
+            })?;
         let RuntimeGuardExpectedValue::DurablePostgresql {
             database_provider,
             server_major_version,
@@ -6351,6 +6544,13 @@ impl PendingProductionMigrationTarget {
             role_contract: self.role_contract,
             expected_migration_inventory_digest: self.expected_migration_inventory_digest,
             verified_infrastructure,
+            first_owner_installation_binding: self
+                .first_owner_install_certificate
+                .as_ref()
+                .expect("verified above")
+                .installation_binding()
+                .clone(),
+            first_owner_install_certificate: self.first_owner_install_certificate,
         };
         execution.ensure_fresh(verified_at)?;
         Ok(execution)
@@ -6361,17 +6561,25 @@ fn verify_production_migration_admission(
     boundary: Box<VerifiedProductionBoundary>,
     mode: crate::database::MigrationStartupMode,
     pins: StartupPostgresqlInfrastructureAttestationPins,
+    first_owner_install_certificate:
+        crate::first_owner_runtime::VerifiedFirstOwnerInstallCertificate,
     now: DateTime<Utc>,
 ) -> Result<PendingProductionMigrationTarget, String> {
     let embedded_digest = crate::database::embedded_migration_inventory_digest()
         .map_err(|error| format!("cannot derive the embedded migration inventory: {error}"))?;
-    verify_production_migration_admission_with_inventory_digest(
+    let mut admission = verify_production_migration_admission_with_inventory_digest(
         pins,
         boundary,
         mode,
         now,
         &embedded_digest,
-    )
+    )?;
+    validate_first_owner_migration_binding(
+        admission.boundary.as_ref(),
+        first_owner_install_certificate.installation_binding(),
+    )?;
+    admission.first_owner_install_certificate = Some(first_owner_install_certificate);
+    Ok(admission)
 }
 
 fn verify_production_migration_admission_with_inventory_digest(
@@ -6439,6 +6647,7 @@ fn verify_production_migration_admission_with_inventory_digest(
         boundary,
         role_contract,
         receipt_bound_database_target,
+        first_owner_install_certificate: None,
         expected_migration_inventory_digest,
         requirement_digest,
         challenge_binding_digest,
@@ -7054,6 +7263,16 @@ impl SecurityContractContext {
                             .into(),
                     );
                 }
+                // The detached certificate is deliberately opened only after
+                // live render admission. A disabled production path therefore
+                // cannot consume or even read the one-shot deployment input.
+                let first_owner_install_certificate =
+                    load_first_owner_install_certificate_candidate(
+                        pins,
+                        &self.contract_root,
+                        &self.profile,
+                        boundary.as_ref(),
+                    )?;
                 let authority = pins
                     .postgresql_infrastructure_attestation
                     .as_ref()
@@ -7062,8 +7281,13 @@ impl SecurityContractContext {
                             .to_string()
                     })?
                     .clone();
-                let admission =
-                    verify_production_migration_admission(boundary, mode, authority, now)?;
+                let admission = verify_production_migration_admission(
+                    boundary,
+                    mode,
+                    authority,
+                    first_owner_install_certificate,
+                    now,
+                )?;
                 admission
                     .role_contract
                     .validate_optional_environment_consistency()?;
@@ -8488,6 +8712,65 @@ fn load_production_build_manifest_candidate(
         raw_bytes: bytes.into_boxed_slice(),
         document,
     })
+}
+
+/// Load and verify the detached one-shot first-owner installation input.
+///
+/// Callers must place this after the live render-admission fence. Merely
+/// parsing startup environment cannot touch the path or mint installation
+/// authority.
+fn load_first_owner_install_certificate_candidate(
+    pins: &StartupSecurityPins,
+    contract_root: &Path,
+    profile: &DeploymentSecurityProfile,
+    boundary: &VerifiedProductionBoundary,
+) -> Result<crate::first_owner_runtime::VerifiedFirstOwnerInstallCertificate, String> {
+    let binding = pins
+        .first_owner_closure_certificate
+        .as_ref()
+        .ok_or_else(|| {
+            "production apply-only has no independently pinned first-owner closure certificate"
+                .to_string()
+        })?;
+    if binding.path.starts_with(contract_root) {
+        return Err(
+            "first-owner closure certificate must be detached from the rollbackable security-contract root"
+                .into(),
+        );
+    }
+    let bytes = read_pinned_absolute_regular_file(
+        "first-owner closure certificate",
+        &binding.path,
+        &binding.digest,
+        u64::try_from(ryuki_core::security_profile::FIRST_OWNER_CLOSURE_CERTIFICATE_MAX_BYTES)
+            .expect("first-owner certificate limit fits u64"),
+    )?;
+    let value = parse_json_strict(&bytes)
+        .map_err(|error| format!("first-owner closure certificate JSON is invalid: {error}"))?;
+    validate_against_schema(
+        "first-owner closure certificate",
+        FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA,
+        &value,
+    )?;
+    let challenge = runtime_admission::exact_challenge(boundary, GuardId::FirstOwnerPathClosed)
+        .map_err(|error| {
+            format!("production apply-only lost its exact first-owner closure challenge: {error}")
+        })?;
+    let authority_pins = pins.first_owner_authority.as_ref().ok_or_else(|| {
+        "production apply-only has no independently pinned first-owner authority".to_string()
+    })?;
+    let authority = runtime_admission::first_owner_authority_from_pins(authority_pins)
+        .map_err(|error| format!("first-owner authority pins are invalid: {error}"))?;
+    crate::first_owner_runtime::verify_first_owner_install_certificate(
+        bytes,
+        &binding.digest,
+        profile,
+        challenge.expected_value(),
+        challenge.requirement_digest(),
+        challenge.challenge_binding_digest(),
+        authority,
+    )
+    .map_err(|error| format!("first-owner closure certificate verification failed: {error}"))
 }
 
 impl ProductionBuildManifestCandidate {
@@ -10449,6 +10732,32 @@ fn optional_first_owner_authority(
     }))
 }
 
+fn optional_first_owner_closure_certificate(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupFirstOwnerClosureCertificatePins>, String> {
+    let path = optional_unicode(get, FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV)?;
+    let digest = optional_unicode(get, FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV)?;
+    if path.is_none() && digest.is_none() {
+        return Ok(None);
+    }
+    let path = path.ok_or_else(|| {
+        format!(
+            "{FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV} is required when {FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV} is configured"
+        )
+    })?;
+    let digest = digest.ok_or_else(|| {
+        format!(
+            "{FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV} is required when {FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV} is configured"
+        )
+    })?;
+    validate_json_absolute_path(FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV, &path)?;
+    validate_digest_pin(FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV, &digest)?;
+    Ok(Some(StartupFirstOwnerClosureCertificatePins {
+        path: PathBuf::from(path),
+        digest,
+    }))
+}
+
 fn optional_production_build_manifest(
     get: &mut impl FnMut(&str) -> Option<OsString>,
 ) -> Result<Option<StartupProductionBuildManifestPins>, String> {
@@ -10552,45 +10861,7 @@ fn read_pinned_absolute_regular_file(
         .to_str()
         .ok_or_else(|| format!("{label} path must contain valid UTF-8"))?;
     validate_json_absolute_path(label, raw_path)?;
-
-    let components = path.components().collect::<Vec<_>>();
-    let mut current = PathBuf::new();
-    for (index, component) in components.iter().enumerate() {
-        current.push(component.as_os_str());
-        if matches!(component, Component::RootDir) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|error| format!("{label} is unavailable: {error}"))?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("{label} path contains a symlink"));
-        }
-        let final_component = index + 1 == components.len();
-        if (final_component && !metadata.is_file()) || (!final_component && !metadata.is_dir()) {
-            return Err(format!(
-                "{label} path must resolve through regular directories to a regular file"
-            ));
-        }
-    }
-
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("{label} metadata is unavailable: {error}"))?;
-    if metadata.len() == 0 || metadata.len() > max_bytes {
-        return Err(format!(
-            "{label} must be non-empty and no larger than {max_bytes} bytes"
-        ));
-    }
-    let bytes = fs::read(path).map_err(|error| format!("{label} read failed: {error}"))?;
-    if bytes.len() as u64 != metadata.len() {
-        return Err(format!("{label} changed while being read"));
-    }
-    let actual_digest = raw_digest(&bytes);
-    if actual_digest != expected_digest {
-        return Err(format!(
-            "{label} digest mismatch: expected {expected_digest}, got {actual_digest}"
-        ));
-    }
-    Ok(bytes)
+    crate::pinned_file::read_stable_pinned_file(label, path, expected_digest, max_bytes)
 }
 
 fn validate_namespaced_id(name: &str, value: &str, prefix: &str) -> Result<(), String> {
@@ -15806,6 +16077,7 @@ mod tests {
                 public_ingress_attestation: None,
                 postgresql_infrastructure_attestation: None,
                 first_owner_authority: None,
+                first_owner_closure_certificate: None,
                 production_build_manifest: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
@@ -16818,6 +17090,103 @@ mod tests {
         let production_pins =
             StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
                 .expect("production pins are complete");
+        assert!(production_pins.first_owner_closure_certificate.is_none());
+
+        let first_owner_certificate_path =
+            "/run/ryuki/first-owner/first-owner-closure-certificate.json";
+        let mut production_with_first_owner_certificate = production_complete.clone();
+        production_with_first_owner_certificate.insert(
+            FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV.into(),
+            OsString::from(first_owner_certificate_path),
+        );
+        production_with_first_owner_certificate.insert(
+            FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV.into(),
+            OsString::from(&digest),
+        );
+        let production_certificate_pins = StartupSecurityPins::from_source(|name| {
+            production_with_first_owner_certificate.get(name).cloned()
+        })
+        .expect("production first-owner certificate pins are complete");
+        let certificate_pins = production_certificate_pins
+            .first_owner_closure_certificate
+            .as_ref()
+            .expect("production first-owner certificate binding");
+        assert_eq!(
+            certificate_pins.path,
+            PathBuf::from(first_owner_certificate_path)
+        );
+        assert_eq!(certificate_pins.digest, digest);
+        production_certificate_pins
+            .validate_first_owner_certificate_mode(crate::database::MigrationStartupMode::ApplyOnly)
+            .expect("apply-only may retain the detached certificate pins");
+        for forbidden_mode in [
+            crate::database::MigrationStartupMode::LocalAuto,
+            crate::database::MigrationStartupMode::VerifyOnly,
+        ] {
+            assert!(production_certificate_pins
+                .validate_first_owner_certificate_mode(forbidden_mode)
+                .unwrap_err()
+                .contains("exact apply-only"));
+        }
+
+        for missing in [
+            FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV,
+            FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV,
+        ] {
+            let error = StartupSecurityPins::from_source(|name| {
+                (name != missing)
+                    .then(|| production_with_first_owner_certificate.get(name).cloned())
+                    .flatten()
+            })
+            .unwrap_err();
+            assert!(error.contains(missing));
+        }
+
+        for invalid_path in [
+            "relative/first-owner-closure-certificate.json",
+            "/run/ryuki/first-owner/../first-owner-closure-certificate.json",
+            "/run/ryuki/first-owner/first-owner-closure-certificate.txt",
+            "/run//ryuki/first-owner/first-owner-closure-certificate.json",
+        ] {
+            let mut invalid = production_with_first_owner_certificate.clone();
+            invalid.insert(
+                FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV.into(),
+                OsString::from(invalid_path),
+            );
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains("normalized absolute .json")
+            );
+        }
+
+        let mut invalid_digest = production_with_first_owner_certificate.clone();
+        invalid_digest.insert(
+            FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV.into(),
+            OsString::from(format!("sha256:{}", "A".repeat(64))),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| invalid_digest.get(name).cloned())
+                .unwrap_err()
+                .contains(FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV)
+        );
+
+        let mut nonproduction_with_first_owner_certificate = values.clone();
+        nonproduction_with_first_owner_certificate.insert(
+            FIRST_OWNER_CLOSURE_CERTIFICATE_PATH_ENV.into(),
+            OsString::from(first_owner_certificate_path),
+        );
+        nonproduction_with_first_owner_certificate.insert(
+            FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST_ENV.into(),
+            OsString::from(&digest),
+        );
+        assert!(StartupSecurityPins::from_source(|name| {
+            nonproduction_with_first_owner_certificate
+                .get(name)
+                .cloned()
+        })
+        .unwrap_err()
+        .contains("production apply-only"));
         for (label, socket_path, public_key) in [
             (
                 "conformance trust-checkpoint",
@@ -17199,13 +17568,17 @@ mod tests {
         .contains("nonzero"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn detached_build_manifest_read_is_exact_bounded_and_regular() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = TempDir::new().expect("temporary build-manifest root");
         let root = fs::canonicalize(temp.path()).expect("canonical temporary root");
         let path = root.join("production-build-manifest.json");
         let bytes = br#"{"contract_kind":"production-build-manifest"}"#;
         fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let digest = raw_digest(bytes);
 
         assert_eq!(

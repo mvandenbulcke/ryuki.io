@@ -756,22 +756,47 @@
       "trace_id": "TRACE-SB-BOOT-01-AC-023",
       "implementation_status": "partial",
       "source_paths": [
-        "sources/ryuki-core/src/security_profile.rs",
+        "catalog/security-contracts/v1/first-owner-closure-certificate.schema.json",
+        "deploy/kubernetes/operations/migration-cutover-contract.yaml",
+        "deploy/kubernetes/operations/migration-job.yaml",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/database.rs",
         "sources/ryuki-api/src/first_owner_runtime.rs",
-        "sources/ryuki-api/src/security_contracts.rs"
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/pinned_file.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
       ],
       "migration_paths": [
-        "migrations/193_first_owner_closure_records.sql"
+        "migrations/193_first_owner_closure_records.sql",
+        "migrations/197_production_migration_operation_markers.sql",
+        "migrations/213_first_owner_deployment_scope.sql"
       ],
       "test_paths": [
-        "sources/ryuki-core/src/security_profile.rs",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/database.rs",
         "sources/ryuki-api/src/first_owner_runtime.rs",
-        "sources/ryuki-api/src/security_contracts.rs"
+        "sources/ryuki-api/src/pinned_file.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "tests/kubernetes_integration_test.rs"
       ],
       "blockers": [
         {
           "kind": "repository_implementation",
-          "detail": "The repository can store and verify permanent closure evidence, but no executable first-owner claim path verifies expiry, consumes one capability atomically, calls the owner-only SQL writer, or proves concurrent-winner and replay behavior."
+          "detail": "The repository-local apply-only installer verifies a canonical detached certificate, consumes a non-cloneable in-process authority, writes and reads back the exact five-domain closure transaction, and reconciles an unknown COMMIT outcome. Production final-render admission remains deliberately false, however, and no externally monotonic one-use capability or admitted certificate materializer with a durable materialization receipt exists."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No revision-bound live PostgreSQL evidence yet proves concurrent-winner, replay, forced rollback, lost-COMMIT reconciliation, or restore behavior for the first-owner installation transaction."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No adopted deployment has materialized and read back the exact pinned certificate path and digest or a durable materialization receipt; the checked-in final-render path remains hard-fenced."
         }
       ],
       "dependency_control_ids": []
@@ -780,22 +805,47 @@
       "trace_id": "TRACE-SB-BOOT-02-AC-023",
       "implementation_status": "partial",
       "source_paths": [
-        "sources/ryuki-core/src/security_profile.rs",
+        "catalog/security-contracts/v1/first-owner-closure-certificate.schema.json",
+        "deploy/kubernetes/operations/migration-cutover-contract.yaml",
+        "deploy/kubernetes/operations/migration-job.yaml",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/database.rs",
         "sources/ryuki-api/src/first_owner_runtime.rs",
-        "sources/ryuki-api/src/security_contracts.rs"
+        "sources/ryuki-api/src/main.rs",
+        "sources/ryuki-api/src/pinned_file.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
       ],
       "migration_paths": [
-        "migrations/193_first_owner_closure_records.sql"
+        "migrations/193_first_owner_closure_records.sql",
+        "migrations/197_production_migration_operation_markers.sql",
+        "migrations/213_first_owner_deployment_scope.sql"
       ],
       "test_paths": [
-        "sources/ryuki-core/src/security_profile.rs",
+        "scripts/validator-rs/src/kubernetes_manifest.rs",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/database.rs",
         "sources/ryuki-api/src/first_owner_runtime.rs",
-        "sources/ryuki-api/src/security_contracts.rs"
+        "sources/ryuki-api/src/pinned_file.rs",
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs",
+        "tests/kubernetes_integration_test.rs"
       ],
       "blockers": [
         {
           "kind": "repository_implementation",
-          "detail": "Immutable closure readback exists, but initial claim consumption, restore and rollback reconciliation, explicit recovery, and end-to-end proof that no state transition reopens bootstrap are absent."
+          "detail": "The repository-local installer enforces forward-only closure state and stable reconciliation markers, but production final-render admission remains deliberately false and the install is not bound to an externally monotonic one-use capability or admitted materialization receipt."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No revision-bound live PostgreSQL evidence yet proves concurrent replay refusal, forced rollback, lost-COMMIT reconciliation, restore behavior, and the absence of any transition that reopens bootstrap."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No adopted deployment has read back the certificate materialization, immutable path and digest, one-use authority, closure rows, audit rows, and reconciliation marker as one production evidence set."
         }
       ],
       "dependency_control_ids": []
@@ -804,22 +854,38 @@
       "trace_id": "TRACE-SB-BOOT-03-AC-023",
       "implementation_status": "partial",
       "source_paths": [
-        "sources/ryuki-core/src/security_profile.rs",
+        "catalog/security-contracts/v1/first-owner-closure-certificate.schema.json",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/database.rs",
         "sources/ryuki-api/src/first_owner_runtime.rs",
-        "sources/ryuki-api/src/security_contracts.rs"
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
       ],
       "migration_paths": [
-        "migrations/193_first_owner_closure_records.sql"
+        "migrations/193_first_owner_closure_records.sql",
+        "migrations/213_first_owner_deployment_scope.sql"
       ],
       "test_paths": [
-        "sources/ryuki-core/src/security_profile.rs",
+        "scripts/validator-rs/src/security_conformance.rs",
+        "sources/ryuki-api/src/audit.rs",
+        "sources/ryuki-api/src/database.rs",
         "sources/ryuki-api/src/first_owner_runtime.rs",
-        "sources/ryuki-api/src/security_contracts.rs"
+        "sources/ryuki-api/src/security_contracts.rs",
+        "sources/ryuki-core/src/security_profile.rs"
       ],
       "blockers": [
         {
           "kind": "repository_implementation",
-          "detail": "Five signed initial domain assignments are verified, but distinct privileged actions and roles, ownership transfer, step-up, maker-checker, last-owner protection, recovery, and break-glass workflows are not implemented."
+          "detail": "The signed certificate and transactional installer cover the exact five initial domain assignments only. Distinct privileged actions and roles, ownership transfer, step-up, maker-checker, last-owner protection, recovery, break-glass workflows, and the broader SB-BOOT-03 ownership-governance lifecycle remain unimplemented."
+        },
+        {
+          "kind": "runtime_evidence",
+          "detail": "No revision-bound live PostgreSQL evidence yet proves the initial assignment ceremony or any governed ownership-lifecycle transition."
+        },
+        {
+          "kind": "deployment_evidence",
+          "detail": "No adopted deployment has supplied and read back the operator governance, authority separation, recovery, and break-glass evidence required to close SB-BOOT-03 and AC-023."
         }
       ],
       "dependency_control_ids": []

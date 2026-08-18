@@ -77,7 +77,7 @@ const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
 
-const SCHEMAS: [(&str, &str); 18] = [
+const SCHEMAS: [(&str, &str); 19] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -97,6 +97,10 @@ const SCHEMAS: [(&str, &str); 18] = [
     (
         "deployed-workload-attestation-envelope.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/deployed-workload-attestation-envelope.schema.json",
+    ),
+    (
+        "first-owner-closure-certificate.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/first-owner-closure-certificate.schema.json",
     ),
     (
         "conformance-trust-root-registry.schema.json",
@@ -9331,6 +9335,71 @@ mod tests {
         })
     }
 
+    fn first_owner_closure_certificate_fixture() -> Value {
+        let digest = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        let principal_id = "principal:validator-first-owner";
+        json!({
+            "schema_version": "1.0.0",
+            "contract_kind": "first-owner-closure-certificate",
+            "canonicalization": "ryuki-canonical-json-v1",
+            "signature_algorithm": "ed25519",
+            "authority_namespace": {
+                "state_contract_version": 1,
+                "deployment_id": "deployment:validator-fixture",
+                "trust_domain_ids": ["trust-domain:validator"],
+                "tenancy_mode": "single_tenant",
+                "tenant_id": null,
+                "authority_id": "first-owner-authority:validator",
+                "authority_key_id": "first-owner-authority-key:validator",
+                "authority_public_key_fingerprint": digest('a'),
+                "authority_epoch": 1,
+                "namespace_id": "first-owner-namespace:validator"
+            },
+            "closure": {
+                "state_contract_version": 1,
+                "deployment_id": "deployment:validator-fixture",
+                "authority_namespace_digest": digest('b'),
+                "status": "closed",
+                "closure_event_id": "first-owner-closure-event:validator",
+                "authority_sequence": 1,
+                "first_owner_principal_id": principal_id,
+                "claim_request_digest": digest('c'),
+                "capability_id": "first-owner-capability:validator",
+                "capability_expires_at": "2026-08-01T00:10:00Z",
+                "closed_at_not_before": "2026-08-01T00:00:00Z",
+                "closed_at_not_after": "2026-08-01T00:00:01Z"
+            },
+            "privileged_domain_assignments": [
+                {
+                    "assignment_event_id": "first-owner-assignment-event:audit",
+                    "domain_id": "audit-administration",
+                    "principal_id": principal_id
+                },
+                {
+                    "assignment_event_id": "first-owner-assignment-event:identity",
+                    "domain_id": "identity-administration",
+                    "principal_id": principal_id
+                },
+                {
+                    "assignment_event_id": "first-owner-assignment-event:execution",
+                    "domain_id": "live-execution-administration",
+                    "principal_id": principal_id
+                },
+                {
+                    "assignment_event_id": "first-owner-assignment-event:policy",
+                    "domain_id": "policy-administration",
+                    "principal_id": principal_id
+                },
+                {
+                    "assignment_event_id": "first-owner-assignment-event:secret",
+                    "domain_id": "secret-key-custody",
+                    "principal_id": principal_id
+                }
+            ],
+            "signature_base64": format!("{}==", "A".repeat(86))
+        })
+    }
+
     fn add_production_migration_overlay(profile: &mut Value) {
         profile["migration_overlay"] = json!({
             "overlay_id": "migration-overlay:production-test",
@@ -9848,6 +9917,78 @@ mod tests {
         );
 
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn first_owner_closure_certificate_schema_is_cataloged_with_canonical_identity() {
+        const SCHEMA_NAME: &str = "first-owner-closure-certificate.schema.json";
+        const SCHEMA_ID: &str =
+            "https://ryuki.io/schemas/security-contracts/v1/first-owner-closure-certificate.schema.json";
+        let schema = load(&format!("catalog/security-contracts/v1/{SCHEMA_NAME}"));
+        let mut errors = Vec::new();
+
+        assert!(
+            SCHEMAS.contains(&(SCHEMA_NAME, SCHEMA_ID)),
+            "first-owner closure certificate must be registered in the schema catalog"
+        );
+        assert_eq!(
+            ryuki_core::security_profile::FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA_URI,
+            SCHEMA_ID,
+            "core and catalog must retain one first-owner certificate schema identity"
+        );
+        validate_schema_document(SCHEMA_NAME, SCHEMA_ID, &schema, &mut errors);
+        validate_instance(
+            "test:first-owner-closure-certificate",
+            SCHEMA_NAME,
+            &schema,
+            &first_owner_closure_certificate_fixture(),
+            &mut errors,
+        );
+
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn first_owner_closure_certificate_schema_rejects_unknown_fields_and_bad_authority_ids() {
+        let schema =
+            load("catalog/security-contracts/v1/first-owner-closure-certificate.schema.json");
+        let fixture = first_owner_closure_certificate_fixture();
+
+        let mut unknown_field = fixture.clone();
+        unknown_field["closure"]["untrusted_authority_hint"] = json!(true);
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:first-owner-closure-certificate-unknown-field",
+            "first-owner-closure-certificate.schema.json",
+            &schema,
+            &unknown_field,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("at /closure") && error.contains("additionalProperties")
+            }),
+            "missing closed-object error: {}",
+            errors.join("\n")
+        );
+
+        let mut bad_authority_id = fixture;
+        bad_authority_id["authority_namespace"]["authority_id"] = json!("authority:validator");
+        errors.clear();
+        validate_instance(
+            "test:first-owner-closure-certificate-bad-authority-id",
+            "first-owner-closure-certificate.schema.json",
+            &schema,
+            &bad_authority_id,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("at /authority_namespace/authority_id") && error.contains("/pattern")
+            }),
+            "missing specialized authority-id error: {}",
+            errors.join("\n")
+        );
     }
 
     #[test]

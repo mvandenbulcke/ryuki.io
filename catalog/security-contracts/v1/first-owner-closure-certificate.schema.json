@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/first-owner-closure-certificate.schema.json",
+  "title": "Ryuki first-owner closure certificate",
+  "description": "Closed canonical certificate proving that a deployment's one-time first-owner path assigned exactly the five privileged domains and permanently closed. Schema validity does not establish trust: a consumer must require exact ryuki-canonical-json-v1 bytes, recompute the authority-namespace digest, enforce cross-field identity and time semantics, verify the domain-separated Ed25519 signature with an independently provisioned key and identity/fingerprint/epoch pins, and apply the transient capability-expiry gate only during installation. The namespace is deployment-owned, so tenant_id is always null while tenancy_mode remains signed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_kind",
+    "canonicalization",
+    "signature_algorithm",
+    "authority_namespace",
+    "closure",
+    "privileged_domain_assignments",
+    "signature_base64"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "contract_kind": {
+      "const": "first-owner-closure-certificate"
+    },
+    "canonicalization": {
+      "const": "ryuki-canonical-json-v1"
+    },
+    "signature_algorithm": {
+      "const": "ed25519"
+    },
+    "authority_namespace": {
+      "$ref": "#/$defs/authorityNamespace"
+    },
+    "closure": {
+      "$ref": "#/$defs/closure"
+    },
+    "privileged_domain_assignments": {
+      "description": "The exact closed set, in canonical domain_id order. Every principal_id must equal closure.first_owner_principal_id and every assignment_event_id must be unique; those cross-field rules are enforced by the semantic verifier.",
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/assignment"
+            },
+            {
+              "properties": {
+                "domain_id": {
+                  "const": "audit-administration"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/assignment"
+            },
+            {
+              "properties": {
+                "domain_id": {
+                  "const": "identity-administration"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/assignment"
+            },
+            {
+              "properties": {
+                "domain_id": {
+                  "const": "live-execution-administration"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/assignment"
+            },
+            {
+              "properties": {
+                "domain_id": {
+                  "const": "policy-administration"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/assignment"
+            },
+            {
+              "properties": {
+                "domain_id": {
+                  "const": "secret-key-custody"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "signature_base64": {
+      "description": "Canonical Base64 encoding of the 64-byte Ed25519 signature. Signing bytes are two consecutive frames: each frame is an unsigned u64 little-endian length followed by those bytes; the first contains the fixed UTF-8 domain ryuki-v1/first-owner-closure-certificate and the second contains ryuki-canonical-json-v1 bytes of this object with signature_base64 omitted.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
+    }
+  },
+  "$defs": {
+    "positiveCounter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "deploymentId": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trustDomainId": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "authorityId": {
+      "type": "string",
+      "pattern": "^first-owner-authority:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "authorityKeyId": {
+      "type": "string",
+      "pattern": "^first-owner-authority-key:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "namespaceId": {
+      "type": "string",
+      "pattern": "^first-owner-namespace:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "closureEventId": {
+      "type": "string",
+      "pattern": "^first-owner-closure-event:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "capabilityId": {
+      "type": "string",
+      "pattern": "^first-owner-capability:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "assignmentEventId": {
+      "type": "string",
+      "pattern": "^first-owner-assignment-event:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "principalId": {
+      "type": "string",
+      "pattern": "^principal:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "canonicalTimestamp": {
+      "description": "Exact seconds-only UTC RFC3339. Calendar validity and ordering are also enforced by the semantic verifier.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "format": "date-time"
+    },
+    "authorityNamespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_contract_version",
+        "deployment_id",
+        "trust_domain_ids",
+        "tenancy_mode",
+        "tenant_id",
+        "authority_id",
+        "authority_key_id",
+        "authority_public_key_fingerprint",
+        "authority_epoch",
+        "namespace_id"
+      ],
+      "properties": {
+        "state_contract_version": {
+          "const": 1
+        },
+        "deployment_id": {
+          "$ref": "#/$defs/deploymentId"
+        },
+        "trust_domain_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/trustDomainId"
+          }
+        },
+        "tenancy_mode": {
+          "enum": [
+            "single_tenant",
+            "multi_tenant"
+          ]
+        },
+        "tenant_id": {
+          "description": "Always null because first-owner closure is deployment-owned in every tenancy mode.",
+          "type": "null"
+        },
+        "authority_id": {
+          "$ref": "#/$defs/authorityId"
+        },
+        "authority_key_id": {
+          "$ref": "#/$defs/authorityKeyId"
+        },
+        "authority_public_key_fingerprint": {
+          "description": "SHA-256 of the raw 32-byte Ed25519 public key and an exact match for the independently provisioned fingerprint.",
+          "$ref": "#/$defs/digest"
+        },
+        "authority_epoch": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "namespace_id": {
+          "$ref": "#/$defs/namespaceId"
+        }
+      }
+    },
+    "closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_contract_version",
+        "deployment_id",
+        "authority_namespace_digest",
+        "status",
+        "closure_event_id",
+        "authority_sequence",
+        "first_owner_principal_id",
+        "claim_request_digest",
+        "capability_id",
+        "capability_expires_at",
+        "closed_at_not_before",
+        "closed_at_not_after"
+      ],
+      "properties": {
+        "state_contract_version": {
+          "const": 1
+        },
+        "deployment_id": {
+          "$ref": "#/$defs/deploymentId"
+        },
+        "authority_namespace_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "status": {
+          "const": "closed"
+        },
+        "closure_event_id": {
+          "$ref": "#/$defs/closureEventId"
+        },
+        "authority_sequence": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "first_owner_principal_id": {
+          "$ref": "#/$defs/principalId"
+        },
+        "claim_request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "capability_id": {
+          "$ref": "#/$defs/capabilityId"
+        },
+        "capability_expires_at": {
+          "$ref": "#/$defs/canonicalTimestamp"
+        },
+        "closed_at_not_before": {
+          "$ref": "#/$defs/canonicalTimestamp"
+        },
+        "closed_at_not_after": {
+          "$ref": "#/$defs/canonicalTimestamp"
+        }
+      }
+    },
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assignment_event_id",
+        "domain_id",
+        "principal_id"
+      ],
+      "properties": {
+        "assignment_event_id": {
+          "$ref": "#/$defs/assignmentEventId"
+        },
+        "domain_id": {
+          "enum": [
+            "audit-administration",
+            "identity-administration",
+            "live-execution-administration",
+            "policy-administration",
+            "secret-key-custody"
+          ]
+        },
+        "principal_id": {
+          "$ref": "#/$defs/principalId"
+        }
+      }
+    }
+  }
+}

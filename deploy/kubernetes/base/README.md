@@ -86,8 +86,21 @@ shape rewrites `envFrom` to immutable
 `platform-api-migration-config-<digest-prefix>` and receipt-binds its exact five
 reviewed keys and API identity. The other six application/security pin groups
 are imported key-by-key from their immutable digest-scoped ConfigMaps. The new
-first-owner authority group adds five public trust-anchor pins through a
-seventh application/security ConfigMap and deliberately adds no socket. The
+first-owner group adds seven pins through a seventh application/security
+ConfigMap: five public trust-anchor pins required by every production process,
+plus the complete-or-none
+`RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH` and
+`RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST` pair required only by production
+`apply-only`. That pair is forbidden in serving, `verify-only`, development,
+and test processes. Its path must be a normalized absolute detached `.json`
+path traversed without symlinks to a regular file no larger than 262,144 bytes
+and not group/other writable; its value digest must be the exact nonzero
+lowercase `sha256:<64 lowercase hex>` digest of the file bytes. The Job imports
+only the two strings and deliberately adds no certificate volume or socket. It
+has no certificate materializer or independent materialization receipt, so a
+projected ConfigMap/Secret symlink cannot satisfy the file contract. Production
+final render remains hard-fenced as unavailable, and the runner exits before
+opening or reading this path while that fence is false. The
 ninth, non-environment pin ConfigMap describes the socket-projection receipt
 authority. Its key is not a trust anchor merely because the manifest supplies
 it, and the production validator no longer accepts an inline or context-selected

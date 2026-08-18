@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 const NAMESPACE: &str = "ryuki-platform";
 const VAULT_NAMESPACE: &str = "vault";
@@ -272,6 +272,8 @@ const POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS: &[&str] = &[
 ];
 const FIRST_OWNER_AUTHORITY_CONFIG_MAP: &str = "platform-first-owner-authority-pins";
 const FIRST_OWNER_AUTHORITY_KEYS: &[&str] = &[
+    "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH",
+    "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST",
     "RYUKI_FIRST_OWNER_AUTHORITY_ID",
     "RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID",
     "RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64",
@@ -412,7 +414,14 @@ const MIGRATION_AUTHORITY_SOCKET_PROJECTIONS: &[(&str, &str, &str, &str, &str, &
         "postgresql-infrastructure-attestation",
     ),
 ];
-const MIGRATION_JOB_ENV_COUNT: usize = 49;
+const MIGRATION_JOB_ENV_COUNT: usize = 1
+    + SECURITY_ADMISSION_KEYS.len()
+    + PRODUCTION_BUILD_MANIFEST_KEYS.len()
+    + CONFORMANCE_TRUST_CHECKPOINT_KEYS.len()
+    + DEPLOYED_WORKLOAD_ATTESTATION_KEYS.len()
+    + PUBLIC_INGRESS_ATTESTATION_KEYS.len()
+    + POSTGRESQL_INFRASTRUCTURE_ATTESTATION_KEYS.len()
+    + FIRST_OWNER_AUTHORITY_KEYS.len();
 const EXPECTED_SERVICE_ACCOUNTS: &[&str] = &[
     "portal-ui",
     "platform-api",
@@ -1515,7 +1524,7 @@ fn validate_migration_job(
                 == Some("RYUKI_MIGRATION_DATABASE_URL")
             && value_at(migration_url, &["value"]).is_none(),
         errors,
-        "migration Job must import the digest-scoped migrator URL key plus all 48 production pin keys",
+        "migration Job must import the digest-scoped migrator URL key plus all 50 production pin keys",
     );
     expect(
         migration_identity.as_ref().is_some_and(|identity| {
@@ -1672,6 +1681,16 @@ fn validate_final_render_pin_config_maps(
             )),
             _ => None,
         };
+        let semantic_values_are_valid = *base_name != FIRST_OWNER_AUTHORITY_CONFIG_MAP
+            || data.is_some_and(|data| {
+                data.get("RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_normalized_absolute_json_path)
+                    && data
+                        .get("RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_nonzero_sha256_digest)
+            });
 
         expect(
             matching.len() == 1
@@ -1693,10 +1712,11 @@ fn validate_final_render_pin_config_maps(
                 && uid.is_some_and(is_canonical_kubernetes_uid)
                 && resource_version.is_some_and(is_canonical_resource_version)
                 && expected_receipt.as_deref()
-                    == str_at(job, &["metadata", "annotations", receipt_annotation]),
+                    == str_at(job, &["metadata", "annotations", receipt_annotation])
+                && semantic_values_are_valid,
             errors,
             format!(
-                "final-render migration Job must bind immutable ConfigMap {expected_name} by exact keys, canonical content digest, UID, resourceVersion, and receipt annotation"
+                "final-render migration Job must bind immutable ConfigMap {expected_name} by exact keys, semantic pin values, canonical content digest, UID, resourceVersion, and receipt annotation"
             ),
         );
     }
@@ -2319,6 +2339,24 @@ fn is_normalized_absolute_socket_path(value: &str) -> bool {
                         || matches!(byte, b'.' | b'_' | b'-')
                 })
         })
+}
+
+fn is_normalized_absolute_json_path(value: &str) -> bool {
+    let path = Path::new(value);
+    let components_are_lexically_normal = value.strip_prefix('/').is_some_and(|suffix| {
+        !suffix.is_empty()
+            && !suffix
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    });
+    value.len() <= 4096
+        && path.is_absolute()
+        && !value.contains('\\')
+        && components_are_lexically_normal
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        && path.extension().and_then(|extension| extension.to_str()) == Some("json")
 }
 
 fn normalized_socket_mount_parent(value: &str) -> Option<&str> {
@@ -3004,6 +3042,10 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
                         "ed25519Required",
                         "privateKeyInWorkloadForbidden",
                         "socketProjectionRequired",
+                        "detachedCertificateRequired",
+                        "descriptorPinnedRegularFileRequired",
+                        "symlinkProjectionForbidden",
+                        "materializationReceiptRequired",
                     ],
                 )
             })
@@ -3019,6 +3061,10 @@ fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut
                 "independentlyGovernedAuthorityRequired",
                 "ed25519Required",
                 "privateKeyInWorkloadForbidden",
+                "detachedCertificateRequired",
+                "descriptorPinnedRegularFileRequired",
+                "symlinkProjectionForbidden",
+                "materializationReceiptRequired",
             ]
             .iter()
             .all(|flag| {
@@ -7049,6 +7095,41 @@ mod tests {
     }
 
     #[test]
+    fn first_owner_final_render_certificate_pins_require_closed_value_shapes() {
+        assert!(is_normalized_absolute_json_path(
+            "/var/run/ryuki-first-owner/closure-certificate.json"
+        ));
+        for invalid in [
+            "closure-certificate.json",
+            "/var/run/../closure-certificate.json",
+            "/var/run/ryuki-first-owner/closure-certificate.txt",
+            "/var//run/ryuki-first-owner/closure-certificate.json",
+            r"C:\\ryuki\\closure-certificate.json",
+        ] {
+            assert!(
+                !is_normalized_absolute_json_path(invalid),
+                "invalid certificate path must fail closed: {invalid}"
+            );
+        }
+
+        assert!(is_nonzero_sha256_digest(&format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )));
+        for invalid in [
+            format!("sha256:{}", "0".repeat(64)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            "a".repeat(64),
+        ] {
+            assert!(
+                !is_nonzero_sha256_digest(&invalid),
+                "invalid certificate digest must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn production_documents_reject_manifest_selected_socket_trust_anchor() {
         let input = json!({
             "manifests": [],
@@ -7407,6 +7488,16 @@ mod tests {
                                 profile_digest.clone()
                             }
                             _ => unreachable!("closed socket authority key inventory"),
+                        }
+                    } else if *base_name == FIRST_OWNER_AUTHORITY_CONFIG_MAP {
+                        match *key {
+                            "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH" => {
+                                "/var/run/ryuki-first-owner/closure-certificate.json".to_string()
+                            }
+                            "RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST" => {
+                                format!("sha256:{}", "a".repeat(64))
+                            }
+                            _ => format!("pin-{index}-{key_index}"),
                         }
                     } else {
                         projection_index

@@ -339,9 +339,23 @@ spec:
                   name: platform-postgresql-infrastructure-attestation-pins-111111111111
                   key: RYUKI_POSTGRESQL_INFRASTRUCTURE_ATTESTATION_PROFILE_DIGEST
             # The first-owner closure authority is an independently governed
-            # Ed25519 trust anchor, not a live socket authority. Its five pins
-            # are receipt-bound through a ninth immutable ConfigMap while the
-            # final-render socket projection inventory remains exactly four.
+            # Ed25519 trust anchor, not a live socket authority. Its seven pins
+            # include the detached certificate's absolute path and exact digest
+            # and are receipt-bound through a ninth immutable ConfigMap while
+            # the final-render socket projection inventory remains exactly four.
+            # The final render must materialize the certificate as a real,
+            # non-symlink, non-group/other-writable regular file before runner
+            # start; an ordinary projected ConfigMap/Secret symlink is rejected.
+            - name: RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH
+            - name: RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-first-owner-authority-pins-111111111111
+                  key: RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST
             - name: RYUKI_FIRST_OWNER_AUTHORITY_ID
               valueFrom:
                 configMapKeyRef:

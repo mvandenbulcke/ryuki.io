@@ -155,6 +155,17 @@ matching nonzero SHA-256 digest and is distinct from all four other authority
 keys, and the epoch is a canonical positive integer. There is no first-owner
 socket: startup uses the pinned key to authenticate the permanent closure
 certificate read through the exact retained PostgreSQL serving runtime.
+The one-shot production `apply-only` process additionally requires the exact
+complete-or-none pair `RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH` and
+`RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST`. The path must be a normalized
+absolute detached `.json` path traversed without symlinks to a regular file no
+larger than 262,144 bytes and not group/other writable. The digest must be the
+exact nonzero lowercase `sha256:<64 lowercase hex>` digest of those file bytes.
+Both variables are forbidden in serving, `verify-only`, development, and test
+processes. The checked-in Job imports only these two strings; it has no
+certificate materializer or materialization receipt, and every production
+final render remains rejected. While that hard fence is false, `apply-only`
+exits before it opens or reads the configured certificate path.
 Production execution remains disabled before credential loading until live
 Kubernetes render admission, one-use attempt consumption, materialized-pin
 binding, and runtime receipt freshness are implemented.

@@ -205,6 +205,25 @@ checkpoint, deployed-workload, public-ingress, and PostgreSQL-infrastructure
 authority keys. There is no first-owner authority socket: the configured key
 authenticates the permanent closure certificate stored in PostgreSQL.
 
+Production `apply-only` additionally requires this exact first-owner closure
+installation input:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH` | Normalized absolute path ending in `.json`, detached from the rollbackable contract root; descriptor-pinned traversal must encounter no symlink and the final node must be a regular file no larger than 262,144 bytes and not group/other writable |
+| `RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST` | Exact nonzero lowercase `sha256:<64 lowercase hex>` digest of the certificate file bytes |
+
+These two variables are one complete-or-none group. They are required only by
+the one-shot production `apply-only` process and are forbidden in serving,
+`verify-only`, development, and test processes. A projected ConfigMap or Secret
+symlink is not an admissible certificate file; a future deployment path must
+materialize and independently receipt-bind a real file with the properties
+above. The checked-in Job currently imports only the path and digest strings:
+it provides no certificate-file materializer or materialization receipt, and
+the production final-render capability remains hard-fenced as unavailable.
+Consequently the runner exits before opening or reading the configured path
+while that hard fence is false.
+
 Startup measures that certificate in a bounded, read-only, repeatable-read
 snapshot through the exact retained `DurablePostgresql` application-serving
 runtime. It requires exact canonical JSON with the closed schema. The pinned

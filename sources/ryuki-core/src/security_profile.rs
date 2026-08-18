@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Component, Path};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, SecondsFormat, Utc};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -12,7 +14,7 @@ use crate::conformance_closure::{
     RUNTIME_GUARD_REQUIREMENT_BINDING_DIGEST_CONTRACT,
     RUNTIME_GUARD_SEMANTIC_CHALLENGE_BINDING_DIGEST_CONTRACT,
 };
-use crate::conformance_trust::canonical_json_bytes;
+use crate::conformance_trust::{canonical_json_bytes, parse_json_strict};
 
 pub const DEPLOYMENT_SECURITY_PROFILE_SCHEMA_URI: &str =
     "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json";
@@ -68,6 +70,24 @@ pub const PRODUCTION_DEPENDENCY_INVENTORY_DIGEST_CONTRACT: &str =
 pub const FIRST_OWNER_AUTHORITY_NAMESPACE_DIGEST_CONTRACT: &str =
     "ryuki-first-owner-authority-namespace-v1";
 pub const FIRST_OWNER_CLOSURE_RECORD_DIGEST_CONTRACT: &str = "ryuki-first-owner-closure-record-v1";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA_URI: &str =
+    "https://ryuki.io/schemas/security-contracts/v1/first-owner-closure-certificate.schema.json";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA_VERSION: &str = "1.0.0";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_CONTRACT_KIND: &str = "first-owner-closure-certificate";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_CANONICALIZATION: &str = "ryuki-canonical-json-v1";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_SIGNATURE_ALGORITHM: &str = "ed25519";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_SIGNATURE_DOMAIN: &str =
+    "ryuki-v1/first-owner-closure-certificate";
+pub const FIRST_OWNER_CLOSURE_CERTIFICATE_MAX_BYTES: usize = 256 * 1024;
+pub const FIRST_OWNER_MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+pub const FIRST_OWNER_STATE_CONTRACT_VERSION: u64 = 1;
+pub const FIRST_OWNER_PRIVILEGED_DOMAINS: [&str; 5] = [
+    "audit-administration",
+    "identity-administration",
+    "live-execution-administration",
+    "policy-administration",
+    "secret-key-custody",
+];
 
 const REQUIRED_PRODUCTION_GUARDS: [GuardId; 8] = [
     GuardId::DurablePostgresql,
@@ -1764,6 +1784,276 @@ pub struct FirstOwnerClosureRecord {
     pub closure_certificate_digest: String,
 }
 
+/// The immutable closure facts authenticated by the external first-owner
+/// authority. The certificate digest is deliberately absent because it hashes
+/// the completed envelope, including the signature.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedFirstOwnerClosure {
+    pub state_contract_version: u64,
+    pub deployment_id: String,
+    pub authority_namespace_digest: String,
+    pub status: FirstOwnerClosureStatus,
+    pub closure_event_id: String,
+    pub authority_sequence: u64,
+    pub first_owner_principal_id: String,
+    pub claim_request_digest: String,
+    pub capability_id: String,
+    pub capability_expires_at: String,
+    pub closed_at_not_before: String,
+    pub closed_at_not_after: String,
+}
+
+/// One member of the closed, ordered privileged-domain assignment set.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedPrivilegedDomainAssignment {
+    pub assignment_event_id: String,
+    pub domain_id: String,
+    pub principal_id: String,
+}
+
+/// Canonical deployment-owned proof that the one-time first-owner path closed.
+///
+/// `tenant_id` remains present inside `authority_namespace` to make the
+/// deployment-owned namespace explicit: it must be JSON `null` in both
+/// tenancy modes. `tenancy_mode` is still signed so a certificate cannot move
+/// between deployment modes.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FirstOwnerClosureCertificate {
+    pub schema_version: String,
+    pub contract_kind: String,
+    pub canonicalization: String,
+    pub signature_algorithm: String,
+    pub authority_namespace: FirstOwnerAuthorityNamespace,
+    pub closure: SignedFirstOwnerClosure,
+    pub privileged_domain_assignments: Vec<SignedPrivilegedDomainAssignment>,
+    pub signature_base64: String,
+}
+
+/// Independently provisioned trust pins for pure certificate verification.
+///
+/// The public key and every identity field come from deployment configuration,
+/// never from the certificate or a rollbackable contract directory.
+#[derive(Debug, Clone, Copy)]
+pub struct FirstOwnerCertificateAuthorityAnchor<'a> {
+    pub authority_id: &'a str,
+    pub authority_key_id: &'a str,
+    pub public_key: &'a [u8; 32],
+    pub public_key_fingerprint: &'a str,
+    pub minimum_authority_epoch: u64,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum FirstOwnerClosureCertificateError {
+    #[error("the first-owner closure certificate is invalid")]
+    InvalidCertificate,
+    #[error("the first-owner closure certificate is not exact canonical JSON")]
+    NonCanonicalCertificate,
+    #[error("the first-owner closure certificate signature representation is invalid")]
+    InvalidSignatureRepresentation,
+    #[error("the independently pinned first-owner authority binding is invalid")]
+    InvalidAuthorityBinding,
+    #[error("the first-owner closure certificate signature verification failed")]
+    SignatureVerificationFailed,
+}
+
+/// Digest-only proof returned after timeless certificate verification.
+///
+/// Expiration is intentionally not part of this proof: a valid permanent
+/// closure remains valid after its one-shot installation capability expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFirstOwnerClosureCertificate {
+    certificate_digest: String,
+    authority_namespace_digest: String,
+    closure_record_digest: String,
+    signature_digest: String,
+}
+
+impl VerifiedFirstOwnerClosureCertificate {
+    pub fn certificate_digest(&self) -> &str {
+        &self.certificate_digest
+    }
+
+    pub fn authority_namespace_digest(&self) -> &str {
+        &self.authority_namespace_digest
+    }
+
+    pub fn closure_record_digest(&self) -> &str {
+        &self.closure_record_digest
+    }
+
+    pub fn signature_digest(&self) -> &str {
+        &self.signature_digest
+    }
+}
+
+#[derive(Serialize)]
+struct UnsignedFirstOwnerClosureCertificate<'a> {
+    schema_version: &'a str,
+    contract_kind: &'a str,
+    canonicalization: &'a str,
+    signature_algorithm: &'a str,
+    authority_namespace: &'a FirstOwnerAuthorityNamespace,
+    closure: &'a SignedFirstOwnerClosure,
+    privileged_domain_assignments: &'a [SignedPrivilegedDomainAssignment],
+}
+
+/// Parse only exact, duplicate-free `ryuki-canonical-json-v1` certificate
+/// bytes. This helper performs no I/O and does not establish signature trust.
+pub fn parse_first_owner_closure_certificate(
+    bytes: &[u8],
+) -> Result<FirstOwnerClosureCertificate, FirstOwnerClosureCertificateError> {
+    if bytes.is_empty() || bytes.len() > FIRST_OWNER_CLOSURE_CERTIFICATE_MAX_BYTES {
+        return Err(FirstOwnerClosureCertificateError::InvalidCertificate);
+    }
+    let value = parse_json_strict(bytes)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    let canonical = canonical_json_bytes(&value)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    if canonical != bytes {
+        return Err(FirstOwnerClosureCertificateError::NonCanonicalCertificate);
+    }
+    let certificate = serde_json::from_value(value)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    validate_first_owner_closure_certificate(&certificate)?;
+    Ok(certificate)
+}
+
+/// Exact canonical bytes of the complete signed certificate.
+pub fn first_owner_closure_certificate_canonical_bytes(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<Vec<u8>, FirstOwnerClosureCertificateError> {
+    validate_first_owner_closure_certificate(certificate)?;
+    let value = serde_json::to_value(certificate)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    canonical_json_bytes(&value).map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)
+}
+
+/// SHA-256 of the exact canonical completed certificate, including signature.
+pub fn first_owner_closure_certificate_digest(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<String, FirstOwnerClosureCertificateError> {
+    Ok(sha256_bytes_digest(
+        &first_owner_closure_certificate_canonical_bytes(certificate)?,
+    ))
+}
+
+/// SHA-256 of the canonical 64-byte Ed25519 signature representation.
+pub fn first_owner_closure_certificate_signature_digest(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<String, FirstOwnerClosureCertificateError> {
+    Ok(sha256_bytes_digest(&decode_first_owner_signature(
+        &certificate.signature_base64,
+    )?))
+}
+
+/// Canonical unsigned JSON subject. `signature_base64` is omitted, not nulled.
+pub fn first_owner_closure_certificate_unsigned_canonical_bytes(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<Vec<u8>, FirstOwnerClosureCertificateError> {
+    validate_first_owner_closure_certificate(certificate)?;
+    let value = serde_json::to_value(UnsignedFirstOwnerClosureCertificate {
+        schema_version: &certificate.schema_version,
+        contract_kind: &certificate.contract_kind,
+        canonicalization: &certificate.canonicalization,
+        signature_algorithm: &certificate.signature_algorithm,
+        authority_namespace: &certificate.authority_namespace,
+        closure: &certificate.closure,
+        privileged_domain_assignments: &certificate.privileged_domain_assignments,
+    })
+    .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    canonical_json_bytes(&value).map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)
+}
+
+/// Exact two-frame Ed25519 preimage: an unsigned little-endian u64 length and
+/// the UTF-8 domain, followed by the same framing for the canonical unsigned
+/// certificate JSON.
+pub fn first_owner_closure_certificate_signing_bytes(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<Vec<u8>, FirstOwnerClosureCertificateError> {
+    let canonical = first_owner_closure_certificate_unsigned_canonical_bytes(certificate)?;
+    let domain = FIRST_OWNER_CLOSURE_CERTIFICATE_SIGNATURE_DOMAIN.as_bytes();
+    let mut signing_bytes = Vec::with_capacity(16 + domain.len() + canonical.len());
+    write_first_owner_frame(&mut signing_bytes, domain)?;
+    write_first_owner_frame(&mut signing_bytes, &canonical)?;
+    Ok(signing_bytes)
+}
+
+/// Build the durable closure-record projection from one complete certificate.
+pub fn first_owner_closure_record_from_certificate(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<FirstOwnerClosureRecord, FirstOwnerClosureCertificateError> {
+    validate_first_owner_closure_certificate(certificate)?;
+    let record = FirstOwnerClosureRecord {
+        state_contract_version: certificate.closure.state_contract_version,
+        deployment_id: certificate.closure.deployment_id.clone(),
+        authority_namespace_digest: certificate.closure.authority_namespace_digest.clone(),
+        status: certificate.closure.status,
+        closure_event_id: certificate.closure.closure_event_id.clone(),
+        authority_sequence: certificate.closure.authority_sequence,
+        first_owner_principal_id: certificate.closure.first_owner_principal_id.clone(),
+        claim_request_digest: certificate.closure.claim_request_digest.clone(),
+        capability_id: certificate.closure.capability_id.clone(),
+        capability_expires_at: certificate.closure.capability_expires_at.clone(),
+        closed_at_not_before: certificate.closure.closed_at_not_before.clone(),
+        closed_at_not_after: certificate.closure.closed_at_not_after.clone(),
+        closure_certificate_digest: first_owner_closure_certificate_digest(certificate)?,
+    };
+    validate_first_owner_closure_record_projection(&record)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    Ok(record)
+}
+
+/// Pure, timeless verification against an independently pinned Ed25519 key.
+pub fn verify_first_owner_closure_certificate(
+    certificate: &FirstOwnerClosureCertificate,
+    authority: FirstOwnerCertificateAuthorityAnchor<'_>,
+) -> Result<VerifiedFirstOwnerClosureCertificate, FirstOwnerClosureCertificateError> {
+    validate_first_owner_closure_certificate(certificate)?;
+    let key = validate_first_owner_certificate_authority(certificate, authority)?;
+    let signature_bytes = decode_first_owner_signature(&certificate.signature_base64)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    key.verify_strict(
+        &first_owner_closure_certificate_signing_bytes(certificate)?,
+        &signature,
+    )
+    .map_err(|_| FirstOwnerClosureCertificateError::SignatureVerificationFailed)?;
+
+    let certificate_digest = first_owner_closure_certificate_digest(certificate)?;
+    let authority_namespace_digest =
+        first_owner_authority_namespace_digest(&certificate.authority_namespace)
+            .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    let closure_record = first_owner_closure_record_from_certificate(certificate)?;
+    let closure_record_digest = first_owner_closure_record_digest(&closure_record)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    Ok(VerifiedFirstOwnerClosureCertificate {
+        certificate_digest,
+        authority_namespace_digest,
+        closure_record_digest,
+        signature_digest: sha256_bytes_digest(&signature_bytes),
+    })
+}
+
+/// Trusted-time gate for the one-shot installation ceremony.
+///
+/// The closure interval must have completed and the capability expiry is
+/// exclusive. Permanent verification must use the timeless signature helper
+/// above instead of reapplying this transient gate.
+pub fn first_owner_closure_certificate_is_installable_at(
+    certificate: &FirstOwnerClosureCertificate,
+    trusted_now: DateTime<Utc>,
+) -> Result<bool, FirstOwnerClosureCertificateError> {
+    validate_first_owner_closure_certificate(certificate)?;
+    let closed_at_not_after = parse_first_owner_timestamp(&certificate.closure.closed_at_not_after)
+        .ok_or(FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    let capability_expires_at =
+        parse_first_owner_timestamp(&certificate.closure.capability_expires_at)
+            .ok_or(FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    Ok(trusted_now >= closed_at_not_after && trusted_now < capability_expires_at)
+}
+
 #[derive(Serialize)]
 struct FirstOwnerAuthorityNamespaceProjection<'a> {
     digest_contract: &'static str,
@@ -1806,6 +2096,163 @@ pub fn first_owner_closure_record_digest(
     record: &FirstOwnerClosureRecord,
 ) -> Result<String, RuntimeGuardDigestError> {
     digest_canonical_bytes(first_owner_closure_record_canonical_bytes(record)?)
+}
+
+fn validate_first_owner_closure_certificate(
+    certificate: &FirstOwnerClosureCertificate,
+) -> Result<(), FirstOwnerClosureCertificateError> {
+    if certificate.schema_version != FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA_VERSION
+        || certificate.contract_kind != FIRST_OWNER_CLOSURE_CERTIFICATE_CONTRACT_KIND
+        || certificate.canonicalization != FIRST_OWNER_CLOSURE_CERTIFICATE_CANONICALIZATION
+        || certificate.signature_algorithm != FIRST_OWNER_CLOSURE_CERTIFICATE_SIGNATURE_ALGORITHM
+        || certificate.authority_namespace.state_contract_version
+            != FIRST_OWNER_STATE_CONTRACT_VERSION
+        || certificate.closure.state_contract_version != FIRST_OWNER_STATE_CONTRACT_VERSION
+        || certificate.authority_namespace.state_contract_version
+            != certificate.closure.state_contract_version
+        || certificate.authority_namespace.deployment_id != certificate.closure.deployment_id
+        || certificate.authority_namespace.trust_domain_ids.len() > 64
+    {
+        return Err(FirstOwnerClosureCertificateError::InvalidCertificate);
+    }
+    validate_first_owner_authority_namespace_projection(&certificate.authority_namespace)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    let namespace_digest = first_owner_authority_namespace_digest(&certificate.authority_namespace)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    let closure = &certificate.closure;
+    let capability_expires_at = parse_first_owner_timestamp(&closure.capability_expires_at);
+    let closed_at_not_before = parse_first_owner_timestamp(&closure.closed_at_not_before);
+    let closed_at_not_after = parse_first_owner_timestamp(&closure.closed_at_not_after);
+    let valid_window = capability_expires_at
+        .zip(closed_at_not_before)
+        .zip(closed_at_not_after)
+        .is_some_and(|((expires, not_before), not_after)| {
+            not_before <= not_after && not_after < expires
+        });
+    if closure.authority_namespace_digest != namespace_digest
+        || !valid_canonical_scoped_id(&closure.deployment_id, "deployment:")
+        || !valid_canonical_scoped_id(&closure.closure_event_id, "first-owner-closure-event:")
+        || closure.authority_sequence == 0
+        || closure.authority_sequence > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
+        || !valid_canonical_scoped_id(&closure.first_owner_principal_id, "principal:")
+        || !valid_sha256_digest(&closure.claim_request_digest)
+        || !valid_canonical_scoped_id(&closure.capability_id, "first-owner-capability:")
+        || !valid_window
+    {
+        return Err(FirstOwnerClosureCertificateError::InvalidCertificate);
+    }
+
+    let assignments = &certificate.privileged_domain_assignments;
+    let unique_assignment_event_ids = assignments
+        .iter()
+        .map(|assignment| assignment.assignment_event_id.as_str())
+        .collect::<HashSet<_>>();
+    if assignments.len() != FIRST_OWNER_PRIVILEGED_DOMAINS.len()
+        || !assignments
+            .iter()
+            .map(|assignment| assignment.domain_id.as_str())
+            .eq(FIRST_OWNER_PRIVILEGED_DOMAINS)
+        || unique_assignment_event_ids.len() != assignments.len()
+        || assignments.iter().any(|assignment| {
+            !valid_canonical_scoped_id(
+                &assignment.assignment_event_id,
+                "first-owner-assignment-event:",
+            ) || assignment.assignment_event_id == closure.closure_event_id
+                || !valid_canonical_scoped_id(&assignment.principal_id, "principal:")
+                || assignment.principal_id != closure.first_owner_principal_id
+        })
+    {
+        return Err(FirstOwnerClosureCertificateError::InvalidCertificate);
+    }
+    decode_first_owner_signature(&certificate.signature_base64)?;
+    Ok(())
+}
+
+fn validate_first_owner_certificate_authority(
+    certificate: &FirstOwnerClosureCertificate,
+    authority: FirstOwnerCertificateAuthorityAnchor<'_>,
+) -> Result<VerifyingKey, FirstOwnerClosureCertificateError> {
+    if !valid_canonical_scoped_id(authority.authority_id, "first-owner-authority:")
+        || !valid_canonical_scoped_id(authority.authority_key_id, "first-owner-authority-key:")
+        || !valid_sha256_digest(authority.public_key_fingerprint)
+        || authority.minimum_authority_epoch == 0
+        || authority.minimum_authority_epoch > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
+    {
+        return Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding);
+    }
+    let key = VerifyingKey::from_bytes(authority.public_key)
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidAuthorityBinding)?;
+    if key.is_weak()
+        || sha256_bytes_digest(authority.public_key) != authority.public_key_fingerprint
+        || certificate.authority_namespace.authority_id != authority.authority_id
+        || certificate.authority_namespace.authority_key_id != authority.authority_key_id
+        || certificate
+            .authority_namespace
+            .authority_public_key_fingerprint
+            != authority.public_key_fingerprint
+        || certificate.authority_namespace.authority_epoch < authority.minimum_authority_epoch
+    {
+        return Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding);
+    }
+    Ok(key)
+}
+
+fn decode_first_owner_signature(
+    value: &str,
+) -> Result<[u8; 64], FirstOwnerClosureCertificateError> {
+    let decoded = BASE64_STANDARD
+        .decode(value.as_bytes())
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidSignatureRepresentation)?;
+    let bytes: [u8; 64] = decoded
+        .try_into()
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidSignatureRepresentation)?;
+    if BASE64_STANDARD.encode(bytes) != value {
+        return Err(FirstOwnerClosureCertificateError::InvalidSignatureRepresentation);
+    }
+    Ok(bytes)
+}
+
+fn write_first_owner_frame(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+) -> Result<(), FirstOwnerClosureCertificateError> {
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| FirstOwnerClosureCertificateError::InvalidCertificate)?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn sha256_bytes_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn parse_first_owner_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
+        })
+        || parse_first_owner_decimal_pair(bytes[11], bytes[12]) > 23
+        || parse_first_owner_decimal_pair(bytes[14], bytes[15]) > 59
+        || parse_first_owner_decimal_pair(bytes[17], bytes[18]) > 59
+    {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .filter(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true) == value)
+}
+
+fn parse_first_owner_decimal_pair(tens: u8, ones: u8) -> u8 {
+    (tens - b'0') * 10 + (ones - b'0')
 }
 
 fn canonical_projection_bytes(
@@ -2729,28 +3176,27 @@ fn validate_production_dependency_runtime_binding(
 fn validate_first_owner_authority_namespace_projection(
     namespace: &FirstOwnerAuthorityNamespace,
 ) -> Result<(), RuntimeGuardDigestError> {
-    let tenant_binding_is_valid = match namespace.tenancy_mode {
-        TenancyMode::SingleTenant => namespace.tenant_id.is_none(),
-        TenancyMode::MultiTenant => namespace
-            .tenant_id
-            .as_deref()
-            .is_some_and(|tenant| valid_canonical_scoped_id(tenant, "tenant:")),
-    };
     if namespace.state_contract_version == 0
-        || namespace.state_contract_version > i64::MAX as u64
+        || namespace.state_contract_version > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
         || !valid_canonical_scoped_id(&namespace.deployment_id, "deployment:")
         || !strictly_sorted_unique_strings(&namespace.trust_domain_ids)
         || !namespace
             .trust_domain_ids
             .iter()
             .all(|trust_domain| valid_canonical_scoped_id(trust_domain, "trust-domain:"))
-        || !tenant_binding_is_valid
-        || !valid_canonical_runtime_identifier(&namespace.authority_id)
-        || !valid_canonical_runtime_identifier(&namespace.authority_key_id)
+        // First-owner closure is deployment-owned. The tenancy mode remains
+        // digest-bound, but no tenant may become the namespace authority in
+        // either deployment mode.
+        || namespace.tenant_id.is_some()
+        || !valid_canonical_scoped_id(&namespace.authority_id, "first-owner-authority:")
+        || !valid_canonical_scoped_id(
+            &namespace.authority_key_id,
+            "first-owner-authority-key:",
+        )
         || !valid_sha256_digest(&namespace.authority_public_key_fingerprint)
         || namespace.authority_epoch == 0
-        || namespace.authority_epoch > i64::MAX as u64
-        || !valid_canonical_runtime_identifier(&namespace.namespace_id)
+        || namespace.authority_epoch > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
+        || !valid_canonical_scoped_id(&namespace.namespace_id, "first-owner-namespace:")
     {
         return Err(RuntimeGuardDigestError::InvalidProjection(
             "first-owner authority namespace",
@@ -2762,18 +3208,12 @@ fn validate_first_owner_authority_namespace_projection(
 fn validate_first_owner_closure_record_projection(
     record: &FirstOwnerClosureRecord,
 ) -> Result<(), RuntimeGuardDigestError> {
-    let canonical_timestamp = |value: &str| {
-        DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|timestamp| timestamp.with_timezone(&Utc))
-            // The durable PostgreSQL closure record stores an exact textual
-            // preimage alongside TIMESTAMPTZ. Seconds-only UTC avoids precision
-            // loss and keeps Rust and SQL acceptance domains identical.
-            .filter(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true) == value)
-    };
-    let capability_expires_at = canonical_timestamp(&record.capability_expires_at);
-    let closed_at_not_before = canonical_timestamp(&record.closed_at_not_before);
-    let closed_at_not_after = canonical_timestamp(&record.closed_at_not_after);
+    // The durable PostgreSQL closure record stores an exact textual preimage
+    // alongside TIMESTAMPTZ. Seconds-only UTC avoids precision loss and keeps
+    // Rust and SQL acceptance domains identical.
+    let capability_expires_at = parse_first_owner_timestamp(&record.capability_expires_at);
+    let closed_at_not_before = parse_first_owner_timestamp(&record.closed_at_not_before);
+    let closed_at_not_after = parse_first_owner_timestamp(&record.closed_at_not_after);
     let valid_window = capability_expires_at
         .zip(closed_at_not_before)
         .zip(closed_at_not_after)
@@ -2781,15 +3221,15 @@ fn validate_first_owner_closure_record_projection(
             not_before <= not_after && not_after < expires
         });
     if record.state_contract_version == 0
-        || record.state_contract_version > i64::MAX as u64
+        || record.state_contract_version > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
         || !valid_canonical_scoped_id(&record.deployment_id, "deployment:")
         || !valid_sha256_digest(&record.authority_namespace_digest)
-        || !valid_canonical_runtime_identifier(&record.closure_event_id)
+        || !valid_canonical_scoped_id(&record.closure_event_id, "first-owner-closure-event:")
         || record.authority_sequence == 0
-        || record.authority_sequence > i64::MAX as u64
-        || !valid_canonical_runtime_identifier(&record.first_owner_principal_id)
+        || record.authority_sequence > FIRST_OWNER_MAX_EXACT_JSON_INTEGER
+        || !valid_canonical_scoped_id(&record.first_owner_principal_id, "principal:")
         || !valid_sha256_digest(&record.claim_request_digest)
-        || !valid_canonical_runtime_identifier(&record.capability_id)
+        || !valid_canonical_scoped_id(&record.capability_id, "first-owner-capability:")
         || !valid_window
         || !valid_sha256_digest(&record.closure_certificate_digest)
     {
@@ -3901,13 +4341,18 @@ fn same_unique_strings(left: &[String], right: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use chrono::TimeZone;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use serde_json::json;
 
     use super::*;
 
     const TEST_PROFILE_DIGEST: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static SECURITY_PROFILE_TEST_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn fixture() -> DeploymentSecurityProfile {
         serde_json::from_str(include_str!(
@@ -3922,6 +4367,21 @@ mod tests {
 
     fn fixture_digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn security_profile_test_entropy(label: &[u8]) -> [u8; 32] {
+        let counter = SECURITY_PROFILE_TEST_ENTROPY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ryuki security-profile test entropy");
+        hasher.update(label);
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update(counter.to_le_bytes());
+        hasher.update(elapsed.to_le_bytes());
+        hasher.finalize().into()
     }
 
     fn authenticator_browser_state_authority() -> AuthenticatorBrowserStateAuthorityProjection {
@@ -4570,6 +5030,61 @@ mod tests {
             closed_at_not_after: "2026-07-16T00:00:01Z".into(),
             closure_certificate_digest: fixture_digest('1'),
         }
+    }
+
+    fn first_owner_certificate_fixture() -> (FirstOwnerClosureCertificate, SigningKey) {
+        let signing_key = SigningKey::from_bytes(&security_profile_test_entropy(
+            b"first-owner closure certificate signing key",
+        ));
+        let public_key = signing_key.verifying_key().to_bytes();
+        let mut namespace = first_owner_authority_namespace("deployment:fixture");
+        namespace.authority_public_key_fingerprint = sha256_bytes_digest(&public_key);
+        let namespace_digest = first_owner_authority_namespace_digest(&namespace).unwrap();
+        let mut certificate = FirstOwnerClosureCertificate {
+            schema_version: FIRST_OWNER_CLOSURE_CERTIFICATE_SCHEMA_VERSION.into(),
+            contract_kind: FIRST_OWNER_CLOSURE_CERTIFICATE_CONTRACT_KIND.into(),
+            canonicalization: FIRST_OWNER_CLOSURE_CERTIFICATE_CANONICALIZATION.into(),
+            signature_algorithm: FIRST_OWNER_CLOSURE_CERTIFICATE_SIGNATURE_ALGORITHM.into(),
+            authority_namespace: namespace,
+            closure: SignedFirstOwnerClosure {
+                state_contract_version: FIRST_OWNER_STATE_CONTRACT_VERSION,
+                deployment_id: "deployment:fixture".into(),
+                authority_namespace_digest: namespace_digest,
+                status: FirstOwnerClosureStatus::Closed,
+                closure_event_id: "first-owner-closure-event:fixture".into(),
+                authority_sequence: 1,
+                first_owner_principal_id: "principal:fixture-owner".into(),
+                claim_request_digest: fixture_digest('f'),
+                capability_id: "first-owner-capability:fixture".into(),
+                capability_expires_at: "2026-07-16T01:00:00Z".into(),
+                closed_at_not_before: "2026-07-16T00:00:00Z".into(),
+                closed_at_not_after: "2026-07-16T00:00:01Z".into(),
+            },
+            privileged_domain_assignments: FIRST_OWNER_PRIVILEGED_DOMAINS
+                .iter()
+                .enumerate()
+                .map(|(index, domain_id)| SignedPrivilegedDomainAssignment {
+                    assignment_event_id: format!("first-owner-assignment-event:event-{index}"),
+                    domain_id: (*domain_id).into(),
+                    principal_id: "principal:fixture-owner".into(),
+                })
+                .collect(),
+            signature_base64: BASE64_STANDARD.encode([0_u8; 64]),
+        };
+        resign_first_owner_certificate(&mut certificate, &signing_key);
+        (certificate, signing_key)
+    }
+
+    fn resign_first_owner_certificate(
+        certificate: &mut FirstOwnerClosureCertificate,
+        signing_key: &SigningKey,
+    ) {
+        certificate.signature_base64 = BASE64_STANDARD.encode([0_u8; 64]);
+        let signature = signing_key.sign(
+            &first_owner_closure_certificate_signing_bytes(certificate)
+                .expect("certificate fixture must have valid signing semantics"),
+        );
+        certificate.signature_base64 = BASE64_STANDARD.encode(signature.to_bytes());
     }
 
     fn expected_guard_value(guard_id: GuardId, deployment_id: &str) -> RuntimeGuardExpectedValue {
@@ -7270,18 +7785,548 @@ mod tests {
         fractional_timestamp.closed_at_not_after = "2026-07-16T00:00:01.001Z".into();
         assert!(first_owner_closure_record_digest(&fractional_timestamp).is_err());
 
+        let mut maximum_sequence = closure.clone();
+        maximum_sequence.authority_sequence = FIRST_OWNER_MAX_EXACT_JSON_INTEGER;
+        assert!(first_owner_closure_record_digest(&maximum_sequence).is_ok());
+
         let mut oversized_sequence = closure;
-        oversized_sequence.authority_sequence = (i64::MAX as u64) + 1;
+        oversized_sequence.authority_sequence = FIRST_OWNER_MAX_EXACT_JSON_INTEGER + 1;
         assert!(first_owner_closure_record_digest(&oversized_sequence).is_err());
 
         let mut oversized_namespace = namespace.clone();
-        oversized_namespace.authority_epoch = (i64::MAX as u64) + 1;
+        oversized_namespace.authority_epoch = FIRST_OWNER_MAX_EXACT_JSON_INTEGER + 1;
         assert!(first_owner_authority_namespace_digest(&oversized_namespace).is_err());
+
+        let mut maximum_namespace = namespace.clone();
+        maximum_namespace.authority_epoch = FIRST_OWNER_MAX_EXACT_JSON_INTEGER;
+        assert!(first_owner_authority_namespace_digest(&maximum_namespace).is_ok());
 
         let mut unsorted_namespace = namespace;
         unsorted_namespace.trust_domain_ids =
             vec!["trust-domain:zeta".into(), "trust-domain:alpha".into()];
         assert!(first_owner_authority_namespace_digest(&unsorted_namespace).is_err());
+    }
+
+    #[test]
+    fn first_owner_certificate_has_exact_canonical_signature_and_digest_contracts() {
+        let (certificate, signing_key) = first_owner_certificate_fixture();
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_fingerprint = sha256_bytes_digest(&public_key);
+        let authority = FirstOwnerCertificateAuthorityAnchor {
+            authority_id: "first-owner-authority:fixture",
+            authority_key_id: "first-owner-authority-key:fixture",
+            public_key: &public_key,
+            public_key_fingerprint: &public_key_fingerprint,
+            minimum_authority_epoch: 1,
+        };
+
+        let canonical = first_owner_closure_certificate_canonical_bytes(&certificate).unwrap();
+        assert!(canonical.len() <= FIRST_OWNER_CLOSURE_CERTIFICATE_MAX_BYTES);
+        assert_eq!(
+            parse_first_owner_closure_certificate(&canonical).unwrap(),
+            certificate
+        );
+        let verified = verify_first_owner_closure_certificate(&certificate, authority).unwrap();
+        assert_eq!(
+            verified.certificate_digest(),
+            first_owner_closure_certificate_digest(&certificate).unwrap()
+        );
+        assert_eq!(
+            verified.authority_namespace_digest(),
+            certificate.closure.authority_namespace_digest
+        );
+        assert_eq!(
+            verified.signature_digest(),
+            first_owner_closure_certificate_signature_digest(&certificate).unwrap()
+        );
+        let closure_record = first_owner_closure_record_from_certificate(&certificate).unwrap();
+        assert_eq!(
+            verified.closure_record_digest(),
+            first_owner_closure_record_digest(&closure_record).unwrap()
+        );
+        assert_eq!(
+            closure_record.closure_certificate_digest,
+            verified.certificate_digest()
+        );
+
+        let unsigned =
+            first_owner_closure_certificate_unsigned_canonical_bytes(&certificate).unwrap();
+        let signing_bytes = first_owner_closure_certificate_signing_bytes(&certificate).unwrap();
+        let domain = FIRST_OWNER_CLOSURE_CERTIFICATE_SIGNATURE_DOMAIN.as_bytes();
+        assert_eq!(
+            &signing_bytes[..8],
+            &(u64::try_from(domain.len()).unwrap()).to_le_bytes()
+        );
+        assert_eq!(&signing_bytes[8..8 + domain.len()], domain);
+        let second_frame_offset = 8 + domain.len();
+        assert_eq!(
+            &signing_bytes[second_frame_offset..second_frame_offset + 8],
+            &(u64::try_from(unsigned.len()).unwrap()).to_le_bytes()
+        );
+        assert_eq!(&signing_bytes[second_frame_offset + 8..], unsigned);
+    }
+
+    #[test]
+    fn first_owner_signing_preimage_matches_a_fixed_manual_golden() {
+        const GOLDEN_NAMESPACE_DIGEST: &str =
+            "sha256:0de0f4059499e1296bf351368d6a1b91ba216289966e0c7620dcab63578cf0f1";
+        const GOLDEN_UNSIGNED: &str = concat!(
+            "{\"authority_namespace\":{\"authority_epoch\":7,",
+            "\"authority_id\":\"first-owner-authority:golden\",",
+            "\"authority_key_id\":\"first-owner-authority-key:golden\",",
+            "\"authority_public_key_fingerprint\":\"sha256:",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+            "\"deployment_id\":\"deployment:golden\",",
+            "\"namespace_id\":\"first-owner-namespace:golden\",",
+            "\"state_contract_version\":1,\"tenancy_mode\":\"single_tenant\",",
+            "\"tenant_id\":null,\"trust_domain_ids\":[\"trust-domain:golden\"]},",
+            "\"canonicalization\":\"ryuki-canonical-json-v1\",",
+            "\"closure\":{\"authority_namespace_digest\":\"",
+            "sha256:0de0f4059499e1296bf351368d6a1b91ba216289966e0c7620dcab63578cf0f1\",",
+            "\"authority_sequence\":11,",
+            "\"capability_expires_at\":\"2026-08-03T12:05:00Z\",",
+            "\"capability_id\":\"first-owner-capability:golden\",",
+            "\"claim_request_digest\":\"sha256:",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",",
+            "\"closed_at_not_after\":\"2026-08-03T12:00:01Z\",",
+            "\"closed_at_not_before\":\"2026-08-03T12:00:00Z\",",
+            "\"closure_event_id\":\"first-owner-closure-event:golden\",",
+            "\"deployment_id\":\"deployment:golden\",",
+            "\"first_owner_principal_id\":\"principal:golden-owner\",",
+            "\"state_contract_version\":1,\"status\":\"closed\"},",
+            "\"contract_kind\":\"first-owner-closure-certificate\",",
+            "\"privileged_domain_assignments\":[",
+            "{\"assignment_event_id\":\"first-owner-assignment-event:event-0\",",
+            "\"domain_id\":\"audit-administration\",\"principal_id\":\"principal:golden-owner\"},",
+            "{\"assignment_event_id\":\"first-owner-assignment-event:event-1\",",
+            "\"domain_id\":\"identity-administration\",\"principal_id\":\"principal:golden-owner\"},",
+            "{\"assignment_event_id\":\"first-owner-assignment-event:event-2\",",
+            "\"domain_id\":\"live-execution-administration\",",
+            "\"principal_id\":\"principal:golden-owner\"},",
+            "{\"assignment_event_id\":\"first-owner-assignment-event:event-3\",",
+            "\"domain_id\":\"policy-administration\",\"principal_id\":\"principal:golden-owner\"},",
+            "{\"assignment_event_id\":\"first-owner-assignment-event:event-4\",",
+            "\"domain_id\":\"secret-key-custody\",\"principal_id\":\"principal:golden-owner\"}],",
+            "\"schema_version\":\"1.0.0\",\"signature_algorithm\":\"ed25519\"}"
+        );
+        let certificate = FirstOwnerClosureCertificate {
+            schema_version: "1.0.0".into(),
+            contract_kind: "first-owner-closure-certificate".into(),
+            canonicalization: "ryuki-canonical-json-v1".into(),
+            signature_algorithm: "ed25519".into(),
+            authority_namespace: FirstOwnerAuthorityNamespace {
+                state_contract_version: 1,
+                deployment_id: "deployment:golden".into(),
+                trust_domain_ids: vec!["trust-domain:golden".into()],
+                tenancy_mode: TenancyMode::SingleTenant,
+                tenant_id: None,
+                authority_id: "first-owner-authority:golden".into(),
+                authority_key_id: "first-owner-authority-key:golden".into(),
+                authority_public_key_fingerprint: fixture_digest('a'),
+                authority_epoch: 7,
+                namespace_id: "first-owner-namespace:golden".into(),
+            },
+            closure: SignedFirstOwnerClosure {
+                state_contract_version: 1,
+                deployment_id: "deployment:golden".into(),
+                authority_namespace_digest: GOLDEN_NAMESPACE_DIGEST.into(),
+                status: FirstOwnerClosureStatus::Closed,
+                closure_event_id: "first-owner-closure-event:golden".into(),
+                authority_sequence: 11,
+                first_owner_principal_id: "principal:golden-owner".into(),
+                claim_request_digest: fixture_digest('b'),
+                capability_id: "first-owner-capability:golden".into(),
+                capability_expires_at: "2026-08-03T12:05:00Z".into(),
+                closed_at_not_before: "2026-08-03T12:00:00Z".into(),
+                closed_at_not_after: "2026-08-03T12:00:01Z".into(),
+            },
+            privileged_domain_assignments: vec![
+                SignedPrivilegedDomainAssignment {
+                    assignment_event_id: "first-owner-assignment-event:event-0".into(),
+                    domain_id: "audit-administration".into(),
+                    principal_id: "principal:golden-owner".into(),
+                },
+                SignedPrivilegedDomainAssignment {
+                    assignment_event_id: "first-owner-assignment-event:event-1".into(),
+                    domain_id: "identity-administration".into(),
+                    principal_id: "principal:golden-owner".into(),
+                },
+                SignedPrivilegedDomainAssignment {
+                    assignment_event_id: "first-owner-assignment-event:event-2".into(),
+                    domain_id: "live-execution-administration".into(),
+                    principal_id: "principal:golden-owner".into(),
+                },
+                SignedPrivilegedDomainAssignment {
+                    assignment_event_id: "first-owner-assignment-event:event-3".into(),
+                    domain_id: "policy-administration".into(),
+                    principal_id: "principal:golden-owner".into(),
+                },
+                SignedPrivilegedDomainAssignment {
+                    assignment_event_id: "first-owner-assignment-event:event-4".into(),
+                    domain_id: "secret-key-custody".into(),
+                    principal_id: "principal:golden-owner".into(),
+                },
+            ],
+            signature_base64: BASE64_STANDARD.encode([0_u8; 64]),
+        };
+
+        assert_eq!(GOLDEN_UNSIGNED.len(), 1_950);
+        assert_eq!(
+            first_owner_closure_certificate_unsigned_canonical_bytes(&certificate).unwrap(),
+            GOLDEN_UNSIGNED.as_bytes()
+        );
+        let mut expected =
+            b"\x28\x00\x00\x00\x00\x00\x00\x00ryuki-v1/first-owner-closure-certificate\x9e\x07\x00\x00\x00\x00\x00\x00"
+                .to_vec();
+        expected.extend_from_slice(GOLDEN_UNSIGNED.as_bytes());
+        assert_eq!(
+            first_owner_closure_certificate_signing_bytes(&certificate).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn first_owner_certificate_schema_and_serde_close_every_object_shape() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../catalog/security-contracts/v1/first-owner-closure-certificate.schema.json"
+        ))
+        .expect("first-owner closure certificate schema must be JSON");
+        let validator = jsonschema::draft202012::options()
+            .build(&schema)
+            .expect("first-owner closure certificate schema must compile");
+        let (certificate, _) = first_owner_certificate_fixture();
+        let value = serde_json::to_value(&certificate).unwrap();
+        assert!(validator.is_valid(&value));
+
+        let mut unknown = value.clone();
+        unknown["unexpected"] = json!(true);
+        assert!(!validator.is_valid(&unknown));
+        let unknown_bytes = canonical_json_bytes(&unknown).unwrap();
+        assert_eq!(
+            parse_first_owner_closure_certificate(&unknown_bytes),
+            Err(FirstOwnerClosureCertificateError::InvalidCertificate)
+        );
+
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("contract_kind");
+        assert!(!validator.is_valid(&missing));
+        let missing_bytes = canonical_json_bytes(&missing).unwrap();
+        assert_eq!(
+            parse_first_owner_closure_certificate(&missing_bytes),
+            Err(FirstOwnerClosureCertificateError::InvalidCertificate)
+        );
+
+        let canonical = first_owner_closure_certificate_canonical_bytes(&certificate).unwrap();
+        let pretty = serde_json::to_vec_pretty(&certificate).unwrap();
+        assert_eq!(
+            parse_first_owner_closure_certificate(&pretty),
+            Err(FirstOwnerClosureCertificateError::NonCanonicalCertificate)
+        );
+        let canonical_text = String::from_utf8(canonical).unwrap();
+        let duplicate = canonical_text.replacen('{', "{\"schema_version\":\"1.0.0\",", 1);
+        assert_eq!(
+            parse_first_owner_closure_certificate(duplicate.as_bytes()),
+            Err(FirstOwnerClosureCertificateError::InvalidCertificate)
+        );
+
+        let nested_duplicate = canonical_text.replacen(
+            "\"authority_epoch\":1,",
+            "\"authority_epoch\":1,\"authority_epoch\":1,",
+            1,
+        );
+        assert_eq!(
+            parse_first_owner_closure_certificate(nested_duplicate.as_bytes()),
+            Err(FirstOwnerClosureCertificateError::InvalidCertificate)
+        );
+        assert_eq!(
+            parse_first_owner_closure_certificate(&[]),
+            Err(FirstOwnerClosureCertificateError::InvalidCertificate)
+        );
+        let oversized = vec![b' '; FIRST_OWNER_CLOSURE_CERTIFICATE_MAX_BYTES + 1];
+        assert_eq!(
+            parse_first_owner_closure_certificate(&oversized),
+            Err(FirstOwnerClosureCertificateError::InvalidCertificate)
+        );
+    }
+
+    #[test]
+    fn first_owner_certificate_requires_the_exact_closed_domain_assignment_set() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../catalog/security-contracts/v1/first-owner-closure-certificate.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+        let (certificate, _) = first_owner_certificate_fixture();
+
+        let mut reordered = certificate.clone();
+        reordered.privileged_domain_assignments.reverse();
+        assert!(first_owner_closure_certificate_canonical_bytes(&reordered).is_err());
+        assert!(!validator.is_valid(&serde_json::to_value(&reordered).unwrap()));
+
+        let mut duplicate_domain = certificate.clone();
+        duplicate_domain.privileged_domain_assignments[1].domain_id =
+            FIRST_OWNER_PRIVILEGED_DOMAINS[0].into();
+        assert!(first_owner_closure_certificate_canonical_bytes(&duplicate_domain).is_err());
+        assert!(!validator.is_valid(&serde_json::to_value(&duplicate_domain).unwrap()));
+
+        let mut duplicate_event = certificate.clone();
+        duplicate_event.privileged_domain_assignments[1].assignment_event_id = duplicate_event
+            .privileged_domain_assignments[0]
+            .assignment_event_id
+            .clone();
+        assert!(first_owner_closure_certificate_canonical_bytes(&duplicate_event).is_err());
+
+        let mut wrong_principal = certificate;
+        wrong_principal.privileged_domain_assignments[4].principal_id =
+            "principal:substituted-owner".into();
+        assert!(first_owner_closure_certificate_canonical_bytes(&wrong_principal).is_err());
+    }
+
+    #[test]
+    fn first_owner_namespace_is_deployment_owned_in_both_tenancy_modes() {
+        let (mut certificate, signing_key) = first_owner_certificate_fixture();
+        certificate.authority_namespace.tenancy_mode = TenancyMode::MultiTenant;
+        certificate.authority_namespace.tenant_id = None;
+        certificate.closure.authority_namespace_digest =
+            first_owner_authority_namespace_digest(&certificate.authority_namespace).unwrap();
+        resign_first_owner_certificate(&mut certificate, &signing_key);
+        assert!(first_owner_closure_certificate_canonical_bytes(&certificate).is_ok());
+
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_fingerprint = sha256_bytes_digest(&public_key);
+        verify_first_owner_closure_certificate(
+            &certificate,
+            FirstOwnerCertificateAuthorityAnchor {
+                authority_id: "first-owner-authority:fixture",
+                authority_key_id: "first-owner-authority-key:fixture",
+                public_key: &public_key,
+                public_key_fingerprint: &public_key_fingerprint,
+                minimum_authority_epoch: 1,
+            },
+        )
+        .unwrap();
+
+        certificate.authority_namespace.tenant_id = Some("tenant:forbidden".into());
+        assert!(first_owner_authority_namespace_digest(&certificate.authority_namespace).is_err());
+        assert!(first_owner_closure_certificate_canonical_bytes(&certificate).is_err());
+    }
+
+    #[test]
+    fn first_owner_certificate_rejects_every_privileged_identifier_prefix_substitution() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../catalog/security-contracts/v1/first-owner-closure-certificate.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+        let (certificate, _) = first_owner_certificate_fixture();
+        let assert_rejected = |candidate: &FirstOwnerClosureCertificate| {
+            assert!(first_owner_closure_certificate_canonical_bytes(candidate).is_err());
+            assert!(!validator.is_valid(&serde_json::to_value(candidate).unwrap()));
+        };
+
+        let mut wrong_authority = certificate.clone();
+        wrong_authority.authority_namespace.authority_id = "runtime-authority:fixture".into();
+        assert_rejected(&wrong_authority);
+
+        let mut wrong_authority_key = certificate.clone();
+        wrong_authority_key.authority_namespace.authority_key_id =
+            "runtime-authority-key:fixture".into();
+        assert_rejected(&wrong_authority_key);
+
+        let mut wrong_namespace = certificate.clone();
+        wrong_namespace.authority_namespace.namespace_id = "runtime-namespace:fixture".into();
+        assert_rejected(&wrong_namespace);
+
+        let mut wrong_closure_event = certificate.clone();
+        wrong_closure_event.closure.closure_event_id = "domain-event:fixture".into();
+        assert_rejected(&wrong_closure_event);
+
+        let mut wrong_capability = certificate.clone();
+        wrong_capability.closure.capability_id = "capability:fixture".into();
+        assert_rejected(&wrong_capability);
+
+        let mut wrong_principal = certificate.clone();
+        wrong_principal.closure.first_owner_principal_id = "subject:fixture-owner".into();
+        for assignment in &mut wrong_principal.privileged_domain_assignments {
+            assignment.principal_id = "subject:fixture-owner".into();
+        }
+        assert_rejected(&wrong_principal);
+
+        let mut wrong_assignment_event = certificate;
+        wrong_assignment_event.privileged_domain_assignments[0].assignment_event_id =
+            "domain-event:assignment".into();
+        assert_rejected(&wrong_assignment_event);
+    }
+
+    #[test]
+    fn first_owner_certificate_rejects_noncanonical_scalars_and_counter_bounds() {
+        let (certificate, _) = first_owner_certificate_fixture();
+
+        let mut invalid_signature = certificate.clone();
+        invalid_signature.signature_base64 = "A".repeat(88);
+        assert_eq!(
+            first_owner_closure_certificate_canonical_bytes(&invalid_signature),
+            Err(FirstOwnerClosureCertificateError::InvalidSignatureRepresentation)
+        );
+
+        let mut fractional_timestamp = certificate.clone();
+        fractional_timestamp.closure.closed_at_not_after = "2026-07-16T00:00:01.001Z".into();
+        assert!(first_owner_closure_certificate_canonical_bytes(&fractional_timestamp).is_err());
+
+        let mut offset_timestamp = certificate.clone();
+        offset_timestamp.closure.closed_at_not_after = "2026-07-16T02:00:01+02:00".into();
+        assert!(first_owner_closure_certificate_canonical_bytes(&offset_timestamp).is_err());
+
+        let mut invalid_timestamp = certificate.clone();
+        invalid_timestamp.closure.closed_at_not_after = "2026-02-30T00:00:01Z".into();
+        assert!(first_owner_closure_certificate_canonical_bytes(&invalid_timestamp).is_err());
+
+        let mut leap_second = certificate.clone();
+        leap_second.closure.closed_at_not_after = "2026-07-16T00:00:60Z".into();
+        assert!(first_owner_closure_certificate_canonical_bytes(&leap_second).is_err());
+
+        let mut zero_digest = certificate.clone();
+        zero_digest.closure.claim_request_digest = fixture_digest('0');
+        assert!(first_owner_closure_certificate_canonical_bytes(&zero_digest).is_err());
+
+        let mut uppercase_digest = certificate.clone();
+        uppercase_digest.closure.claim_request_digest = format!("sha256:{}", "A".repeat(64));
+        assert!(first_owner_closure_certificate_canonical_bytes(&uppercase_digest).is_err());
+
+        let mut zero_counter = certificate.clone();
+        zero_counter.closure.authority_sequence = 0;
+        assert!(first_owner_closure_certificate_canonical_bytes(&zero_counter).is_err());
+
+        let mut maximum_counter = certificate.clone();
+        maximum_counter.closure.authority_sequence = FIRST_OWNER_MAX_EXACT_JSON_INTEGER;
+        assert!(first_owner_closure_certificate_canonical_bytes(&maximum_counter).is_ok());
+
+        let mut oversized_counter = certificate;
+        oversized_counter.closure.authority_sequence = FIRST_OWNER_MAX_EXACT_JSON_INTEGER + 1;
+        assert!(first_owner_closure_certificate_canonical_bytes(&oversized_counter).is_err());
+    }
+
+    #[test]
+    fn first_owner_signature_verification_uses_only_independent_exact_pins() {
+        let (certificate, signing_key) = first_owner_certificate_fixture();
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_fingerprint = sha256_bytes_digest(&public_key);
+        let authority = |minimum_authority_epoch| FirstOwnerCertificateAuthorityAnchor {
+            authority_id: "first-owner-authority:fixture",
+            authority_key_id: "first-owner-authority-key:fixture",
+            public_key: &public_key,
+            public_key_fingerprint: &public_key_fingerprint,
+            minimum_authority_epoch,
+        };
+        assert!(verify_first_owner_closure_certificate(&certificate, authority(1)).is_ok());
+        assert_eq!(
+            verify_first_owner_closure_certificate(&certificate, authority(2)),
+            Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding)
+        );
+        assert_eq!(
+            verify_first_owner_closure_certificate(
+                &certificate,
+                FirstOwnerCertificateAuthorityAnchor {
+                    authority_id: "first-owner-authority:substituted",
+                    authority_key_id: "first-owner-authority-key:fixture",
+                    public_key: &public_key,
+                    public_key_fingerprint: &public_key_fingerprint,
+                    minimum_authority_epoch: 1,
+                },
+            ),
+            Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding)
+        );
+        assert_eq!(
+            verify_first_owner_closure_certificate(
+                &certificate,
+                FirstOwnerCertificateAuthorityAnchor {
+                    authority_id: "first-owner-authority:fixture",
+                    authority_key_id: "first-owner-authority-key:substituted",
+                    public_key: &public_key,
+                    public_key_fingerprint: &public_key_fingerprint,
+                    minimum_authority_epoch: 1,
+                },
+            ),
+            Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding)
+        );
+
+        let mut forged_signature = certificate.clone();
+        forged_signature.signature_base64 = BASE64_STANDARD.encode([0x42_u8; 64]);
+        assert_eq!(
+            verify_first_owner_closure_certificate(&forged_signature, authority(1)),
+            Err(FirstOwnerClosureCertificateError::SignatureVerificationFailed)
+        );
+
+        let wrong_fingerprint = fixture_digest('a');
+        assert_eq!(
+            verify_first_owner_closure_certificate(
+                &certificate,
+                FirstOwnerCertificateAuthorityAnchor {
+                    authority_id: "first-owner-authority:fixture",
+                    authority_key_id: "first-owner-authority-key:fixture",
+                    public_key: &public_key,
+                    public_key_fingerprint: &wrong_fingerprint,
+                    minimum_authority_epoch: 1,
+                },
+            ),
+            Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding)
+        );
+
+        let mut weak_public_key = [0_u8; 32];
+        // Canonical Edwards identity encoding: valid Ed25519 bytes, but a
+        // small-order key that must never be admitted as an authority.
+        weak_public_key[0] = 1;
+        assert!(
+            VerifyingKey::from_bytes(&weak_public_key)
+                .unwrap()
+                .is_weak()
+        );
+        let weak_fingerprint = sha256_bytes_digest(&weak_public_key);
+        let mut weak_key_certificate = certificate;
+        weak_key_certificate
+            .authority_namespace
+            .authority_public_key_fingerprint = weak_fingerprint.clone();
+        weak_key_certificate.closure.authority_namespace_digest =
+            first_owner_authority_namespace_digest(&weak_key_certificate.authority_namespace)
+                .unwrap();
+        assert_eq!(
+            verify_first_owner_closure_certificate(
+                &weak_key_certificate,
+                FirstOwnerCertificateAuthorityAnchor {
+                    authority_id: "first-owner-authority:fixture",
+                    authority_key_id: "first-owner-authority-key:fixture",
+                    public_key: &weak_public_key,
+                    public_key_fingerprint: &weak_fingerprint,
+                    minimum_authority_epoch: 1,
+                },
+            ),
+            Err(FirstOwnerClosureCertificateError::InvalidAuthorityBinding)
+        );
+    }
+
+    #[test]
+    fn first_owner_install_capability_has_an_exclusive_expiry_boundary() {
+        let (certificate, _) = first_owner_certificate_fixture();
+        let instant = |hour, minute, second| {
+            Utc.with_ymd_and_hms(2026, 7, 16, hour, minute, second)
+                .unwrap()
+        };
+        assert!(
+            !first_owner_closure_certificate_is_installable_at(&certificate, instant(0, 0, 0))
+                .unwrap()
+        );
+        assert!(
+            first_owner_closure_certificate_is_installable_at(&certificate, instant(0, 0, 1))
+                .unwrap()
+        );
+        assert!(
+            first_owner_closure_certificate_is_installable_at(&certificate, instant(0, 59, 59))
+                .unwrap()
+        );
+        assert!(
+            !first_owner_closure_certificate_is_installable_at(&certificate, instant(1, 0, 0))
+                .unwrap()
+        );
     }
 
     #[test]

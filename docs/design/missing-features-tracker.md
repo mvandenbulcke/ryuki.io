@@ -73,6 +73,27 @@ therefore no deployable scope under SB-CONF-04. Only
 `TRACE-SB-OPS-07-AC-016` and `TRACE-SB-CONF-05-AC-055` currently have non-null
 deployment tiers.
 
+SB-0 now has a repository-local, lower-level first-owner closure installation
+slice, without closing the SB-0 package. Exact production apply-only inputs bind
+a descriptor-pinned detached certificate to independent authority pins,
+deployment scope, trusted interval, and the migration receipt. Migration 213
+performs the forward-only tenant-scope correction; the outer transaction
+consumes an in-process authority, invokes the migration-193 writer, forces the
+five-domain constraint, validates the linked closure/assignment/audit/event
+readback, and retains a stable reconciliation marker. Follow-on migrations and
+unknown-COMMIT reconciliation verify the durable closure instead of reopening
+or blindly retrying it.
+
+The production runtime-render admission fence is still hard-coded closed. No
+certificate materializer or validated materialization receipt, externally
+monotonic one-use authority, live PostgreSQL 18 concurrency/rollback/lost-
+COMMIT/restore receipt, or operator ceremony exists. The current readback does
+not establish the entire historical audit chain, and privileged-domain
+transfer, separation/risk acceptance, maker-checker removal, last-owner
+protection, recovery, WebAuthn, and break-glass remain open. Consequently the
+SB-0 checkbox stays `[ ]`, all three SB-BOOT/AC-023 trace rows stay `partial`,
+the 14/118/9 totals stay unchanged, and production acceptance stays false.
+
 SB-2 now has a first permit-bearing instance slice for
 `GET /api/requests/{id}`. Authentication middleware retains exact session or
 federated credential evidence; the request repository revalidates it, resolves

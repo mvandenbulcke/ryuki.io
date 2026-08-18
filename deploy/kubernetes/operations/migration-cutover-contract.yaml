@@ -411,6 +411,8 @@ productionPinProjections:
     resourceVersion: RENDER_REQUIRED
     jobReceiptAnnotation: ryuki.io/pin-first-owner-authority-receipt
     configKeys:
+      - RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH
+      - RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST
       - RYUKI_FIRST_OWNER_AUTHORITY_ID
       - RYUKI_FIRST_OWNER_AUTHORITY_KEY_ID
       - RYUKI_FIRST_OWNER_AUTHORITY_PUBLIC_KEY_BASE64
@@ -421,6 +423,10 @@ productionPinProjections:
     ed25519Required: true
     privateKeyInWorkloadForbidden: true
     socketProjectionRequired: false
+    detachedCertificateRequired: true
+    descriptorPinnedRegularFileRequired: true
+    symlinkProjectionForbidden: true
+    materializationReceiptRequired: true
   completeGroupsRequired: true
   exactPinConfigMapReceiptCount: 9
   releaseDigestPrefixBoundNamesRequired: true

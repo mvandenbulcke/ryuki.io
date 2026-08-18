@@ -895,11 +895,11 @@ mod tests {
         );
         assert_eq!(
             value["summary"]["runtime_tracking_state_counts"]["required_unproven"],
-            46
+            49
         );
         assert_eq!(
             value["summary"]["runtime_tracking_state_counts"]["not_evaluated"],
-            95
+            92
         );
         assert_eq!(
             value["summary"]["deployment_evidence_state_counts"]["not_in_scope"],

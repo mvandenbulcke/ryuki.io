@@ -38,6 +38,9 @@ zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 aws-lc-rs = "1"
 pkcs8 = "0.10"

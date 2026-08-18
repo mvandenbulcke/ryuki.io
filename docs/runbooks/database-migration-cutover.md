@@ -22,11 +22,13 @@ Before interpreting `RYUKI_MIGRATION_MODE` or opening a database connection,
 every mode admits the same seven baseline deployment-security pins documented
 in `docs/configuration.md`; production additionally requires its complete
 build, checkpoint, deployed-workload, public-ingress, PostgreSQL-infrastructure,
-and first-owner authority pin groups. The one-shot Job uses the same root-owned
-contract tree baked into the release image and imports every external value by
-an exact `ConfigMap` or `Secret` key reference. A missing, inactive, unresolved,
-partial, or digest-mismatched contract therefore exits before migration
-credentials or PostgreSQL are touched.
+and first-owner authority pin groups. Production `apply-only` additionally
+requires its complete two-value first-owner closure-certificate path/digest
+group. The one-shot Job uses the same root-owned contract tree baked into the
+release image and imports every external value by an exact `ConfigMap` or
+`Secret` key reference. A missing, inactive, unresolved, partial, or
+digest-mismatched contract therefore exits before migration credentials or
+PostgreSQL are touched.
 
 `RYUKI_MIGRATION_MODE` is a closed enum:
 
@@ -121,7 +123,7 @@ means of bypassing the current execution block:
 | `platform-deployed-workload-attestation-pins-<digest-prefix>` | The complete ten-value workload authority, measurement-profile, and expected-workload binding |
 | `platform-public-ingress-attestation-pins-<digest-prefix>` | The complete nine-value public-ingress authority/profile binding required by production startup |
 | `platform-postgresql-infrastructure-attestation-pins-<digest-prefix>` | The complete nine-value PostgreSQL infrastructure authority/profile binding |
-| `platform-first-owner-authority-pins-<digest-prefix>` | The complete five-value first-owner Ed25519 authority binding; it is imported key-by-key as application environment and deliberately has no socket projection |
+| `platform-first-owner-authority-pins-<digest-prefix>` | The complete seven-value first-owner binding: five always-required Ed25519 authority pins plus the complete-or-none two-value exact `apply-only` closure-certificate path/digest group; all seven are imported key-by-key and the group deliberately has no socket projection |
 | `platform-migration-socket-projection-authority-pins-<digest-prefix>` | The exact eight `RYUKI_MIGRATION_SOCKET_PROJECTION_RECEIPT_*` authority/key/profile values; it is render-verification input only and is never imported as application environment or mounted into the Job |
 
 These resources contain reviewed non-secret settings, selectors, public keys,
@@ -129,6 +131,19 @@ fingerprints, epochs, profile identities/versions/digests, and normalized
 socket paths only. They contain no database password, bearer credential,
 private signing key, or raw provider data. The sole migration connection
 string remains the one exact key in the digest-scoped VaultDynamicSecret.
+
+The two first-owner installation keys are
+`RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_PATH` and
+`RYUKI_FIRST_OWNER_CLOSURE_CERTIFICATE_DIGEST`. They are forbidden in serving,
+`verify-only`, development, and test processes. The path must be normalized,
+absolute, detached, and end in `.json`; descriptor-pinned traversal must reject
+symlinks, require a regular file no larger than 262,144 bytes, and reject
+group/other-writable mode bits. The digest must exactly equal the nonzero
+lowercase `sha256:<64 lowercase hex>` digest of the file bytes. The Job imports
+only those strings. It does not materialize the file or carry an independent
+certificate-materialization receipt, so a projected ConfigMap/Secret symlink
+does not satisfy the contract. Because final-render admission remains hard-
+fenced as unavailable, the runner exits before opening or reading the path.
 
 Each of the nine pin ConfigMap names ends in the same first 12 image-digest hex
 characters as the Job. Its metadata carries `ryuki.io/release-digest-prefix` and
