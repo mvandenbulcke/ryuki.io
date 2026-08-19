@@ -75,14 +75,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Deploy exactly the trusted push tree CI validated, not whatever
           # main moved to since.
           ref: ${{ needs.validate-run.outputs.head_sha }}
           persist-credentials: false
       - name: Setup Pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       # docs/ doubles as the repo's internal documentation tree (design notes,
       # workflow specs, runbooks) that the validator depends on in place.
       # Only the curated site files below are published; everything else in
@@ -99,7 +99,7 @@ jobs:
           cp docs/openapi.json _site/
           cp -R docs/assets _site/assets
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: './_site'
       - name: Deploy to GitHub Pages
