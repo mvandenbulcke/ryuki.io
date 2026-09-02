@@ -8,7 +8,7 @@
 # at compile time (sources/ryuki-api/src/database.rs).
 
 # rust:1.96-bookworm, pinned to the reviewed multi-platform index.
-FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS chef
+FROM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
 
 RUN ["/usr/local/cargo/bin/cargo", "install", "cargo-chef", "--version", "0.1.77", "--locked", "--root", "/opt/ryuki-tools/cargo-chef-0.1.77"]
 RUN ["/usr/sbin/groupadd", "--system", "--gid", "10001", "ryuki-build"]
